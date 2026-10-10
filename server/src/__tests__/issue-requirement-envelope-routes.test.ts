@@ -16,6 +16,10 @@ const body = {
   accepted_requirements: ["Internal only", "Cite the source"],
   native_document_complete: true,
 };
+const assignmentContext = (issueId: string) => ({
+  issueId, source: "issue.create", taskId: issueId, taskKey: issueId,
+  wakeReason: "issue_assigned", wakeSource: "assignment", wakeTriggerDetail: "system",
+});
 
 describeDb("atomic issue requirement envelope", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -75,10 +79,11 @@ describeDb("atomic issue requirement envelope", () => {
       { id: otherAgentId, companyId, name: "Other agent", role: "engineer", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
     ]);
     await db.insert(heartbeatRuns).values([
-      { id: runId, companyId, agentId, status: "running", startedAt: new Date(), contextSnapshot: { issueId } },
-      { id: otherRunId, companyId, agentId, status: "running", startedAt: new Date(), contextSnapshot: { issueId: randomUUID() } },
+      { id: runId, companyId, agentId, invocationSource: "assignment", triggerDetail: "system", status: "running", startedAt: new Date(), contextSnapshot: assignmentContext(issueId) },
+      { id: otherRunId, companyId, agentId, invocationSource: "assignment", triggerDetail: "system", status: "running", startedAt: new Date(), contextSnapshot: assignmentContext(randomUUID()) },
     ]);
-    await db.insert(issues).values({ id: issueId, companyId, title: "Request", description: JSON.stringify(body), status: "todo", assigneeAgentId: agentId });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Request", description: JSON.stringify(body), status: "todo", assigneeAgentId: agentId,
+      executionRunId: runId, executionAgentNameKey: "owner", executionLockedAt: new Date() });
   });
 
   it("freezes before checkout and rereads the same seven fields afterward", async () => {
@@ -170,21 +175,39 @@ describeDb("atomic issue requirement envelope", () => {
   });
 
   it("holds if two live Runs claim the same Issue before checkout", async () => {
-    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId } }).where(eq(heartbeatRuns.id, otherRunId));
+    await db.update(heartbeatRuns).set({ contextSnapshot: assignmentContext(issueId) }).where(eq(heartbeatRuns.id, otherRunId));
     expect((await get(actor())).status).toBe(409);
     expect((await get(actor({ runId: otherRunId }))).status).toBe(409);
   });
 
   it("holds an additional Run context instruction", async () => {
-    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, source: "issue.create" } })
-      .where(eq(heartbeatRuns.id, runId));
     expect((await get(actor())).status).toBe(200);
-    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, instruction: "Use another source" } })
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...assignmentContext(issueId), instruction: "Use another source" } })
       .where(eq(heartbeatRuns.id, runId));
     expect((await get(actor())).status).toBe(409);
-    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, source: ["issue.create"] } })
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...assignmentContext(issueId), source: ["issue.create"] } })
       .where(eq(heartbeatRuns.id, runId));
     expect((await get(actor())).status).toBe(409);
+    for (const changes of [
+      { taskId: randomUUID() }, { taskKey: randomUUID() }, { wakeReason: "issue_commented" },
+      { wakeSource: "on_demand" }, { wakeTriggerDetail: "manual" },
+    ]) {
+      await db.update(heartbeatRuns).set({ contextSnapshot: { ...assignmentContext(issueId), ...changes } })
+        .where(eq(heartbeatRuns.id, runId));
+      expect((await get(actor())).status).toBe(409);
+    }
+    await db.update(heartbeatRuns).set({ contextSnapshot: assignmentContext(issueId), invocationSource: "on_demand" })
+      .where(eq(heartbeatRuns.id, runId));
+    expect((await get(actor())).status).toBe(409);
+    await db.update(heartbeatRuns).set({ invocationSource: "assignment", triggerDetail: "manual" })
+      .where(eq(heartbeatRuns.id, runId));
+    expect((await get(actor())).status).toBe(409);
+    await db.update(heartbeatRuns).set({
+      invocationSource: "automation", triggerDetail: "system",
+      contextSnapshot: { ...assignmentContext(issueId), source: "issue.status_change",
+        wakeReason: "issue_status_changed", wakeSource: "automation" },
+    }).where(eq(heartbeatRuns.id, runId));
+    expect((await get(actor())).status).toBe(200);
   });
 
   it("holds after an unreviewed database migration", async () => {

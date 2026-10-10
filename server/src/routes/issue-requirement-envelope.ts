@@ -15,6 +15,34 @@ type DescriptionBody = {
   native_document_complete: true;
 };
 
+const ASSIGNMENT_RUN_CONTEXT_KEYS = [
+  "issueId", "source", "taskId", "taskKey", "wakeReason", "wakeSource", "wakeTriggerDetail",
+] as const;
+
+function assertSupportedAssignmentRunContext(run: {
+  contextSnapshot: Record<string, unknown> | null;
+  invocationSource: string;
+  triggerDetail: string | null;
+}, issueId: string) {
+  const context = run.contextSnapshot;
+  if (!context || Array.isArray(context) ||
+      Object.keys(context).length !== ASSIGNMENT_RUN_CONTEXT_KEYS.length ||
+      ASSIGNMENT_RUN_CONTEXT_KEYS.some((key) => !Object.hasOwn(context, key))) {
+    hold("Active Run carries unsupported task context");
+  }
+  const expected = context.source === "issue.create" || context.source === "issue.update"
+    ? { wakeReason: "issue_assigned", wakeSource: "assignment" }
+    : context.source === "issue.status_change"
+    ? { wakeReason: "issue_status_changed", wakeSource: "automation" }
+    : null;
+  if (!expected || context.issueId !== issueId || context.taskId !== issueId ||
+      context.taskKey !== issueId || context.wakeReason !== expected.wakeReason ||
+      context.wakeSource !== expected.wakeSource || context.wakeTriggerDetail !== "system" ||
+      run.invocationSource !== expected.wakeSource || run.triggerDetail !== "system") {
+    hold("Active Run context is not a supported Issue assignment wake");
+  }
+}
+
 // SHA-256 of the sorted SQL-content hashes for every migration in this fork
 // through 0313. A new or replaced migration requires an explicit canary review.
 const APPROVED_MIGRATION_SET_SHA256 = "7b78cd60efa0fd8e4153379cbb10508dd9dcfd108df4c029d4a7ead2fe13bb51";
@@ -215,6 +243,8 @@ export function issueRequirementEnvelopeRoutes(db: Db) {
         id: heartbeatRuns.id,
         status: heartbeatRuns.status,
         finishedAt: heartbeatRuns.finishedAt,
+        invocationSource: heartbeatRuns.invocationSource,
+        triggerDetail: heartbeatRuns.triggerDetail,
         nativeIssueId: heartbeatRuns.nativeIssueId,
         contextSnapshot: heartbeatRuns.contextSnapshot,
       }).from(heartbeatRuns).where(and(
@@ -227,14 +257,7 @@ export function issueRequirementEnvelopeRoutes(db: Db) {
           (run.nativeIssueId !== null && run.nativeIssueId !== issue.id)) {
         throw forbidden("Active Run is not bound to this Issue");
       }
-      const runContext = run.contextSnapshot;
-      if (!runContext || Array.isArray(runContext) ||
-          Object.keys(runContext).some((key) => key !== "issueId" && key !== "source") ||
-          (runContext.source !== undefined &&
-            (typeof runContext.source !== "string" ||
-              !["issue.create", "issue.update", "issue.status_change"].includes(runContext.source)))) {
-        hold("Active Run carries unsupported task context");
-      }
+      assertSupportedAssignmentRunContext(run, issue.id);
       const [competingRun] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
         .where(and(
           eq(heartbeatRuns.companyId, issue.companyId),
@@ -248,7 +271,9 @@ export function issueRequirementEnvelopeRoutes(db: Db) {
         )).limit(1);
       if (competingRun) hold("More than one active Run claims this Issue");
       if (issue.checkoutRunId === null) {
-        if (!["todo", "backlog"].includes(issue.status) || issue.executionRunId !== null) {
+        // heartbeat stamps the active execution Run before the agent can
+        // perform checkout. The broker freezes in this state first.
+        if (!["todo", "backlog"].includes(issue.status) || issue.executionRunId !== runId) {
           hold("Issue is not in the pre-checkout canary state");
         }
       } else if (issue.checkoutRunId !== runId || issue.executionRunId !== runId) {
@@ -266,7 +291,7 @@ export function issueRequirementEnvelopeRoutes(db: Db) {
           issue.requestDepth !== 0 || issue.billingCode || issue.sourceTrust || issue.unblockDescriptor ||
           issue.executionPolicy || issue.executionState || issue.assigneeAdapterOverrides ||
           issue.executionWorkspaceId || issue.executionWorkspacePreference || issue.executionWorkspaceSettings ||
-          issue.executionAgentNameKey || issue.monitorNextCheckAt || issue.monitorWakeRequestedAt ||
+          issue.monitorNextCheckAt || issue.monitorWakeRequestedAt ||
           issue.monitorLastTriggeredAt || issue.monitorAttemptCount !== 0 || issue.monitorNotes ||
           issue.monitorScheduledBy || issue.blockedTransitionAt || issue.blockedOwnerNotifiedAt ||
           issue.completedAt || issue.cancelledAt || issue.hiddenAt) {
