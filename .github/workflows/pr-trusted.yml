@@ -318,6 +318,12 @@ jobs:
       - name: Test feature module boundary check
         run: node --test ./scripts/check-module-boundaries.test.mjs
 
+      - name: Validate direct issue material classification
+        run: pnpm check:issue-material-classification
+
+      - name: Test direct issue material classification check
+        run: pnpm test:issue-material-classification
+
       - name: Test PR quality-gate scripts
         run: node --test '.github/scripts/tests/*.test.mjs'
 
