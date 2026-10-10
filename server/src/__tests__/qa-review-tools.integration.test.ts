@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { assets, documentAnnotationComments, documentAnnotationThreads, documents, heartbeatRuns, issueAttachments, issueComments, issueExecutionDecisions, issueRelations, issues, issueWorkProducts } from "@paperclipai/db";
+import { agents, assets, documentAnnotationComments, documentAnnotationThreads, documents, heartbeatRuns, issueAttachments, issueComments, issueExecutionDecisions, issueRelations, issues, issueWorkProducts } from "@paperclipai/db";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { documentService } from "../services/documents.js";
@@ -56,6 +56,7 @@ describe("run-bound QA review MCP", () => {
       "read_assigned_issue", "list_assigned_issue_comments", "read_assigned_issue_document",
       "list_assigned_issue_attachments", "read_assigned_issue_attachment_text", "submit_review_decision",
       "read_assigned_issue_description", "list_assigned_issue_annotations", "read_assigned_review_receipt",
+      "read_assigned_issue_comment", "read_assigned_issue_annotation_text",
     ]);
     const issue = await tool("read_assigned_issue");
     expect(issue.body.result.structuredContent).toMatchObject({ id: fixture.issueId, title: "Verify runner API tools" });
@@ -166,6 +167,8 @@ describe("run-bound QA review MCP", () => {
       expectedLastDecisionId: before.reviewStage.lastDecisionId,
     });
     expect(staleVerdict.body.result.isError).toBe(true);
+    expect(staleVerdict.body.result.content[0].text).toContain("re-read the issue");
+    expect(staleVerdict.body.result.content[0].text).not.toContain("do not resubmit");
     expect(await rows()).toHaveLength(0);
     const after = (await tool("read_assigned_issue")).body.result.structuredContent;
     expect(after.revision).toBeGreaterThan(before.revision);
@@ -184,11 +187,33 @@ describe("run-bound QA review MCP", () => {
     const afterCreate = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
     expect(afterCreate).toBeGreaterThan(initial);
     await server.db.delete(issueWorkProducts).where(eq(issueWorkProducts.id, product!.id));
+    expect(await server.db.select().from(issueWorkProducts).where(eq(issueWorkProducts.id, product!.id))).toHaveLength(0);
     const afterDelete = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
     expect(afterDelete).toBeGreaterThan(afterCreate);
   });
 
-  it("does not expose raw comment metadata or an unbounded comment body", async () => {
+  it("invalidates a verdict after an attachment is added or removed", async () => {
+    const { fixture, stageId, tool, rows } = await reviewFixture();
+    const before = (await tool("read_assigned_issue")).body.result.structuredContent;
+    const [attachment] = await server.db.insert(issueAttachments).values({
+      companyId: fixture.companyId, issueId: fixture.issueId, assetId: fixture.artifactId,
+    }).returning();
+    const afterAdd = (await tool("read_assigned_issue")).body.result.structuredContent;
+    expect(afterAdd.revision).toBeGreaterThan(before.revision);
+    const verdict = (read: typeof before) => tool("submit_review_decision", {
+      decision: "approve", summary: "Evidence was checked.", expectedStageId: stageId,
+      expectedStatusVersion: read.statusVersion, expectedRevision: read.revision,
+      expectedLastDecisionId: read.reviewStage.lastDecisionId,
+    });
+    expect((await verdict(before)).body.result.isError).toBe(true);
+    await server.db.delete(issueAttachments).where(eq(issueAttachments.id, attachment!.id));
+    const afterDelete = (await tool("read_assigned_issue")).body.result.structuredContent;
+    expect(afterDelete.revision).toBeGreaterThan(afterAdd.revision);
+    expect((await verdict(afterAdd)).body.result.isError).toBe(true);
+    expect(await rows()).toHaveLength(0);
+  });
+
+  it("pages oversized Japanese comments without exposing raw metadata", async () => {
     const { fixture, tool } = await reviewFixture();
     await server.db.insert(issueComments).values({
       companyId: fixture.companyId, issueId: fixture.issueId,
@@ -199,15 +224,33 @@ describe("run-bound QA review MCP", () => {
     const first = (await tool("list_assigned_issue_comments", {
       expectedRevision: firstRevision,
     })).body.result.structuredContent;
-    await server.db.insert(issueComments).values({
+    const [longComment] = await server.db.insert(issueComments).values({
       companyId: fixture.companyId, issueId: fixture.issueId,
-      authorAgentId: fixture.agentId, body: "C".repeat(16_001),
-    });
+      authorAgentId: fixture.agentId, body: "審査\\\"".repeat(6_000),
+    }).returning();
     const secondRevision = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
     const oversized = await tool("list_assigned_issue_comments", {
       expectedRevision: secondRevision,
     });
-    expect(oversized.body.result.isError).toBe(true);
+    expect(oversized.body.result.isError).not.toBe(true);
+    const omitted = oversized.body.result.structuredContent.comments.find((item: { id: string }) => item.id === longComment!.id);
+    expect(omitted).toMatchObject({ body: "", bodyOmitted: true });
+    let offset = 0;
+    let assembled = "";
+    while (true) {
+      const page = await tool("read_assigned_issue_comment", {
+        commentId: longComment!.id, expectedRevision: secondRevision, offset,
+      });
+      expect(page.body.result.isError).not.toBe(true);
+      expect(page.wireBytes).toBeLessThanOrEqual(64_000);
+      assembled += page.body.result.structuredContent.text;
+      if (page.body.result.structuredContent.nextOffset === null) break;
+      offset = page.body.result.structuredContent.nextOffset;
+    }
+    expect(assembled).toBe("審査\\\"".repeat(6_000));
+    expect((await tool("read_assigned_issue_comment", {
+      commentId: randomUUID(), expectedRevision: secondRevision,
+    })).body.result.isError).toBe(true);
     expect(first.comments).toEqual([expect.objectContaining({ body: "Assigned issue comment." })]);
     expect(JSON.stringify(first)).not.toContain("private-comment-request-marker");
   });
@@ -216,12 +259,12 @@ describe("run-bound QA review MCP", () => {
     const { fixture, tool } = await reviewFixture();
     const [firstComment, secondComment] = await server.db.insert(issueComments).values([
       { companyId: fixture.companyId, issueId: fixture.issueId,
-        authorAgentId: fixture.agentId, body: "A".repeat(8_000), createdAt: new Date("2026-01-01T00:00:00Z") },
+        authorAgentId: fixture.agentId, body: "あ".repeat(8_000), createdAt: new Date("2026-01-01T00:00:00Z") },
       { companyId: fixture.companyId, issueId: fixture.issueId,
-        authorAgentId: fixture.agentId, body: "B".repeat(8_000), createdAt: new Date("2026-01-01T00:00:01Z") },
+        authorAgentId: fixture.agentId, body: "い".repeat(8_000), createdAt: new Date("2026-01-01T00:00:01Z") },
     ]).returning();
     const expectedRevision = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
-    const first = (await tool("list_assigned_issue_comments", { expectedRevision })).body.result.structuredContent;
+    const first = (await tool("list_assigned_issue_comments", { expectedRevision, limit: 1 })).body.result.structuredContent;
     expect(first.comments.map((comment: { id: string }) => comment.id)).toEqual([firstComment!.id]);
     expect(first.nextAfterCommentId).toBe(firstComment!.id);
     const second = (await tool("list_assigned_issue_comments", {
@@ -289,12 +332,30 @@ describe("run-bound QA review MCP", () => {
     }).where(eq(documentAnnotationComments.id, comment!.id));
     expect((await tool("list_assigned_issue_annotations", args)).body.result.isError).toBe(true);
     await server.db.update(documentAnnotationComments).set({
-      body: "A".repeat(16_001),
+      body: "確認\\\"".repeat(6_000),
     }).where(eq(documentAnnotationComments.id, comment!.id));
     const oversizedRevision = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
-    expect((await tool("list_assigned_issue_annotations", {
+    const oversized = await tool("list_assigned_issue_annotations", {
       key: "notes", expectedRevision: oversizedRevision,
-    })).body.result.isError).toBe(true);
+    });
+    expect(oversized.body.result.isError).not.toBe(true);
+    expect(oversized.body.result.structuredContent.annotations[0]).toMatchObject({
+      commentId: comment!.id, bodyOmitted: true,
+    });
+    let annotationBody = "";
+    let offset = 0;
+    while (true) {
+      const text = await tool("read_assigned_issue_annotation_text", {
+        key: "notes", threadId: thread!.id, commentId: comment!.id,
+        field: "body", expectedRevision: oversizedRevision, offset,
+      });
+      expect(text.body.result.isError).not.toBe(true);
+      expect(text.wireBytes).toBeLessThanOrEqual(64_000);
+      annotationBody += text.body.result.structuredContent.text;
+      if (text.body.result.structuredContent.nextOffset === null) break;
+      offset = text.body.result.structuredContent.nextOffset;
+    }
+    expect(annotationBody).toBe("確認\\\"".repeat(6_000));
   });
 
   it("lists assigned attachments and reads only bounded text content", async () => {
@@ -395,6 +456,13 @@ describe("run-bound QA review MCP", () => {
     expect(bounded.result.isError).toBe(true);
     expect(wire).not.toContain("I".repeat(1_000));
     expect(Buffer.byteLength(wire, "utf8")).toBeLessThanOrEqual(64_000);
+    const unknown = await fetch(`${server.apiUrl}/api/mcp/qa-review`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: "I".repeat(100_000), method: "unknown/method" }),
+    });
+    const unknownWire = await unknown.text();
+    expect(JSON.parse(unknownWire)).toMatchObject({ id: null, error: { code: -32601 } });
+    expect(Buffer.byteLength(unknownWire, "utf8")).toBeLessThanOrEqual(64_000);
   });
 
   it("recovers a recorded decision when its oversized response is withheld", async () => {
@@ -505,6 +573,31 @@ describe("run-bound QA review MCP", () => {
     })]);
   });
 
+  it("recovers a request-changes receipt after assignment returns to another agent", async () => {
+    const { fixture, stageId, tool } = await reviewFixture();
+    const [implementer] = await server.db.insert(agents).values({
+      companyId: fixture.companyId, name: "Implementer", adapterType: "paperclip_runner", status: "active",
+    }).returning();
+    await server.db.update(issues).set({ executionState: {
+      status: "pending", currentStageId: stageId, currentStageIndex: 0,
+      currentStageType: "review", currentParticipant: { type: "agent", agentId: fixture.agentId },
+      returnAssignee: { type: "agent", agentId: implementer!.id }, reviewRequest: null,
+      completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null, monitor: null,
+    } }).where(eq(issues.id, fixture.issueId));
+    const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
+    const summary = "Please add the missing source evidence.";
+    expect((await tool("submit_review_decision", {
+      decision: "request_changes", summary, expectedStageId: stageId,
+      expectedStatusVersion: issue.statusVersion, expectedRevision: issue.revision,
+      expectedLastDecisionId: issue.reviewStage.lastDecisionId,
+    })).body.result.isError).not.toBe(true);
+    const [returned] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect(returned!.assigneeAgentId).toBe(implementer!.id);
+    expect((await tool("read_assigned_review_receipt", {
+      expectedStageId: stageId, decision: "request_changes", summary,
+    })).body.result.structuredContent).toMatchObject({ recorded: true, decisionOutcome: "changes_requested" });
+  });
+
   it("commits at most one decision when opposite QA verdicts race from one pending stage", async () => {
     const { fixture, stageId, tool, rows } = await reviewFixture();
     const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
@@ -537,6 +630,8 @@ describe("run-bound QA review MCP", () => {
     const results = await Promise.all([approve, changes]);
     expect(results.filter((result) => result.body.result?.isError !== true)).toHaveLength(1);
     expect(results.filter((result) => result.body.result?.isError === true)).toHaveLength(1);
+    expect(results.find((result) => result.body.result?.isError === true)!.body.result.content[0].text)
+      .toContain("re-read the issue");
     expect(await rows()).toHaveLength(1);
   }, 45_000);
 

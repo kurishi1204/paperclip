@@ -102,6 +102,7 @@ describe("claude remote execution", () => {
     vi.stubEnv("HOME", path.join(rootDir, "operator-home"));
     vi.stubEnv("HOST_ONLY_QA_SECRET", "must-not-reach-child");
     const managedHome = path.join(rootDir, "managed-home");
+    await writeFile(path.join(rootDir, "CLAUDE.md"), "Untrusted project instructions must not be loaded");
     const qaServer = {
       name: "paperclip_qa", connectionId: "paperclip-qa-review",
       url: "http://127.0.0.1:3100/api/mcp/qa-review", token: "run-bound-token",
@@ -127,13 +128,15 @@ describe("claude remote execution", () => {
     });
     expect(result.exitCode).toBe(0);
     const invocation = (runChildProcess.mock.calls as unknown as Array<[string, string, string[], {
-      env: Record<string, string>; inheritHostEnv?: boolean;
+      env: Record<string, string>; inheritHostEnv?: boolean; cwd: string;
     }]>).find(call => call[2].includes("--print"));
     expect(invocation).toBeDefined();
     const args = invocation![2], options = invocation![3];
-    expect(args).toEqual(expect.arrayContaining(["--restricted", "--tools", "", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--strict-mcp-config"]));
+    expect(args).toEqual(expect.arrayContaining(["--restricted", "--setting-sources", "", "--tools", "", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--strict-mcp-config"]));
     expect(args).not.toEqual(expect.arrayContaining(["--dangerously-skip-permissions", "--add-dir", "--resume", "--append-system-prompt-file"]));
-    expect(args[args.indexOf("--allowedTools") + 1]).toBe("mcp__paperclip_qa__read_assigned_issue,mcp__paperclip_qa__list_assigned_issue_comments,mcp__paperclip_qa__read_assigned_issue_document,mcp__paperclip_qa__list_assigned_issue_attachments,mcp__paperclip_qa__read_assigned_issue_attachment_text,mcp__paperclip_qa__submit_review_decision,mcp__paperclip_qa__read_assigned_issue_description,mcp__paperclip_qa__list_assigned_issue_annotations,mcp__paperclip_qa__read_assigned_review_receipt");
+    expect(args[args.indexOf("--allowedTools") + 1]).toBe("mcp__paperclip_qa__read_assigned_issue,mcp__paperclip_qa__list_assigned_issue_comments,mcp__paperclip_qa__read_assigned_issue_document,mcp__paperclip_qa__list_assigned_issue_attachments,mcp__paperclip_qa__read_assigned_issue_attachment_text,mcp__paperclip_qa__submit_review_decision,mcp__paperclip_qa__read_assigned_issue_description,mcp__paperclip_qa__list_assigned_issue_annotations,mcp__paperclip_qa__read_assigned_review_receipt,mcp__paperclip_qa__read_assigned_issue_comment,mcp__paperclip_qa__read_assigned_issue_annotation_text");
+    expect(options.cwd).toBe(path.join(managedHome, "qa-working-directory"));
+    expect(await readFile(path.join(options.cwd, "CLAUDE.md"), "utf8").catch(() => null)).toBeNull();
     expect(options.inheritHostEnv).toBe(false);
     expect(options.env.ANTHROPIC_API_KEY).toBe("provider-test-key");
     expect(options.env.HOME).toBe(managedHome);

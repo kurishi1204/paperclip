@@ -1,7 +1,7 @@
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import { projectToolContext } from "../services/project-tool-context.js";
-import { assertActiveQaParticipant, callQaReviewTool, hasOwnQaDecision, qaReviewToolDefinitions } from "../services/qa-review-tools.js";
+import { assertActiveQaParticipant, callQaReviewTool, hasOwnQaDecision, QaDecisionOutcomeUnknownError, qaReviewToolDefinitions } from "../services/qa-review-tools.js";
 import { assertCompanyAccess } from "./authz.js";
 import { forbidden } from "../errors.js";
 
@@ -24,6 +24,9 @@ export function qaReviewToolRoutes(db: Db) {
       agentId: context.run.agentId, runId: context.run.id,
     })) throw forbidden("QA tools require the current review participant or this run's formal decision");
     const { id = null, method, params } = req.body ?? {};
+    const serializedId = JSON.stringify(id);
+    const boundedId = (typeof id === "string" || typeof id === "number" || id === null) &&
+      serializedId && Buffer.byteLength(serializedId, "utf8") <= 512 ? id : null;
     const send = (result: unknown) => {
       // content.text and structuredContent duplicate the result. Bound the actual
       // JSON-RPC wire response, rather than any one tool's projected object.
@@ -33,9 +36,6 @@ export function qaReviewToolRoutes(db: Db) {
       }
       // A caller-controlled JSON-RPC id can itself be oversized. Preserve only
       // a small id so even the fail-closed response has a fixed byte bound.
-      const serializedId = JSON.stringify(id);
-      const boundedId = (typeof id === "string" || typeof id === "number" || id === null) &&
-        serializedId && Buffer.byteLength(serializedId, "utf8") <= 512 ? id : null;
       const message = method === "tools/call" && params?.name === "submit_review_decision"
         ? QA_MCP_DECISION_UNCERTAIN_MESSAGE : QA_MCP_OVERSIZE_MESSAGE;
       const fallback = JSON.stringify({ jsonrpc: "2.0", id: boundedId,
@@ -45,7 +45,9 @@ export function qaReviewToolRoutes(db: Db) {
     if (method === "initialize") return send({ protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "paperclip-qa-review", version: "1" } });
     if (method === "notifications/initialized") return res.status(202).end();
     if (method === "tools/list") return send({ tools: qaReviewToolDefinitions });
-    if (method !== "tools/call") return res.json({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
+    if (method !== "tools/call") return res.type("application/json").send(JSON.stringify({
+      jsonrpc: "2.0", id: boundedId, error: { code: -32601, message: "Method not found" },
+    }));
     try {
       if (!qaReviewToolDefinitions.some(tool => tool.name === params?.name)) throw forbidden("Unknown QA review tool");
       if (!activeParticipant && params?.name !== "read_assigned_review_receipt") {
@@ -70,7 +72,9 @@ export function qaReviewToolRoutes(db: Db) {
       const reason = Buffer.byteLength(rawReason, "utf8") <= MAX_QA_MCP_ERROR_MESSAGE_BYTES
         ? rawReason : "QA review tool failed";
       const message = params?.name === "submit_review_decision"
-        ? `${reason}. Use read_assigned_review_receipt with the original stage, decision, and summary; do not resubmit the decision`
+        ? error instanceof QaDecisionOutcomeUnknownError
+          ? `${reason}. Use read_assigned_review_receipt with the original stage, decision, and summary; do not resubmit the decision`
+          : `${reason}. No decision was recorded by this attempt; re-read the issue and submit a new decision if the review stage remains pending`
         : reason;
       return send({ isError: true, content: [{ type: "text", text: message }] });
     }

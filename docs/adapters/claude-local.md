@@ -48,7 +48,7 @@ tools disabled, ignores user and project settings, and passes only the
 run-bound `paperclip_qa` MCP server. Extra CLI arguments, Chrome, custom
 commands, and remote execution targets fail configuration validation.
 
-The nine MCP tools read only an explicit projection of the assigned issue,
+The eleven MCP tools read only an explicit projection of the assigned issue,
 page through its description and document bodies (including the plan), comments,
 document annotations, and UTF-8 attachment text, list assigned attachments,
 submit `approve` or `request_changes`, and read back this run's matching formal
@@ -70,10 +70,11 @@ endpoint, shell command, or credential path. The Claude child does not inherit
 the host environment or the Paperclip run token; its MCP config contains the
 run token for the named QA server only. A stopped run or changed assignment
 loses access. Document bodies are returned in pages of at most 16,000
-characters. Comment pages contain at most 16,000 characters of allowlisted
-fields and fail closed on an oversized single comment. Attachment metadata is paged, and text content is returned in
-pages of at most 16,384 bytes. Annotation pages contain at most 16,000
-characters and fail closed when one annotation exceeds that size. Binary or invalid UTF-8 attachments are
+characters. Comment and annotation lists budget their serialized UTF-8 response.
+Large text is marked omitted with its character count and can be read in pages
+of at most 2,000 Unicode characters through the corresponding text tool.
+Attachment metadata is paged, and text content is returned in pages of at most
+16,384 bytes. Binary or invalid UTF-8 attachments are
 identified but not interpreted: their acceptance evidence must be available
 through an assigned issue document/comment or handled by a human reviewer.
 Every QA MCP tool response is also bounded to 64,000 UTF-8 bytes on the
@@ -83,6 +84,11 @@ the caller can request a smaller evidence page or use human review. An
 oversized decision response may occur after the decision was recorded, so the
 agent must check `read_assigned_review_receipt` with the original stage,
 decision, and summary and must not resubmit the decision.
+Validation errors, stale revision conflicts, and explicit non-2xx PATCH
+responses are definite failures: the agent can re-read the issue and submit a
+new verdict if the review stage remains pending. Transport loss and an
+unverified successful response remain outcome-unknown until a matching receipt
+is read.
 After a missing verdict response, the agent checks the receipt with the exact
 stage, decision, and summary from its attempt. A missing receipt remains
 unknown and does not authorize resubmission. Only that receipt remains readable

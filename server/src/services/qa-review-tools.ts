@@ -8,6 +8,14 @@ import { parseIssueExecutionState } from "./issue-execution-policy.js";
 const commentPageSchema = z.object({
   expectedRevision: z.number().int().nonnegative(),
   afterCommentId: z.string().uuid().optional(),
+  limit: z.number().int().min(1).max(100).default(100),
+}).strict();
+
+const commentTextPageSchema = z.object({
+  commentId: z.string().uuid(),
+  expectedRevision: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative().max(10_000_000).default(0),
+  limit: z.number().int().min(1).max(2_000).default(2_000),
 }).strict();
 
 const commentSourceSchema = z.object({
@@ -27,6 +35,16 @@ const annotationPageSchema = z.object({
   expectedRevision: z.number().int().nonnegative(),
   offset: z.number().int().nonnegative().max(1_000_000).default(0),
   limit: z.number().int().min(1).max(25).default(10),
+}).strict();
+
+const annotationTextPageSchema = z.object({
+  key: issueDocumentKeySchema,
+  threadId: z.string().uuid(),
+  commentId: z.string().uuid().nullable(),
+  field: z.enum(["selectedText", "body"]),
+  expectedRevision: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative().max(10_000_000).default(0),
+  limit: z.number().int().min(1).max(2_000).default(2_000),
 }).strict();
 
 const annotationThreadSchema = z.object({
@@ -108,6 +126,8 @@ export const QA_REVIEW_TOOL_NAMES = [
   "read_assigned_issue_description",
   "list_assigned_issue_annotations",
   "read_assigned_review_receipt",
+  "read_assigned_issue_comment",
+  "read_assigned_issue_annotation_text",
 ] as const;
 
 export const qaReviewToolDefinitions = [
@@ -118,7 +138,7 @@ export const qaReviewToolDefinitions = [
   },
   {
     name: QA_REVIEW_TOOL_NAMES[1],
-    description: "Read bounded, ascending pages of assigned-issue comments at the expected issue revision. Use nextAfterCommentId until null. An oversized single comment fails closed.",
+    description: "Read bounded, ascending pages of assigned-issue comments at the expected issue revision. Use nextAfterCommentId until null. If bodyOmitted is true, page that comment with read_assigned_issue_comment.",
     inputSchema: z.toJSONSchema(commentPageSchema),
   },
   {
@@ -148,7 +168,7 @@ export const qaReviewToolDefinitions = [
   },
   {
     name: QA_REVIEW_TOOL_NAMES[7],
-    description: "Read bounded pages of every annotation and comment on one assigned-issue document at the expected issue revision. Use status=all implicitly; continue with nextOffset until null. An oversized single annotation fails closed.",
+    description: "Read bounded pages of every annotation and comment on one assigned-issue document at the expected issue revision. Use status=all implicitly; continue with nextOffset until null. Page omitted selectedText or body with read_assigned_issue_annotation_text.",
     inputSchema: z.toJSONSchema(annotationPageSchema),
   },
   {
@@ -156,7 +176,35 @@ export const qaReviewToolDefinitions = [
     description: "After a verdict response is missing, read only this run's matching formal review decision. Supply the original stage, decision, and summary. A missing receipt is unknown; do not resend the verdict.",
     inputSchema: z.toJSONSchema(receiptSchema),
   },
+  {
+    name: QA_REVIEW_TOOL_NAMES[9],
+    description: "Read a bounded Unicode text page of one comment on the assigned issue. Continue with nextOffset until null; use the same issue revision as the comment list.",
+    inputSchema: z.toJSONSchema(commentTextPageSchema),
+  },
+  {
+    name: QA_REVIEW_TOOL_NAMES[10],
+    description: "Read a bounded Unicode text page of an omitted annotation selectedText or body. Use the document, thread and comment identifiers returned by list_assigned_issue_annotations, and continue with nextOffset until null.",
+    inputSchema: z.toJSONSchema(annotationTextPageSchema),
+  },
 ];
+
+// The MCP route sends each result twice (structuredContent and content.text).
+// Budget the actual UTF-8 serialization, including escaped JSON, before adding
+// another item to a list. The remaining headroom covers the JSON-RPC id.
+function fitsQaWire(value: unknown) {
+  const text = JSON.stringify(value);
+  return Buffer.byteLength(JSON.stringify({
+    content: [{ type: "text", text }], structuredContent: value,
+  }), "utf8") <= 56_000;
+}
+
+function textPage(body: string, offset: number, limit: number) {
+  const characters = Array.from(body);
+  if (offset > characters.length) throw conflict("Text offset is beyond the current body");
+  const nextOffset = offset + limit < characters.length ? offset + limit : null;
+  return { text: characters.slice(offset, offset + limit).join(""), offset,
+    nextOffset, totalCharacters: characters.length };
+}
 
 export function assertActiveQaParticipant(issue: {
   status: string;
@@ -212,15 +260,33 @@ function apiOrigin(input: QaToolInput) {
 }
 
 async function issueApi(input: QaToolInput, method: "GET" | "PATCH", suffix: string, body?: object) {
-  const response = await fetch(`${apiOrigin(input)}/api/issues/${input.issue.id}${suffix}`, {
-    method,
-    headers: { Authorization: `Bearer ${input.token}`, "Content-Type": "application/json" },
-    ...(body ? { body: JSON.stringify(body) } : {}),
-    signal: AbortSignal.timeout(60_000),
-  });
-  const result = await response.json();
-  if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : `QA issue request failed (${response.status})`);
+  let response: Response;
+  try {
+    response = await fetch(`${apiOrigin(input)}/api/issues/${input.issue.id}${suffix}`, {
+      method,
+      headers: { Authorization: `Bearer ${input.token}`, "Content-Type": "application/json" },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(60_000),
+    });
+  } catch (error) {
+    if (method === "PATCH") throw new QaDecisionOutcomeUnknownError("QA decision transport failed", { cause: error });
+    throw error;
+  }
+  if (!response.ok) {
+    const result = await response.json().catch(() => null);
+    throw new Error(result && typeof result.error === "string" ? result.error : `QA issue request failed (${response.status})`);
+  }
+  let result;
+  try { result = await response.json(); }
+  catch (error) {
+    if (method === "PATCH") throw new QaDecisionOutcomeUnknownError("QA decision response could not be parsed", { cause: error });
+    throw error;
+  }
   return result;
+}
+
+export class QaDecisionOutcomeUnknownError extends Error {
+  override name = "QaDecisionOutcomeUnknownError";
 }
 
 type QaAttachment = {
@@ -367,6 +433,17 @@ async function readAssignedReviewReceipt(input: QaToolInput) {
 export async function callQaReviewTool(input: QaToolInput) {
   if (input.name === QA_REVIEW_TOOL_NAMES[8]) return readAssignedReviewReceipt(input);
   const stage = assertActiveQaParticipant(input.issue, input.agentId);
+  if (input.name === QA_REVIEW_TOOL_NAMES[9]) {
+    const args = commentTextPageSchema.parse(input.arguments);
+    assertExpectedRevision(input, args.expectedRevision);
+    const raw = await issueApi(input, "GET", `/comments/${args.commentId}`);
+    const comment = commentSourceSchema.parse(raw);
+    if (comment.id !== args.commentId || comment.issueId !== input.issue.id) {
+      throw conflict("Assigned issue comment could not be verified");
+    }
+    return { commentId: comment.id, issueRevision: args.expectedRevision,
+      ...textPage(comment.body, args.offset, args.limit) };
+  }
   if (input.name === QA_REVIEW_TOOL_NAMES[0]) {
     z.object({}).strict().parse(input.arguments);
     return projectAssignedIssue(input, await issueApi(input, "GET", ""), stage);
@@ -402,15 +479,29 @@ export async function callQaReviewTool(input: QaToolInput) {
       : [{ threadId: thread.id, status: thread.status, anchorState: thread.anchorState,
         selectedText: thread.selectedText, commentId: null, body: null }]);
     if (args.offset > entries.length) throw conflict("Annotation offset is beyond the current page set");
-    const page: typeof entries = [];
-    let characters = 0;
+    const page: Array<{ threadId: string; status: string; anchorState: string;
+      selectedText: string; commentId: string | null; body: string | null;
+      selectedTextCharacters: number; bodyCharacters: number;
+      selectedTextOmitted: boolean; bodyOmitted: boolean }> = [];
     for (const entry of entries.slice(args.offset, args.offset + args.limit)) {
-      const entryCharacters = Array.from(entry.selectedText).length + Array.from(entry.body ?? "").length;
-      if (entryCharacters > 16_000) throw conflict("One annotation exceeds the QA page size; use human review");
-      if (characters + entryCharacters > 16_000) break;
-      page.push(entry);
-      characters += entryCharacters;
+      const projected = { ...entry,
+        selectedTextCharacters: Array.from(entry.selectedText).length,
+        bodyCharacters: Array.from(entry.body ?? "").length,
+        selectedTextOmitted: false, bodyOmitted: false };
+      const candidate = () => ({ key: args.key, issueRevision: args.expectedRevision,
+        annotations: [...page, projected], offset: args.offset, nextOffset: null, total: entries.length });
+      if (!fitsQaWire(candidate())) {
+        projected.body = null;
+        projected.bodyOmitted = entry.body !== null;
+      }
+      if (!fitsQaWire(candidate())) {
+        projected.selectedText = "";
+        projected.selectedTextOmitted = true;
+      }
+      if (!fitsQaWire(candidate())) break;
+      page.push(projected);
     }
+    if (page.length === 0 && args.offset < entries.length) throw conflict("Annotation metadata exceeds the QA page size; use human review");
     const nextOffset = args.offset + page.length < entries.length ? args.offset + page.length : null;
     return { key: args.key, issueRevision: args.expectedRevision, annotations: page,
       offset: args.offset, nextOffset, total: entries.length };
@@ -418,32 +509,56 @@ export async function callQaReviewTool(input: QaToolInput) {
   if (input.name === QA_REVIEW_TOOL_NAMES[1]) {
     const args = commentPageSchema.parse(input.arguments);
     assertExpectedRevision(input, args.expectedRevision);
-    const query = new URLSearchParams({ order: "asc", limit: "100" });
+    const query = new URLSearchParams({ order: "asc", limit: String(args.limit) });
     if (args.afterCommentId) query.set("after", args.afterCommentId);
     const comments = z.array(commentSourceSchema).parse(await issueApi(input, "GET", `/comments?${query}`));
     if (comments.some((comment) => comment.issueId !== input.issue.id)) {
       throw conflict("Assigned issue comment page contains another issue");
     }
     const page: Array<{ id: string; body: string; createdAt: string;
-      authorType: string | null; authorAgentId: string | null }> = [];
-    let characters = 0;
+      authorType: string | null; authorAgentId: string | null;
+      bodyCharacters: number; bodyOmitted: boolean }> = [];
     for (const comment of comments) {
       const projected = {
         id: comment.id, body: comment.body, createdAt: comment.createdAt,
         authorType: comment.authorType, authorAgentId: comment.authorAgentId,
+        bodyCharacters: Array.from(comment.body).length, bodyOmitted: false,
       };
-      const entryCharacters = JSON.stringify(projected).length;
-      if (entryCharacters > 16_000) throw conflict("One comment exceeds the QA page size; use human review");
-      if (characters + entryCharacters > 16_000) break;
+      const candidate = () => ({ comments: [...page, projected], issueRevision: args.expectedRevision,
+        nextAfterCommentId: null });
+      if (!fitsQaWire(candidate())) {
+        projected.body = "";
+        projected.bodyOmitted = true;
+      }
+      if (!fitsQaWire(candidate())) break;
       page.push(projected);
-      characters += entryCharacters;
     }
+    if (page.length === 0 && comments.length > 0) throw conflict("Comment metadata exceeds the QA page size; use human review");
     return {
       comments: page,
       issueRevision: args.expectedRevision,
-      nextAfterCommentId: page.length > 0 && (page.length < comments.length || comments.length === 100)
+      nextAfterCommentId: page.length > 0 && (page.length < comments.length || comments.length === args.limit)
         ? page[page.length - 1]!.id : null,
     };
+  }
+  if (input.name === QA_REVIEW_TOOL_NAMES[10]) {
+    const args = annotationTextPageSchema.parse(input.arguments);
+    assertExpectedRevision(input, args.expectedRevision);
+    const raw = await issueApi(input, "GET", `/documents/${encodeURIComponent(args.key)}/annotations?status=all&includeComments=true`);
+    const threads = z.array(annotationThreadSchema).parse(raw);
+    if (threads.some((thread) => thread.issueId !== input.issue.id || thread.documentKey !== args.key ||
+        thread.comments.some((comment) => comment.issueId !== input.issue.id || comment.threadId !== thread.id))) {
+      throw conflict("Assigned issue annotations contain another issue or document");
+    }
+    const thread = threads.find((item) => item.id === args.threadId);
+    if (!thread) throw forbidden("Annotation is not on the assigned issue document");
+    const body = args.field === "selectedText" ? thread.selectedText :
+      thread.comments.find((item) => item.id === args.commentId)?.body;
+    if (body === undefined || (args.field === "body" && args.commentId === null)) {
+      throw forbidden("Annotation text is not on the assigned issue document");
+    }
+    return { key: args.key, threadId: args.threadId, commentId: args.commentId,
+      field: args.field, issueRevision: args.expectedRevision, ...textPage(body, args.offset, args.limit) };
   }
   if (input.name === QA_REVIEW_TOOL_NAMES[2]) {
     const args = documentPageSchema.parse(input.arguments);
@@ -492,16 +607,23 @@ export async function callQaReviewTool(input: QaToolInput) {
       lastDecisionId: args.expectedLastDecisionId,
     },
   });
-  const next = parseIssueExecutionState(result.executionState);
+  let verified: { status: string; statusVersion: number; revision: number; executionState: unknown };
+  try {
+    verified = z.object({ status: z.string(), statusVersion: z.number().int(),
+      revision: z.number().int(), executionState: z.unknown() }).parse(result);
+  } catch (error) {
+    throw new QaDecisionOutcomeUnknownError("Decision response could not be verified", { cause: error });
+  }
+  const next = parseIssueExecutionState(verified.executionState);
   if (!next?.lastDecisionId || next.lastDecisionId === args.expectedLastDecisionId ||
       next.lastDecisionOutcome !== (args.decision === "approve" ? "approved" : "changes_requested")) {
-    throw conflict("Decision response is unverified");
+    throw new QaDecisionOutcomeUnknownError("Decision response is unverified");
   }
   return {
     issueId: input.issue.id,
-    status: result.status,
-    statusVersion: result.statusVersion,
-    revision: result.revision,
+    status: verified.status,
+    statusVersion: verified.statusVersion,
+    revision: verified.revision,
     decisionId: next.lastDecisionId,
     decisionOutcome: next.lastDecisionOutcome,
     executionState: next,

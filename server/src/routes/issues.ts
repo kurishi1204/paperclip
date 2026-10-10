@@ -13569,7 +13569,14 @@ export function issueRoutes(
           agentId: existing.assigneeAgentId,
         });
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
-        if (runToStopForReassignment) {
+        // A formal QA request_changes is submitted by the run being reassigned.
+        // Cancelling that run before the locked verdict write can kill the
+        // response and make its run-bound receipt unreachable. After the
+        // transition, QA tools expose only this run's receipt; let the CLI
+        // receive it and finish normally while assignment dispatch proceeds.
+        const qaVerdictFromActiveRun = Boolean(qaReviewExpected && actor.runId &&
+          runToStopForReassignment?.id === actor.runId);
+        if (runToStopForReassignment && !qaVerdictFromActiveRun) {
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
             "Cancelled before issue reassignment",
