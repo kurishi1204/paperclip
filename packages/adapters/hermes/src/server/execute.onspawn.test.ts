@@ -316,6 +316,14 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     expect(result.sessionParams).toEqual({});
   });
 
+  it("clears a failed bounded resume so the next wake can start fresh", async () => {
+    vi.mocked(serverUtils.runChildProcess).mockResolvedValueOnce({ exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "expired session", pid: null, startedAt: null });
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 8, env: { HERMES_HOME: "/private/qa/hermes" } });
+    const result = await execute({ ...ctx, runtime: { ...ctx.runtime, sessionParams: { sessionId: "expired-session", hermesHome: "/private/qa/hermes" } } } as any);
+    expect(vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)![2]).toContain("--resume");
+    expect(result.sessionParams).toEqual({});
+  });
+
   it("ignores server-managed instruction files before a bounded spawn", async () => {
     const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 1, env: { HERMES_HOME: "/private/qa/hermes" }, instructionsFilePath: "/private/secret" });
     await execute(ctx as any);

@@ -683,8 +683,9 @@ export async function execute(
       ? { sessionId: acceptedSessionId, hermesHome: env.HERMES_HOME }
       : { sessionId: acceptedSessionId };
     executionResult.sessionDisplayId = acceptedSessionId.slice(0, 16);
-  } else if (bounded && previousParams?.sessionId && previousHome !== env.HERMES_HOME) {
-    // A legacy or moved session cannot be resumed from this dedicated home.
+  } else if (bounded && previousParams?.sessionId &&
+             (previousHome !== env.HERMES_HOME || result.exitCode !== 0 || result.timedOut)) {
+    // A legacy, moved, or failed session must not trap the next bounded wake.
     executionResult.sessionParams = {};
   }
 

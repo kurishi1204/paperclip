@@ -132,6 +132,33 @@ test("bounded environment check exercises a real hello with an empty HOME", asyn
   }
 });
 
+test("bounded environment probe passes enabledToolsets to the real CLI", async () => {
+  const stage = await realpath(await mkdtemp(path.join(os.tmpdir(), "hermes-bounded-toolsets-")));
+  const home = path.join(stage, "home");
+  const cli = path.join(stage, "fake-hermes");
+  const keys = ["PAPERCLIP_HERMES_BOUNDED_AGENT_ID", "PAPERCLIP_HERMES_BOUNDED_HOME", "PAPERCLIP_HERMES_TRUSTED_COMMAND"] as const;
+  const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    await mkdir(home, { mode: 0o700 });
+    await writeFile(cli, '#!/bin/sh\ncase " $* " in *" -t web "*) echo hello;; *) exit 7;; esac\n');
+    await chmod(cli, 0o755);
+    process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID = "bounded-toolsets-agent";
+    process.env.PAPERCLIP_HERMES_BOUNDED_HOME = home;
+    process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND = cli;
+    const result = await testEnvironment({
+      companyId: "test", adapterType: "hermes_local", agentId: "bounded-toolsets-agent",
+      config: { boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", enabledToolsets: ["web"], maxTurnsPerRun: 8, env: { HERMES_HOME: home } },
+    });
+    expect(result.status).toBe("pass");
+  } finally {
+    for (const key of keys) {
+      if (original[key] === undefined) delete process.env[key];
+      else process.env[key] = original[key];
+    }
+    await rm(stage, { recursive: true, force: true });
+  }
+});
+
 test("standard environment check reports a host provider key that the legacy run inherits", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-no-host-key-"));
   const cliPath = path.join(tempDir, "fake-hermes");

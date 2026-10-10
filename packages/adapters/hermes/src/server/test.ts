@@ -360,7 +360,8 @@ export async function testEnvironment(
     } else {
       const args = ["chat", "-Q", "-q", "Respond with hello. Do not use tools.", "--max-turns", "1", "--source", "tool"];
       if (bounded) args.push("--ignore-user-config", "--ignore-rules");
-      const toolsets = asString(config.toolsets);
+      const toolsets = asString(config.toolsets) ||
+        (Array.isArray(config.enabledToolsets) ? config.enabledToolsets.join(",") : undefined);
       if (toolsets) args.push("-t", toolsets);
       if (asString(config.model)) args.push("-m", asString(config.model)!);
       const provider = asString(config.provider);
