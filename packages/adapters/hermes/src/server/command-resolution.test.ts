@@ -47,6 +47,20 @@ test("testEnvironment accepts config.command when hermesCommand is absent", asyn
   }
 });
 
+test("environment check fails when Hermes is found but cannot start", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-unusable-"));
+  const cliPath = path.join(tempDir, "fake-hermes");
+  try {
+    await writeFile(cliPath, "#!/bin/sh\nexit 7\n");
+    await chmod(cliPath, 0o755);
+    const result = await testEnvironment({ companyId: "test", adapterType: "hermes_local", config: { command: cliPath } });
+    expect(result.status).toBe("fail");
+    expect(result.checks.some((check) => check.code === "hermes_cli_unusable")).toBe(true);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("managed connections probe the selected environment without falling back to host keys", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-managed-probe-"));
   const cliPath = path.join(tempDir, "fake-hermes");

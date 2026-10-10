@@ -61,7 +61,7 @@ export function getConfigSchema(): AdapterConfigSchema {
         label: "Bounded execution",
         type: "toggle",
         default: false,
-        hint: "Require an explicit provider, model, toolsets, turn limit and dedicated HERMES_HOME. Reject approval-bypass arguments and unrecognized environment variables.",
+        hint: "Research-only mode: require a pinned provider/model, web toolset, turn limit and private HERMES_HOME. Reject agent command overrides and extra arguments.",
       },
       {
         key: "persistSession",

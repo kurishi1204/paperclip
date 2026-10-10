@@ -255,15 +255,43 @@ Available toolsets: `terminal`, `file`, `web`, `browser`, `code_execution`, `vis
 | `promptTemplate` | string | *(built-in)* | Custom prompt template |
 | `paperclipApiUrl` | string | `http://127.0.0.1:3100/api` | Paperclip API base URL |
 
-The local adapter does not add `--yolo` and rejects `--yolo` and
-`--ignore-rules` in `extraArgs`. It passes only basic process settings from the
-Paperclip host; unrelated host credentials do not reach Hermes. Explicit
-`env` values still reach the child in standard mode. In bounded mode, use a
-private absolute `env.HERMES_HOME` for that agent's authentication and config;
-the child also receives it as `HOME`. Only provider credential variables and
-basic process settings are accepted there. All `extraArgs` are rejected in
-bounded mode. A bounded run without its
-required configuration fails before starting Hermes.
+Standard mode retains the earlier unattended CLI behavior, including `--yolo`,
+for existing agents. It still passes only selected process settings from the
+Paperclip host, so unrelated host credentials do not reach Hermes. Use bounded
+mode for new research agents that must not bypass Hermes approvals.
+
+Bounded mode requires a private, real `env.HERMES_HOME` directory owned by the
+runtime user. The Paperclip service operator must set
+`PAPERCLIP_HERMES_BOUNDED_HOME` to this exact absolute path in the server
+environment; it is checked before every run and is never passed to the child.
+Use one dedicated home per bounded agent and a separate service process when
+multiple agents require different homes. The home must be separate from the
+host home, and `.env` and
+`auth.json`, when present, must be private regular files. The only supported
+toolset is `web`; all `extraArgs` and agent-configured command overrides are
+rejected. Custom `promptTemplate` is ignored in bounded mode so a configured
+terminal instruction cannot override the web-only task contract. The adapter passes `--ignore-user-config` so a changed
+`config.yaml` cannot disable approvals. Its `.env` accepts only provider and
+search connection keys. Bounded mode requires an explicit provider other than
+`auto`, an explicit model, and a positive `maxTurnsPerRun`. The operator may
+pin an absolute Hermes executable with the Paperclip server environment
+variable `PAPERCLIP_HERMES_TRUSTED_COMMAND`; this value is not taken from agent
+config or forwarded to Hermes.
+
+For sustained web research, configure an official Hermes search backend in
+that dedicated `.env`, such as `TAVILY_API_KEY`. Enabling the `web` toolset
+alone does not provide search. Store the key outside agent instructions and
+never put it in an issue or a run prompt. Bounded mode currently returns
+research output to Paperclip; issue updates and independent QA require a
+separate control-plane path. See the [Hermes web-search guide](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/web-search.md).
+It does not give Hermes the Paperclip run API token or runtime connector token,
+and refuses operator-file instructions, custom working directories, worktree
+creation, and checkpoints. Bounded runs use the server-owned task brief and
+return their answer in the Run result for later review.
+The bounded process runs under the Paperclip service user, so it can still
+read its own provider authentication files. Protecting those credentials from
+arbitrary code running as that same OS user requires a separate UID or a
+credential broker; this mode does not promise such isolation.
 
 ### Prompt Template Variables
 

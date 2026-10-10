@@ -12,14 +12,14 @@ import type {
 } from "@paperclipai/adapter-utils";
 
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 
 import { HERMES_CLI, DEFAULT_MODEL, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
 import { resolveHermesCommand } from "./execute.js";
-import { buildHermesChildEnv, validateHermesExtraArgs } from "./safe-runtime.js";
+import { buildHermesChildEnv, validateBoundedHermesHome, validateBoundedRuntimeOptions, validateBoundedToolsets, validateHermesExtraArgs } from "./safe-runtime.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -33,10 +33,11 @@ function asString(v: unknown): string | undefined {
 
 async function checkCliInstalled(
   command: string,
+  env: Record<string, string>,
 ): Promise<AdapterEnvironmentCheck | null> {
   try {
     // Try to run the command to see if it exists
-    await execFileAsync(command, ["--version"], { timeout: 10_000 });
+    await execFileAsync(command, ["--version"], { env, timeout: 10_000 });
     return null; // OK — it ran successfully
   } catch (err: unknown) {
     const e = err as NodeJS.ErrnoException;
@@ -48,18 +49,22 @@ async function checkCliInstalled(
         code: "hermes_cli_not_found",
       };
     }
-    // Command exists but --version might have failed for some reason
-    // Still consider it installed
-    return null;
+    return {
+      level: "error",
+      message: "Hermes CLI exists but could not start with the selected runtime environment",
+      hint: "Check the Hermes executable and its Python installation under this service account.",
+      code: "hermes_cli_unusable",
+    };
   }
 }
 
 async function checkCliVersion(
   command: string,
+  env: Record<string, string>,
 ): Promise<AdapterEnvironmentCheck | null> {
   try {
     const { stdout } = await execFileAsync(command, ["--version"], {
-      timeout: 10_000,
+      env, timeout: 10_000,
     });
     const version = stdout.trim();
     if (version) {
@@ -81,36 +86,6 @@ async function checkCliVersion(
         "Could not determine Hermes Agent version (hermes --version failed)",
       hint: "Make sure the hermes CLI is properly installed and functional",
       code: "hermes_version_failed",
-    };
-  }
-}
-
-async function checkPython(): Promise<AdapterEnvironmentCheck | null> {
-  try {
-    const { stdout } = await execFileAsync("python3", ["--version"], {
-      timeout: 5_000,
-    });
-    const version = stdout.trim();
-    const match = version.match(/(\d+)\.(\d+)/);
-    if (match) {
-      const major = parseInt(match[1], 10);
-      const minor = parseInt(match[2], 10);
-      if (major < 3 || (major === 3 && minor < 10)) {
-        return {
-          level: "error",
-          message: `Python ${version} found — Hermes requires Python 3.10+`,
-          hint: "Upgrade Python to 3.10 or later",
-          code: "hermes_python_old",
-        };
-      }
-    }
-    return null; // OK
-  } catch {
-    return {
-      level: "warn",
-      message: "python3 not found in PATH",
-      hint: "Hermes Agent requires Python 3.10+. Install it from python.org",
-      code: "hermes_python_missing",
     };
   }
 }
@@ -151,7 +126,7 @@ async function checkApiKeys(
   const hermesEnvKeys: Record<string, string> = {};
   try {
     const hermesHome = asString(envConfig.HERMES_HOME) ||
-      path.join(asString(envConfig.HOME) || process.env.HOME || "/root", ".hermes");
+      path.join(asString(envConfig.HOME) || process.env.HOME || process.env.USERPROFILE || "/root", ".hermes");
     const hermesEnvPath = path.join(hermesHome, ".env");
     const content = readFileSync(hermesEnvPath, "utf-8");
     for (const line of content.split("\n")) {
@@ -192,6 +167,17 @@ async function checkApiKeys(
       message: `API keys found: ${providers.join(", ")}`,
       code: "hermes_api_keys_found",
     };
+  }
+
+  if (config.provider === "openai-codex") {
+    const home = asString(envConfig.HERMES_HOME);
+    if (home && existsSync(path.join(home, "auth.json"))) {
+      return {
+        level: "info",
+        message: "Codex auth file exists in the selected Hermes home; use a managed connection probe to verify it works.",
+        code: "hermes_codex_auth_file_present",
+      };
+    }
   }
 
   const requestedModel = asString(config.model);
@@ -329,12 +315,20 @@ export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
   const config = (ctx.config ?? {}) as Record<string, unknown>;
-  const command = resolveHermesCommand(config);
+  let command: string;
   const checks: AdapterEnvironmentCheck[] = [];
   let childEnv: Record<string, string>;
   try {
+    command = resolveHermesCommand(config);
     childEnv = buildHermesChildEnv(config.env, config.boundedExecution === true);
     validateHermesExtraArgs(config.extraArgs, config.boundedExecution === true);
+    if (config.boundedExecution === true) {
+      validateBoundedRuntimeOptions(config);
+      const toolsets = asString(config.toolsets) ||
+        (Array.isArray(config.enabledToolsets) ? config.enabledToolsets.join(",") : undefined);
+      validateBoundedToolsets(toolsets);
+      await validateBoundedHermesHome(childEnv.HERMES_HOME);
+    }
   } catch (error) {
     checks.push({ level: "error", code: "hermes_environment_invalid", message: error instanceof Error ? error.message : "Invalid Hermes environment" });
     return { adapterType: ADAPTER_TYPE, status: "fail", checks, testedAt: new Date().toISOString() };
@@ -343,7 +337,8 @@ export async function testEnvironment(
     (Array.isArray(config.enabledToolsets) && config.enabledToolsets.length > 0 &&
      config.enabledToolsets.every((value) => typeof value === "string" && value.length > 0));
   if (config.boundedExecution === true &&
-      (!asString(config.provider) || !asString(config.model) ||
+      (!asString(config.provider) || config.provider === "auto" ||
+       !asString(config.model) || config.model === "auto" ||
        !hasToolsets || !Number.isInteger(config.maxTurnsPerRun) ||
        (config.maxTurnsPerRun as number) <= 0)) {
     checks.push({ level: "error", code: "hermes_bounded_config_incomplete", message: "Bounded Hermes execution requires explicit provider, model, toolsets and positive maxTurnsPerRun." });
@@ -357,7 +352,10 @@ export async function testEnvironment(
     if (remote) {
       checks.push({ level: "error", code: "hermes_remote_probe_unsupported", message: "Hermes connection testing requires a local execution environment." });
     } else {
-      const args = ["chat", "-Q", "-q", "Respond with hello. Do not use tools.", "--max-turns", "1"];
+      const args = ["chat", "-Q", "-q", "Respond with hello. Do not use tools.", "--max-turns", "1", "--source", "tool"];
+      if (config.boundedExecution === true) args.push("--ignore-user-config");
+      const toolsets = asString(config.toolsets);
+      if (toolsets) args.push("-t", toolsets);
       if (asString(config.model)) args.push("-m", asString(config.model)!);
       const provider = asString(config.provider);
       if (provider && provider !== "auto") args.push("--provider", provider);
@@ -375,7 +373,7 @@ export async function testEnvironment(
   }
 
   // 1. CLI installed?
-  const cliCheck = await checkCliInstalled(command);
+  const cliCheck = await checkCliInstalled(command, childEnv);
   if (cliCheck) {
     checks.push(cliCheck);
     if (cliCheck.level === "error") {
@@ -389,18 +387,14 @@ export async function testEnvironment(
   }
 
   // 2. CLI version
-  const versionCheck = await checkCliVersion(command);
+  const versionCheck = await checkCliVersion(command, childEnv);
   if (versionCheck) checks.push(versionCheck);
 
-  // 3. Python available?
-  const pythonCheck = await checkPython();
-  if (pythonCheck) checks.push(pythonCheck);
-
-  // 4. Model config
+  // 3. Model config
   const modelCheck = checkModel(config);
   if (modelCheck) checks.push(modelCheck);
 
-  // 5. Detect Hermes config once for the remaining checks.
+  // 4. Detect Hermes config once for the remaining checks.
   let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
   try {
     detectedConfig = await detectModel(childEnv.HERMES_HOME
@@ -410,11 +404,11 @@ export async function testEnvironment(
     // Non-fatal
   }
 
-  // 6. API keys (check config.env — server resolves secrets before calling us)
+  // 5. API keys (check config.env — server resolves secrets before calling us)
   const apiKeyCheck = await checkApiKeys(config, detectedConfig);
   if (apiKeyCheck) checks.push(apiKeyCheck);
 
-  // 7. Provider/model consistency
+  // 6. Provider/model consistency
   const providerCheck = await checkProviderConsistency(config, detectedConfig);
   if (providerCheck) checks.push(providerCheck);
 
