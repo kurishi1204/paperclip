@@ -10,6 +10,12 @@ const commentPageSchema = z.object({
   afterCommentId: z.string().uuid().optional(),
 }).strict();
 
+const commentSourceSchema = z.object({
+  id: z.string().uuid(), issueId: z.string().uuid(), body: z.string(),
+  createdAt: z.string(), authorType: z.string().nullable(),
+  authorAgentId: z.string().uuid().nullable(),
+});
+
 const descriptionPageSchema = z.object({
   expectedRevision: z.number().int().nonnegative(),
   offset: z.number().int().nonnegative().max(10_000_000).default(0),
@@ -112,7 +118,7 @@ export const qaReviewToolDefinitions = [
   },
   {
     name: QA_REVIEW_TOOL_NAMES[1],
-    description: "Read the assigned issue's comments in ascending pages of 100 at the expected issue revision. Use the last returned comment ID as afterCommentId until a page is empty.",
+    description: "Read bounded, ascending pages of assigned-issue comments at the expected issue revision. Use nextAfterCommentId until null. An oversized single comment fails closed.",
     inputSchema: z.toJSONSchema(commentPageSchema),
   },
   {
@@ -410,11 +416,29 @@ export async function callQaReviewTool(input: QaToolInput) {
     assertExpectedRevision(input, args.expectedRevision);
     const query = new URLSearchParams({ order: "asc", limit: "100" });
     if (args.afterCommentId) query.set("after", args.afterCommentId);
-    const comments = await issueApi(input, "GET", `/comments?${query}`);
+    const comments = z.array(commentSourceSchema).parse(await issueApi(input, "GET", `/comments?${query}`));
+    if (comments.some((comment) => comment.issueId !== input.issue.id)) {
+      throw conflict("Assigned issue comment page contains another issue");
+    }
+    const page: Array<{ id: string; body: string; createdAt: string;
+      authorType: string | null; authorAgentId: string | null }> = [];
+    let characters = 0;
+    for (const comment of comments) {
+      const projected = {
+        id: comment.id, body: comment.body, createdAt: comment.createdAt,
+        authorType: comment.authorType, authorAgentId: comment.authorAgentId,
+      };
+      const entryCharacters = JSON.stringify(projected).length;
+      if (entryCharacters > 16_000) throw conflict("One comment exceeds the QA page size; use human review");
+      if (characters + entryCharacters > 16_000) break;
+      page.push(projected);
+      characters += entryCharacters;
+    }
     return {
-      comments,
+      comments: page,
       issueRevision: args.expectedRevision,
-      nextAfterCommentId: Array.isArray(comments) && comments.length === 100 ? comments[99]?.id ?? null : null,
+      nextAfterCommentId: page.length > 0 && (page.length < comments.length || comments.length === 100)
+        ? page[page.length - 1]!.id : null,
     };
   }
   if (input.name === QA_REVIEW_TOOL_NAMES[2]) {

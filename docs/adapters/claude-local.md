@@ -67,7 +67,8 @@ endpoint, shell command, or credential path. The Claude child does not inherit
 the host environment or the Paperclip run token; its MCP config contains the
 run token for the named QA server only. A stopped run or changed assignment
 loses access. Document bodies are returned in pages of at most 16,000
-characters. Attachment metadata is paged, and text content is returned in
+characters. Comment pages contain at most 16,000 characters of allowlisted
+fields and fail closed on an oversized single comment. Attachment metadata is paged, and text content is returned in
 pages of at most 16,384 bytes. Annotation pages contain at most 16,000
 characters and fail closed when one annotation exceeds that size. Binary or invalid UTF-8 attachments are
 identified but not interpreted: their acceptance evidence must be available

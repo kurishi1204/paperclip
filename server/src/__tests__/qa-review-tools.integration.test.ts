@@ -136,6 +136,49 @@ describe("run-bound QA review MCP", () => {
     expect(page.nextOffset).toBe(16_000);
   });
 
+  it("does not expose raw comment metadata or an unbounded comment body", async () => {
+    const { fixture, tool } = await reviewFixture();
+    await server.db.insert(issueComments).values({
+      companyId: fixture.companyId, issueId: fixture.issueId,
+      authorAgentId: fixture.agentId, body: "Assigned issue comment.",
+      clientRequestId: "private-comment-request-marker",
+    });
+    const firstRevision = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
+    const first = (await tool("list_assigned_issue_comments", {
+      expectedRevision: firstRevision,
+    })).body.result.structuredContent;
+    await server.db.insert(issueComments).values({
+      companyId: fixture.companyId, issueId: fixture.issueId,
+      authorAgentId: fixture.agentId, body: "C".repeat(16_001),
+    });
+    const secondRevision = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
+    const oversized = await tool("list_assigned_issue_comments", {
+      expectedRevision: secondRevision,
+    });
+    expect(oversized.body.result.isError).toBe(true);
+    expect(first.comments).toEqual([expect.objectContaining({ body: "Assigned issue comment." })]);
+    expect(JSON.stringify(first)).not.toContain("private-comment-request-marker");
+  });
+
+  it("pages large assigned comments without dropping the remaining comment", async () => {
+    const { fixture, tool } = await reviewFixture();
+    const [firstComment, secondComment] = await server.db.insert(issueComments).values([
+      { companyId: fixture.companyId, issueId: fixture.issueId,
+        authorAgentId: fixture.agentId, body: "A".repeat(8_000), createdAt: new Date("2026-01-01T00:00:00Z") },
+      { companyId: fixture.companyId, issueId: fixture.issueId,
+        authorAgentId: fixture.agentId, body: "B".repeat(8_000), createdAt: new Date("2026-01-01T00:00:01Z") },
+    ]).returning();
+    const expectedRevision = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
+    const first = (await tool("list_assigned_issue_comments", { expectedRevision })).body.result.structuredContent;
+    expect(first.comments.map((comment: { id: string }) => comment.id)).toEqual([firstComment!.id]);
+    expect(first.nextAfterCommentId).toBe(firstComment!.id);
+    const second = (await tool("list_assigned_issue_comments", {
+      expectedRevision, afterCommentId: first.nextAfterCommentId,
+    })).body.result.structuredContent;
+    expect(second.comments.map((comment: { id: string }) => comment.id)).toEqual([secondComment!.id]);
+    expect(second.nextAfterCommentId).toBeNull();
+  });
+
   it("reads bounded non-plan document pages only through the assigned issue", async () => {
     const { fixture, tool } = await reviewFixture();
     const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
