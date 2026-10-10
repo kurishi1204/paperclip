@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { agents, companies, createDb, goals, heartbeatRuns, issueComments, issueWatchdogs, issues, projects } from "@paperclipai/db";
+import { agentWakeupRequests, agents, companies, createDb, environmentLeases, goals, heartbeatRuns, issueComments, issueWatchdogs, issues, projects } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRequirementEnvelopeRoutes } from "../routes/issue-requirement-envelope.js";
@@ -30,6 +30,8 @@ describeDb("atomic issue requirement envelope", () => {
   let otherAgentId: string;
   let runId: string;
   let otherRunId: string;
+  let wakeId: string;
+  let otherWakeId: string;
   let issueId: string;
 
   beforeAll(async () => {
@@ -38,10 +40,12 @@ describeDb("atomic issue requirement envelope", () => {
   }, 30_000);
   afterAll(async () => { await tempDb?.cleanup(); });
   afterEach(async () => {
+    await db.delete(environmentLeases);
     await db.delete(issueComments);
     await db.delete(issueWatchdogs);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(projects);
     await db.delete(goals);
     await db.delete(agents);
@@ -69,6 +73,8 @@ describeDb("atomic issue requirement envelope", () => {
     otherAgentId = randomUUID();
     runId = randomUUID();
     otherRunId = randomUUID();
+    wakeId = randomUUID();
+    otherWakeId = randomUUID();
     issueId = randomUUID();
     await db.insert(companies).values([
       { id: companyId, name: "Projection", issuePrefix: "PRJ" },
@@ -78,9 +84,16 @@ describeDb("atomic issue requirement envelope", () => {
       { id: agentId, companyId, name: "Owner", role: "engineer", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
       { id: otherAgentId, companyId, name: "Other agent", role: "engineer", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} },
     ]);
+    const otherIssueId = randomUUID();
+    await db.insert(agentWakeupRequests).values([
+      { id: wakeId, companyId, agentId, source: "assignment", triggerDetail: "system", reason: "issue_assigned", status: "claimed", runId,
+        payload: { issueId, mutation: "create", _paperclipWakeContext: assignmentContext(issueId) } },
+      { id: otherWakeId, companyId, agentId, source: "assignment", triggerDetail: "system", reason: "issue_assigned", status: "claimed", runId: otherRunId,
+        payload: { issueId: otherIssueId, mutation: "create", _paperclipWakeContext: assignmentContext(otherIssueId) } },
+    ]);
     await db.insert(heartbeatRuns).values([
-      { id: runId, companyId, agentId, invocationSource: "assignment", triggerDetail: "system", status: "running", startedAt: new Date(), contextSnapshot: assignmentContext(issueId) },
-      { id: otherRunId, companyId, agentId, invocationSource: "assignment", triggerDetail: "system", status: "running", startedAt: new Date(), contextSnapshot: assignmentContext(randomUUID()) },
+      { id: runId, companyId, agentId, wakeupRequestId: wakeId, invocationSource: "assignment", triggerDetail: "system", status: "running", startedAt: new Date(), contextSnapshot: assignmentContext(issueId) },
+      { id: otherRunId, companyId, agentId, wakeupRequestId: otherWakeId, invocationSource: "assignment", triggerDetail: "system", status: "running", startedAt: new Date(), contextSnapshot: assignmentContext(otherIssueId) },
     ]);
     await db.insert(issues).values({ id: issueId, companyId, title: "Request", description: JSON.stringify(body), status: "todo", assigneeAgentId: agentId,
       executionRunId: runId, executionAgentNameKey: "owner", executionLockedAt: new Date() });
@@ -103,6 +116,17 @@ describeDb("atomic issue requirement envelope", () => {
     const conditional = await get(actor()).set("If-None-Match", `"${before.body.revision}"`);
     expect(conditional.status).toBe(200);
     expect(conditional.body).toEqual(before.body);
+  });
+
+  it("accepts only the active Run's local environment lease", async () => {
+    const [lease] = await db.insert(environmentLeases).values({
+      companyId, issueId, heartbeatRunId: runId, provider: "local",
+      status: "active", leasePolicy: "ephemeral",
+    }).returning();
+    expect((await get(actor())).status).toBe(200);
+    await db.update(environmentLeases).set({ heartbeatRunId: otherRunId })
+      .where(eq(environmentLeases.id, lease!.id));
+    expect((await get(actor())).status).toBe(409);
   });
 
   it("keeps revision stable on operational updates but changes on title and description edits", async () => {
@@ -180,11 +204,14 @@ describeDb("atomic issue requirement envelope", () => {
     expect((await get(actor({ runId: otherRunId }))).status).toBe(409);
   });
 
-  it("holds an additional Run context instruction", async () => {
-    expect((await get(actor())).status).toBe(200);
+  it("uses the claimed wake for task identity and ignores unrelated runtime context", async () => {
+    const canonical = await get(actor());
+    expect(canonical.status).toBe(200);
     await db.update(heartbeatRuns).set({ contextSnapshot: { ...assignmentContext(issueId), instruction: "Use another source" } })
       .where(eq(heartbeatRuns.id, runId));
-    expect((await get(actor())).status).toBe(409);
+    const extended = await get(actor());
+    expect(extended.status).toBe(200);
+    expect(extended.body).toEqual(canonical.body);
     await db.update(heartbeatRuns).set({ contextSnapshot: { ...assignmentContext(issueId), source: ["issue.create"] } })
       .where(eq(heartbeatRuns.id, runId));
     expect((await get(actor())).status).toBe(409);
@@ -207,6 +234,11 @@ describeDb("atomic issue requirement envelope", () => {
       contextSnapshot: { ...assignmentContext(issueId), source: "issue.status_change",
         wakeReason: "issue_status_changed", wakeSource: "automation" },
     }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agentWakeupRequests).set({
+      source: "automation", reason: "issue_status_changed",
+      payload: { issueId, mutation: "update", _paperclipWakeContext: { ...assignmentContext(issueId),
+        source: "issue.status_change", wakeReason: "issue_status_changed", wakeSource: "automation" } },
+    }).where(eq(agentWakeupRequests.id, wakeId));
     expect((await get(actor())).status).toBe(200);
   });
 

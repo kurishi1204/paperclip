@@ -9426,6 +9426,8 @@ export type HeartbeatEnvironmentRuntime = ReturnType<
 export interface HeartbeatServiceOptions {
   /** Test seam before the atomic native runtime handoff. */
   beforeNativeRuntimeSelection?: (runId: string) => Promise<void>;
+  /** Test seam for observing an already claimed Run before automatic Issue checkout. */
+  beforeIssueAutoCheckout?: (input: { runId: string; issueId: string }) => Promise<void>;
   /** Test seam immediately before the durable chat-control admission check. */
   beforeChatControlRecoveryCheck?: (input: {
     runId: string;
@@ -20735,6 +20737,7 @@ export function heartbeatService(
         })
       ) {
         try {
+          await options.beforeIssueAutoCheckout?.({ runId: run.id, issueId });
           await issuesSvc.checkout(
             issueId,
             agent.id,

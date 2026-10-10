@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { Router } from "express";
 import { and, eq, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRuns, issues } from "@paperclipai/db";
+import { agentWakeupRequests, environmentLeases, heartbeatRuns, issues, runIdentityContexts } from "@paperclipai/db";
 import { conflict, forbidden, notFound, unauthorized } from "../errors.js";
 import { accessService } from "../services/access.js";
 import { captureIssueRequirementSnapshotInTransaction } from "../services/issue-requirement-snapshot.js";
@@ -15,31 +16,55 @@ type DescriptionBody = {
   native_document_complete: true;
 };
 
-const ASSIGNMENT_RUN_CONTEXT_KEYS = [
-  "issueId", "source", "taskId", "taskKey", "wakeReason", "wakeSource", "wakeTriggerDetail",
-] as const;
-
-function assertSupportedAssignmentRunContext(run: {
+function assertSupportedAssignmentRunOrigin(run: {
+  id: string;
+  wakeupRequestId: string | null;
   contextSnapshot: Record<string, unknown> | null;
   invocationSource: string;
   triggerDetail: string | null;
-}, issueId: string) {
+}, wake: {
+  id: string;
+  runId: string | null;
+  source: string;
+  triggerDetail: string | null;
+  reason: string | null;
+  status: string;
+  payload: Record<string, unknown> | null;
+} | undefined, issueId: string) {
   const context = run.contextSnapshot;
-  if (!context || Array.isArray(context) ||
-      Object.keys(context).length !== ASSIGNMENT_RUN_CONTEXT_KEYS.length ||
-      ASSIGNMENT_RUN_CONTEXT_KEYS.some((key) => !Object.hasOwn(context, key))) {
-    hold("Active Run carries unsupported task context");
+  if (!context || Array.isArray(context) || !wake || !run.wakeupRequestId ||
+      wake.id !== run.wakeupRequestId || wake.runId !== run.id || wake.status !== "claimed") {
+    hold("Active Run has no claimed Issue wake receipt");
   }
-  const expected = context.source === "issue.create" || context.source === "issue.update"
-    ? { wakeReason: "issue_assigned", wakeSource: "assignment" }
-    : context.source === "issue.status_change"
-    ? { wakeReason: "issue_status_changed", wakeSource: "automation" }
+  // This receipt is created with the Run by the server. It records the task
+  // context before runtime credentials are attached to the running Run.
+  const source = (wake.payload?._paperclipWakeContext as Record<string, unknown> | undefined)?.source;
+  const origin = source === "issue.create" || source === "issue.update"
+    ? { source, wakeReason: "issue_assigned", wakeSource: "assignment", mutation: source === "issue.create" ? "create" : "update" }
+    : source === "issue.status_change"
+    ? { source, wakeReason: "issue_status_changed", wakeSource: "automation", mutation: "update" }
     : null;
-  if (!expected || context.issueId !== issueId || context.taskId !== issueId ||
-      context.taskKey !== issueId || context.wakeReason !== expected.wakeReason ||
-      context.wakeSource !== expected.wakeSource || context.wakeTriggerDetail !== "system" ||
-      run.invocationSource !== expected.wakeSource || run.triggerDetail !== "system") {
-    hold("Active Run context is not a supported Issue assignment wake");
+  if (!origin) hold("Run was not created by a supported Issue wake");
+  const taskContext = {
+    issueId, source: origin.source, taskId: issueId, taskKey: issueId,
+    wakeReason: origin.wakeReason, wakeSource: origin.wakeSource, wakeTriggerDetail: "system",
+  };
+  if (wake.source !== origin.wakeSource || wake.reason !== origin.wakeReason ||
+      wake.triggerDetail !== "system" || run.invocationSource !== origin.wakeSource ||
+      run.triggerDetail !== "system" || !isDeepStrictEqual(wake.payload, {
+        issueId, mutation: origin.mutation, _paperclipWakeContext: taskContext,
+      })) {
+    hold("Run wake receipt is not a supported Issue assignment");
+  }
+  // Heartbeat extends the flat Run context with execution identity, checkout,
+  // account and adapter metadata while the Run executes. Those keys are not
+  // requirement authority. Project only the task identity fields minted in
+  // the claimed wake receipt; all requirement text comes from the locked
+  // Issue row below. Checking the whole context shape would reject normal
+  // heartbeat execution whenever another runtime field is introduced.
+  const taskIdentity = Object.fromEntries(Object.keys(taskContext).map((key) => [key, context[key]]));
+  if (!isDeepStrictEqual(taskIdentity, taskContext)) {
+    hold("Active Run carries unsupported task context");
   }
 }
 
@@ -143,10 +168,12 @@ function readDescription(value: string | null): DescriptionBody {
   return body as DescriptionBody;
 }
 
-/** Any direct Issue reference outside the serialization row is unsupported. */
+/** Inventory every direct Issue reference; classify only the current Run's local lease. */
 async function hasUnsupportedIssueReference(
   tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
   issueId: string,
+  companyId: string,
+  runId: string,
 ): Promise<boolean> {
   // Inspect the actual migrated schema, including newly added tables. The
   // suffix check catches explicit columns that lack a foreign key; the FK
@@ -177,6 +204,23 @@ async function hasUnsupportedIssueReference(
   for (const reference of references) {
     if (typeof reference.tableName !== "string" || typeof reference.columnName !== "string") {
       hold("Issue reference inventory is malformed");
+    }
+    if (reference.tableName === "environment_leases" && reference.columnName === "issue_id") {
+      // A managed heartbeat acquires a local environment lease for this Issue
+      // after checkout. It is execution plumbing for the authenticated Run,
+      // not an additional requirement. A lease from any other Run, company,
+      // provider or lifecycle state remains unsupported.
+      const leases = await tx.select({
+        companyId: environmentLeases.companyId,
+        heartbeatRunId: environmentLeases.heartbeatRunId,
+        status: environmentLeases.status,
+        leasePolicy: environmentLeases.leasePolicy,
+        provider: environmentLeases.provider,
+      }).from(environmentLeases).where(eq(environmentLeases.issueId, issueId));
+      if (leases.some((lease) => lease.companyId !== companyId ||
+          lease.heartbeatRunId !== runId || lease.status !== "active" ||
+          lease.leasePolicy !== "ephemeral" || lease.provider !== "local")) return true;
+      continue;
     }
     const tableName = reference.tableName.replaceAll('"', '""');
     const columnName = reference.columnName.replaceAll('"', '""');
@@ -241,6 +285,9 @@ export function issueRequirementEnvelopeRoutes(db: Db) {
       }
       const [run] = await tx.select({
         id: heartbeatRuns.id,
+        wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
+        responsibleUserId: heartbeatRuns.responsibleUserId,
         status: heartbeatRuns.status,
         finishedAt: heartbeatRuns.finishedAt,
         invocationSource: heartbeatRuns.invocationSource,
@@ -257,7 +304,20 @@ export function issueRequirementEnvelopeRoutes(db: Db) {
           (run.nativeIssueId !== null && run.nativeIssueId !== issue.id)) {
         throw forbidden("Active Run is not bound to this Issue");
       }
-      assertSupportedAssignmentRunContext(run, issue.id);
+      const [wake] = run.wakeupRequestId ? await tx.select({
+        id: agentWakeupRequests.id,
+        runId: agentWakeupRequests.runId,
+        source: agentWakeupRequests.source,
+        triggerDetail: agentWakeupRequests.triggerDetail,
+        reason: agentWakeupRequests.reason,
+        status: agentWakeupRequests.status,
+        payload: agentWakeupRequests.payload,
+      }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.id, run.wakeupRequestId),
+        eq(agentWakeupRequests.companyId, issue.companyId),
+        eq(agentWakeupRequests.agentId, actor.agentId),
+      )).limit(1) : [];
+      assertSupportedAssignmentRunOrigin(run, wake, issue.id);
       const [competingRun] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
         .where(and(
           eq(heartbeatRuns.companyId, issue.companyId),
@@ -287,7 +347,7 @@ export function issueRequirementEnvelopeRoutes(db: Db) {
           issue.titleNeedsGeneration || issue.lastStatusDecisionId || issue.reviewPolicy ||
           issue.workMode !== "standard" || issue.harnessKind || issue.originKind !== "manual" ||
           issue.originId || issue.originRunId || issue.originIdentityContextId ||
-          issue.continuationIdentityContextId || issue.originFingerprint !== "default" ||
+          issue.originFingerprint !== "default" ||
           issue.requestDepth !== 0 || issue.billingCode || issue.sourceTrust || issue.unblockDescriptor ||
           issue.executionPolicy || issue.executionState || issue.assigneeAdapterOverrides ||
           issue.executionWorkspaceId || issue.executionWorkspacePreference || issue.executionWorkspaceSettings ||
@@ -297,6 +357,31 @@ export function issueRequirementEnvelopeRoutes(db: Db) {
           issue.completedAt || issue.cancelledAt || issue.hiddenAt) {
         hold("Issue has unsupported linked or execution material");
       }
+      // A normal managed heartbeat activates its own attribution context on
+      // the Issue after checkout. This is a server-owned Run identity link,
+      // not another source of task requirements.
+      if (issue.continuationIdentityContextId || run.activeIdentityContextId) {
+        if (!issue.continuationIdentityContextId ||
+            issue.continuationIdentityContextId !== run.activeIdentityContextId) {
+          hold("Issue identity is not bound to the active Run");
+        }
+        const [identity] = await tx.select({
+          status: runIdentityContexts.status,
+          responsibleUserId: runIdentityContexts.responsibleUserId,
+          cause: runIdentityContexts.cause,
+          messageId: runIdentityContexts.messageId,
+          parentContextId: runIdentityContexts.parentContextId,
+        }).from(runIdentityContexts).where(and(
+          eq(runIdentityContexts.id, issue.continuationIdentityContextId),
+          eq(runIdentityContexts.companyId, issue.companyId),
+          eq(runIdentityContexts.runId, runId),
+        )).limit(1);
+        if (!identity || identity.status !== "accepted" ||
+            identity.responsibleUserId !== run.responsibleUserId ||
+            identity.cause !== wake.reason || identity.messageId || identity.parentContextId) {
+          hold("Run identity carries unsupported continuation material");
+        }
+      }
       await assertReviewedSchema(tx);
       const snapshot = await captureIssueRequirementSnapshotInTransaction(tx, { companyId: issue.companyId, issueId: issue.id });
       if (Object.values(snapshot.counts).some((count) => count !== 0)) {
@@ -304,7 +389,7 @@ export function issueRequirementEnvelopeRoutes(db: Db) {
       }
       const [child] = await tx.select({ id: issues.id }).from(issues)
         .where(and(eq(issues.companyId, issue.companyId), eq(issues.parentId, issue.id))).limit(1);
-      if (child || await hasUnsupportedIssueReference(tx, issue.id)) {
+      if (child || await hasUnsupportedIssueReference(tx, issue.id, issue.companyId, runId)) {
         hold("Issue has unsupported graph or governance material");
       }
       const description = readDescription(issue.description);
