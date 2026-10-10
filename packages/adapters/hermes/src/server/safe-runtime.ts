@@ -185,7 +185,7 @@ export function validateBoundedRuntimeOptions(config: Record<string, unknown>): 
   // worktree/checkpoint. Paperclip-owned assignment context remains available.
   // instructionsFilePath is server-injected for managed instruction bundles.
   // The bounded adapter tolerates it but never reads or injects that file.
-  for (const key of ["cwd", "worktreeMode", "checkpoints"]) {
+  for (const key of ["cwd", "worktreeMode", "checkpoints", "verbose"]) {
     if (config[key] !== undefined && config[key] !== null && config[key] !== false && config[key] !== "") {
       throw new Error("Bounded Hermes execution does not accept " + key);
     }

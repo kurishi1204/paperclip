@@ -356,6 +356,26 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     expect(result.resultJson).toMatchObject({ session_id: null });
   });
 
+  it("rejects verbose logging before a bounded child can receive it", async () => {
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 1, env: { HERMES_HOME: "/private/qa/hermes" }, verbose: true });
+    await expect(execute(ctx as any)).rejects.toThrow(/does not accept verbose/);
+    expect(serverUtils.runChildProcess).not.toHaveBeenCalled();
+  });
+
+  it("does not persist a bounded session after a failed child", async () => {
+    vi.mocked(serverUtils.runChildProcess).mockResolvedValueOnce({ exitCode: 1, signal: null, timedOut: false, stdout: "Partial result\nsession_id: plausible-session\n", stderr: "", pid: null, startedAt: null });
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 1, env: { HERMES_HOME: "/private/qa/hermes" } });
+    const result = await execute(ctx as any);
+    expect(result.sessionParams).toBeUndefined();
+    expect(result.resultJson).toMatchObject({ session_id: null });
+  });
+
+  it("rejects option-shaped bounded session IDs before resume", async () => {
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 1, env: { HERMES_HOME: "/private/qa/hermes" } });
+    await expect(execute({ ...ctx, runtime: { ...ctx.runtime, sessionParams: { sessionId: "--yolo", hermesHome: "/private/qa/hermes" } } } as any)).rejects.toThrow(/not a valid resume argument/);
+    expect(serverUtils.runChildProcess).not.toHaveBeenCalled();
+  });
+
   it("keeps Hermes' final session marker when the model response contains another", async () => {
     vi.mocked(serverUtils.runChildProcess).mockResolvedValueOnce({
       exitCode: 0, signal: null, timedOut: false,

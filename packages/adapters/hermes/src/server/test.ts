@@ -350,9 +350,10 @@ export async function testEnvironment(
     return { adapterType: ADAPTER_TYPE, status: "fail", checks, testedAt: new Date().toISOString() };
   }
 
-  // Managed connections must prove the selected destination with the isolated
-  // runtime environment. Host credentials and ~/.hermes are not evidence.
-  if (config.managedAiRouting) {
+  // Every bounded test must exercise the same empty HOME and real provider
+  // invocation as execute. A version check cannot prove the first heartbeat.
+  // Managed connections must also prove their selected destination.
+  if (config.managedAiRouting || bounded) {
     const remote = ctx.executionTarget?.kind === "remote";
     if (remote) {
       checks.push({ level: "error", code: "hermes_remote_probe_unsupported", message: "Hermes connection testing requires a local execution environment." });

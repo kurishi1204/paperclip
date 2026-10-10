@@ -245,10 +245,10 @@ export function buildPrompt(
 // ---------------------------------------------------------------------------
 
 /** Hermes appends the session marker after the model response. */
-const SESSION_ID_REGEX = /(?:^|\n)session_id:\s*([a-zA-Z0-9_-]+)\s*$/;
+const SESSION_ID_REGEX = /(?:^|\n)session_id:\s*([a-zA-Z0-9_][a-zA-Z0-9_-]*)\s*$/;
 
 /** Regex for legacy session output format */
-const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
+const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_][a-zA-Z0-9_-]*)/i;
 
 /** Regex to extract token usage from Hermes output. */
 const TOKEN_USAGE_REGEX =
@@ -402,6 +402,9 @@ export async function execute(
   const prevSessionId = (!bounded || previousHome === env.HERMES_HOME)
     ? cfgString(previousParams?.sessionId)
     : undefined;
+  if (bounded && prevSessionId && !/^[A-Za-z0-9_][A-Za-z0-9_-]*$/.test(prevSessionId)) {
+    throw new Error("Bounded Hermes session ID is not a valid resume argument");
+  }
 
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
@@ -518,7 +521,7 @@ export async function execute(
 
   if (worktreeMode) args.push("-w");
   if (checkpoints) args.push("--checkpoints");
-  if (cfgBoolean(config.verbose) === true) args.push("-v");
+  if (!bounded && cfgBoolean(config.verbose) === true) args.push("-v");
 
   // Tag sessions as "tool" source so they don't clutter the user's session history.
   // Requires hermes-agent >= PR #3255 (feat/session-source-tag).
@@ -626,13 +629,16 @@ export async function execute(
 
   // ── Parse output ───────────────────────────────────────────────────────
   const parsed = parseHermesOutput(result.stdout || "", result.stderr || "", !bounded);
+  const acceptedSessionId = !bounded || (result.exitCode === 0 && !result.timedOut)
+    ? parsed.sessionId
+    : undefined;
 
   await ctx.onLog(
     "stdout",
     `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`,
   );
-  if (parsed.sessionId) {
-    await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
+  if (acceptedSessionId) {
+    await ctx.onLog("stdout", `[hermes] Session: ${acceptedSessionId}\n`);
   }
 
   // ── Build result ───────────────────────────────────────────────────────
@@ -666,17 +672,17 @@ export async function execute(
   // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
   executionResult.resultJson = {
     result: parsed.response || "",
-    session_id: parsed.sessionId || null,
+    session_id: acceptedSessionId || null,
     usage: parsed.usage || null,
     cost_usd: parsed.costUsd ?? null,
   };
 
   // Store session ID for next run
-  if (persistSession && parsed.sessionId) {
+  if (persistSession && acceptedSessionId) {
     executionResult.sessionParams = bounded
-      ? { sessionId: parsed.sessionId, hermesHome: env.HERMES_HOME }
-      : { sessionId: parsed.sessionId };
-    executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
+      ? { sessionId: acceptedSessionId, hermesHome: env.HERMES_HOME }
+      : { sessionId: acceptedSessionId };
+    executionResult.sessionDisplayId = acceptedSessionId.slice(0, 16);
   } else if (bounded && previousParams?.sessionId && previousHome !== env.HERMES_HOME) {
     // A legacy or moved session cannot be resumed from this dedicated home.
     executionResult.sessionParams = {};

@@ -34,6 +34,11 @@ describe("bounded Hermes real child boundary", () => {
         context: { issueId: "fixture-issue", paperclipWorkspace: { cwd: stage } },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
         authToken: "synthetic-paperclip-token",
+        runtimeTools: {
+          mcpEndpoint: "http://127.0.0.1/private", bearerToken: "synthetic-runtime-token",
+          expiresAt: "2026-10-11T00:00:00Z", tools: ["connections_search"], guidance: "private guidance",
+          rest: { connectionsSearch: "http://127.0.0.1/search", connectionRequest: "http://127.0.0.1/request" },
+        },
         onLog: async () => {},
         onMeta: async () => {},
       } as any);

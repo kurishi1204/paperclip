@@ -299,6 +299,12 @@ The bounded process runs under the Paperclip service user, so it can still
 read its own provider authentication files. Protecting those credentials from
 arbitrary code running as that same OS user requires a separate UID or a
 credential broker; this mode does not promise such isolation.
+The operator pin applies while this agent uses the Hermes adapter. An actor
+authorized to change its adapter type can move the agent to another runtime;
+restrict that permission for the pinned agent or use a separate service user.
+For the COL-17 Mini pilot, the observed binding uses local `openai-codex`
+authentication and no managed AI routing. A managed connection with additional
+endpoint environment variables needs a separate compatibility check before use.
 
 ### Prompt Template Variables
 

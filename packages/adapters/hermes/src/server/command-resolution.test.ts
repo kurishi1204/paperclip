@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { expect, test } from "vitest";
 
 import { HERMES_CLI } from "../shared/constants.js";
@@ -102,6 +102,34 @@ test("bounded environment check fails before a probe when home or arguments are 
   const missingHome = await testEnvironment({ ...base, config: { ...base.config, env: {} } });
   expect(missingHome.status).toBe("fail");
   expect(missingHome.checks[0]?.code).toBe("hermes_environment_invalid");
+});
+
+test("bounded environment check exercises a real hello with an empty HOME", async () => {
+  const stage = await realpath(await mkdtemp(path.join(os.tmpdir(), "hermes-bounded-probe-")));
+  const home = path.join(stage, "home");
+  const cli = path.join(stage, "fake-hermes");
+  const keys = ["PAPERCLIP_HERMES_BOUNDED_AGENT_ID", "PAPERCLIP_HERMES_BOUNDED_HOME", "PAPERCLIP_HERMES_TRUSTED_COMMAND"] as const;
+  const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    await mkdir(home, { mode: 0o700 });
+    await writeFile(cli, "#!/bin/sh\n[ \"$HOME\" != \"$HERMES_HOME\" ] || exit 7\n[ \"$1\" = chat ] || exit 7\ncase \" $* \" in *\" --ignore-user-config \"*) ;; *) exit 7;; esac\necho hello\n");
+    await chmod(cli, 0o755);
+    process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID = "bounded-probe-agent";
+    process.env.PAPERCLIP_HERMES_BOUNDED_HOME = home;
+    process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND = cli;
+    const result = await testEnvironment({
+      companyId: "test", adapterType: "hermes_local", agentId: "bounded-probe-agent",
+      config: { boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 1, env: { HERMES_HOME: home } },
+    });
+    expect(result.status).toBe("pass");
+    expect(result.checks.some((check) => check.code === "hermes_hello_probe_passed")).toBe(true);
+  } finally {
+    for (const key of keys) {
+      if (original[key] === undefined) delete process.env[key];
+      else process.env[key] = original[key];
+    }
+    await rm(stage, { recursive: true, force: true });
+  }
 });
 
 test("standard environment check reports a host provider key that the legacy run inherits", async () => {
