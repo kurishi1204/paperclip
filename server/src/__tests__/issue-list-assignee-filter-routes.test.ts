@@ -530,6 +530,71 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
     expect(third.headers.etag).toBe(second.headers.etag);
   });
 
+  it("does not reuse an in-flight old projection for a conditional GET after an issue update", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId, name: "Paperclip", issuePrefix: uniqueIssuePrefix(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedCloudTenantMember(companyId);
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Concurrent compact revision probe",
+      status: "todo", priority: "medium",
+    });
+
+    const url = `/api/companies/${companyId}/issues`;
+    const query = { view: "compact", limit: "20" };
+    const baseline = await request(createApp(companyId)).get(url).query(query);
+    expect(baseline.status).toBe(200);
+    expect(baseline.body[0].revision).toBe(0);
+    __clearIssueListResponseCacheForTests();
+
+    let markOldReady!: () => void;
+    let releaseOld!: () => void;
+    let markConditionalEntered!: () => void;
+    const oldReady = new Promise<void>((resolve) => { markOldReady = resolve; });
+    const oldGate = new Promise<void>((resolve) => { releaseOld = resolve; });
+    const conditionalEntered = new Promise<void>((resolve) => { markConditionalEntered = resolve; });
+    let completed = 0;
+    const app = createApp(companyId, { issueListDiagnostics: {
+      onCoordinateStart({ conditional }) {
+        if (conditional) markConditionalEntered();
+      },
+      async onComputeComplete() {
+        if (++completed === 1) {
+          markOldReady();
+          await oldGate;
+        }
+      },
+    } });
+
+    const oldRequest = request(app).get(url).query(query).then((response) => response);
+    try {
+      await oldReady;
+      await db.update(issues).set({ monitorNotes: "changed after old projection" })
+        .where(eq(issues.id, issueId));
+      const conditionalRequest = request(app).get(url).query(query)
+        .set("If-None-Match", baseline.headers.etag).then((response) => response);
+      await conditionalEntered;
+      releaseOld();
+      const [oldResponse, conditionalResponse] = await Promise.all([oldRequest, conditionalRequest]);
+      expect(oldResponse.status).toBe(200);
+      expect(oldResponse.body[0].revision).toBe(0);
+      expect(conditionalResponse.status, JSON.stringify(conditionalResponse.body)).toBe(200);
+      expect(conditionalResponse.body[0].revision).toBe(1);
+      expect(conditionalResponse.headers.etag).not.toBe(baseline.headers.etag);
+
+      const cached = await request(app).get(url).query(query);
+      expect(cached.status).toBe(200);
+      expect(cached.body[0].revision).toBe(1);
+      expect(cached.headers.etag).toBe(conditionalResponse.headers.etag);
+    } finally {
+      releaseOld();
+      await oldRequest;
+    }
+  });
+
   it("coalesces simultaneous identical compact issue-list requests into one service computation", async () => {
     const companyId = randomUUID();
     const issueId = randomUUID();

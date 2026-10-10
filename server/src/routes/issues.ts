@@ -3112,10 +3112,12 @@ type IssueListStormEvent = {
 };
 
 type IssueListDiagnostics = {
+  onCoordinateStart?: (context: { conditional: boolean }) => void;
   onComputeStart?: (context: {
     companyId: string;
     cacheKeyHash: string;
   }) => void | Promise<void>;
+  onComputeComplete?: () => void | Promise<void>;
   onStormDetected?: (event: IssueListStormEvent) => void;
 };
 
@@ -3320,6 +3322,7 @@ async function coordinateIssueListGet(input: {
   identicalInFlightCount: number;
   retryAfterSeconds?: number;
 }> {
+  input.diagnostics?.onCoordinateStart?.({ conditional: input.bypassCacheRead === true });
   const now = Date.now();
   pruneIssueListResponseCache(now);
 
@@ -3336,7 +3339,10 @@ async function coordinateIssueListGet(input: {
   }
 
   const existing = issueListInflight.get(input.requestKey.key);
-  if (existing) {
+  // A conditional GET must compute against the current Issue rows. An older
+  // identical request may already have projected the previous revision while
+  // still waiting to complete, so its promise cannot satisfy revalidation.
+  if (existing && !input.bypassCacheRead) {
     existing.waiterCount += 1;
     const identicalInFlightCount = existing.waiterCount + 1;
     if (
@@ -3392,7 +3398,9 @@ async function coordinateIssueListGet(input: {
       companyId: input.companyId,
       cacheKeyHash: input.requestKey.keyHash,
     });
-    return input.compute();
+    const response = await input.compute();
+    await input.diagnostics?.onComputeComplete?.();
+    return response;
   })();
   const inflightEntry: IssueListInflightEntry = {
     promise,
@@ -3404,7 +3412,9 @@ async function coordinateIssueListGet(input: {
 
   try {
     const response = await promise;
-    if (input.allowTtlCache) {
+    // A newer revalidation may have replaced this in-flight entry. Do not let
+    // the older response overwrite its fresher cache entry when it resolves.
+    if (input.allowTtlCache && issueListInflight.get(input.requestKey.key) === inflightEntry) {
       setIssueListResponseCacheEntry(input.requestKey.key, {
         response,
         expiresAt: Date.now() + ISSUE_LIST_SERVER_CACHE_TTL_MS,
