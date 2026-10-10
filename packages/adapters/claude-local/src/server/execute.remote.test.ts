@@ -126,7 +126,7 @@ describe("claude remote execution", () => {
     const args = invocation![2], options = invocation![3];
     expect(args).toEqual(expect.arrayContaining(["--restricted", "--tools", "", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--strict-mcp-config"]));
     expect(args).not.toEqual(expect.arrayContaining(["--dangerously-skip-permissions", "--add-dir", "--resume", "--append-system-prompt-file"]));
-    expect(args[args.indexOf("--allowedTools") + 1]).toBe("mcp__paperclip_qa__read_assigned_issue,mcp__paperclip_qa__list_assigned_issue_comments,mcp__paperclip_qa__submit_review_decision");
+    expect(args[args.indexOf("--allowedTools") + 1]).toBe("mcp__paperclip_qa__read_assigned_issue,mcp__paperclip_qa__list_assigned_issue_comments,mcp__paperclip_qa__read_assigned_issue_document,mcp__paperclip_qa__list_assigned_issue_attachments,mcp__paperclip_qa__read_assigned_issue_attachment_text,mcp__paperclip_qa__submit_review_decision");
     expect(options.inheritHostEnv).toBe(false);
     expect(options.env.ANTHROPIC_API_KEY).toBe("provider-test-key");
     for (const key of ["PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY", "HOST_ONLY_QA_SECRET"]) expect(options.env[key]).toBeUndefined();

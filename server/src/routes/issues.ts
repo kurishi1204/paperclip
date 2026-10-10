@@ -364,6 +364,7 @@ const updateIssueRouteSchema = updateIssueSchema.extend({
   qaReviewExpected: z.object({
     stageId: z.string().uuid(),
     statusVersion: z.number().int().nonnegative(),
+    revision: z.number().int().nonnegative(),
     lastDecisionId: z.string().uuid().nullable(),
   }).strict().optional(),
 });
@@ -12885,6 +12886,7 @@ export function issueRoutes(
       const qaReviewExpected = req.body.qaReviewExpected as {
         stageId: string;
         statusVersion: number;
+        revision: number;
         lastDecisionId: string | null;
       } | undefined;
       if (qaReviewExpected && (
@@ -13737,13 +13739,14 @@ export function issueRoutes(
         const state = parseIssueExecutionState(locked?.executionState);
         if (!locked || locked.companyId !== existing.companyId ||
             locked.status !== "in_review" || locked.statusVersion !== qaReviewExpected.statusVersion ||
+            locked.revision !== qaReviewExpected.revision ||
             locked.assigneeAgentId !== actor.agentId || locked.assigneeUserId !== null ||
             state?.status !== "pending" || state.currentStageType !== "review" ||
             state.currentStageId !== qaReviewExpected.stageId ||
             state.lastDecisionId !== qaReviewExpected.lastDecisionId ||
             state.currentParticipant?.type !== "agent" ||
             state.currentParticipant.agentId !== actor.agentId) {
-          throw conflict("Review stage changed; read the issue again before deciding");
+          throw conflict("Issue revision or review stage changed; read the issue again before deciding");
         }
       };
       const persistReviewTransitionActivity = async (

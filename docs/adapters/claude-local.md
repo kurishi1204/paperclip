@@ -48,16 +48,24 @@ tools disabled, ignores user and project settings, and passes only the
 run-bound `paperclip_qa` MCP server. Extra CLI arguments, Chrome, custom
 commands, and remote execution targets fail configuration validation.
 
-The three MCP tools read the assigned issue, page through its comments, and
-submit `approve` or `request_changes` with the stage, status version, and last
-decision ID read from the issue. Issue PATCH rechecks all three while holding
-the Issue row lock in the transaction that records the decision. A competing
+The six MCP tools read the assigned issue, page through its comments and
+non-plan documents, list assigned attachments, read bounded UTF-8 text pages
+from those attachments, and submit `approve` or `request_changes`. Evidence
+pages and the verdict carry the whole requirement revision read from the issue;
+the verdict also carries the stage, status version, and last decision ID.
+Issue PATCH rechecks all four while holding the Issue row lock in the
+transaction that records the decision. A competing or stale-content
 verdict receives a conflict. A successful decision produces a formal
 `issue_execution_decisions` record. The tool accepts no issue ID, arbitrary
 endpoint, shell command, or credential path. The Claude child does not inherit
 the host environment or the Paperclip run token; its MCP config contains the
 run token for the named QA server only. A stopped run or changed assignment
-loses access. This mode still requires a live test of the agent's managed
+loses access. Document bodies are returned in pages of at most 16,000
+characters. Attachment metadata is paged, and text content is returned in
+pages of at most 16,384 bytes. Binary or invalid UTF-8 attachments are
+identified but not interpreted: their acceptance evidence must be available
+through an assigned issue document/comment or handled by a human reviewer.
+This mode still requires a live test of the agent's managed
 Anthropic login and its actual QA run before operational acceptance.
 
 ## Default model
