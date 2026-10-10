@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 
 import { HERMES_CLI } from "../shared/constants.js";
 
@@ -32,6 +33,19 @@ const DENIED_CONFIG_ENV_KEYS = new Set([
   "HERMES_IGNORE_USER_CONFIG", "BASH_ENV", "ENV", "PYTHONPATH",
   "PYTHONSTARTUP", "NODE_OPTIONS",
 ]);
+
+export function isBoundedHermesExecution(
+  config: Record<string, unknown>,
+  agentId: string | undefined,
+  hostEnv: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const pinnedId = hostEnv.PAPERCLIP_HERMES_BOUNDED_AGENT_ID;
+  if (pinnedId && agentId === pinnedId) return true;
+  if (config.boundedExecution !== undefined && config.boundedExecution !== null && config.boundedExecution !== false) {
+    throw new Error("Bounded Hermes execution requires this agent ID to match PAPERCLIP_HERMES_BOUNDED_AGENT_ID");
+  }
+  return false;
+}
 
 function platformPath(platform: NodeJS.Platform): typeof path {
   return (platform === "win32" ? path.win32 : path.posix) as typeof path;
@@ -89,8 +103,16 @@ export function buildHermesChildEnv(
   bounded: boolean,
   hostEnv: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
+  inheritHostEnv = !bounded,
 ): Record<string, string> {
   const env: Record<string, string> = {};
+  // Standard mode retains the historical host environment, including Git,
+  // shell and provider settings. The spawn helper sanitizes Paperclip keys.
+  if (inheritHostEnv) {
+    for (const [key, value] of Object.entries(sanitizeInheritedPaperclipEnv(hostEnv))) {
+      if (typeof value === "string") env[key] = value;
+    }
+  }
   const hostKeys: readonly string[] = platform === "win32"
     ? [...HOST_ENV_KEYS, ...WINDOWS_HOST_ENV_KEYS]
     : HOST_ENV_KEYS;
@@ -109,11 +131,14 @@ export function buildHermesChildEnv(
   for (const [key, rawValue] of Object.entries(configEnv)) {
     const normalized = envKey(key, platform);
     if (normalized === "PAPERCLIP_API_KEY" || normalized === "PAPERCLIP_WAKE_PAYLOAD_JSON") continue;
-    if (DENIED_CONFIG_ENV_KEYS.has(normalized)) {
+    if (bounded && DENIED_CONFIG_ENV_KEYS.has(normalized)) {
       throw new Error("Hermes env " + key + " is not allowed");
     }
     if (bounded && (!BOUNDED_CONFIG_ENV_KEYS.has(key) || normalized !== key)) {
-      throw new Error("Hermes env " + key + " is not allowed in bounded execution");
+      // The server also adds scratch and Git runtime variables to config.env.
+      // They are unrelated to web research; ignore them instead of failing a
+      // real heartbeat or passing them to the child.
+      continue;
     }
     if (typeof rawValue !== "string" && bounded) {
       throw new Error("Bounded Hermes env " + key + " must be a string");
@@ -158,7 +183,9 @@ export function validateBoundedToolsets(raw: string | undefined): void {
 export function validateBoundedRuntimeOptions(config: Record<string, unknown>): void {
   // Research-only runs do not read operator files or ask Hermes to create a
   // worktree/checkpoint. Paperclip-owned assignment context remains available.
-  for (const key of ["instructionsFilePath", "cwd", "worktreeMode", "checkpoints"]) {
+  // instructionsFilePath is server-injected for managed instruction bundles.
+  // The bounded adapter tolerates it but never reads or injects that file.
+  for (const key of ["cwd", "worktreeMode", "checkpoints"]) {
     if (config[key] !== undefined && config[key] !== null && config[key] !== false && config[key] !== "") {
       throw new Error("Bounded Hermes execution does not accept " + key);
     }

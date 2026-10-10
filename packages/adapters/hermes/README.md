@@ -230,7 +230,7 @@ Create issues in Paperclip and assign them to your Hermes agent. On each heartbe
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `toolsets` | string | *(all)* | Comma-separated toolsets to enable (e.g. `"terminal,file,web"`) |
-| `boundedExecution` | boolean | `false` | Require explicit provider, model, toolsets, turn limit and dedicated `HERMES_HOME`; restrict extra arguments and environment variables |
+| `boundedExecution` | boolean | `false` | Request web-only bounded execution; the service must also pin the agent ID and dedicated `HERMES_HOME` |
 
 Available toolsets: `terminal`, `file`, `web`, `browser`, `code_execution`, `vision`, `mcp`, `creative`, `productivity`
 
@@ -256,14 +256,17 @@ Available toolsets: `terminal`, `file`, `web`, `browser`, `code_execution`, `vis
 | `paperclipApiUrl` | string | `http://127.0.0.1:3100/api` | Paperclip API base URL |
 
 Standard mode retains the earlier unattended CLI behavior, including `--yolo`,
-for existing agents. It still passes only selected process settings from the
-Paperclip host, so unrelated host credentials do not reach Hermes. Use bounded
-mode for new research agents that must not bypass Hermes approvals.
+and the legacy host environment for existing agents. Managed AI connections
+use only their selected runtime environment. Use bounded mode for new research
+agents that must not bypass Hermes approvals.
 
 Bounded mode requires a private, real `env.HERMES_HOME` directory owned by the
 runtime user. The Paperclip service operator must set
 `PAPERCLIP_HERMES_BOUNDED_HOME` to this exact absolute path in the server
-environment; it is checked before every run and is never passed to the child.
+environment, and `PAPERCLIP_HERMES_BOUNDED_AGENT_ID` to the saved agent ID.
+Both are checked before every run and neither is passed to the child. The
+agent ID pin prevents an adapter-config update from switching that agent back
+to standard mode. Without the pin, a requested bounded run fails closed.
 Use one dedicated home per bounded agent and a separate service process when
 multiple agents require different homes. The home must be separate from the
 host home, and `.env` and
@@ -271,8 +274,11 @@ host home, and `.env` and
 toolset is `web`; all `extraArgs` and agent-configured command overrides are
 rejected. Custom `promptTemplate` is ignored in bounded mode so a configured
 terminal instruction cannot override the web-only task contract. The adapter passes `--ignore-user-config` so a changed
-`config.yaml` cannot disable approvals. Its `.env` accepts only provider and
-search connection keys. Bounded mode requires an explicit provider other than
+`config.yaml` cannot disable approvals. On Mini Hermes v0.14.0 this flag does
+not suppress `SOUL.md`, memory or home plugins; provision a clean dedicated
+home and review its contents before enabling it. Its `.env` accepts only provider and
+search connection keys. Server-added scratch and Git environment fields are
+ignored. Bounded mode requires an explicit provider other than
 `auto`, an explicit model, and a positive `maxTurnsPerRun`. The operator may
 pin an absolute Hermes executable with the Paperclip server environment
 variable `PAPERCLIP_HERMES_TRUSTED_COMMAND`; this value is not taken from agent
@@ -284,9 +290,10 @@ alone does not provide search. Store the key outside agent instructions and
 never put it in an issue or a run prompt. Bounded mode currently returns
 research output to Paperclip; issue updates and independent QA require a
 separate control-plane path. See the [Hermes web-search guide](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/web-search.md).
-It does not give Hermes the Paperclip run API token or runtime connector token,
-and refuses operator-file instructions, custom working directories, worktree
-creation, and checkpoints. Bounded runs use the server-owned task brief and
+It does not give Hermes the Paperclip run API token or runtime connector token.
+The adapter ignores managed instruction files, connector guidance and agent
+working directories, creates a fresh empty directory for each run, and refuses
+worktree creation and checkpoints. Bounded runs use the server-owned task brief and
 return their answer in the Run result for later review.
 The bounded process runs under the Paperclip service user, so it can still
 read its own provider authentication files. Protecting those credentials from

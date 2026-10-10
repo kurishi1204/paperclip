@@ -104,7 +104,7 @@ test("bounded environment check fails before a probe when home or arguments are 
   expect(missingHome.checks[0]?.code).toBe("hermes_environment_invalid");
 });
 
-test("environment check does not count an unrelated host provider key", async () => {
+test("standard environment check reports a host provider key that the legacy run inherits", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-no-host-key-"));
   const cliPath = path.join(tempDir, "fake-hermes");
   const prior = process.env.ANTHROPIC_API_KEY;
@@ -117,8 +117,7 @@ test("environment check does not count an unrelated host provider key", async ()
       adapterType: "hermes_local",
       config: { command: cliPath, env: { HERMES_HOME: tempDir } },
     });
-    expect(result.checks.some((check) => check.code === "hermes_no_api_keys")).toBe(true);
-    expect(result.checks.some((check) => check.code === "hermes_api_keys_found")).toBe(false);
+    expect(result.checks.some((check) => check.code === "hermes_api_keys_found")).toBe(true);
   } finally {
     if (prior === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = prior;

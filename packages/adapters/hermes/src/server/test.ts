@@ -14,12 +14,14 @@ import type {
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import os from "node:os";
+import fs from "node:fs/promises";
 import { promisify } from "node:util";
 
 import { HERMES_CLI, DEFAULT_MODEL, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
 import { resolveHermesCommand } from "./execute.js";
-import { buildHermesChildEnv, validateBoundedHermesHome, validateBoundedRuntimeOptions, validateBoundedToolsets, validateHermesExtraArgs } from "./safe-runtime.js";
+import { buildHermesChildEnv, isBoundedHermesExecution, validateBoundedHermesHome, validateBoundedRuntimeOptions, validateBoundedToolsets, validateHermesExtraArgs } from "./safe-runtime.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -37,7 +39,7 @@ async function checkCliInstalled(
 ): Promise<AdapterEnvironmentCheck | null> {
   try {
     // Try to run the command to see if it exists
-    await execFileAsync(command, ["--version"], { env, timeout: 10_000 });
+    await execFileAsync(command, ["--version"], { env, timeout: 30_000 });
     return null; // OK — it ran successfully
   } catch (err: unknown) {
     const e = err as NodeJS.ErrnoException;
@@ -64,7 +66,7 @@ async function checkCliVersion(
 ): Promise<AdapterEnvironmentCheck | null> {
   try {
     const { stdout } = await execFileAsync(command, ["--version"], {
-      env, timeout: 10_000,
+      env, timeout: 30_000,
     });
     const version = stdout.trim();
     if (version) {
@@ -112,14 +114,13 @@ function checkModel(
 async function checkApiKeys(
   config: Record<string, unknown>,
   detectedConfig: Awaited<ReturnType<typeof detectModel>> | null,
+  childEnv: Record<string, string>,
 ): Promise<AdapterEnvironmentCheck | null> {
   // The server resolves secret refs into config.env before calling testEnvironment.
-  // Neither standard nor bounded children inherit the host's provider keys.
-  const envConfig = (config.env ?? {}) as Record<string, unknown>;
-  const resolvedEnv: Record<string, string> = {};
-  for (const [key, value] of Object.entries(envConfig)) {
-    if (typeof value === "string" && value.length > 0) resolvedEnv[key] = value;
-  }
+  // Bounded children do not inherit host provider keys; standard mode keeps
+  // the historical host environment.
+  const envConfig = childEnv;
+  const resolvedEnv = childEnv;
 
   // Read the same Hermes home that execute() will use. Never credit host keys
   // or a global ~/.hermes file as evidence for a bounded child process.
@@ -314,15 +315,19 @@ async function checkProviderConsistency(
 export async function testEnvironment(
   ctx: AdapterEnvironmentTestContext,
 ): Promise<AdapterEnvironmentTestResult> {
-  const config = (ctx.config ?? {}) as Record<string, unknown>;
+  const rawConfig = (ctx.config ?? {}) as Record<string, unknown>;
   let command: string;
   const checks: AdapterEnvironmentCheck[] = [];
   let childEnv: Record<string, string>;
+  let bounded: boolean;
+  let config: Record<string, unknown>;
   try {
+    bounded = isBoundedHermesExecution(rawConfig, ctx.agentId);
+    config = bounded ? { ...rawConfig, boundedExecution: true } : rawConfig;
     command = resolveHermesCommand(config);
-    childEnv = buildHermesChildEnv(config.env, config.boundedExecution === true);
-    validateHermesExtraArgs(config.extraArgs, config.boundedExecution === true);
-    if (config.boundedExecution === true) {
+    childEnv = buildHermesChildEnv(config.env, bounded, process.env, process.platform, !bounded && config.managedAiRouting !== true);
+    validateHermesExtraArgs(config.extraArgs, bounded);
+    if (bounded) {
       validateBoundedRuntimeOptions(config);
       const toolsets = asString(config.toolsets) ||
         (Array.isArray(config.enabledToolsets) ? config.enabledToolsets.join(",") : undefined);
@@ -336,7 +341,7 @@ export async function testEnvironment(
   const hasToolsets = Boolean(asString(config.toolsets)) ||
     (Array.isArray(config.enabledToolsets) && config.enabledToolsets.length > 0 &&
      config.enabledToolsets.every((value) => typeof value === "string" && value.length > 0));
-  if (config.boundedExecution === true &&
+  if (bounded &&
       (!asString(config.provider) || config.provider === "auto" ||
        !asString(config.model) || config.model === "auto" ||
        !hasToolsets || !Number.isInteger(config.maxTurnsPerRun) ||
@@ -353,20 +358,27 @@ export async function testEnvironment(
       checks.push({ level: "error", code: "hermes_remote_probe_unsupported", message: "Hermes connection testing requires a local execution environment." });
     } else {
       const args = ["chat", "-Q", "-q", "Respond with hello. Do not use tools.", "--max-turns", "1", "--source", "tool"];
-      if (config.boundedExecution === true) args.push("--ignore-user-config");
+      if (bounded) args.push("--ignore-user-config");
       const toolsets = asString(config.toolsets);
       if (toolsets) args.push("-t", toolsets);
       if (asString(config.model)) args.push("-m", asString(config.model)!);
       const provider = asString(config.provider);
       if (provider && provider !== "auto") args.push("--provider", provider);
+      const isolatedCwd = bounded ? await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-probe-")) : undefined;
+      if (isolatedCwd) {
+        childEnv.HOME = isolatedCwd;
+        if (process.platform === "win32") childEnv.USERPROFILE = isolatedCwd;
+      }
       try {
         const { stdout } = await execFileAsync(command, args, {
-          env: childEnv, cwd: asString(config.cwd), timeout: 45_000, maxBuffer: 1024 * 1024,
+          env: childEnv, cwd: isolatedCwd ?? asString(config.cwd), timeout: 45_000, maxBuffer: 1024 * 1024,
         });
         if (!/\bhello\b/i.test(stdout)) throw new Error("No hello response");
         checks.push({ level: "info", code: "hermes_hello_probe_passed", message: "Hermes responded through the selected connection." });
       } catch {
         checks.push({ level: "error", code: "hermes_hello_probe_failed", message: "Hermes could not complete a request through this connection.", hint: "Check the Hermes installation, endpoint, credential, and model, then test again." });
+      } finally {
+        if (isolatedCwd) await fs.rm(isolatedCwd, { recursive: true, force: true });
       }
     }
     return { adapterType: ADAPTER_TYPE, status: checks.some(check => check.level === "error") ? "fail" : "pass", checks, testedAt: new Date().toISOString() };
@@ -405,7 +417,7 @@ export async function testEnvironment(
   }
 
   // 5. API keys (check config.env — server resolves secrets before calling us)
-  const apiKeyCheck = await checkApiKeys(config, detectedConfig);
+  const apiKeyCheck = await checkApiKeys(config, detectedConfig, childEnv);
   if (apiKeyCheck) checks.push(apiKeyCheck);
 
   // 6. Provider/model consistency

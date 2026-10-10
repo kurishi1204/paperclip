@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   buildHermesChildEnv,
+  isBoundedHermesExecution,
   resolveHermesCommandForConfig,
   validateBoundedHermesHome,
   validateBoundedRuntimeOptions,
@@ -22,9 +23,11 @@ describe("Hermes child boundary", () => {
     PAPERCLIP_HERMES_BOUNDED_HOME: "/private/qa/hermes",
   };
 
-  it("does not inherit unrelated credentials or approval flags", () => {
+  it("preserves the legacy standard host environment except Paperclip identity", () => {
     const env = buildHermesChildEnv(undefined, false, host);
-    expect(env).toEqual({ HOME: "/Users/runner", PATH: "/usr/bin:/bin", LANG: "en_US.UTF-8" });
+    expect(env.ANTHROPIC_API_KEY).toBe("unrelated-host-secret");
+    expect(env.HERMES_YOLO_MODE).toBe("1");
+    expect(env.PAPERCLIP_API_KEY).toBeUndefined();
   });
 
   it("uses a dedicated home and only explicit provider credentials in bounded mode", () => {
@@ -39,12 +42,11 @@ describe("Hermes child boundary", () => {
   it("rejects a global home and unknown control variables in bounded mode", () => {
     expect(() => buildHermesChildEnv({ HERMES_HOME: "relative/path" }, true, host)).toThrow(/absolute HERMES_HOME/);
     expect(() => buildHermesChildEnv({ HERMES_HOME: "/Users/runner" }, true, host)).toThrow(/separate from the host home/);
-    expect(() => buildHermesChildEnv({ HERMES_HOME: "/private/qa/hermes", HOME: "/Users/runner" }, true, host)).toThrow(/not allowed/);
-    expect(() => buildHermesChildEnv({ HERMES_HOME: "/private/qa/hermes", PATH: "/tmp/fake" }, true, host)).toThrow(/not allowed/);
+    expect(buildHermesChildEnv({ HERMES_HOME: "/private/qa/hermes", HOME: "/tmp/forged", PATH: "/tmp/fake" }, true, host)).toMatchObject({ HOME: "/Users/runner", PATH: "/usr/bin:/bin" });
     expect(() => buildHermesChildEnv({ HERMES_HOME: "/private/qa/hermes", HERMES_YOLO_MODE: "1" }, true, host)).toThrow(/not allowed/);
     expect(() => buildHermesChildEnv({ HERMES_HOME: "/private/qa/other" }, true, host)).toThrow(/operator-pinned home/);
     expect(() => buildHermesChildEnv({ HERMES_HOME: "/private/qa/hermes" }, true, { ...host, PAPERCLIP_HERMES_BOUNDED_HOME: undefined })).toThrow(/operator-pinned/);
-    expect(() => buildHermesChildEnv({ HERMES_ACCEPT_HOOKS: "1" }, false, host)).toThrow(/not allowed/);
+    expect(buildHermesChildEnv({ HERMES_ACCEPT_HOOKS: "1", PYTHONPATH: "/old/venv" }, false, host)).toMatchObject({ HERMES_ACCEPT_HOOKS: "1", PYTHONPATH: "/old/venv" });
   });
 
   it("preserves standard arguments and rejects all bounded extra args", () => {
@@ -68,9 +70,10 @@ describe("Hermes child boundary", () => {
     expect(() => validateBoundedToolsets("terminal,file,web")).toThrow(/only the web toolset/);
   });
 
-  it("rejects file and workspace options for bounded research", () => {
-    for (const option of ["instructionsFilePath", "cwd", "worktreeMode", "checkpoints"]) {
-      const value = option === "instructionsFilePath" || option === "cwd" ? "/private/other" : true;
+  it("tolerates server-managed instructions but rejects workspace options for bounded research", () => {
+    expect(() => validateBoundedRuntimeOptions({ instructionsFilePath: "/private/managed" })).not.toThrow();
+    for (const option of ["cwd", "worktreeMode", "checkpoints"]) {
+      const value = option === "cwd" ? "/private/other" : true;
       expect(() => validateBoundedRuntimeOptions({ [option]: value })).toThrow(/does not accept/);
     }
     expect(() => validateBoundedRuntimeOptions({ boundedExecution: true, quiet: true })).not.toThrow();
@@ -82,9 +85,19 @@ describe("Hermes child boundary", () => {
     expect(env.PATH).toBe(winHost.Path);
     expect(env.SystemRoot).toBe(winHost.SystemRoot);
     expect(env.HOME).toBe(winHost.USERPROFILE);
-    expect(() => buildHermesChildEnv({ Hermes_Yolo_Mode: "1" }, false, winHost, "win32")).toThrow(/not allowed/);
+    expect(buildHermesChildEnv({ Hermes_Yolo_Mode: "1" }, false, winHost, "win32").Hermes_Yolo_Mode).toBe("1");
     expect(() => buildHermesChildEnv({ HERMES_HOME: "C:\\Paperclip\\hermes", PythonPath: "C:\\tmp" }, true, winHost, "win32")).toThrow(/not allowed/);
     expect(buildHermesChildEnv({ HERMES_HOME: "C:\\Paperclip\\hermes" }, true, winHost, "win32").HERMES_HOME).toBe("C:\\Paperclip\\hermes");
+  });
+
+  it("operator-pins bounded mode so an agent config cannot downgrade it", () => {
+    const hostEnv = { PAPERCLIP_HERMES_BOUNDED_AGENT_ID: "agent-1" };
+    expect(isBoundedHermesExecution({ boundedExecution: false }, "agent-1", hostEnv)).toBe(true);
+    expect(isBoundedHermesExecution({ boundedExecution: "true" }, "agent-1", hostEnv)).toBe(true);
+    expect(isBoundedHermesExecution({}, "agent-2", hostEnv)).toBe(false);
+    expect(() => isBoundedHermesExecution({ boundedExecution: true }, "agent-2", hostEnv)).toThrow(/agent ID/);
+    expect(() => isBoundedHermesExecution({ boundedExecution: "true" }, "agent-2", hostEnv)).toThrow(/agent ID/);
+    expect(() => isBoundedHermesExecution({ boundedExecution: true }, "agent-1", {})).toThrow(/agent ID/);
   });
 
   it("rejects persistent approval bypasses in a dedicated Hermes .env", async () => {

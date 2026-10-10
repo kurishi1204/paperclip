@@ -17,7 +17,8 @@
  *   --source           session source tag for filtering
  */
 
-import fs from "node:fs/promises";
+import * as fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import type {
@@ -54,6 +55,7 @@ import {
 import { reconcileHermesPaperclipSkills } from "./skills.js";
 import {
   buildHermesChildEnv,
+  isBoundedHermesExecution,
   resolveHermesCommandForConfig,
   validateBoundedHermesHome,
   validateBoundedRuntimeOptions,
@@ -154,8 +156,18 @@ export function buildPrompt(
   config: Record<string, unknown>,
   options: { resumedSession?: boolean } = {},
 ): string {
-  const context = (ctx as any).context || {};
+  const rawContext = (ctx as any).context || {};
   const bounded = cfgBoolean(config.boundedExecution) === true;
+  // A web-only run cannot use connector APIs. Do not place connector
+  // instructions in its wake prompt even when the server delivers them.
+  const context = bounded ? {
+    ...rawContext,
+    paperclipWake: {
+      ...(rawContext.paperclipWake && typeof rawContext.paperclipWake === "object" ? rawContext.paperclipWake : {}),
+      connectorSkillInstructions: undefined,
+      connectionInstructions: undefined,
+    },
+  } : rawContext;
   const template = bounded
     ? HERMES_BOUNDED_RESEARCH_PROMPT_TEMPLATE
     : cfgString(config.promptTemplate) || (context.conversationMode === true
@@ -286,7 +298,7 @@ function cleanResponse(raw: string): string {
 // Output parsing
 // ---------------------------------------------------------------------------
 
-function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
+function parseHermesOutput(stdout: string, stderr: string, allowLegacySession = true): ParsedOutput {
   const combined = stdout + "\n" + stderr;
   const result: ParsedOutput = {};
 
@@ -304,7 +316,7 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
     }
   } else {
     // Legacy format (non-quiet mode)
-    const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
+    const legacyMatch = allowLegacySession ? combined.match(SESSION_ID_REGEX_LEGACY) : null;
     if (legacyMatch?.[1]) {
       result.sessionId = legacyMatch?.[1] ?? null;
     }
@@ -352,7 +364,9 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
 export async function execute(
   ctx: AdapterExecutionContext,
 ): Promise<AdapterExecutionResult> {
-  const config = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
+  const rawConfig = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
+  const bounded = isBoundedHermesExecution(rawConfig, ctx.agent?.id);
+  const config = bounded ? { ...rawConfig, boundedExecution: true } : rawConfig;
 
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = resolveHermesCommand(config);
@@ -361,10 +375,10 @@ export async function execute(
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
-  const bounded = cfgBoolean(config.boundedExecution) === true;
   const extraArgs = validateHermesExtraArgs(config.extraArgs, bounded);
+  const inheritHostEnv = !bounded && config.managedAiRouting !== true;
   const env: Record<string, string> = {
-    ...buildHermesChildEnv(config.env, bounded),
+    ...buildHermesChildEnv(config.env, bounded, process.env, process.platform, inheritHostEnv),
     ...(!bounded ? buildPaperclipEnv(ctx.agent, ctx.agentIdentity) : {}),
     ...(!bounded ? buildRuntimeToolsEnv(ctx.runtimeTools) : {}),
   };
@@ -446,7 +460,7 @@ export async function execute(
   // when present, inject that bundle into the Hermes prompt.
   const instructionsFilePath = cfgString(config.instructionsFilePath);
   let agentInstructions = "";
-  if (instructionsFilePath) {
+  if (!bounded && instructionsFilePath) {
     try {
       agentInstructions = await fs.readFile(instructionsFilePath, "utf-8");
       const loadedInstructionsLength = agentInstructions.length;
@@ -476,7 +490,7 @@ export async function execute(
 
   // ── Build command args ─────────────────────────────────────────────────
   // Use -Q (quiet) to get clean output: just response + session_id line
-  const useQuiet = cfgBoolean(config.quiet) === true; // default false
+  const useQuiet = bounded || cfgBoolean(config.quiet) === true; // legacy default false
   const args: string[] = ["chat", "-q", prompt];
   if (useQuiet) args.push("-Q");
   // Preserve unattended standard-mode behavior while bounded runs use only
@@ -542,12 +556,14 @@ export async function execute(
   const workspaceCwd = workspace && typeof workspace === "object"
     ? cfgString((workspace as Record<string, unknown>).cwd)
     : undefined;
-  const cwd =
+  const standardCwd =
     cfgString(config.cwd) || workspaceCwd || cfgString(ctx.config?.workspaceDir) || ".";
-  try {
-    await ensureAbsoluteDirectory(cwd);
-  } catch {
-    // Non-fatal
+  if (!bounded) {
+    try {
+      await ensureAbsoluteDirectory(standardCwd);
+    } catch {
+      // Non-fatal for the legacy standard mode.
+    }
   }
 
   // ── Log start ──────────────────────────────────────────────────────────
@@ -586,17 +602,30 @@ export async function execute(
     return ctx.onLog(stream, chunk);
   };
 
-  const result = await runChildProcess(ctx.runId, hermesCmd, args, {
-    cwd,
-    env,
-    timeoutSec,
-    graceSec,
-    onLog: wrappedOnLog,
-    onSpawn: ctx.onSpawn,
-  });
+  // A fresh empty CWD keeps repository/server instruction files out of the
+  // Hermes prompt. Remove it after the child has exited or been reaped.
+  const boundedCwd = bounded ? await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-web-")) : undefined;
+  if (boundedCwd) {
+    env.HOME = boundedCwd;
+    if (process.platform === "win32") env.USERPROFILE = boundedCwd;
+  }
+  let result: Awaited<ReturnType<typeof runChildProcess>>;
+  try {
+    result = await runChildProcess(ctx.runId, hermesCmd, args, {
+      cwd: boundedCwd ?? standardCwd,
+      env,
+      inheritHostEnv,
+      timeoutSec,
+      graceSec,
+      onLog: wrappedOnLog,
+      onSpawn: ctx.onSpawn,
+    });
+  } finally {
+    if (boundedCwd) await fs.rm(boundedCwd, { recursive: true, force: true });
+  }
 
   // ── Parse output ───────────────────────────────────────────────────────
-  const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
+  const parsed = parseHermesOutput(result.stdout || "", result.stderr || "", !bounded);
 
   await ctx.onLog(
     "stdout",
