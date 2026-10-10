@@ -275,10 +275,27 @@ toolset is `web`; all `extraArgs` and agent-configured command overrides are
 rejected. Custom `promptTemplate` is ignored in bounded mode so a configured
 terminal instruction cannot override the web-only task contract. The adapter passes `--ignore-user-config` and
 `--ignore-rules`; the latter suppresses home instructions and memories without
-disabling tool approvals. On Mini Hermes v0.14.0 plugins can load before those
-flags take effect, so the dedicated home's plugins, hooks, skills, memories,
-and cron directories must stay private and empty. Any skills prompt snapshot
-must contain the exact empty structure. `active_profile` may only be absent or
+disabling tool approvals. Some Hermes home inputs load before those flags take
+effect. The dedicated home's plugins, hooks, memories, and cron directories
+must stay private and empty. An empty skills directory is allowed for older
+Hermes versions. Mini Hermes v0.21.6 copies its bundled skills into the
+dedicated home on first startup. Before switching the Paperclip service to
+that version, seed the bundled skills in the dedicated home using the pinned
+Hermes installation, then set `PAPERCLIP_HERMES_SKILLS_TREE_SHA256` in the
+service environment to the digest returned by `hashBoundedHermesSkillsTree()`
+from this adapter's built `dist/server/safe-runtime.js`. The digest includes
+every relative path, entry type, owner, group, mode, file size, and file
+SHA-256. An added, edited, linked, or missing entry stops the next bounded
+launch. The skills directory itself remains private; bundled child directories
+may be readable but not writable by other users. Recompute and review this
+pin after a Hermes update. The observed v0.21.6 web-only CLI exposed only
+`web_search` and `web_extract`, and its skill instructions were absent from
+the saved model prompt. This does not authorize a broader toolset.
+Any skills prompt snapshot must contain the exact empty structure. The
+auto-generated `SOUL.md` also requires its exact file SHA-256 in the service
+environment as `PAPERCLIP_HERMES_SOUL_SHA256`; the observed v0.21.6
+`--ignore-rules` run used the default identity instead of this file.
+`active_profile` may only be absent or
 `default`, and any `config.yaml` requires a matching operator-owned SHA-256 in
 `PAPERCLIP_HERMES_CONFIG_SHA256`. A present `mcp.json` blocks startup. These
 checks run before every bounded execution and environment probe. Its `.env` accepts only provider and

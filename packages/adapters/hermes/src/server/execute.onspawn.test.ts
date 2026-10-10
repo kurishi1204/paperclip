@@ -38,7 +38,7 @@ vi.mock("node:fs/promises", () => ({
   readdir: vi.fn(async () => []),
   stat: vi.fn(async () => ({ isFile: () => true, isDirectory: () => false })),
   lstat: vi.fn(async (target: string) => {
-    if (["/.env", "/auth.json", "/active_profile", "/.skills_prompt_snapshot.json", "/config.yaml", "/mcp.json"].some((suffix) => target.endsWith(suffix))) {
+    if (["/.env", "/auth.json", "/SOUL.md", "/active_profile", "/.skills_prompt_snapshot.json", "/config.yaml", "/mcp.json"].some((suffix) => target.endsWith(suffix))) {
       const error = new Error("not found") as NodeJS.ErrnoException;
       error.code = "ENOENT";
       throw error;

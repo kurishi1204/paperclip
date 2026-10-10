@@ -5,6 +5,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   buildHermesChildEnv,
+  hashBoundedHermesSkillsTree,
   isBoundedHermesExecution,
   resolveHermesCommandForConfig,
   validateBoundedHermesHome,
@@ -158,6 +159,48 @@ describe("Hermes child boundary", () => {
     } finally {
       if (priorHash === undefined) delete process.env.PAPERCLIP_HERMES_CONFIG_SHA256;
       else process.env.PAPERCLIP_HERMES_CONFIG_SHA256 = priorHash;
+      await fs.rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts only an operator-pinned Hermes bundled skills tree after first startup", async () => {
+    const created = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-bundled-skills-"));
+    const home = await fs.realpath(created);
+    const skills = path.join(home, "skills");
+    const skill = path.join(skills, "research", "SKILL.md");
+    const soul = path.join(home, "SOUL.md");
+    const priorTree = process.env.PAPERCLIP_HERMES_SKILLS_TREE_SHA256;
+    const priorSoul = process.env.PAPERCLIP_HERMES_SOUL_SHA256;
+    try {
+      await fs.chmod(home, 0o700);
+      await fs.mkdir(path.dirname(skill), { recursive: true, mode: 0o700 });
+      await fs.writeFile(skill, "Bundled public research skill\n", { mode: 0o600 });
+      await fs.writeFile(path.join(skills, ".bundled_manifest"), "research:fixture\n", { mode: 0o600 });
+      await fs.writeFile(soul, "Default identity\n", { mode: 0o600 });
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/operator pin/);
+      process.env.PAPERCLIP_HERMES_SKILLS_TREE_SHA256 = await hashBoundedHermesSkillsTree(skills);
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/SOUL.md.*operator pin/);
+      process.env.PAPERCLIP_HERMES_SOUL_SHA256 = createHash("sha256").update("Default identity\n").digest("hex");
+      await expect(validateBoundedHermesHome(home)).resolves.toBeUndefined();
+
+      await fs.appendFile(skill, "unreviewed instruction\n");
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/operator pin/);
+      await fs.writeFile(skill, "Bundled public research skill\n");
+      await fs.symlink(skill, path.join(skills, "unexpected-link"));
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/unsafe entry/);
+      await fs.unlink(path.join(skills, "unexpected-link"));
+      await fs.chmod(skill, 0o622);
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/unsafe entry/);
+      await fs.chmod(skill, 0o600);
+      await fs.appendFile(soul, "override\n");
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/SOUL.md.*operator pin/);
+      await fs.rm(skills, { recursive: true });
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/pinned skills tree is missing/);
+    } finally {
+      if (priorTree === undefined) delete process.env.PAPERCLIP_HERMES_SKILLS_TREE_SHA256;
+      else process.env.PAPERCLIP_HERMES_SKILLS_TREE_SHA256 = priorTree;
+      if (priorSoul === undefined) delete process.env.PAPERCLIP_HERMES_SOUL_SHA256;
+      else process.env.PAPERCLIP_HERMES_SOUL_SHA256 = priorSoul;
       await fs.rm(home, { recursive: true, force: true });
     }
   });

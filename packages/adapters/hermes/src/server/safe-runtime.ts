@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
@@ -193,6 +194,81 @@ export function validateBoundedRuntimeOptions(config: Record<string, unknown>): 
   }
 }
 
+function sameFile(before: import("node:fs").Stats, after: import("node:fs").Stats): boolean {
+  return before.dev === after.dev && before.ino === after.ino &&
+    before.mode === after.mode && before.uid === after.uid && before.gid === after.gid &&
+    before.size === after.size && before.mtimeMs === after.mtimeMs &&
+    before.ctimeMs === after.ctimeMs && before.nlink === after.nlink;
+}
+
+function pinnedSha256(name: string): string | undefined {
+  const value = process.env[name];
+  if (value !== undefined && !/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error("Bounded Hermes " + name + " must be a SHA-256 digest");
+  }
+  return value;
+}
+
+async function readSealedFile(file: string, before: import("node:fs").Stats): Promise<Buffer> {
+  const handle = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || !sameFile(before, opened)) {
+      throw new Error("Bounded Hermes file changed during inspection");
+    }
+    const data = await handle.readFile();
+    if (!sameFile(opened, await handle.stat()) || data.length !== opened.size ||
+        !sameFile(opened, await fs.lstat(file))) {
+      throw new Error("Bounded Hermes file changed during inspection");
+    }
+    return data;
+  } finally {
+    await handle.close();
+  }
+}
+
+// Hermes 0.21.6 copies its bundled skills into HERMES_HOME on first startup.
+// The web-only CLI does not expose skill tools, but a later launch must still
+// reject additions or edits in this same-UID extension surface.
+export async function hashBoundedHermesSkillsTree(skillsHome: string): Promise<string> {
+  const hash = createHash("sha256").update("hermes-bounded-skills-v1\n");
+  let entriesSeen = 0;
+  let bytesSeen = 0;
+  const visit = async (full: string, relative: string): Promise<void> => {
+    const before = await fs.lstat(full);
+    if (before.isSymbolicLink() || (!before.isDirectory() && !before.isFile()) ||
+        (process.platform !== "win32" &&
+         ((typeof process.getuid === "function" && before.uid !== process.getuid()) ||
+          (before.mode & 0o022) !== 0 || (before.mode & 0o7000) !== 0)) ||
+        (before.isFile() && before.nlink !== 1)) {
+      throw new Error("Bounded Hermes skills tree contains an unsafe entry");
+    }
+    entriesSeen += 1;
+    if (entriesSeen > 5000) throw new Error("Bounded Hermes skills tree exceeds entry limit");
+    if (before.isDirectory()) {
+      hash.update(JSON.stringify({ path: relative, type: "directory", uid: before.uid,
+        gid: before.gid, mode: before.mode & 0o7777 }) + "\n");
+      const children = await fs.readdir(full);
+      children.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+      for (const name of children) {
+        await visit(path.join(full, name), relative ? relative + "/" + name : name);
+      }
+      if (!sameFile(before, await fs.lstat(full))) {
+        throw new Error("Bounded Hermes skills tree changed during inspection");
+      }
+      return;
+    }
+    bytesSeen += before.size;
+    if (bytesSeen > 50_000_000) throw new Error("Bounded Hermes skills tree exceeds byte limit");
+    const data = await readSealedFile(full, before);
+    hash.update(JSON.stringify({ path: relative, type: "file", uid: before.uid,
+      gid: before.gid, mode: before.mode & 0o7777, size: data.length,
+      sha256: createHash("sha256").update(data).digest("hex") }) + "\n");
+  };
+  await visit(skillsHome, "");
+  return hash.digest("hex");
+}
+
 export async function validateBoundedHermesHome(home: string): Promise<void> {
   const stat = await fs.lstat(home);
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Bounded HERMES_HOME must be a real directory");
@@ -230,14 +306,19 @@ export async function validateBoundedHermesHome(home: string): Promise<void> {
   }
 
   // Hermes discovers these from HERMES_HOME before its chat flags have taken
-  // effect. Keep the bounded web worker's extension surface empty.
+  // effect. Only the operator-pinned bundled skills tree may be non-empty.
   for (const directory of ["plugins", "hooks", "skills", "memories", "cron"]) {
     const target = path.join(home, directory);
     let entry;
     try {
       entry = await fs.lstat(target);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        if (directory === "skills" && pinnedSha256("PAPERCLIP_HERMES_SKILLS_TREE_SHA256")) {
+          throw new Error("Bounded Hermes pinned skills tree is missing");
+        }
+        continue;
+      }
       throw error;
     }
     if (!entry.isDirectory() || entry.isSymbolicLink()) {
@@ -248,9 +329,41 @@ export async function validateBoundedHermesHome(home: string): Promise<void> {
          (entry.mode & 0o077) !== 0)) {
       throw new Error("Bounded Hermes " + directory + " must be private to the runtime user");
     }
-    if ((await fs.readdir(target)).length !== 0) {
+    const entries = await fs.readdir(target);
+    if (directory === "skills" && entries.length > 0) {
+      const expected = pinnedSha256("PAPERCLIP_HERMES_SKILLS_TREE_SHA256");
+      if (!expected || await hashBoundedHermesSkillsTree(target) !== expected) {
+        throw new Error("Bounded Hermes skills tree does not match the operator pin");
+      }
+    } else if (entries.length !== 0) {
       throw new Error("Bounded Hermes " + directory + " must be empty");
+    } else if (directory === "skills" && pinnedSha256("PAPERCLIP_HERMES_SKILLS_TREE_SHA256")) {
+      throw new Error("Bounded Hermes pinned skills tree is missing");
     }
+  }
+
+  // --ignore-rules excludes SOUL.md from the CLI's model prompt. Pin the
+  // default file generated by Hermes anyway so later CLI behavior cannot
+  // silently start consuming an altered identity.
+  const soul = path.join(home, "SOUL.md");
+  const expectedSoul = pinnedSha256("PAPERCLIP_HERMES_SOUL_SHA256");
+  let soulStat;
+  try {
+    soulStat = await fs.lstat(soul);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (soulStat) {
+    if (!soulStat.isFile() || soulStat.isSymbolicLink() || soulStat.nlink !== 1 ||
+        soulStat.size > 1_000_000 ||
+        (process.platform !== "win32" &&
+         ((typeof process.getuid === "function" && soulStat.uid !== process.getuid()) ||
+          (soulStat.mode & 0o077) !== 0)) || !expectedSoul ||
+        createHash("sha256").update(await readSealedFile(soul, soulStat)).digest("hex") !== expectedSoul) {
+      throw new Error("Bounded Hermes SOUL.md does not match the operator pin");
+    }
+  } else if (expectedSoul) {
+    throw new Error("Bounded Hermes pinned SOUL.md is missing");
   }
 
   // A non-default active profile can replace HERMES_HOME at CLI startup.
