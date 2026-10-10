@@ -13,11 +13,13 @@ import type {
 
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import { promisify } from "node:util";
 
 import { HERMES_CLI, DEFAULT_MODEL, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
 import { resolveHermesCommand } from "./execute.js";
+import { buildHermesChildEnv, validateHermesExtraArgs } from "./safe-runtime.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -136,23 +138,21 @@ async function checkApiKeys(
   config: Record<string, unknown>,
   detectedConfig: Awaited<ReturnType<typeof detectModel>> | null,
 ): Promise<AdapterEnvironmentCheck | null> {
-  // The server resolves secret refs into config.env before calling testEnvironment,
-  // so we check config.env first (adapter-configured secrets), then fall back to
-  // process.env (server/host environment), then ~/.hermes/.env (Hermes local config).
+  // The server resolves secret refs into config.env before calling testEnvironment.
+  // Neither standard nor bounded children inherit the host's provider keys.
   const envConfig = (config.env ?? {}) as Record<string, unknown>;
   const resolvedEnv: Record<string, string> = {};
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string" && value.length > 0) resolvedEnv[key] = value;
   }
 
-  // Also read ~/.hermes/.env — Hermes stores API keys there by default and does
-  // not export them to the parent process, so Paperclip's process.env won't
-  // contain them.  Parsing this file ensures the environment test reports
-  // accurate results for keys that Hermes already knows about.
+  // Read the same Hermes home that execute() will use. Never credit host keys
+  // or a global ~/.hermes file as evidence for a bounded child process.
   const hermesEnvKeys: Record<string, string> = {};
   try {
-    const homeDir = process.env.HOME || process.env.USERPROFILE || "/root";
-    const hermesEnvPath = `${homeDir}/.hermes/.env`;
+    const hermesHome = asString(envConfig.HERMES_HOME) ||
+      path.join(asString(envConfig.HOME) || process.env.HOME || "/root", ".hermes");
+    const hermesEnvPath = path.join(hermesHome, ".env");
     const content = readFileSync(hermesEnvPath, "utf-8");
     for (const line of content.split("\n")) {
       const trimmed = line.trim();
@@ -169,7 +169,7 @@ async function checkApiKeys(
   }
 
   const has = (key: string): boolean =>
-    !!(resolvedEnv[key] ?? process.env[key] ?? hermesEnvKeys[key]);
+    !!(resolvedEnv[key] ?? hermesEnvKeys[key]);
 
   const hasAnthropic = has("ANTHROPIC_API_KEY");
   const hasOpenRouter = has("OPENROUTER_API_KEY");
@@ -331,6 +331,24 @@ export async function testEnvironment(
   const config = (ctx.config ?? {}) as Record<string, unknown>;
   const command = resolveHermesCommand(config);
   const checks: AdapterEnvironmentCheck[] = [];
+  let childEnv: Record<string, string>;
+  try {
+    childEnv = buildHermesChildEnv(config.env, config.boundedExecution === true);
+    validateHermesExtraArgs(config.extraArgs, config.boundedExecution === true);
+  } catch (error) {
+    checks.push({ level: "error", code: "hermes_environment_invalid", message: error instanceof Error ? error.message : "Invalid Hermes environment" });
+    return { adapterType: ADAPTER_TYPE, status: "fail", checks, testedAt: new Date().toISOString() };
+  }
+  const hasToolsets = Boolean(asString(config.toolsets)) ||
+    (Array.isArray(config.enabledToolsets) && config.enabledToolsets.length > 0 &&
+     config.enabledToolsets.every((value) => typeof value === "string" && value.length > 0));
+  if (config.boundedExecution === true &&
+      (!asString(config.provider) || !asString(config.model) ||
+       !hasToolsets || !Number.isInteger(config.maxTurnsPerRun) ||
+       (config.maxTurnsPerRun as number) <= 0)) {
+    checks.push({ level: "error", code: "hermes_bounded_config_incomplete", message: "Bounded Hermes execution requires explicit provider, model, toolsets and positive maxTurnsPerRun." });
+    return { adapterType: ADAPTER_TYPE, status: "fail", checks, testedAt: new Date().toISOString() };
+  }
 
   // Managed connections must prove the selected destination with the isolated
   // runtime environment. Host credentials and ~/.hermes are not evidence.
@@ -339,17 +357,13 @@ export async function testEnvironment(
     if (remote) {
       checks.push({ level: "error", code: "hermes_remote_probe_unsupported", message: "Hermes connection testing requires a local execution environment." });
     } else {
-      const env = { ...process.env };
-      for (const [key, value] of Object.entries((config.env ?? {}) as Record<string, unknown>)) {
-        if (typeof value === "string") env[key] = value;
-      }
       const args = ["chat", "-Q", "-q", "Respond with hello. Do not use tools.", "--max-turns", "1"];
       if (asString(config.model)) args.push("-m", asString(config.model)!);
       const provider = asString(config.provider);
       if (provider && provider !== "auto") args.push("--provider", provider);
       try {
         const { stdout } = await execFileAsync(command, args, {
-          env, cwd: asString(config.cwd), timeout: 45_000, maxBuffer: 1024 * 1024,
+          env: childEnv, cwd: asString(config.cwd), timeout: 45_000, maxBuffer: 1024 * 1024,
         });
         if (!/\bhello\b/i.test(stdout)) throw new Error("No hello response");
         checks.push({ level: "info", code: "hermes_hello_probe_passed", message: "Hermes responded through the selected connection." });
@@ -389,7 +403,9 @@ export async function testEnvironment(
   // 5. Detect Hermes config once for the remaining checks.
   let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
   try {
-    detectedConfig = await detectModel();
+    detectedConfig = await detectModel(childEnv.HERMES_HOME
+      ? path.join(childEnv.HERMES_HOME, "config.yaml")
+      : undefined);
   } catch {
     // Non-fatal
   }

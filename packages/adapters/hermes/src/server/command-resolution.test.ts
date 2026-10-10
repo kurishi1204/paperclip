@@ -65,3 +65,49 @@ test("managed connections probe the selected environment without falling back to
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test("bounded environment check fails before a probe when home or arguments are unsafe", async () => {
+  const base = {
+    companyId: "test",
+    adapterType: "hermes_local" as const,
+    config: {
+      command: "/missing/hermes",
+      managedAiRouting: true,
+      boundedExecution: true,
+      provider: "openai-codex",
+      model: "gpt-5.6-sol",
+      toolsets: "web",
+      maxTurnsPerRun: 1,
+      env: { HERMES_HOME: "/private/qa/hermes" },
+    },
+  };
+  const unsafeArg = await testEnvironment({ ...base, config: { ...base.config, extraArgs: ["--yolo"] } });
+  expect(unsafeArg.status).toBe("fail");
+  expect(unsafeArg.checks[0]?.code).toBe("hermes_environment_invalid");
+
+  const missingHome = await testEnvironment({ ...base, config: { ...base.config, env: {} } });
+  expect(missingHome.status).toBe("fail");
+  expect(missingHome.checks[0]?.code).toBe("hermes_environment_invalid");
+});
+
+test("environment check does not count an unrelated host provider key", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-no-host-key-"));
+  const cliPath = path.join(tempDir, "fake-hermes");
+  const prior = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "unrelated-host-secret";
+  try {
+    await writeFile(cliPath, "#!/bin/sh\necho fake-hermes 1.2.3\n");
+    await chmod(cliPath, 0o755);
+    const result = await testEnvironment({
+      companyId: "test",
+      adapterType: "hermes_local",
+      config: { command: cliPath, env: { HERMES_HOME: tempDir } },
+    });
+    expect(result.checks.some((check) => check.code === "hermes_no_api_keys")).toBe(true);
+    expect(result.checks.some((check) => check.code === "hermes_api_keys_found")).toBe(false);
+  } finally {
+    if (prior === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prior;
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});

@@ -230,6 +230,7 @@ Create issues in Paperclip and assign them to your Hermes agent. On each heartbe
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `toolsets` | string | *(all)* | Comma-separated toolsets to enable (e.g. `"terminal,file,web"`) |
+| `boundedExecution` | boolean | `false` | Require explicit provider, model, toolsets, turn limit and dedicated `HERMES_HOME`; restrict extra arguments and environment variables |
 
 Available toolsets: `terminal`, `file`, `web`, `browser`, `code_execution`, `vision`, `mcp`, `creative`, `productivity`
 
@@ -253,6 +254,16 @@ Available toolsets: `terminal`, `file`, `web`, `browser`, `code_execution`, `vis
 | `env` | object | `{}` | Extra environment variables |
 | `promptTemplate` | string | *(built-in)* | Custom prompt template |
 | `paperclipApiUrl` | string | `http://127.0.0.1:3100/api` | Paperclip API base URL |
+
+The local adapter does not add `--yolo` and rejects `--yolo` and
+`--ignore-rules` in `extraArgs`. It passes only basic process settings from the
+Paperclip host; unrelated host credentials do not reach Hermes. Explicit
+`env` values still reach the child in standard mode. In bounded mode, use a
+private absolute `env.HERMES_HOME` for that agent's authentication and config;
+the child also receives it as `HOME`. Only provider credential variables and
+basic process settings are accepted there. All `extraArgs` are rejected in
+bounded mode. A bounded run without its
+required configuration fails before starting Hermes.
 
 ### Prompt Template Variables
 

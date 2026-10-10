@@ -14,7 +14,6 @@
  *   -w/--worktree      isolated git worktree
  *   -v/--verbose       verbose output
  *   --checkpoints      filesystem checkpoints
- *   --yolo             bypass dangerous-command approval prompts (agents have no TTY)
  *   --source           session source tag for filtering
  */
 
@@ -54,6 +53,7 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
+import { buildHermesChildEnv, validateHermesExtraArgs } from "./safe-runtime.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -344,7 +344,17 @@ export async function execute(
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
-  const extraArgs = cfgStringArray(config.extraArgs);
+  const bounded = cfgBoolean(config.boundedExecution) === true;
+  const extraArgs = validateHermesExtraArgs(config.extraArgs, bounded);
+  const env: Record<string, string> = {
+    ...buildHermesChildEnv(config.env, bounded),
+    ...buildPaperclipEnv(ctx.agent, ctx.agentIdentity),
+    ...buildRuntimeToolsEnv(ctx.runtimeTools),
+  };
+  if (bounded && (!cfgString(config.provider) || !cfgString(config.model) ||
+      !toolsets || !maxTurns || maxTurns <= 0 || !Number.isInteger(maxTurns))) {
+    throw new Error("Bounded Hermes execution requires explicit provider, model, toolsets and positive maxTurnsPerRun");
+  }
   const persistSession = cfgBoolean(config.persistSession) !== false;
   const worktreeMode = cfgBoolean(config.worktreeMode) === true;
   const checkpoints = cfgBoolean(config.checkpoints) === true;
@@ -386,7 +396,9 @@ export async function execute(
 
   if (!explicitProvider) {
     try {
-      detectedConfig = await detectModel();
+      detectedConfig = await detectModel(env.HERMES_HOME
+        ? path.join(env.HERMES_HOME, "config.yaml")
+        : undefined);
     } catch {
       // Non-fatal — detection failure shouldn't block execution
     }
@@ -467,30 +479,15 @@ export async function execute(
   // Requires hermes-agent >= PR #3255 (feat/session-source-tag).
   args.push("--source", "tool");
 
-  // Bypass Hermes dangerous-command approval prompts.
-  // Paperclip agents run as non-interactive subprocesses with no TTY,
-  // so approval prompts would always timeout and deny legitimate commands
-  // (curl, python3 -c, etc.). Agents operate in a sandbox — the approval
-  // system is designed for human-attended interactive sessions.
-  args.push("--yolo");
-
   if (persistSession && prevSessionId) {
     args.push("--resume", prevSessionId);
   }
 
-  if (extraArgs?.length) {
+  if (extraArgs.length) {
     args.push(...extraArgs);
   }
 
   // ── Build environment ──────────────────────────────────────────────────
-  const userEnv = config.env as Record<string, string> | undefined;
-  const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
-    ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
-    ...buildPaperclipEnv(ctx.agent, ctx.agentIdentity),
-    ...buildRuntimeToolsEnv(ctx.runtimeTools),
-  };
-
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
   // PAPERCLIP_API_KEY is never accepted from config — the harness-minted run

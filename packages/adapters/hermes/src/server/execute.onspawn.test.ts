@@ -225,4 +225,45 @@ describe("hermes-local adapter onSpawn forwarding", () => {
       else process.env.PAPERCLIP_API_KEY = previousApiKey;
     }
   });
+
+  it("launches bounded Hermes without approval bypasses or unrelated host secrets", async () => {
+    const previousHostSecret = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "unrelated-host-secret";
+    try {
+      const { ctx } = makeCtx({
+        boundedExecution: true,
+        provider: "openai-codex",
+        model: "gpt-5.6-sol",
+        toolsets: "web",
+        maxTurnsPerRun: 1,
+        env: { HERMES_HOME: "/private/qa/hermes" },
+      });
+      await execute(ctx as any);
+      const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+      const args = call[2];
+      expect(args).not.toContain("--yolo");
+      expect(args).not.toContain("--ignore-rules");
+      expect(args).toContainEqual("web");
+      expect(call[3].env?.HOME).toBe("/private/qa/hermes");
+      expect(call[3].env?.HERMES_HOME).toBe("/private/qa/hermes");
+      expect(call[3].env?.ANTHROPIC_API_KEY).toBeUndefined();
+    } finally {
+      if (previousHostSecret === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = previousHostSecret;
+    }
+  });
+
+  it("fails before spawn when a bounded run requests unsafe CLI arguments", async () => {
+    const { ctx } = makeCtx({
+      boundedExecution: true,
+      provider: "openai-codex",
+      model: "gpt-5.6-sol",
+      toolsets: "web",
+      maxTurnsPerRun: 1,
+      env: { HERMES_HOME: "/private/qa/hermes" },
+      extraArgs: ["--ignore-rules"],
+    });
+    await expect(execute(ctx as any)).rejects.toThrow(/approval bypass/);
+    expect(serverUtils.runChildProcess).not.toHaveBeenCalled();
+  });
 });
