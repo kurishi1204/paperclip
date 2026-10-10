@@ -76,6 +76,13 @@ pages of at most 16,384 bytes. Annotation pages contain at most 16,000
 characters and fail closed when one annotation exceeds that size. Binary or invalid UTF-8 attachments are
 identified but not interpreted: their acceptance evidence must be available
 through an assigned issue document/comment or handled by a human reviewer.
+Every QA MCP tool response is also bounded to 64,000 UTF-8 bytes on the
+serialized JSON-RPC wire body, including both `content.text` and
+`structuredContent`. An oversized response fails closed with a generic error;
+the caller can request a smaller evidence page or use human review. An
+oversized decision response may occur after the decision was recorded, so the
+agent must check `read_assigned_review_receipt` with the original stage,
+decision, and summary and must not resubmit the decision.
 After a missing verdict response, the agent checks the receipt with the exact
 stage, decision, and summary from its attempt. A missing receipt remains
 unknown and does not authorize resubmission. Only that receipt remains readable

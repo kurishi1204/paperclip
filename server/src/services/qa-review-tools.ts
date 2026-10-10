@@ -495,7 +495,7 @@ export async function callQaReviewTool(input: QaToolInput) {
   const next = parseIssueExecutionState(result.executionState);
   if (!next?.lastDecisionId || next.lastDecisionId === args.expectedLastDecisionId ||
       next.lastDecisionOutcome !== (args.decision === "approve" ? "approved" : "changes_requested")) {
-    throw conflict("Decision response is unverified; inspect the issue before any retry");
+    throw conflict("Decision response is unverified");
   }
   return {
     issueId: input.issue.id,

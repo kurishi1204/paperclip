@@ -6,6 +6,7 @@ import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { documentService } from "../services/documents.js";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
+import * as qaReviewTools from "../services/qa-review-tools.js";
 
 describe("run-bound QA review MCP", () => {
   let server: Awaited<ReturnType<typeof startRunnerApiTestServer>>;
@@ -38,7 +39,8 @@ describe("run-bound QA review MCP", () => {
         method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: randomUUID(), method, params }),
       });
-      return { status: response.status, body: await response.json() };
+      const wire = await response.text();
+      return { status: response.status, body: JSON.parse(wire), wireBytes: Buffer.byteLength(wire, "utf8") };
     };
     const tool = (name: string, args: object = {}) => call("tools/call", { name, arguments: args });
     const rows = () => server.db.select().from(issueExecutionDecisions).where(and(
@@ -326,6 +328,102 @@ describe("run-bound QA review MCP", () => {
     expect((await tool("read_assigned_issue_attachment_text", { attachmentId: foreignId, expectedRevision })).body.result.isError).toBe(true);
     expect((await tool("read_assigned_issue_attachment_text", { attachmentId: binaryId, expectedRevision })).body.result.isError).toBe(true);
     expect((await tool("read_assigned_issue_attachment_text", { attachmentId: assignedId, expectedRevision, limit: 16_385 })).body.result.isError).toBe(true);
+  });
+
+  it("fails closed on a long assigned attachment name before it reaches the QA subprocess", async () => {
+    const { fixture, tool } = await reviewFixture();
+    const stored = await server.storage.putFile({
+      companyId: fixture.companyId, namespace: "qa-evidence",
+      originalFilename: "A".repeat(100_000), contentType: "text/plain", body: Buffer.from("evidence"),
+    });
+    const [asset] = await server.db.insert(assets).values({ companyId: fixture.companyId, ...stored }).returning();
+    await server.db.insert(issueAttachments).values({
+      companyId: fixture.companyId, issueId: fixture.issueId, assetId: asset!.id,
+    });
+    const expectedRevision = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
+    const response = await tool("list_assigned_issue_attachments", { expectedRevision });
+    expect(response.body.result.isError).toBe(true);
+    expect(response.body.result.structuredContent).toBeUndefined();
+    expect(JSON.stringify(response.body)).not.toContain("A".repeat(1_000));
+    expect(response.wireBytes).toBeLessThanOrEqual(64_000);
+  });
+
+  it.each(qaReviewTools.QA_REVIEW_TOOL_NAMES)("caps the entire %s tools/call response", async (name) => {
+    const { tool } = await reviewFixture();
+    // The object alone fits; duplicated content.text + structuredContent does not.
+    const executor = vi.spyOn(qaReviewTools, "callQaReviewTool").mockResolvedValue({ payload: "Z".repeat(35_000) });
+    try {
+      const response = await tool(name);
+      expect(response.body.result.isError).toBe(true);
+      expect(response.body.result.structuredContent).toBeUndefined();
+      expect(JSON.stringify(response.body)).not.toContain("Z".repeat(1_000));
+      expect(response.wireBytes).toBeLessThanOrEqual(64_000);
+      if (name === "submit_review_decision") {
+        expect(response.body.result.content[0].text).toContain("read_assigned_review_receipt");
+        expect(response.body.result.content[0].text).not.toMatch(/retry/i);
+      }
+    } finally {
+      executor.mockRestore();
+    }
+  });
+
+  it("replaces an oversized tool error message with a bounded generic error", async () => {
+    const { tool } = await reviewFixture();
+    const executor = vi.spyOn(qaReviewTools, "callQaReviewTool").mockRejectedValue(new Error("E".repeat(100_000)));
+    try {
+      const response = await tool("read_assigned_issue");
+      expect(response.body.result.isError).toBe(true);
+      expect(response.body.result.content[0].text).toBe("QA review tool failed");
+      expect(response.wireBytes).toBeLessThanOrEqual(64_000);
+    } finally {
+      executor.mockRestore();
+    }
+  });
+
+  it("bounds the JSON-RPC id even when the caller supplies an oversized value", async () => {
+    const { token, tool } = await reviewFixture();
+    const response = await tool("read_assigned_issue");
+    expect(response.body.result.isError).not.toBe(true);
+    const raw = await fetch(`${server.apiUrl}/api/mcp/qa-review`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: "I".repeat(100_000), method: "tools/call",
+        params: { name: "read_assigned_issue", arguments: {} } }),
+    });
+    const wire = await raw.text();
+    const bounded = JSON.parse(wire);
+    expect(bounded.id).toBeNull();
+    expect(bounded.result.isError).toBe(true);
+    expect(wire).not.toContain("I".repeat(1_000));
+    expect(Buffer.byteLength(wire, "utf8")).toBeLessThanOrEqual(64_000);
+  });
+
+  it("recovers a recorded decision when its oversized response is withheld", async () => {
+    const { stageId, tool, rows } = await reviewFixture();
+    const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
+    const summary = "Evidence was checked before the response failed.";
+    const original = qaReviewTools.callQaReviewTool;
+    const executor = vi.spyOn(qaReviewTools, "callQaReviewTool").mockImplementation(async (input) => ({
+      ...await original(input), responsePadding: "P".repeat(35_000),
+    }));
+    let submitted!: Awaited<ReturnType<typeof tool>>;
+    try {
+      submitted = await tool("submit_review_decision", {
+        decision: "approve", summary, expectedStageId: stageId,
+        expectedStatusVersion: issue.statusVersion, expectedRevision: issue.revision,
+        expectedLastDecisionId: issue.reviewStage.lastDecisionId,
+      });
+    } finally {
+      executor.mockRestore();
+    }
+    expect(submitted.body.result.isError).toBe(true);
+    expect(submitted.body.result.content[0].text).toContain("read_assigned_review_receipt");
+    expect(submitted.body.result.content[0].text).not.toMatch(/retry/i);
+    expect(submitted.wireBytes).toBeLessThanOrEqual(64_000);
+    expect(await rows()).toHaveLength(1);
+    const receipt = (await tool("read_assigned_review_receipt", {
+      expectedStageId: stageId, decision: "approve", summary,
+    })).body.result.structuredContent;
+    expect(receipt).toMatchObject({ recorded: true, decisionOutcome: "approved" });
   });
 
   it("records one exact review decision and rejects stale replay", async () => {
