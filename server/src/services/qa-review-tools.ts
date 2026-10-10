@@ -274,7 +274,13 @@ async function issueApi(input: QaToolInput, method: "GET" | "PATCH", suffix: str
   }
   if (!response.ok) {
     const result = await response.json().catch(() => null);
-    throw new Error(result && typeof result.error === "string" ? result.error : `QA issue request failed (${response.status})`);
+    const reason = result && typeof result.error === "string" ? result.error : `QA issue request failed (${response.status})`;
+    // A server failure or gateway timeout can be emitted after the transition
+    // committed. Only explicit client/precondition rejection is definite.
+    if (method === "PATCH" && (response.status >= 500 || response.status === 408 || response.status === 429)) {
+      throw new QaDecisionOutcomeUnknownError(reason);
+    }
+    throw new Error(reason);
   }
   let result;
   try { result = await response.json(); }

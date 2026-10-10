@@ -84,9 +84,9 @@ the caller can request a smaller evidence page or use human review. An
 oversized decision response may occur after the decision was recorded, so the
 agent must check `read_assigned_review_receipt` with the original stage,
 decision, and summary and must not resubmit the decision.
-Validation errors, stale revision conflicts, and explicit non-2xx PATCH
-responses are definite failures: the agent can re-read the issue and submit a
-new verdict if the review stage remains pending. Transport loss and an
+Validation errors and explicit client/precondition PATCH rejections are definite
+failures: the agent can re-read the issue and submit a new verdict if the review
+stage remains pending. Transport loss, server or gateway errors, and an
 unverified successful response remain outcome-unknown until a matching receipt
 is read.
 After a missing verdict response, the agent checks the receipt with the exact

@@ -177,6 +177,33 @@ describe("run-bound QA review MCP", () => {
     })]);
   });
 
+  it("treats a server error after a verdict request as outcome-unknown", async () => {
+    const { stageId, tool, rows } = await reviewFixture();
+    const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
+    const realFetch = globalThis.fetch;
+    const intercepted = vi.spyOn(globalThis, "fetch").mockImplementation((url, init) => {
+      if (typeof url === "string" && url.includes("/api/issues/") && init?.method === "PATCH") {
+        return Promise.resolve(new Response(JSON.stringify({ error: "upstream failure" }), {
+          status: 500, headers: { "Content-Type": "application/json" },
+        }));
+      }
+      return realFetch(url, init);
+    });
+    try {
+      const response = await tool("submit_review_decision", {
+        decision: "approve", summary: "Evidence reviewed.", expectedStageId: stageId,
+        expectedStatusVersion: issue.statusVersion, expectedRevision: issue.revision,
+        expectedLastDecisionId: issue.reviewStage.lastDecisionId,
+      });
+      expect(response.body.result.isError).toBe(true);
+      expect(response.body.result.content[0].text).toContain("read_assigned_review_receipt");
+      expect(response.body.result.content[0].text).toContain("do not resubmit");
+      expect(await rows()).toHaveLength(0);
+    } finally {
+      intercepted.mockRestore();
+    }
+  });
+
   it("increments the issue requirement revision for work-product create and delete", async () => {
     const { fixture, tool } = await reviewFixture();
     const initial = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
