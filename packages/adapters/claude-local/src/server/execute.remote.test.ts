@@ -101,6 +101,8 @@ describe("claude remote execution", () => {
     vi.stubEnv("PAPERCLIP_HOME", rootDir);
     vi.stubEnv("HOME", path.join(rootDir, "operator-home"));
     vi.stubEnv("HOST_ONLY_QA_SECRET", "must-not-reach-child");
+    vi.stubEnv("HTTPS_PROXY", "http://operator-proxy.test:8080");
+    vi.stubEnv("NODE_EXTRA_CA_CERTS", "/operator/ca.pem");
     const managedHome = path.join(rootDir, "managed-home");
     await writeFile(path.join(rootDir, "CLAUDE.md"), "Untrusted project instructions must not be loaded");
     const qaServer = {
@@ -120,6 +122,7 @@ describe("claude remote execution", () => {
           XDG_DATA_HOME: path.join(managedHome, "data"),
           CLAUDE_CONFIG_DIR: path.join(managedHome, "provider"),
           ANTHROPIC_API_KEY: "provider-test-key", PAPERCLIP_AGENT_PRIVATE_KEY: "must-not-reach-child",
+          HTTPS_PROXY: "http://agent-proxy.test:8080", NODE_EXTRA_CA_CERTS: "/agent/ca.pem",
         },
       },
       context: {}, authToken: "run-bound-token",
@@ -143,6 +146,8 @@ describe("claude remote execution", () => {
     expect(options.env.CLAUDE_CONFIG_DIR).toBe(path.join(managedHome, "provider"));
     expect(options.env.XDG_CONFIG_HOME).toBe(path.join(managedHome, "config"));
     expect(options.env.XDG_DATA_HOME).toBe(path.join(managedHome, "data"));
+    expect(options.env.HTTPS_PROXY).toBe("http://operator-proxy.test:8080");
+    expect(options.env.NODE_EXTRA_CA_CERTS).toBe("/operator/ca.pem");
     for (const key of ["PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY", "HOST_ONLY_QA_SECRET"]) expect(options.env[key]).toBeUndefined();
     const mcpConfig = JSON.parse(await readFile(args[args.indexOf("--mcp-config") + 1]!, "utf8"));
     expect(Object.keys(mcpConfig.mcpServers)).toEqual(["paperclip_qa"]);

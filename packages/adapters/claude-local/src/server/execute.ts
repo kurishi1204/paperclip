@@ -325,7 +325,10 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     // when CLAUDE_CONFIG_DIR still points at the disposable provider home.
     const allowed = new Set(["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"]);
     for (const key of Object.keys(env)) if (!allowed.has(key)) delete env[key];
-    for (const key of ["PATH", "TMPDIR", "LANG", "LC_ALL"] as const) {
+    // A managed host may need its operator-supplied proxy or CA to reach
+    // Anthropic. Copy these only from the server process, never from an agent's
+    // adapter config, so a task cannot redirect the QA credential to its proxy.
+    for (const key of ["PATH", "TMPDIR", "LANG", "LC_ALL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR"] as const) {
       if (typeof process.env[key] === "string") env[key] = process.env[key]!;
     }
   }

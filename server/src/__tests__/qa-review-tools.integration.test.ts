@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { agents, assets, documentAnnotationComments, documentAnnotationThreads, documents, heartbeatRuns, issueAttachments, issueComments, issueExecutionDecisions, issueRelations, issues, issueWorkProducts } from "@paperclipai/db";
+import { agentWakeupRequests, agents, assets, documentAnnotationComments, documentAnnotationThreads, documents, heartbeatRuns, issueAttachments, issueComments, issueExecutionDecisions, issueRelations, issues, issueWorkProducts } from "@paperclipai/db";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { documentService } from "../services/documents.js";
@@ -17,8 +17,8 @@ describe("run-bound QA review MCP", () => {
   }, 90_000);
   afterAll(async () => { await server?.close(); vi.unstubAllEnvs(); });
 
-  async function reviewFixture() {
-    const fixture = await server.fixture();
+  async function reviewFixture(withResponsibleUser = false) {
+    const fixture = await server.fixture(withResponsibleUser ? { connectionScenario: "fresh" } : {});
     const stageId = randomUUID();
     const policy = normalizeIssueExecutionPolicy({
       stages: [{ id: stageId, type: "review", participants: [{ type: "agent", agentId: fixture.agentId }] }],
@@ -175,6 +175,23 @@ describe("run-bound QA review MCP", () => {
     expect(after.workProducts).toEqual([expect.objectContaining({
       id: product!.id, status: "closed", url: "https://example.test/evidence-v2",
     })]);
+  });
+
+  it("ignores work-product timestamp refreshes but invalidates changed evidence", async () => {
+    const { fixture, tool } = await reviewFixture();
+    const [product] = await server.db.insert(issueWorkProducts).values({
+      companyId: fixture.companyId, issueId: fixture.issueId,
+      type: "artifact", provider: "paperclip", status: "ready", title: "Evidence",
+    }).returning();
+    const before = (await tool("read_assigned_issue")).body.result.structuredContent;
+    await server.db.update(issueWorkProducts).set({ updatedAt: new Date(Date.now() + 1_000) })
+      .where(eq(issueWorkProducts.id, product!.id));
+    const afterRefresh = (await tool("read_assigned_issue")).body.result.structuredContent;
+    expect(afterRefresh.revision).toBe(before.revision);
+    await server.db.update(issueWorkProducts).set({ metadata: { verdict: "new evidence" } })
+      .where(eq(issueWorkProducts.id, product!.id));
+    const afterEvidence = (await tool("read_assigned_issue")).body.result.structuredContent;
+    expect(afterEvidence.revision).toBeGreaterThan(afterRefresh.revision);
   });
 
   it("treats a server error after a verdict request as outcome-unknown", async () => {
@@ -601,7 +618,10 @@ describe("run-bound QA review MCP", () => {
   });
 
   it("recovers a request-changes receipt after assignment returns to another agent", async () => {
-    const { fixture, stageId, tool } = await reviewFixture();
+    const { fixture, stageId, tool } = await reviewFixture(true);
+    const [lockedBefore] = await server.db.select({ executionRunId: issues.executionRunId })
+      .from(issues).where(eq(issues.id, fixture.issueId));
+    expect(lockedBefore!.executionRunId).toBe(fixture.runId);
     const [implementer] = await server.db.insert(agents).values({
       companyId: fixture.companyId, name: "Implementer", adapterType: "paperclip_runner", status: "active",
     }).returning();
@@ -620,6 +640,16 @@ describe("run-bound QA review MCP", () => {
     })).body.result.isError).not.toBe(true);
     const [returned] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
     expect(returned!.assigneeAgentId).toBe(implementer!.id);
+    expect(returned!.executionRunId).toBeNull();
+    const [qaRun] = await server.db.select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+    expect(qaRun!.status).toBe("running");
+    // The QA subprocess is still running so the implementer wake is durable
+    // and deferred until its execution lease settles.
+    await expect.poll(() => server.db.select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, implementer!.id)), {
+      timeout: 10_000,
+    }).toEqual([expect.objectContaining({ status: "deferred_issue_execution" })]);
     expect((await tool("read_assigned_review_receipt", {
       expectedStageId: stageId, decision: "request_changes", summary,
     })).body.result.structuredContent).toMatchObject({ recorded: true, decisionOutcome: "changes_requested" });
