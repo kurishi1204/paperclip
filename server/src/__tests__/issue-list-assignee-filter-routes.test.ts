@@ -588,10 +588,84 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
       const cached = await request(app).get(url).query(query);
       expect(cached.status).toBe(200);
       expect(cached.body[0].revision).toBe(1);
+      expect(cached.headers["x-paperclip-request-cache"]).toBe("miss");
       expect(cached.headers.etag).toBe(conditionalResponse.headers.etag);
     } finally {
       releaseOld();
       await oldRequest;
+    }
+  });
+
+  it("does not cache an older conditional projection over a newer concurrent read", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId, name: "Paperclip", issuePrefix: uniqueIssuePrefix(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedCloudTenantMember(companyId);
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Concurrent cache order probe",
+      status: "todo", priority: "medium",
+    });
+
+    const url = `/api/companies/${companyId}/issues`;
+    const query = { view: "compact", limit: "20" };
+    const baseline = await request(createApp(companyId)).get(url).query(query);
+    expect(baseline.status).toBe(200);
+    expect(baseline.body[0].revision).toBe(0);
+    __clearIssueListResponseCacheForTests();
+
+    let markFirstStarted!: () => void;
+    let releaseFirst!: () => void;
+    let markOldConditionalReady!: () => void;
+    let releaseOldConditional!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const oldConditionalReady = new Promise<void>((resolve) => { markOldConditionalReady = resolve; });
+    const oldConditionalGate = new Promise<void>((resolve) => { releaseOldConditional = resolve; });
+    let started = 0;
+    let completed = 0;
+    const app = createApp(companyId, { issueListDiagnostics: {
+      async onComputeStart() {
+        if (++started === 1) {
+          markFirstStarted();
+          await firstGate;
+        }
+      },
+      async onComputeComplete() {
+        if (++completed === 1) {
+          markOldConditionalReady();
+          await oldConditionalGate;
+        }
+      },
+    } });
+
+    const firstRequest = request(app).get(url).query(query).then((response) => response);
+    let conditionalRequest: typeof firstRequest | undefined;
+    try {
+      await firstStarted;
+      conditionalRequest = request(app).get(url).query(query)
+        .set("If-None-Match", baseline.headers.etag).then((response) => response);
+      await oldConditionalReady;
+      await db.update(issues).set({ monitorNotes: "newer revision after conditional read" })
+        .where(eq(issues.id, issueId));
+      releaseFirst();
+      const newer = await firstRequest;
+      expect(newer.status).toBe(200);
+      expect(newer.body[0].revision).toBe(1);
+      releaseOldConditional();
+      const older = await conditionalRequest;
+      expect(older.status).toBe(304);
+
+      const cached = await request(app).get(url).query(query);
+      expect(cached.status).toBe(200);
+      expect(cached.body[0].revision).toBe(1);
+      expect(cached.headers["x-paperclip-request-cache"]).toBe("miss");
+    } finally {
+      releaseFirst();
+      releaseOldConditional();
+      await Promise.allSettled([firstRequest, conditionalRequest]);
     }
   });
 

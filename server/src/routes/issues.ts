@@ -3132,10 +3132,12 @@ type IssueListInflightEntry = {
   startedAt: number;
   waiterCount: number;
   stormLogged: boolean;
+  cacheable: boolean;
 };
 
 const issueListResponseCache = new Map<string, IssueListCacheEntry>();
 const issueListInflight = new Map<string, IssueListInflightEntry>();
+const issueListActiveComputations = new Map<string, Set<IssueListInflightEntry>>();
 const issueListActorClientInflight = new Map<string, number>();
 
 export function __getIssueListResponseCacheSizeForTests() {
@@ -3393,6 +3395,16 @@ async function coordinateIssueListGet(input: {
   }
 
   issueListActorClientInflight.set(actorClientKey, actorClientInflight + 1);
+  const activeComputations = issueListActiveComputations.get(input.requestKey.key)
+    ?? new Set<IssueListInflightEntry>();
+  const overlapsIndependentComputation = activeComputations.size > 0;
+  if (overlapsIndependentComputation) {
+    // The two computations may read different Issue revisions in either
+    // order. Neither start nor finish order proves which response is newer.
+    // Invalidate the prior TTL entry and require a new read after they drain.
+    for (const active of activeComputations) active.cacheable = false;
+    issueListResponseCache.delete(input.requestKey.key);
+  }
   const promise = (async () => {
     await input.diagnostics?.onComputeStart?.({
       companyId: input.companyId,
@@ -3407,14 +3419,16 @@ async function coordinateIssueListGet(input: {
     startedAt: now,
     waiterCount: 0,
     stormLogged: false,
+    cacheable: !overlapsIndependentComputation,
   };
+  activeComputations.add(inflightEntry);
+  issueListActiveComputations.set(input.requestKey.key, activeComputations);
   issueListInflight.set(input.requestKey.key, inflightEntry);
 
   try {
     const response = await promise;
-    // A newer revalidation may have replaced this in-flight entry. Do not let
-    // the older response overwrite its fresher cache entry when it resolves.
-    if (input.allowTtlCache && issueListInflight.get(input.requestKey.key) === inflightEntry) {
+    if (input.allowTtlCache && inflightEntry.cacheable &&
+        issueListInflight.get(input.requestKey.key) === inflightEntry) {
       setIssueListResponseCacheEntry(input.requestKey.key, {
         response,
         expiresAt: Date.now() + ISSUE_LIST_SERVER_CACHE_TTL_MS,
@@ -3423,6 +3437,8 @@ async function coordinateIssueListGet(input: {
     }
     return { response, cacheStatus: "miss", identicalInFlightCount: 1 };
   } finally {
+    activeComputations.delete(inflightEntry);
+    if (activeComputations.size === 0) issueListActiveComputations.delete(input.requestKey.key);
     if (issueListInflight.get(input.requestKey.key) === inflightEntry) {
       issueListInflight.delete(input.requestKey.key);
     }
