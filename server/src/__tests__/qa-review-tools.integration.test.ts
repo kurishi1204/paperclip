@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { assets, documentAnnotationComments, documentAnnotationThreads, documents, heartbeatRuns, issueAttachments, issueComments, issueExecutionDecisions, issueRelations, issues } from "@paperclipai/db";
+import { assets, documentAnnotationComments, documentAnnotationThreads, documents, heartbeatRuns, issueAttachments, issueComments, issueExecutionDecisions, issueRelations, issues, issueWorkProducts } from "@paperclipai/db";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { documentService } from "../services/documents.js";
@@ -134,6 +134,56 @@ describe("run-bound QA review MCP", () => {
     })).body.result.structuredContent;
     expect(page.body).toBe(body.slice(0, 16_000));
     expect(page.nextOffset).toBe(16_000);
+  });
+
+  it("fails closed when assigned work-product metadata cannot fit the overview", async () => {
+    const { fixture, tool } = await reviewFixture();
+    await server.db.insert(issueWorkProducts).values({
+      companyId: fixture.companyId, issueId: fixture.issueId,
+      type: "artifact", provider: "paperclip", status: "ready",
+      title: "W".repeat(100_000),
+    });
+    expect((await tool("read_assigned_issue")).body.result.isError).toBe(true);
+  });
+
+  it("rejects a verdict after the assigned work product changed", async () => {
+    const { fixture, stageId, tool, rows } = await reviewFixture();
+    const [product] = await server.db.insert(issueWorkProducts).values({
+      companyId: fixture.companyId, issueId: fixture.issueId,
+      type: "artifact", provider: "paperclip", status: "ready",
+      title: "Acceptance evidence", url: "https://example.test/evidence-v1",
+    }).returning();
+    const before = (await tool("read_assigned_issue")).body.result.structuredContent;
+    await server.db.update(issueWorkProducts).set({
+      status: "closed", url: "https://example.test/evidence-v2",
+    }).where(eq(issueWorkProducts.id, product!.id));
+    const staleVerdict = await tool("submit_review_decision", {
+      decision: "approve", summary: "Approved evidence v1.",
+      expectedStageId: stageId, expectedStatusVersion: before.statusVersion,
+      expectedRevision: before.revision,
+      expectedLastDecisionId: before.reviewStage.lastDecisionId,
+    });
+    expect(staleVerdict.body.result.isError).toBe(true);
+    expect(await rows()).toHaveLength(0);
+    const after = (await tool("read_assigned_issue")).body.result.structuredContent;
+    expect(after.revision).toBeGreaterThan(before.revision);
+    expect(after.workProducts).toEqual([expect.objectContaining({
+      id: product!.id, status: "closed", url: "https://example.test/evidence-v2",
+    })]);
+  });
+
+  it("increments the issue requirement revision for work-product create and delete", async () => {
+    const { fixture, tool } = await reviewFixture();
+    const initial = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
+    const [product] = await server.db.insert(issueWorkProducts).values({
+      companyId: fixture.companyId, issueId: fixture.issueId,
+      type: "artifact", provider: "paperclip", status: "ready", title: "Temporary evidence",
+    }).returning();
+    const afterCreate = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
+    expect(afterCreate).toBeGreaterThan(initial);
+    await server.db.delete(issueWorkProducts).where(eq(issueWorkProducts.id, product!.id));
+    const afterDelete = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
+    expect(afterDelete).toBeGreaterThan(afterCreate);
   });
 
   it("does not expose raw comment metadata or an unbounded comment body", async () => {

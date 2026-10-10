@@ -55,11 +55,14 @@ submit `approve` or `request_changes`, and read back this run's matching formal
 decision receipt if the response is lost. The issue overview contains only
 document metadata and assigned work-product identifiers, status, and URLs; it
 does not return related issues, project records, adapter overrides, or full
-plan bodies. A legacy plan embedded in the description is read through the
+plan bodies. The overview fails closed above 16,000 UTF-8 bytes, including
+large or numerous work-product titles and URLs; it does not silently truncate
+evidence. A legacy plan embedded in the description is read through the
 description page tool. Evidence
 pages and the verdict carry the whole requirement revision read from the issue;
 the verdict also carries the stage, status version, and last decision ID.
-Issue PATCH rechecks all four while holding the Issue row lock in the
+Work-product create, update, and delete also increment that requirement
+revision. Issue PATCH rechecks all four while holding the Issue row lock in the
 transaction that records the decision. A competing or stale-content
 verdict receives a conflict. A successful decision produces a formal
 `issue_execution_decisions` record. The tool accepts no issue ID, arbitrary

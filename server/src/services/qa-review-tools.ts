@@ -304,7 +304,7 @@ function projectAssignedIssue(input: QaToolInput, raw: unknown, stage: ReturnTyp
       issue.workProducts.some((product) => product.issueId !== input.issue.id)) {
     throw conflict("Assigned issue projection changed or contains another issue");
   }
-  return {
+  const projection = {
     id: issue.id, identifier: issue.identifier, title: issue.title,
     descriptionCharacters: Array.from(issue.description ?? "").length,
     status: issue.status, workMode: issue.workMode,
@@ -331,6 +331,10 @@ function projectAssignedIssue(input: QaToolInput, raw: unknown, stage: ReturnTyp
       isPrimary: product.isPrimary,
     })),
   };
+  if (Buffer.byteLength(JSON.stringify(projection), "utf8") > 16_000) {
+    throw conflict("Assigned issue metadata exceeds the QA overview size; use human review");
+  }
+  return projection;
 }
 
 function reviewComment(decision: "approve" | "request_changes", summary: string) {
