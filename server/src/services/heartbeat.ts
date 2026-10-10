@@ -25099,7 +25099,7 @@ export function heartbeatService(
                 : {}),
             };
             const qaReviewMode = agent.adapterType === "claude_local" && runtimeConfig.qaReviewToolsOnly === true;
-            const runtimeTools = qaReviewMode ? null : createAdapterRuntimeToolAccess({
+            const runtimeTools = qaReviewMode ? undefined : createAdapterRuntimeToolAccess({
               agentId: agent.id,
               companyId: agent.companyId,
               runId: run.id,

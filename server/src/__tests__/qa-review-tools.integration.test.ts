@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { heartbeatRuns, issueExecutionDecisions, issues } from "@paperclipai/db";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
@@ -100,6 +100,71 @@ describe("run-bound QA review MCP", () => {
     expect(await rows()).toEqual([expect.objectContaining({
       issueId: fixture.issueId, stageId, actorAgentId: fixture.agentId, outcome: "changes_requested",
     })]);
+  });
+
+  it("commits at most one decision when opposite QA verdicts race from one pending stage", async () => {
+    const { fixture, stageId, tool, rows } = await reviewFixture();
+    const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
+    const expected = {
+      expectedStageId: stageId,
+      expectedStatusVersion: issue.statusVersion,
+      expectedLastDecisionId: null,
+    };
+    let approve!: Promise<Awaited<ReturnType<typeof tool>>>;
+    let changes!: Promise<Awaited<ReturnType<typeof tool>>>;
+    await server.db.transaction(async (tx) => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, fixture.issueId)).for("update");
+      approve = tool("submit_review_decision", {
+        ...expected, decision: "approve", summary: "The evidence passed QA.",
+      });
+      changes = tool("submit_review_decision", {
+        ...expected, decision: "request_changes", summary: "The evidence needs repair.",
+      });
+      await expect.poll(async () => {
+        const blocked = await server.db.execute(sql<{ count: string }>`
+          SELECT count(*)::text AS count FROM pg_stat_activity
+          WHERE datname = current_database() AND wait_event_type = 'Lock'
+            AND query LIKE '%issues%'
+            AND query NOT LIKE '%pg_stat_activity%'
+        `);
+        return Number(blocked[0]?.count ?? 0);
+      }, { timeout: 15_000 }).toBeGreaterThanOrEqual(2);
+    });
+    const results = await Promise.all([approve, changes]);
+    expect(results.filter((result) => result.body.result?.isError !== true)).toHaveLength(1);
+    expect(results.filter((result) => result.body.result?.isError === true)).toHaveLength(1);
+    expect(await rows()).toHaveLength(1);
+  }, 45_000);
+
+  it("checks the QA precondition in Issue PATCH and refuses mixed mutations", async () => {
+    const { fixture, stageId, token, rows } = await reviewFixture();
+    const issue = (await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!;
+    const patch = (body: object) => fetch(`${server.apiUrl}/api/issues/${fixture.issueId}`, {
+      method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const verdict = {
+      status: "done", comment: "kind: review\ndecision: approved\nsummary: Verified.",
+      qaReviewExpected: { stageId, statusVersion: issue.statusVersion + 1, lastDecisionId: null },
+    };
+    expect((await patch(verdict)).status).toBe(409);
+    expect((await patch({
+      ...verdict, description: "An unrelated edit must not accompany the QA verdict.",
+      qaReviewExpected: { ...verdict.qaReviewExpected, statusVersion: issue.statusVersion },
+    })).status).toBe(403);
+    expect(await rows()).toHaveLength(0);
+  });
+
+  it("preserves an ordinary Issue PATCH without a QA precondition", async () => {
+    const { fixture, token, rows } = await reviewFixture();
+    const response = await fetch(`${server.apiUrl}/api/issues/${fixture.issueId}`, {
+      method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "Ordinary issue update" }),
+    });
+    expect(response.status).toBe(200);
+    expect((await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]?.title)
+      .toBe("Ordinary issue update");
+    expect(await rows()).toHaveLength(0);
   });
 
   it("rejects stale version and loses authority when the run or assignment ends", async () => {

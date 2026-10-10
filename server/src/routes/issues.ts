@@ -359,6 +359,13 @@ import {
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
+  // Only the run-bound QA tool uses this precondition. The normal Issue PATCH
+  // keeps its existing behavior when this field is absent.
+  qaReviewExpected: z.object({
+    stageId: z.string().uuid(),
+    statusVersion: z.number().int().nonnegative(),
+    lastDecisionId: z.string().uuid().nullable(),
+  }).strict().optional(),
 });
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
@@ -12875,6 +12882,20 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!existing) return;
+      const qaReviewExpected = req.body.qaReviewExpected as {
+        stageId: string;
+        statusVersion: number;
+        lastDecisionId: string | null;
+      } | undefined;
+      if (qaReviewExpected && (
+        req.actor.type !== "agent" || req.actor.source !== "agent_jwt" ||
+        !req.actor.agentId || !req.actor.runId ||
+        !["done", "in_progress"].includes(req.body.status) ||
+        typeof req.body.comment !== "string" ||
+        Object.keys(req.body).some((key) => !["status", "comment", "qaReviewExpected"].includes(key))
+      )) {
+        throw forbidden("QA review precondition requires a run-bound verdict-only patch");
+      }
       // MCP task changes cannot stop a run or implicitly decide a pending review.
       const mcpParticipationChange = req.actor.source === "mcp_oauth" &&
         ["status", "assigneeAgentId", "assigneeUserId", "blockedByIssueIds", "parentId", "projectId"].some(key => req.body[key] !== undefined);
@@ -12943,6 +12964,7 @@ export function issueRoutes(
         hiddenAt: hiddenAtRaw,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         expectedRevision: _expectedRevision,
+        qaReviewExpected: _qaReviewExpected,
         ...updateFields
       } = req.body;
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
@@ -13302,6 +13324,13 @@ export function issueRoutes(
                 req.body.executionPolicy !== undefined && monitorChanged,
             });
       const decisionId = transition.decision ? randomUUID() : null;
+      if (qaReviewExpected && (
+        !transition.decision || transition.decision.stageId !== qaReviewExpected.stageId ||
+        transition.decision.stageType !== "review" ||
+        transition.decision.outcome !== (updateFields.status === "done" ? "approved" : "changes_requested")
+      )) {
+        throw conflict("QA review precondition no longer matches the pending stage");
+      }
       if (decisionId) {
         const nextExecutionState = transition.patch.executionState;
         if (!nextExecutionState || typeof nextExecutionState !== "object") {
@@ -13699,6 +13728,24 @@ export function issueRoutes(
         }
         return true;
       };
+      const assertLockedQaReviewExpectation = async (tx: Parameters<typeof svc.update>[2]) => {
+        if (!qaReviewExpected) return;
+        // Use the same row lock and transaction that write the transition,
+        // comment and issue_execution_decisions row below. A check in the MCP
+        // service or before this transaction cannot prevent two verdicts.
+        const locked = await svc.getByIdForUpdate(id, tx);
+        const state = parseIssueExecutionState(locked?.executionState);
+        if (!locked || locked.companyId !== existing.companyId ||
+            locked.status !== "in_review" || locked.statusVersion !== qaReviewExpected.statusVersion ||
+            locked.assigneeAgentId !== actor.agentId || locked.assigneeUserId !== null ||
+            state?.status !== "pending" || state.currentStageType !== "review" ||
+            state.currentStageId !== qaReviewExpected.stageId ||
+            state.lastDecisionId !== qaReviewExpected.lastDecisionId ||
+            state.currentParticipant?.type !== "agent" ||
+            state.currentParticipant.agentId !== actor.agentId) {
+          throw conflict("Review stage changed; read the issue again before deciding");
+        }
+      };
       const persistReviewTransitionActivity = async (
         tx: Parameters<typeof svc.update>[2],
         updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>,
@@ -13792,10 +13839,12 @@ export function issueRoutes(
         Boolean(decision) ||
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
-        reviewPolicySensitiveMutationRequested;
+        reviewPolicySensitiveMutationRequested ||
+        Boolean(qaReviewExpected);
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
+            await assertLockedQaReviewExpectation(tx);
             if (
               reviewPolicySensitiveMutationRequested &&
               !(await assertLockedReviewPolicyAllowsMutation(tx))

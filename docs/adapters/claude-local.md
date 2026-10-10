@@ -49,8 +49,10 @@ run-bound `paperclip_qa` MCP server. Extra CLI arguments, Chrome, custom
 commands, and remote execution targets fail configuration validation.
 
 The three MCP tools read the assigned issue, page through its comments, and
-submit `approve` or `request_changes` with an expected stage and issue version.
-The decision uses the existing Issue PATCH route and produces a formal
+submit `approve` or `request_changes` with the stage, status version, and last
+decision ID read from the issue. Issue PATCH rechecks all three while holding
+the Issue row lock in the transaction that records the decision. A competing
+verdict receives a conflict. A successful decision produces a formal
 `issue_execution_decisions` record. The tool accepts no issue ID, arbitrary
 endpoint, shell command, or credential path. The Claude child does not inherit
 the host environment or the Paperclip run token; its MCP config contains the

@@ -113,6 +113,11 @@ export async function callQaReviewTool(input: QaToolInput) {
   const result = await issueApi(input, "PATCH", "", {
     status: args.decision === "approve" ? "done" : "in_progress",
     comment,
+    qaReviewExpected: {
+      stageId: args.expectedStageId,
+      statusVersion: args.expectedStatusVersion,
+      lastDecisionId: args.expectedLastDecisionId,
+    },
   });
   const next = parseIssueExecutionState(result.executionState);
   if (!next?.lastDecisionId || next.lastDecisionId === args.expectedLastDecisionId ||
