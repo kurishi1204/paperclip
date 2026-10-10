@@ -1,0 +1,26 @@
+# First canary Issue requirement envelope
+
+This is the read contract for the first `internal_docs_only` company request sent to the COLO PR120 broker. The endpoint is `GET /api/issues/:id/requirement-envelope`. It returns exactly `id`, `companyId`, `revision`, `task_kind`, `requirements_text`, `accepted_requirements`, and `native_document_complete`. There is no pagination, conditional 304 response, ETag, or response cache. `Cache-Control: no-store` is mandatory.
+
+The whole Issue `description` must be a JSON object with exactly these four keys:
+
+```json
+{
+  "task_kind": "internal_docs_only",
+  "requirements_text": "Write an internal note.",
+  "accepted_requirements": ["Internal circulation only"],
+  "native_document_complete": true
+}
+```
+
+The text and each acceptance item must be nonempty strings after whitespace is removed. Missing, extra, duplicate, malformed, or unsupported fields produce HTTP 409 with `code: requirement_projection_hold`. This strict description format is **only** the first canary. It does not define a general Paperclip Issue format or authorize interpretation of arbitrary Markdown, comments, documents, attachments, or approvals as accepted requirements. An existing Issue such as COL-3 may therefore HOLD; this route cannot be used to claim that such an Issue was accepted or dispatched.
+
+The route holds the Issue row lock and checks authorization, the active Run binding, native requirement child counts, unsupported graph/governance material, and the complete JSON description in one database transaction. The actor must be the assigned agent using a runtime-issued agent JWT, and the running Paperclip Run must carry this Issue id in its context. Context may also contain only a known Issue creation, update, or status-change source marker; any other context key holds the canary. Before checkout, the Issue may be `backlog` or `todo` with no checkout/execution Run lock. After checkout, both locks must match that same Run and the Issue must be `in_progress`. Another company, agent, Run, or credential class cannot read this projection. Two active Runs claiming the same Issue hold the canary. A parent or child Issue, linked project or goal, watchdog (including an inactive one), work product, approval, plan decomposition, execution decision, recovery action, or any currently versioned native child material holds the canary rather than being silently omitted. The route inspects the migrated database catalog for all direct Issue references, including future columns; any populated reference outside the active Run and Issue row also holds it. Other execution settings and nonstandard Issue origins hold it.
+
+The route also verifies the exact set of applied SQL migration hashes through migration 0313. An unreviewed added or replaced migration holds the canary, even if the new schema is unrelated to Issues. Releasing a later schema requires reviewing its new paths for instruction material and updating this bound and its fault tests.
+
+`revision` is a SHA-256 digest of the fixed envelope schema marker, Issue and company IDs, the owner-authored Issue title, and the four accepted description fields in a fixed JSON key order. The title affects task meaning even though it is not returned in the seven-field envelope, so editing it changes the revision. The digest does not use `issues.revision`, status timestamps, or the all-row snapshot digest: those change during checkout and ordinary status updates. A description requirement edit also changes this revision. The broker must still reread after checkout and immediately before each effect; a repeated GET is a guard, not an atomic compare-and-swap with a later external call.
+
+This GET is read-only. It neither reserves an outbox intent nor invokes Orca or any other external effect. Durable outbox reservation, same-transaction comparison, dispatch, and authoritative external readback belong to a later phase and need their own acceptance evidence. This endpoint does not establish company request acceptance, worker dispatch, result QA, or business acceptance.
+
+Implementation and local verification used Codex as the fallback because Claude was not signed in. The exact model ID of this Codex agent was not exposed by the runtime and remains unverified. Independent Claude review, PR CI, merge, main CI, and live external acceptance remain separate gates.
