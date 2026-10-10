@@ -3,12 +3,15 @@ import { and, asc, eq, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   assets,
+  documentAnnotationComments,
+  documentAnnotationThreads,
   documents,
   issueAttachments,
   issueComments,
   issueDocuments,
   issueLabels,
   issueRelations,
+  issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
 import { conflict, notFound } from "../errors.js";
@@ -31,6 +34,9 @@ export type IssueRequirementSnapshot = {
     relations: number;
     attachments: number;
     labels: number;
+    annotationThreads: number;
+    annotationComments: number;
+    interactions: number;
   };
 };
 
@@ -98,6 +104,32 @@ export async function captureIssueRequirementSnapshotInTransaction(
     .from(issueLabels)
     .where(and(eq(issueLabels.companyId, input.companyId), eq(issueLabels.issueId, issue.id)))
     .orderBy(asc(issueLabels.labelId));
+  const annotationThreadRows = await tx
+    .select()
+    .from(documentAnnotationThreads)
+    .where(and(
+      eq(documentAnnotationThreads.companyId, input.companyId),
+      eq(documentAnnotationThreads.issueId, issue.id),
+    ))
+    .orderBy(asc(documentAnnotationThreads.id));
+  const annotationCommentRows = await tx
+    .select({ comment: documentAnnotationComments })
+    .from(documentAnnotationComments)
+    .innerJoin(documentAnnotationThreads,
+      eq(documentAnnotationComments.threadId, documentAnnotationThreads.id))
+    .where(and(
+      eq(documentAnnotationThreads.companyId, input.companyId),
+      eq(documentAnnotationThreads.issueId, issue.id),
+    ))
+    .orderBy(asc(documentAnnotationComments.id));
+  const interactionRows = await tx
+    .select()
+    .from(issueThreadInteractions)
+    .where(and(
+      eq(issueThreadInteractions.companyId, input.companyId),
+      eq(issueThreadInteractions.issueId, issue.id),
+    ))
+    .orderBy(asc(issueThreadInteractions.id));
 
   // Derived attribution and its bookkeeping timestamp can be populated on a
   // read. They do not change the authored instruction and do not bump revision.
@@ -112,6 +144,9 @@ export async function captureIssueRequirementSnapshotInTransaction(
     relations: relationRows,
     attachments: attachmentRows,
     labels: labelRows,
+    annotationThreads: annotationThreadRows,
+    annotationComments: annotationCommentRows,
+    interactions: interactionRows,
   });
   const materialSha256 = createHash("sha256").update(JSON.stringify(material)).digest("hex");
   return {
@@ -126,6 +161,9 @@ export async function captureIssueRequirementSnapshotInTransaction(
       relations: relationRows.length,
       attachments: attachmentRows.length,
       labels: labelRows.length,
+      annotationThreads: annotationThreadRows.length,
+      annotationComments: annotationCommentRows.length,
+      interactions: interactionRows.length,
     },
   };
 }

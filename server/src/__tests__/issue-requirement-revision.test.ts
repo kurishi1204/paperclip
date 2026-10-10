@@ -6,10 +6,13 @@ import {
   companies,
   createDb,
   documents,
+  documentAnnotationComments,
+  documentAnnotationThreads,
   issueAttachments,
   issueComments,
   issueLabels,
   issueRelations,
+  issueThreadInteractions,
   issues,
   labels,
 } from "@paperclipai/db";
@@ -202,5 +205,94 @@ describePostgres("issue requirement revision", () => {
       release();
       await frozenTx;
     }
+  });
+
+  it("versions issue document annotation threads and comments on every mutation", async () => {
+    const annotatedIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: annotatedIssueId, companyId, title: "Annotated request", status: "backlog", priority: "medium",
+    });
+    await documentService(db).upsertIssueDocument({
+      issueId: annotatedIssueId, key: "plan", title: "Plan", format: "markdown", body: "Alpha plan",
+    });
+    const document = await documentService(db).getIssueDocumentByKey(annotatedIssueId, "plan");
+    expect(document).toBeTruthy();
+    const input = { companyId, issueId: annotatedIssueId };
+    const threadId = randomUUID();
+    const commentId = randomUUID();
+    const changed = async (mutate: () => Promise<unknown>) => {
+      const before = await captureIssueRequirementSnapshot(db, input);
+      await mutate();
+      const after = await captureIssueRequirementSnapshot(db, input);
+      expect(after.revision).toBeGreaterThan(before.revision);
+      expect(after.materialSha256).not.toBe(before.materialSha256);
+      await expect(db.transaction((tx) => assertIssueRequirementSnapshotInTransaction(tx, before)))
+        .rejects.toMatchObject({ status: 409 });
+      return after;
+    };
+
+    let snapshot = await changed(() => db.insert(documentAnnotationThreads).values({
+      id: threadId, companyId, issueId: annotatedIssueId, documentId: document!.id,
+      documentKey: "plan", originalRevisionNumber: 1, currentRevisionNumber: 1,
+      selectedText: "Alpha", normalizedStart: 0, normalizedEnd: 5,
+      markdownStart: 0, markdownEnd: 5,
+      anchorSelector: {
+        quote: { exact: "Alpha", prefix: "", suffix: "" },
+        position: { normalizedStart: 0, normalizedEnd: 5, markdownStart: 0, markdownEnd: 5 },
+      },
+    }));
+    expect(snapshot.counts.annotationThreads).toBe(1);
+    snapshot = await changed(() => db.update(documentAnnotationThreads)
+      .set({ status: "resolved" }).where(eq(documentAnnotationThreads.id, threadId)));
+    snapshot = await changed(() => db.insert(documentAnnotationComments).values({
+      id: commentId, companyId, threadId, issueId: annotatedIssueId,
+      documentId: document!.id, body: "Use the second option", authorType: "user",
+    }));
+    expect(snapshot.counts.annotationComments).toBe(1);
+    snapshot = await changed(() => db.update(documentAnnotationComments)
+      .set({ body: "Use the third option" }).where(eq(documentAnnotationComments.id, commentId)));
+    snapshot = await changed(() => db.delete(documentAnnotationComments)
+      .where(eq(documentAnnotationComments.id, commentId)));
+    expect(snapshot.counts.annotationComments).toBe(0);
+    snapshot = await changed(() => db.delete(documentAnnotationThreads)
+      .where(eq(documentAnnotationThreads.id, threadId)));
+    expect(snapshot.counts.annotationThreads).toBe(0);
+  });
+
+  it("versions a human question and its answer, including answer revision and deletion", async () => {
+    const questionIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: questionIssueId, companyId, title: "Question request", status: "backlog", priority: "medium",
+    });
+    const input = { companyId, issueId: questionIssueId };
+    const interactionId = randomUUID();
+    const changed = async (mutate: () => Promise<unknown>) => {
+      const before = await captureIssueRequirementSnapshot(db, input);
+      await mutate();
+      const after = await captureIssueRequirementSnapshot(db, input);
+      expect(after.revision).toBeGreaterThan(before.revision);
+      expect(after.materialSha256).not.toBe(before.materialSha256);
+      await expect(db.transaction((tx) => assertIssueRequirementSnapshotInTransaction(tx, before)))
+        .rejects.toMatchObject({ status: 409 });
+      return after;
+    };
+    let snapshot = await changed(() => db.insert(issueThreadInteractions).values({
+      id: interactionId, companyId, issueId: questionIssueId, kind: "ask_user_questions",
+      payload: { version: 1, questions: [{
+        id: "direction", prompt: "Which direction?", selectionMode: "single",
+        options: [{ id: "first", label: "First" }, { id: "second", label: "Second" }],
+      }] },
+    }));
+    expect(snapshot.counts.interactions).toBe(1);
+    snapshot = await changed(() => db.update(issueThreadInteractions).set({
+      status: "answered", result: { version: 1, answers: [{ questionId: "direction", optionIds: ["first"] }] },
+    }).where(eq(issueThreadInteractions.id, interactionId)));
+    snapshot = await changed(() => db.update(issueThreadInteractions).set({
+      result: { version: 1, answers: [{ questionId: "direction", optionIds: ["second"] }] },
+    }).where(eq(issueThreadInteractions.id, interactionId)));
+    expect(snapshot.counts.interactions).toBe(1);
+    snapshot = await changed(() => db.delete(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId)));
+    expect(snapshot.counts.interactions).toBe(0);
   });
 });

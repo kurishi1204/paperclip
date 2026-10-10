@@ -15023,6 +15023,16 @@ export function issueRoutes(
       })();
 
       await queueTaskWatchdogEvaluation(issue, actor.runId);
+      if (comment) {
+        // The comment insert advances the issue's requirement revision after
+        // updateIssue returned its row. Return the committed row so the next
+        // conditional edit can use this response as its expected revision.
+        const committedIssue = await svc.getById(issue.id);
+        if (!committedIssue || committedIssue.companyId !== issue.companyId) {
+          throw conflict("Issue changed while preparing the update response");
+        }
+        issueResponse = { ...issueResponse, ...committedIssue };
+      }
       const changes = issueResponse.changes ?? {};
       if (prefersMinimalIssueUpdateResponse(req)) {
         res.setHeader("Preference-Applied", "return=minimal");

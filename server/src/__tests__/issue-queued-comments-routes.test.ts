@@ -99,6 +99,30 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     return testApp;
   }
 
+  it("returns the committed revision after a PATCH that also adds a comment", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId, name: "Revision response test", issuePrefix: "REV",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Initial title", status: "backlog", priority: "medium",
+    });
+    const client = app(companyId);
+    const updated = await request(client).patch(`/api/issues/${issueId}`).send({
+      title: "Changed title", comment: "Owner clarification",
+    });
+    expect(updated.status).toBe(200);
+    const [committed] = await db.select({ revision: issues.revision })
+      .from(issues).where(eq(issues.id, issueId));
+    expect(updated.body.revision).toBe(committed!.revision);
+    const next = await request(client).patch(`/api/issues/${issueId}`).send({
+      expectedRevision: updated.body.revision, title: "Next title",
+    });
+    expect(next.status).toBe(200);
+  });
+
   async function seedQueue() {
     const companyId = randomUUID();
     const agentId = randomUUID();

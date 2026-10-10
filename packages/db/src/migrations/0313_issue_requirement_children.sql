@@ -39,6 +39,21 @@ BEGIN
       affected := array_append(affected, NEW.issue_id);
       affected := array_append(affected, NEW.related_issue_id);
     END IF;
+  ELSIF TG_TABLE_NAME = 'document_annotation_comments' THEN
+    -- A comment is displayed through its thread. Protect that owner's issue
+    -- even if a legacy/direct row has inconsistent issue_id metadata.
+    IF TG_OP <> 'INSERT' THEN
+      affected := array_append(affected, OLD.issue_id);
+      SELECT issue_id INTO row_issue_id
+        FROM document_annotation_threads WHERE id = OLD.thread_id;
+      affected := array_append(affected, row_issue_id);
+    END IF;
+    IF TG_OP <> 'DELETE' THEN
+      affected := array_append(affected, NEW.issue_id);
+      SELECT issue_id INTO row_issue_id
+        FROM document_annotation_threads WHERE id = NEW.thread_id;
+      affected := array_append(affected, row_issue_id);
+    END IF;
   ELSE
     IF TG_OP <> 'INSERT' THEN
       affected := array_append(affected, OLD.issue_id);
@@ -75,4 +90,16 @@ BEFORE UPDATE ON assets
 FOR EACH ROW EXECUTE FUNCTION paperclip_bump_issue_revision_from_child();--> statement-breakpoint
 CREATE TRIGGER paperclip_issue_labels_revision_trigger
 BEFORE INSERT OR UPDATE OR DELETE ON issue_labels
+FOR EACH ROW EXECUTE FUNCTION paperclip_bump_issue_revision_from_child();
+--> statement-breakpoint
+CREATE TRIGGER paperclip_document_annotation_threads_revision_trigger
+BEFORE INSERT OR UPDATE OR DELETE ON document_annotation_threads
+FOR EACH ROW EXECUTE FUNCTION paperclip_bump_issue_revision_from_child();
+--> statement-breakpoint
+CREATE TRIGGER paperclip_document_annotation_comments_revision_trigger
+BEFORE INSERT OR UPDATE OR DELETE ON document_annotation_comments
+FOR EACH ROW EXECUTE FUNCTION paperclip_bump_issue_revision_from_child();
+--> statement-breakpoint
+CREATE TRIGGER paperclip_issue_thread_interactions_revision_trigger
+BEFORE INSERT OR UPDATE OR DELETE ON issue_thread_interactions
 FOR EACH ROW EXECUTE FUNCTION paperclip_bump_issue_revision_from_child();

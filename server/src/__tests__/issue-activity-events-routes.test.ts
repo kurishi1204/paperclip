@@ -272,18 +272,22 @@ describe("issue activity event routes", () => {
     expect(noOp.body.changes).not.toHaveProperty("title");
   });
 
-  it("keeps a comment-only PATCH receipt free of the internal revision bump", async () => {
+  it("returns the committed revision without treating a comment as a field change", async () => {
     const issue = { ...makeIssue(), revision: 8 };
-    mockIssueService.getById.mockResolvedValue(issue);
+    let currentIssue = issue;
+    mockIssueService.getById.mockImplementation(async () => currentIssue);
     mockIssueService.update.mockImplementation(async () => {
       const updated = { ...issue, revision: 9, updatedAt: new Date("2026-07-30T12:01:00.000Z") };
       return { ...updated, changes: buildIssueChanges(issue, updated) };
     });
-    mockIssueService.addComment.mockResolvedValue({
-      id: "comment-only-receipt",
-      issueId: issue.id,
-      companyId: issue.companyId,
-      body: "New instruction",
+    mockIssueService.addComment.mockImplementation(async () => {
+      currentIssue = { ...issue, revision: 10 };
+      return {
+        id: "comment-only-receipt",
+        issueId: issue.id,
+        companyId: issue.companyId,
+        body: "New instruction",
+      };
     });
 
     const response = await request(await createApp())
@@ -291,7 +295,7 @@ describe("issue activity event routes", () => {
       .send({ comment: "New instruction" });
 
     expect(response.status).toBe(200);
-    expect(response.body.revision).toBe(9);
+    expect(response.body.revision).toBe(10);
     expect(response.body.changes).toEqual({});
     expect(response.body.comment).toMatchObject({ body: "New instruction" });
   });
