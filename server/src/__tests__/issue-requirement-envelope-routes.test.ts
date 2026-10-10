@@ -204,14 +204,14 @@ describeDb("atomic issue requirement envelope", () => {
     expect((await get(actor({ runId: otherRunId }))).status).toBe(409);
   });
 
-  it("uses the claimed wake for task identity and ignores unrelated runtime context", async () => {
-    const canonical = await get(actor());
-    expect(canonical.status).toBe(200);
+  it("holds extra Run execution instructions while preserving the claimed wake task identity", async () => {
+    expect((await get(actor())).status).toBe(200);
     await db.update(heartbeatRuns).set({ contextSnapshot: { ...assignmentContext(issueId), instruction: "Use another source" } })
       .where(eq(heartbeatRuns.id, runId));
-    const extended = await get(actor());
-    expect(extended.status).toBe(200);
-    expect(extended.body).toEqual(canonical.body);
+    expect((await get(actor())).status).toBe(409);
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...assignmentContext(issueId), forceFreshSession: true } })
+      .where(eq(heartbeatRuns.id, runId));
+    expect((await get(actor())).status).toBe(409);
     await db.update(heartbeatRuns).set({ contextSnapshot: { ...assignmentContext(issueId), source: ["issue.create"] } })
       .where(eq(heartbeatRuns.id, runId));
     expect((await get(actor())).status).toBe(409);

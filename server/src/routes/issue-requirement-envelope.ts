@@ -3,10 +3,11 @@ import { isDeepStrictEqual } from "node:util";
 import { Router } from "express";
 import { and, eq, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentWakeupRequests, environmentLeases, heartbeatRuns, issues, runIdentityContexts } from "@paperclipai/db";
+import { agentWakeupRequests, agents, environmentLeases, heartbeatRuns, issues, runIdentityContexts } from "@paperclipai/db";
 import { conflict, forbidden, notFound, unauthorized } from "../errors.js";
 import { accessService } from "../services/access.js";
 import { captureIssueRequirementSnapshotInTransaction } from "../services/issue-requirement-snapshot.js";
+import { ISSUE_REQUIREMENT_CONTEXT_HASH_KEY, issueRequirementContextHash } from "../services/issue-requirement-context-attestation.js";
 import { assertCompanyAccess, hasCompanyAccess } from "./authz.js";
 
 type DescriptionBody = {
@@ -30,7 +31,10 @@ function assertSupportedAssignmentRunOrigin(run: {
   reason: string | null;
   status: string;
   payload: Record<string, unknown> | null;
-} | undefined, issueId: string) {
+} | undefined, agent: {
+  adapterType: string;
+  runtimeConfig: Record<string, unknown>;
+} | undefined, responsibleUserId: string | null, issueId: string) {
   const context = run.contextSnapshot;
   if (!context || Array.isArray(context) || !wake || !run.wakeupRequestId ||
       wake.id !== run.wakeupRequestId || wake.runId !== run.id || wake.status !== "claimed") {
@@ -49,21 +53,59 @@ function assertSupportedAssignmentRunOrigin(run: {
     issueId, source: origin.source, taskId: issueId, taskKey: issueId,
     wakeReason: origin.wakeReason, wakeSource: origin.wakeSource, wakeTriggerDetail: "system",
   };
+  const { [ISSUE_REQUIREMENT_CONTEXT_HASH_KEY]: attestedHash, ...originPayload } = wake.payload ?? {};
   if (wake.source !== origin.wakeSource || wake.reason !== origin.wakeReason ||
       wake.triggerDetail !== "system" || run.invocationSource !== origin.wakeSource ||
-      run.triggerDetail !== "system" || !isDeepStrictEqual(wake.payload, {
+      run.triggerDetail !== "system" || !isDeepStrictEqual(originPayload, {
         issueId, mutation: origin.mutation, _paperclipWakeContext: taskContext,
       })) {
     hold("Run wake receipt is not a supported Issue assignment");
   }
-  // Heartbeat extends the flat Run context with execution identity, checkout,
-  // account and adapter metadata while the Run executes. Those keys are not
-  // requirement authority. Project only the task identity fields minted in
-  // the claimed wake receipt; all requirement text comes from the locked
-  // Issue row below. Checking the whole context shape would reject normal
-  // heartbeat execution whenever another runtime field is introduced.
-  const taskIdentity = Object.fromEntries(Object.keys(taskContext).map((key) => [key, context[key]]));
-  if (!isDeepStrictEqual(taskIdentity, taskContext)) {
+  // Once heartbeat has built the execution context, the server stores a hash
+  // of every field beside its claimed wake receipt. No client supplies this
+  // attestation; a modified execution control or task field then fails closed.
+  if (attestedHash !== undefined) {
+    if (typeof attestedHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(attestedHash) ||
+        attestedHash !== issueRequirementContextHash(context)) {
+      hold("Active Run context differs from its server receipt");
+    }
+    return;
+  }
+  // The managed Anthropic account attribution is attached by heartbeat after
+  // the Run starts. It is not task input, but unlike arbitrary context extras
+  // it has a typed, server-owned binding to this agent and responsible user.
+  // Keep every other field in the comparison: heartbeat also reads flat Run
+  // context fields as execution controls (for example forceFreshSession), so
+  // accepting unknown extras would let a changed execution receive the same
+  // requirement envelope.
+  const taskBearingContext = { ...context };
+  if (Object.hasOwn(taskBearingContext, "aiConnection")) {
+    const connection = taskBearingContext.aiConnection;
+    const binding = agent?.runtimeConfig.aiConnection;
+    if (!connection || typeof connection !== "object" || Array.isArray(connection) ||
+        !binding || typeof binding !== "object" || Array.isArray(binding) ||
+        agent?.adapterType !== "claude_local") {
+      hold("Run has unsupported managed AI metadata");
+    }
+    const account = connection as Record<string, unknown>;
+    const direct = binding as Record<string, unknown>;
+    const fields = ["connectionId", "grantId", "provider", "method", "mode", "responsibleUserId", "accountName", "identity", "sessionIdentity"];
+    if (Object.keys(account).length !== fields.length || fields.some((field) => !Object.hasOwn(account, field)) ||
+        !["responsible_user", "shared"].includes(String(direct.mode)) ||
+        direct.provider !== "anthropic" || account.provider !== direct.provider ||
+        account.method !== direct.method || account.mode !== direct.mode ||
+        account.responsibleUserId !== (direct.mode === "shared" ? null : responsibleUserId) ||
+        typeof account.connectionId !== "string" || !account.connectionId ||
+        typeof account.grantId !== "string" || !account.grantId ||
+        typeof account.accountName !== "string" ||
+        typeof account.identity !== "string" || !account.identity ||
+        typeof account.sessionIdentity !== "string" || !account.sessionIdentity ||
+        (direct.mode === "responsible_user" && !responsibleUserId)) {
+      hold("Run has malformed managed AI metadata");
+    }
+    delete taskBearingContext.aiConnection;
+  }
+  if (!isDeepStrictEqual(taskBearingContext, taskContext)) {
     hold("Active Run carries unsupported task context");
   }
 }
@@ -317,7 +359,13 @@ export function issueRequirementEnvelopeRoutes(db: Db) {
         eq(agentWakeupRequests.companyId, issue.companyId),
         eq(agentWakeupRequests.agentId, actor.agentId),
       )).limit(1) : [];
-      assertSupportedAssignmentRunOrigin(run, wake, issue.id);
+      const [agent] = await tx.select({
+        adapterType: agents.adapterType,
+        runtimeConfig: agents.runtimeConfig,
+      }).from(agents).where(and(
+        eq(agents.id, actor.agentId), eq(agents.companyId, issue.companyId),
+      )).limit(1);
+      assertSupportedAssignmentRunOrigin(run, wake, agent, run.responsibleUserId, issue.id);
       const [competingRun] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
         .where(and(
           eq(heartbeatRuns.companyId, issue.companyId),

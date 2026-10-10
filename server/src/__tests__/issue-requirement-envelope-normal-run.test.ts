@@ -206,8 +206,30 @@ describeDb("requirement envelope on a normal Issue assignment Run", () => {
       expect((await read()).status).toBe(409);
       await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, run!.id));
       expect((await read()).status).toBe(200);
+      await db.update(heartbeatRuns).set({ contextSnapshot: { ...context, instruction: "Use another source" } })
+        .where(eq(heartbeatRuns.id, run!.id));
+      expect((await read()).status).toBe(409);
+      await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, run!.id));
+      expect((await read()).status).toBe(200);
+      await db.update(heartbeatRuns).set({ contextSnapshot: { ...context, forceFreshSession: true } })
+        .where(eq(heartbeatRuns.id, run!.id));
+      expect((await read()).status).toBe(409);
+      await db.update(heartbeatRuns).set({ contextSnapshot: {
+        ...context, aiConnection: { ...(context.aiConnection as Record<string, unknown>), responsibleUserId: randomUUID() },
+      } }).where(eq(heartbeatRuns.id, run!.id));
+      expect((await read()).status).toBe(409);
+      await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, run!.id));
+      expect((await read()).status).toBe(200);
       const [claimedWake] = await db.select().from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.id, run!.wakeupRequestId!));
+      expect(claimedWake!.payload?._paperclipIssueRequirementContextHash).toMatch(/^sha256:[0-9a-f]{64}$/);
+      await db.update(agentWakeupRequests).set({ payload: {
+        ...claimedWake!.payload, _paperclipIssueRequirementContextHash: `sha256:${"0".repeat(64)}`,
+      } }).where(eq(agentWakeupRequests.id, claimedWake!.id));
+      expect((await read()).status).toBe(409);
+      await db.update(agentWakeupRequests).set({ payload: claimedWake!.payload })
+        .where(eq(agentWakeupRequests.id, claimedWake!.id));
+      expect((await read()).status).toBe(200);
       await db.update(agentWakeupRequests).set({ payload: { ...claimedWake!.payload, mutation: "comment" } })
         .where(eq(agentWakeupRequests.id, claimedWake!.id));
       expect((await read()).status).toBe(409);

@@ -67,6 +67,7 @@ import {
 } from "./adapter-execution-control.js";
 import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
+import { ISSUE_REQUIREMENT_CONTEXT_HASH_KEY, issueRequirementContextHash } from "./issue-requirement-context-attestation.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
@@ -94,7 +95,7 @@ import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
 import {
   and,
@@ -23088,13 +23089,56 @@ export function heartbeatService(
             }
           : {}),
       };
-      await db
-        .update(heartbeatRuns)
-        .set({
-          contextSnapshot: context,
-          updatedAt: new Date(),
-        })
-        .where(eq(heartbeatRuns.id, run.id));
+      const persistRuntimeContext = async () => {
+        await db.transaction(async (tx) => {
+          // The original claimed Run context must be the exact task identity
+          // minted by a supported Issue wake. Do not attest an injected control
+          // merely because heartbeat later persisted it alongside its own data.
+          const initial = instructionCleanupRun.contextSnapshot;
+          const canaryIssueId = readNonEmptyString(initial?.issueId);
+          const source = initial?.source;
+          const origin = source === "issue.create" || source === "issue.update"
+            ? { mutation: source === "issue.create" ? "create" : "update", reason: "issue_assigned", wakeSource: "assignment" }
+            : source === "issue.status_change"
+            ? { mutation: "update", reason: "issue_status_changed", wakeSource: "automation" }
+            : null;
+          const taskContext = canaryIssueId && origin ? {
+            issueId: canaryIssueId, source, taskId: canaryIssueId, taskKey: canaryIssueId,
+            wakeReason: origin.reason, wakeSource: origin.wakeSource, wakeTriggerDetail: "system",
+          } : null;
+          if (canaryIssueId && origin && taskContext && isDeepStrictEqual(initial, taskContext) &&
+              Object.entries(taskContext).every(([key, value]) => context[key] === value) &&
+              instructionCleanupRun.wakeupRequestId &&
+              instructionCleanupRun.invocationSource === origin.wakeSource &&
+              instructionCleanupRun.triggerDetail === "system") {
+            const [wake] = await tx.select().from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.id, instructionCleanupRun.wakeupRequestId),
+              eq(agentWakeupRequests.companyId, run.companyId),
+              eq(agentWakeupRequests.agentId, run.agentId),
+              eq(agentWakeupRequests.runId, run.id),
+              eq(agentWakeupRequests.status, "claimed"),
+            )).for("update");
+            const [boundIssue] = await tx.select({ id: issues.id }).from(issues).where(and(
+              eq(issues.id, canaryIssueId),
+              eq(issues.companyId, run.companyId),
+              eq(issues.assigneeAgentId, run.agentId),
+              eq(issues.checkoutRunId, run.id),
+            )).limit(1);
+            const { [ISSUE_REQUIREMENT_CONTEXT_HASH_KEY]: _priorHash, ...originPayload } = wake?.payload ?? {};
+            if (boundIssue && wake?.source === origin.wakeSource && wake.reason === origin.reason &&
+                wake.triggerDetail === "system" && isDeepStrictEqual(originPayload, {
+                  issueId: canaryIssueId, mutation: origin.mutation, _paperclipWakeContext: taskContext,
+                })) {
+              await tx.update(agentWakeupRequests).set({
+                payload: { ...originPayload, [ISSUE_REQUIREMENT_CONTEXT_HASH_KEY]: issueRequirementContextHash(context) },
+              }).where(eq(agentWakeupRequests.id, wake.id));
+            }
+          }
+          await tx.update(heartbeatRuns).set({ contextSnapshot: context, updatedAt: new Date() })
+            .where(eq(heartbeatRuns.id, run.id));
+        });
+      };
+      await persistRuntimeContext();
       const runtimeSessionResolution = resolveRuntimeSessionParamsForWorkspace({
         agentId: agent.id,
         previousSessionParams,
@@ -23378,13 +23422,15 @@ export function heartbeatService(
       };
       try {
         const startedAt = run.startedAt ?? new Date();
+        // Workspace hints are added after the environment receipt. Persist
+        // their full context and its wake attestation together before invoke.
+        await persistRuntimeContext();
         const runningWithSession = await db
           .update(heartbeatRuns)
           .set({
             startedAt,
             sessionIdBefore:
               runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
-            contextSnapshot: context,
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id))
@@ -23605,13 +23651,7 @@ export function heartbeatService(
           context.paperclipRuntimePrimaryUrl =
             runtimeServices.find((service) => readNonEmptyString(service.url))
               ?.url ?? null;
-          await db
-            .update(heartbeatRuns)
-            .set({
-              contextSnapshot: context,
-              updatedAt: new Date(),
-            })
-            .where(eq(heartbeatRuns.id, run.id));
+          await persistRuntimeContext();
         }
         if (
           issueId &&
@@ -25504,13 +25544,7 @@ export function heartbeatService(
             combinedRuntimeServices.find((service) =>
               readNonEmptyString(service.url),
             )?.url ?? null;
-          await db
-            .update(heartbeatRuns)
-            .set({
-              contextSnapshot: context,
-              updatedAt: new Date(),
-            })
-            .where(eq(heartbeatRuns.id, run.id));
+          await persistRuntimeContext();
           if (issueId) {
             try {
               await postWorkspaceReadyComment({
