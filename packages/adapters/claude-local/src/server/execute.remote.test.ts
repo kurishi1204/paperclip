@@ -136,6 +136,8 @@ describe("claude remote execution", () => {
     expect(invocation).toBeDefined();
     const args = invocation![2], options = invocation![3];
     expect(args).toEqual(expect.arrayContaining(["--restricted", "--setting-sources", "", "--tools", "", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--strict-mcp-config"]));
+    expect(args.filter(arg => arg === "--permission-mode")).toHaveLength(1);
+    expect(args.filter(arg => arg === "--permission-prompts")).toHaveLength(1);
     expect(args).not.toEqual(expect.arrayContaining(["--dangerously-skip-permissions", "--add-dir", "--resume", "--append-system-prompt-file"]));
     expect(args[args.indexOf("--allowedTools") + 1]).toBe("mcp__paperclip_qa__read_assigned_issue,mcp__paperclip_qa__list_assigned_issue_comments,mcp__paperclip_qa__read_assigned_issue_document,mcp__paperclip_qa__list_assigned_issue_attachments,mcp__paperclip_qa__read_assigned_issue_attachment_text,mcp__paperclip_qa__submit_review_decision,mcp__paperclip_qa__read_assigned_issue_description,mcp__paperclip_qa__list_assigned_issue_annotations,mcp__paperclip_qa__read_assigned_review_receipt,mcp__paperclip_qa__read_assigned_issue_comment,mcp__paperclip_qa__read_assigned_issue_annotation_text");
     expect(options.cwd).toBe(path.join(managedHome, "qa-working-directory"));

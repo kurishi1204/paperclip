@@ -1,14 +1,17 @@
--- Work-product title, URL and state are visible to the formal QA reviewer.
--- A timestamp-only refresh is not review evidence and must not invalidate a
--- review snapshot. Compare every other column so future evidence fields are
--- covered without maintaining a list of column names here.
+-- Keep this comparison aligned with the workProducts projection in
+-- services/qa-review-tools.ts. Provider sync metadata and timestamps are not
+-- visible to the formal QA reviewer and must not invalidate its snapshot.
 CREATE FUNCTION paperclip_bump_issue_revision_from_work_product()
 RETURNS trigger AS $$
 DECLARE
   affected uuid[] := ARRAY[]::uuid[];
 BEGIN
   IF TG_OP = 'UPDATE' AND
-     (to_jsonb(OLD) - 'updated_at') = (to_jsonb(NEW) - 'updated_at') THEN
+     ROW(OLD.issue_id, OLD.type, OLD.provider, OLD.title, OLD.url,
+         OLD.status, OLD.review_state, OLD.health_status, OLD.is_primary)
+     IS NOT DISTINCT FROM
+     ROW(NEW.issue_id, NEW.type, NEW.provider, NEW.title, NEW.url,
+         NEW.status, NEW.review_state, NEW.health_status, NEW.is_primary) THEN
     RETURN NEW;
   END IF;
 

@@ -53,8 +53,14 @@ export function qaReviewToolRoutes(db: Db) {
       if (!activeParticipant && params?.name !== "read_assigned_review_receipt") {
         throw forbidden("Only this run's review receipt remains available after the decision");
       }
-      const apiUrl = process.env.PAPERCLIP_API_URL;
-      if (!apiUrl) throw new Error("Paperclip API origin is unavailable");
+      // Call back through the listener that accepted this authenticated MCP
+      // request. PAPERCLIP_API_URL can be a public tunnel and must not carry
+      // this run's token out of the host for a server-local read or decision.
+      const localAddress = req.socket.localAddress;
+      const localPort = req.socket.localPort;
+      if (!localAddress || !localPort) throw new Error("Paperclip local API listener is unavailable");
+      const localHost = localAddress.includes(":") ? `[${localAddress}]` : localAddress;
+      const apiUrl = `http://${localHost}:${localPort}`;
       const result = await callQaReviewTool({
         db,
         runId: context.run.id,

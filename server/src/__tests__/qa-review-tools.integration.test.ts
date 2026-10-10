@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { documentService } from "../services/documents.js";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
+import { createWakeQueue } from "../modules/wake-queue/index.js";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 import * as qaReviewTools from "../services/qa-review-tools.js";
 
@@ -73,6 +74,18 @@ describe("run-bound QA review MCP", () => {
     });
     expect(unauthenticated.status).toBe(403);
     expect(token).toBeTruthy();
+  });
+
+  it("uses its accepted local listener for self-reads even when the public API URL is remote", async () => {
+    const { fixture, tool } = await reviewFixture();
+    vi.stubEnv("PAPERCLIP_API_URL", "https://public-paperclip.invalid");
+    try {
+      const read = await tool("read_assigned_issue");
+      expect(read.body.result.isError).not.toBe(true);
+      expect(read.body.result.structuredContent.id).toBe(fixture.issueId);
+    } finally {
+      vi.stubEnv("PAPERCLIP_API_URL", server.apiUrl);
+    }
   });
 
   it("projects the assigned issue without neighboring issue or project records", async () => {
@@ -177,7 +190,7 @@ describe("run-bound QA review MCP", () => {
     })]);
   });
 
-  it("ignores work-product timestamp refreshes but invalidates changed evidence", async () => {
+  it("ignores unprojected work-product refreshes but invalidates reviewer-visible evidence", async () => {
     const { fixture, tool } = await reviewFixture();
     const [product] = await server.db.insert(issueWorkProducts).values({
       companyId: fixture.companyId, issueId: fixture.issueId,
@@ -190,8 +203,12 @@ describe("run-bound QA review MCP", () => {
     expect(afterRefresh.revision).toBe(before.revision);
     await server.db.update(issueWorkProducts).set({ metadata: { verdict: "new evidence" } })
       .where(eq(issueWorkProducts.id, product!.id));
+    const afterMetadata = (await tool("read_assigned_issue")).body.result.structuredContent;
+    expect(afterMetadata.revision).toBe(afterRefresh.revision);
+    await server.db.update(issueWorkProducts).set({ status: "closed" })
+      .where(eq(issueWorkProducts.id, product!.id));
     const afterEvidence = (await tool("read_assigned_issue")).body.result.structuredContent;
-    expect(afterEvidence.revision).toBeGreaterThan(afterRefresh.revision);
+    expect(afterEvidence.revision).toBeGreaterThan(afterMetadata.revision);
   });
 
   it("treats a server error after a verdict request as outcome-unknown", async () => {
@@ -653,6 +670,28 @@ describe("run-bound QA review MCP", () => {
     expect((await tool("read_assigned_review_receipt", {
       expectedStageId: stageId, decision: "request_changes", summary,
     })).body.result.structuredContent).toMatchObject({ recorded: true, decisionOutcome: "changes_requested" });
+    // The returned implementer must actually receive a run when QA exits.
+    // A durable deferred receipt alone does not complete the handoff.
+    await server.db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, fixture.runId));
+    const releasedByCleanup = await createWakeQueue(server.db, {
+      resolveResponsibleUserId: async () => fixture.responsibleUserId,
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null,
+      wakeAdmissionHelpers: {} as never,
+      recovery: {
+        escalateStrandedAssignedIssue: async () => {},
+        escalateStrandedRecoveryIssueInPlace: async () => {},
+      },
+    }).releaseIssueExecution({ companyId: fixture.companyId, runId: fixture.runId, now: new Date() });
+    expect(releasedByCleanup.outcome.kind).toBe("promoted");
+    const [released] = await server.db.select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, implementer!.id));
+    expect(released?.status).not.toBe("deferred_issue_execution");
+    expect(released?.runId).toBeTruthy();
+    const [implementerRun] = await server.db.select({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, released!.runId!));
+    expect(implementerRun?.agentId).toBe(implementer!.id);
   });
 
   it("commits at most one decision when opposite QA verdicts race from one pending stage", async () => {

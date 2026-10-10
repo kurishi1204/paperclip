@@ -61,6 +61,19 @@ const receiptSchema = z.object({
   summary: z.string().trim().min(1).max(10_000),
 }).strict();
 
+/** The QA subprocess is local; its run token must stay on the local listener. */
+export function qaReviewLocalApiUrl(env: NodeJS.ProcessEnv = process.env): string | null {
+  const host = env.PAPERCLIP_LISTEN_HOST?.trim().toLowerCase();
+  const rawPort = env.PAPERCLIP_LISTEN_PORT?.trim() ?? "";
+  const port = Number(rawPort);
+  if (!/^\d+$/.test(rawPort) || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  if (host === "127.0.0.1" || host === "localhost" || host === "0.0.0.0") {
+    return `http://127.0.0.1:${port}`;
+  }
+  if (host === "::1" || host === "::") return `http://[::1]:${port}`;
+  return null;
+}
+
 const documentSummarySchema = z.object({
   id: z.string().uuid(), issueId: z.string().uuid(), key: z.string(),
   title: z.string().nullable(), format: z.string(),

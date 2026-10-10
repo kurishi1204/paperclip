@@ -312,7 +312,7 @@ import type {
 } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { createRuntimeToolsToken } from "../runtime-tools-token.js";
-import { QA_REVIEW_MCP_CONNECTION_ID, QA_REVIEW_MCP_NAME } from "./qa-review-tools.js";
+import { QA_REVIEW_MCP_CONNECTION_ID, QA_REVIEW_MCP_NAME, qaReviewLocalApiUrl } from "./qa-review-tools.js";
 import {
   parseObject,
   asBoolean,
@@ -25130,11 +25130,12 @@ export function heartbeatService(
                 connectionId: "paperclip-runtime-tools",
               });
             }
-            if (authToken && configuredPaperclipApiBaseUrl() && issueRef) {
+            const qaLocalApiUrl = qaReviewMode ? qaReviewLocalApiUrl() : null;
+            if (authToken && issueRef && (qaReviewMode ? qaLocalApiUrl : configuredPaperclipApiBaseUrl())) {
               if (qaReviewMode) {
                 runtimeMcpServers.unshift({
                   name: QA_REVIEW_MCP_NAME,
-                  url: `${paperclipApiBaseUrl()}/api/mcp/qa-review`,
+                  url: `${qaLocalApiUrl}/api/mcp/qa-review`,
                   token: authToken,
                   connectionId: QA_REVIEW_MCP_CONNECTION_ID,
                 });

@@ -15,6 +15,7 @@ import {
   completionContracts,
   createDb,
   heartbeatRuns,
+  issues,
   nativeRunFinalizations,
   nativeRunResults,
   statusDecisions,
@@ -217,5 +218,55 @@ describeEmbeddedPostgres("direct adapter native-runner isolation", () => {
       acpToolInventoryComplete: true, acpPendingToolCount: 0,
     } });
     expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it("delivers only the local run-bound QA MCP to a QA Claude invocation", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    let captured: { config: Record<string, unknown>; runtimeTools: unknown; managedMcp: unknown;
+      servers: Array<{ name: string; connectionId?: string; url: string; token?: string }> } | null = null;
+    const prior = {
+      secret: process.env.PAPERCLIP_AGENT_JWT_SECRET,
+      host: process.env.PAPERCLIP_LISTEN_HOST,
+      port: process.env.PAPERCLIP_LISTEN_PORT,
+      publicUrl: process.env.PAPERCLIP_API_URL,
+    };
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID();
+    process.env.PAPERCLIP_LISTEN_HOST = "127.0.0.1";
+    process.env.PAPERCLIP_LISTEN_PORT = "3317";
+    process.env.PAPERCLIP_API_URL = "https://public-paperclip.invalid";
+    registerServerAdapter({
+      type: "claude_local", supportsLocalAgentJwt: true,
+      execute: async (ctx) => {
+        captured = { config: ctx.config, runtimeTools: ctx.runtimeTools,
+          managedMcp: ctx.context.paperclipManagedMcp, servers: ctx.runtimeMcp?.getServers() ?? [] };
+        return { exitCode: 0, signal: null, timedOut: false };
+      },
+      testEnvironment: async () => ({ adapterType: "claude_local", status: "pass", checks: [], testedAt: new Date(0).toISOString() }),
+    });
+    try {
+      await db.insert(companies).values({ id: companyId, name: "Formal QA", issuePrefix: "QA", defaultResponsibleUserId: "responsible-user" });
+      await db.insert(agents).values({ id: agentId, companyId, name: "QA reviewer", adapterType: "claude_local",
+        role: "engineer", status: "idle", adapterConfig: { qaReviewToolsOnly: true }, runtimeConfig: {}, permissions: {} });
+      await db.insert(issues).values({ id: issueId, companyId, issueNumber: 1, identifier: "QA-1",
+        title: "Review assigned result", status: "in_review", assigneeAgentId: agentId });
+      const queued = await heartbeat.invoke(agentId, "on_demand", { issueId }, "manual");
+      expect(queued).not.toBeNull();
+      expect((await waitForRunToFinish(heartbeat, queued!.id))?.status).toBe("succeeded");
+      expect(captured?.config.qaReviewToolsOnly).toBe(true);
+      expect(captured?.runtimeTools).toBeUndefined();
+      expect(captured?.managedMcp).toBeUndefined();
+      expect(captured?.servers).toHaveLength(1);
+      expect(captured?.servers[0]).toMatchObject({ name: "paperclip_qa",
+        connectionId: "paperclip-qa-review", url: "http://127.0.0.1:3317/api/mcp/qa-review" });
+      expect(captured?.servers[0]?.token).toBeTruthy();
+    } finally {
+      const restore = (key: string, value: string | undefined) => {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      };
+      restore("PAPERCLIP_AGENT_JWT_SECRET", prior.secret);
+      restore("PAPERCLIP_LISTEN_HOST", prior.host);
+      restore("PAPERCLIP_LISTEN_PORT", prior.port);
+      restore("PAPERCLIP_API_URL", prior.publicUrl);
+    }
   });
 });
