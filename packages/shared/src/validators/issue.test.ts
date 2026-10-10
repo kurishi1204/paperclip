@@ -15,6 +15,12 @@ import {
 import { createAgentSchema } from "./agent.js";
 
 describe("issue validators", () => {
+  it("retains only a safe integer issue revision on conditional updates", () => {
+    expect(updateIssueSchema.parse({ title: "Revised", expectedRevision: 0 }).expectedRevision).toBe(0);
+    for (const expectedRevision of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, "1", null]) {
+      expect(updateIssueSchema.safeParse({ title: "Revised", expectedRevision }).success).toBe(false);
+    }
+  });
   it("validates the typed recovery display snapshot while retaining older metadata", () => {
     const metadata = { version: 1, sections: [{ rows: [{ type: "text", text: "Details" }] }] };
     const recovery = { kind: "disposition_repair_escalated", actionId: "9af8228f-0be7-45ae-a104-6fbe0af6f1d3", attemptCount: 2, maxAttempts: 2, reason: "unchanged_source_state_exhausted", assigneeAgentId: null };

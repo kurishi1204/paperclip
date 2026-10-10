@@ -4312,6 +4312,41 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  it("advances a full issue revision and rejects a stale conditional edit under the row lock", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Initial" });
+    const initial = await svc.getById(issueId);
+    expect(initial?.revision).toBe(0);
+    await db.update(issues).set({ description: "Concurrent requirement" }).where(eq(issues.id, issueId));
+    const current = await svc.getById(issueId);
+    expect(current?.revision).toBe(1);
+    await expect(svc.update(issueId, { title: "Stale title", expectedRevision: 0 }))
+      .rejects.toMatchObject({ status: 409 });
+    expect((await svc.getById(issueId))?.title).toBe("Initial");
+    const updated = await svc.update(issueId, { title: "Current title", expectedRevision: 1 });
+    expect(updated?.revision).toBe(2);
+    const competing = await Promise.allSettled([
+      svc.update(issueId, { title: "Writer one", expectedRevision: 2 }),
+      svc.update(issueId, { description: "Writer two", expectedRevision: 2 }),
+    ]);
+    expect(competing.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    expect(competing.filter((outcome) => outcome.status === "rejected")).toHaveLength(1);
+    expect((await svc.getById(issueId))?.revision).toBe(3);
+    expect(await svc.update(issueId, {
+      title: "Wrong company",
+      expectedRevision: 3,
+      companyGuard: randomUUID(),
+    })).toBeNull();
+    expect((await svc.getById(issueId))?.revision).toBe(3);
+  });
+
   it("persists blocked-by relations and exposes both blockedBy and blocks summaries", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({

@@ -261,6 +261,7 @@ retain their titles and default to no generation request.
 - `title` text not null
 - `description` text null
 - `status` enum: `backlog | todo | in_progress | in_review | done | blocked | cancelled`
+- `revision` bigint not null default 0; a database trigger increments it for every `issues` row UPDATE, including writes by older clients. This is separate from `status_version`, which tracks selected status/ownership decisions.
 - `priority` enum: `critical | high | medium | low`
 - `review_policy` nullable enum: `anyone | not_creator | human_only`; null is equivalent to `anyone`
 - `assignee_agent_id` uuid fk `agents.id` null
@@ -291,6 +292,7 @@ retain their titles and default to no generation request.
 
 Invariants:
 
+- `GET /api/issues/:id` and issue lists expose `revision`. `PATCH /api/issues/:id` accepts optional `expectedRevision` only for board title/description edits. It compares the value under the issue row lock and returns 409 before changing state when stale. Requests combining `expectedRevision` with comments, run control, assignment, review decisions, or other fields are rejected before effects. Database triggers advance the same revision for native comments, linked documents, relation edges, attachments, label memberships, issue-linked document annotations, and issue thread interactions including human answers. A PATCH response with an added comment rereads the committed issue row before returning its revision. Internal callers can freeze and compare these materials with `captureIssueRequirementSnapshot` and `assertIssueRequirementSnapshotInTransaction`; the latter must run in the transaction that stages an outbox effect. Ordinary GET remains a non-atomic projection. The dedicated `GET /api/issues/:id/requirement-envelope` supplies only the first internal-docs canary envelope, with a separate content revision and strict HOLD conditions; see [Issue requirement envelope](issue-requirement-envelope.md). The parent/child execution graph, watchdog instructions, work products, linked issue status, external asset bytes, independent QA, and business acceptance remain separate evidence or version bindings.
 - single assignee only
 - task must trace to company goal chain via `goal_id`, `parent_id`, or project-goal linkage
 - `in_progress` requires assignee

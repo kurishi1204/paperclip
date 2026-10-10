@@ -24,6 +24,9 @@ export function buildIssueChanges(
   const changes: IssueChanges = {};
   const keys = new Set([...Object.keys(existing), ...Object.keys(updated)]);
   keys.delete("updatedAt");
+  // Monotonic serialization metadata changes on every write; it is not a
+  // business field edited by the caller and must not create an update receipt.
+  keys.delete("revision");
 
   for (const key of keys) {
     const from = existing[key];

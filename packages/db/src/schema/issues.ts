@@ -42,6 +42,8 @@ export const issues = pgTable(
     titleNeedsGeneration: boolean("title_needs_generation").notNull().default(false),
     description: text("description"),
     status: text("status").notNull().default("backlog"),
+    // Database trigger advances this for every issue-row UPDATE, including legacy writers.
+    revision: bigint("revision", { mode: "number" }).notNull().default(0),
     statusVersion: bigint("status_version", { mode: "number" }).notNull().default(0),
     lastStatusDecisionId: uuid("last_status_decision_id"),
     workMode: text("work_mode").notNull().default("standard"),

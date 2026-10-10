@@ -4876,6 +4876,7 @@ const issueListSelect = {
     END
   `,
   status: issues.status,
+  revision: issues.revision,
   statusVersion: issues.statusVersion,
   lastStatusDecisionId: issues.lastStatusDecisionId,
   workMode: issues.workMode,
@@ -10645,6 +10646,7 @@ export function issueService(db: Db) {
         actorRunStopId?: string | null;
         actorUserId?: string | null;
         companyGuard?: string;
+        expectedRevision?: number;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10692,6 +10694,7 @@ export function issueService(db: Db) {
         actorRunStopId,
         actorUserId,
         companyGuard,
+        expectedRevision,
         ...issueData
       } = data;
       // An explicit edit claims the title, even if it keeps the same text.
@@ -10965,6 +10968,13 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (expectedRevision !== undefined && receiptExisting.revision !== expectedRevision) {
+          throw conflict("Issue changed since it was read", {
+            code: "issue_revision_conflict",
+            expectedRevision,
+            currentRevision: receiptExisting.revision,
+          });
+        }
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.

@@ -269,6 +269,11 @@ export const issuesApi = {
         )
       : response;
   },
+  updateConditionalText: (
+    id: string,
+    expectedRevision: number,
+    fields: { title?: string; description?: string | null },
+  ) => api.patch<IssueUpdateResponse>(`/issues/${id}`, { ...fields, expectedRevision }),
   decideStalledReview: (id: string, data: StalledReviewDecision) =>
     api.post<StalledReviewDecisionResponse>(
       `/issues/${id}/stalled-review-decision`,
