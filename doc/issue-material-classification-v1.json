@@ -3,11 +3,14 @@
   "scope": "direct-issue-reference",
   "categories": {
     "cas": [
+      "documentAnnotationComments",
+      "documentAnnotationThreads",
       "issueAttachments",
       "issueComments",
       "issueDocuments",
       "issueLabels",
       "issueRelations",
+      "issueThreadInteractions",
       "issues"
     ],
     "separateEvidence": [
@@ -49,7 +52,6 @@
       "issueReadStates",
       "issueRecoveryActions",
       "issueReferenceMentions",
-      "issueThreadInteractions",
       "issueTreeHoldMembers",
       "issueTreeHolds",
       "issueWatchdogs",
@@ -78,9 +80,6 @@
       "workspaceOperations",
       "workspaceRuntimeServices"
     ],
-    "hold": [
-      "documentAnnotationComments",
-      "documentAnnotationThreads"
-    ]
+    "hold": []
   }
 }

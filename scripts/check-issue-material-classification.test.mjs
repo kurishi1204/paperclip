@@ -98,7 +98,7 @@ test("current repository ledger covers the discovered schema exactly", () => {
   const ledger = JSON.parse(requireLedger());
   const result = validateIssueMaterialLedger(schemaDir, ledger);
   assert.equal(result.total, 74);
-  assert.deepEqual(result.counts, { cas: 6, separateEvidence: 66, hold: 2 });
+  assert.deepEqual(result.counts, { cas: 9, separateEvidence: 65, hold: 0 });
 });
 
 function requireLedger() {
