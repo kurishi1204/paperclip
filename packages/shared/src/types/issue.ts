@@ -797,6 +797,8 @@ export interface Issue {
   description: string | null;
   descriptionTruncated?: boolean;
   status: IssueStatus;
+  /** Monotonic issue-row revision. Optional for clients reading an older deployment. */
+  revision?: number;
   workMode: IssueWorkMode;
   priority: IssuePriority;
   reviewPolicy: IssueReviewPolicy | null;
@@ -887,6 +889,7 @@ export type CompactIssue = Pick<
   | "title"
   | "description"
   | "status"
+  | "revision"
   | "workMode"
   | "priority"
   | "reviewPolicy"

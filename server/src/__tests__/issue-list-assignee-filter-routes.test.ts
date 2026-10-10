@@ -484,6 +484,52 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
     expect(second.text).toBe("");
   });
 
+  it("revalidates compact ETags against a revision-only issue change", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: uniqueIssuePrefix(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedCloudTenantMember(companyId);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Compact revision probe",
+      status: "todo",
+      priority: "medium",
+    });
+
+    const app = createApp(companyId);
+    const first = await request(app)
+      .get(`/api/companies/${companyId}/issues`)
+      .query({ view: "compact", limit: "20" });
+    expect(first.status).toBe(200);
+    expect(first.body[0].revision).toBe(0);
+
+    // monitorNotes is deliberately absent from the compact projection. Only
+    // the issue revision should change the projected response and its ETag.
+    await db.update(issues).set({ monitorNotes: "changed without a compact field" })
+      .where(eq(issues.id, issueId));
+    const second = await request(app)
+      .get(`/api/companies/${companyId}/issues`)
+      .query({ view: "compact", limit: "20" })
+      .set("If-None-Match", first.headers.etag);
+    expect(second.status).toBe(200);
+    expect(second.body[0].revision).toBe(1);
+    expect(second.headers.etag).not.toBe(first.headers.etag);
+
+    // A fresh conditional response must replace the old TTL entry too.
+    const third = await request(app)
+      .get(`/api/companies/${companyId}/issues`)
+      .query({ view: "compact", limit: "20" });
+    expect(third.status).toBe(200);
+    expect(third.body[0].revision).toBe(1);
+    expect(third.headers.etag).toBe(second.headers.etag);
+  });
+
   it("coalesces simultaneous identical compact issue-list requests into one service computation", async () => {
     const companyId = randomUUID();
     const issueId = randomUUID();

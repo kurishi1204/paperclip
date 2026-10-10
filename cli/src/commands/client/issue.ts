@@ -64,6 +64,7 @@ interface IssueCreateOptions extends BaseClientOptions {
 }
 
 interface IssueUpdateOptions extends BaseClientOptions {
+  expectedRevision?: string;
   title?: string;
   description?: string;
   status?: string;
@@ -320,6 +321,7 @@ export function registerIssueCommands(program: Command): void {
       .argument("<issueId>", "Issue ID")
       .option("--title <title>", "Issue title")
       .option("--description <text>", "Issue description")
+      .option("--expected-revision <n>", "Only apply a title/description edit at this issue revision")
       .option("--status <status>", "Issue status")
       .option("--priority <priority>", "Issue priority")
       .option("--assignee-agent-id <id>", "Assignee agent ID")
@@ -334,6 +336,11 @@ export function registerIssueCommands(program: Command): void {
         try {
           const ctx = resolveCommandContext(opts);
           const payload = updateIssueSchema.parse({
+            expectedRevision: opts.expectedRevision === undefined
+              ? undefined
+              : /^\d+$/.test(opts.expectedRevision)
+                ? Number(opts.expectedRevision)
+                : Number.NaN,
             title: opts.title,
             description: opts.description,
             status: opts.status,

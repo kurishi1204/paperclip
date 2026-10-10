@@ -2999,6 +2999,7 @@ function toCompactIssue(issue: any): CompactIssue {
     title: issue.title,
     description: issue.description,
     status: issue.status,
+    revision: issue.revision,
     workMode: issue.workMode,
     priority: issue.priority,
     reviewPolicy: issue.reviewPolicy,
@@ -3310,6 +3311,7 @@ async function coordinateIssueListGet(input: {
   companyId: string;
   requestKey: ReturnType<typeof issueListRequestKey>;
   allowTtlCache: boolean;
+  bypassCacheRead?: boolean;
   diagnostics?: IssueListDiagnostics;
   compute: () => Promise<IssueListPreparedResponse>;
 }): Promise<{
@@ -3321,7 +3323,7 @@ async function coordinateIssueListGet(input: {
   const now = Date.now();
   pruneIssueListResponseCache(now);
 
-  const cached = input.allowTtlCache
+  const cached = input.allowTtlCache && !input.bypassCacheRead
     ? issueListResponseCache.get(input.requestKey.key)
     : undefined;
   if (cached && cached.expiresAt > now) {
@@ -8105,6 +8107,9 @@ export function issueRoutes(
       companyId,
       requestKey,
       allowTtlCache: compactView,
+      // A conditional GET must recompute the current projection and replace
+      // the short TTL entry before comparing ETags.
+      bypassCacheRead: Boolean(req.header("if-none-match")),
       diagnostics: opts.issueListDiagnostics,
       compute: async () => {
         const rawResult = await svc.list(companyId, listFilters);
@@ -12823,6 +12828,20 @@ export function issueRoutes(
     validateIssueMutationBody(updateIssueRouteSchema),
     async (req, res) => {
       const id = req.params.id as string;
+      // Conditional edits must fail before run cancellation, wake, or workspace work.
+      const expectedRevision = req.body.expectedRevision as number | undefined;
+      if (
+        expectedRevision !== undefined &&
+        (req.actor.type !== "board" ||
+          Object.keys(req.body).some(
+            (key) => !["expectedRevision", "title", "description"].includes(key),
+          ))
+      ) {
+        res.status(400).json({
+          error: "Conditional issue update supports only board title and description edits",
+        });
+        return;
+      }
       const existing = await getAccessibleResource(
         req,
         res,
@@ -12897,6 +12916,7 @@ export function issueRoutes(
         deferWakeForGoal,
         hiddenAt: hiddenAtRaw,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
+        expectedRevision: _expectedRevision,
         ...updateFields
       } = req.body;
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
@@ -13227,31 +13247,34 @@ export function issueRoutes(
         req.body.executionPolicy !== undefined && monitorChanged,
       );
 
-      const transition = applyIssueExecutionPolicyTransition({
-        issue: existing,
-        policy: nextExecutionPolicy,
-        previousPolicy: previousExecutionPolicy,
-        requestedStatus:
-          typeof updateFields.status === "string"
-            ? updateFields.status
-            : undefined,
-        requestedAssigneePatch: {
-          assigneeAgentId: normalizedAssigneeAgentId,
-          assigneeUserId:
-            req.body.assigneeUserId === undefined
-              ? undefined
-              : (req.body.assigneeUserId as string | null),
-        },
-        actor: {
-          agentId: actor.agentId ?? null,
-          userId: actor.actorType === "user" ? actor.actorId : null,
-        },
-        allowBoardOverride: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
-        commentBody,
-        reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
-        monitorExplicitlyUpdated:
-          req.body.executionPolicy !== undefined && monitorChanged,
-      });
+      const transition: ReturnType<typeof applyIssueExecutionPolicyTransition> =
+        expectedRevision !== undefined
+          ? { patch: {} }
+          : applyIssueExecutionPolicyTransition({
+              issue: existing,
+              policy: nextExecutionPolicy,
+              previousPolicy: previousExecutionPolicy,
+              requestedStatus:
+                typeof updateFields.status === "string"
+                  ? updateFields.status
+                  : undefined,
+              requestedAssigneePatch: {
+                assigneeAgentId: normalizedAssigneeAgentId,
+                assigneeUserId:
+                  req.body.assigneeUserId === undefined
+                    ? undefined
+                    : (req.body.assigneeUserId as string | null),
+              },
+              actor: {
+                agentId: actor.agentId ?? null,
+                userId: actor.actorType === "user" ? actor.actorId : null,
+              },
+              allowBoardOverride: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
+              commentBody,
+              reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
+              monitorExplicitlyUpdated:
+                req.body.executionPolicy !== undefined && monitorChanged,
+            });
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
         const nextExecutionState = transition.patch.executionState;
@@ -13587,6 +13610,7 @@ export function issueRoutes(
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       const issueUpdateData = {
         ...updateFields,
+        ...(expectedRevision !== undefined ? { expectedRevision } : {}),
         actorAgentId: actor.agentId ?? null,
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,

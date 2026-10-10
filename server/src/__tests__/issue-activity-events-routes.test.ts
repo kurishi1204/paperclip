@@ -64,6 +64,14 @@ function registerModuleMocks() {
     feedbackService: () => mockFeedbackService,
   }));
 
+  vi.doMock("../services/external-objects.js", () => ({
+    externalObjectService: () => ({
+      syncIssueSafely: async () => undefined,
+      syncCommentSafely: async () => undefined,
+      syncDocumentSafely: async () => undefined,
+    }),
+  }));
+
   vi.doMock("../services/heartbeat.js", () => ({
     heartbeatService: () => mockHeartbeatService,
   }));
@@ -202,6 +210,7 @@ describe("issue activity event routes", () => {
     vi.doUnmock("../services/access.js");
     vi.doUnmock("../services/activity-log.js");
     vi.doUnmock("../services/feedback.js");
+    vi.doUnmock("../services/external-objects.js");
     vi.doUnmock("../services/heartbeat.js");
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../services/instance-settings.js");
@@ -261,6 +270,30 @@ describe("issue activity event routes", () => {
       .send({ title: issue.title });
     expect(noOp.status).toBe(200);
     expect(noOp.body.changes).not.toHaveProperty("title");
+  });
+
+  it("keeps a comment-only PATCH receipt free of the internal revision bump", async () => {
+    const issue = { ...makeIssue(), revision: 8 };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async () => {
+      const updated = { ...issue, revision: 9, updatedAt: new Date("2026-07-30T12:01:00.000Z") };
+      return { ...updated, changes: buildIssueChanges(issue, updated) };
+    });
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-only-receipt",
+      issueId: issue.id,
+      companyId: issue.companyId,
+      body: "New instruction",
+    });
+
+    const response = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ comment: "New instruction" });
+
+    expect(response.status).toBe(200);
+    expect(response.body.revision).toBe(9);
+    expect(response.body.changes).toEqual({});
+    expect(response.body.comment).toMatchObject({ body: "New instruction" });
   });
 
   it("echoes scalar blocker state and summaries when setting and clearing blockers", async () => {

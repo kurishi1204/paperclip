@@ -269,6 +269,60 @@ describe("issue update comment wakeups", () => {
     mockIssueService.listReviewAttention.mockResolvedValue(new Map());
   });
 
+  it("rejects a conditional comment and interrupt before run cancellation", async () => {
+    const existing = makeIssue({ revision: 2 });
+    mockIssueService.getById.mockResolvedValue(existing);
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ expectedRevision: 2, comment: "change", interrupt: true });
+    expect(res.status).toBe(400);
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it("passes the board's safe conditional title edit to the row-lock service", async () => {
+    const existing = makeIssue({ revision: 2 });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(makeIssue({ revision: 3, title: "Revised" }));
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ expectedRevision: 2, title: "Revised" });
+    expect(res.status).toBe(200);
+    expect(res.body.revision).toBe(3);
+    expect(mockIssueService.update).toHaveBeenCalledWith(existing.id, expect.objectContaining({
+      expectedRevision: 2,
+      title: "Revised",
+    }));
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
+  it("does not turn a conditional text edit into an execution-policy transition", async () => {
+    const existing = makeIssue({
+      revision: 4,
+      status: "todo",
+      executionState: {
+        status: "pending",
+        currentStageId: "55555555-5555-4555-8555-555555555555",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: ASSIGNEE_AGENT_ID },
+        returnAssignee: { type: "agent", agentId: PREVIOUS_AGENT_ID },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(makeIssue({ revision: 5, title: "Revised" }));
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ expectedRevision: 4, title: "Revised" });
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update.mock.calls[0]?.[1]).not.toHaveProperty("executionState");
+    expect(mockIssueService.update.mock.calls[0]?.[1]).not.toHaveProperty("status");
+  });
+
   it.each(["post", "patch"] as const)("rejects %s board messages under an inherited pause before any mutation", async (method) => {
     const existing = makeIssue();
     mockIssueService.getById.mockResolvedValue(existing);

@@ -261,6 +261,7 @@ retain their titles and default to no generation request.
 - `title` text not null
 - `description` text null
 - `status` enum: `backlog | todo | in_progress | in_review | done | blocked | cancelled`
+- `revision` bigint not null default 0; a database trigger increments it for every `issues` row UPDATE, including writes by older clients. This is separate from `status_version`, which tracks selected status/ownership decisions.
 - `priority` enum: `critical | high | medium | low`
 - `review_policy` nullable enum: `anyone | not_creator | human_only`; null is equivalent to `anyone`
 - `assignee_agent_id` uuid fk `agents.id` null
@@ -291,6 +292,7 @@ retain their titles and default to no generation request.
 
 Invariants:
 
+- `GET /api/issues/:id` and issue lists expose `revision`. `PATCH /api/issues/:id` accepts optional `expectedRevision` only for board title/description edits. It compares the value under the issue row lock and returns 409 before changing state when stale. Requests combining `expectedRevision` with comments, run control, assignment, review decisions, or other fields are rejected before effects. Database triggers advance the same revision for native comment, linked document, relation, attachment, and label membership changes. Internal callers can freeze and compare those materials with `captureIssueRequirementSnapshot` and `assertIssueRequirementSnapshotInTransaction`; the latter must run in the transaction that stages an outbox effect. Work products, interaction decisions, linked issue status, external asset bytes, and business acceptance remain separate evidence.
 - single assignee only
 - task must trace to company goal chain via `goal_id`, `parent_id`, or project-goal linkage
 - `in_progress` requires assignee
