@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { assets, documents, heartbeatRuns, issueAttachments, issueComments, issueExecutionDecisions, issues } from "@paperclipai/db";
+import { assets, documentAnnotationComments, documentAnnotationThreads, documents, heartbeatRuns, issueAttachments, issueComments, issueExecutionDecisions, issueRelations, issues } from "@paperclipai/db";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { documentService } from "../services/documents.js";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 
@@ -52,6 +53,7 @@ describe("run-bound QA review MCP", () => {
     expect((await call("tools/list")).body.result.tools.map((item: { name: string }) => item.name)).toEqual([
       "read_assigned_issue", "list_assigned_issue_comments", "read_assigned_issue_document",
       "list_assigned_issue_attachments", "read_assigned_issue_attachment_text", "submit_review_decision",
+      "read_assigned_issue_description", "list_assigned_issue_annotations", "read_assigned_review_receipt",
     ]);
     const issue = await tool("read_assigned_issue");
     expect(issue.body.result.structuredContent).toMatchObject({ id: fixture.issueId, title: "Verify runner API tools" });
@@ -68,6 +70,70 @@ describe("run-bound QA review MCP", () => {
     });
     expect(unauthenticated.status).toBe(403);
     expect(token).toBeTruthy();
+  });
+
+  it("projects the assigned issue without neighboring issue or project records", async () => {
+    const { fixture, token, tool } = await reviewFixture();
+    await server.db.update(issues).set({
+      title: "Neighbor secret: scarlet-heron",
+      description: "Neighbor body: copper-lynx",
+    }).where(eq(issues.id, fixture.blockerId));
+    await server.db.insert(issueRelations).values({
+      companyId: fixture.companyId,
+      issueId: fixture.blockerId,
+      relatedIssueId: fixture.issueId,
+      type: "blocks",
+    });
+    const rawResponse = await fetch(`${server.apiUrl}/api/issues/${fixture.issueId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(rawResponse.status).toBe(200);
+    const raw = await rawResponse.json();
+    expect(JSON.stringify(raw)).toContain("scarlet-heron");
+    expect(JSON.stringify(raw)).toContain("violet-otter");
+
+    const response = await tool("read_assigned_issue");
+    expect(response.body.result.isError).not.toBe(true);
+    const issue = response.body.result.structuredContent;
+    expect(issue).toMatchObject({
+      id: fixture.issueId,
+      title: "Verify runner API tools",
+      descriptionCharacters: "Fixture marker: amber-fox.".length,
+      reviewStage: { stageId: expect.any(String), lastDecisionId: null },
+      documentSummaries: expect.arrayContaining([expect.objectContaining({ key: "notes" })]),
+    });
+    expect(Object.keys(issue).sort()).toEqual([
+      "descriptionCharacters", "documentSummaries", "id", "identifier", "legacyPlanDocument",
+      "planDocument", "revision", "reviewStage", "status", "statusVersion",
+      "title", "workMode", "workProducts",
+    ].sort());
+    expect(JSON.stringify(issue)).not.toMatch(/scarlet-heron|copper-lynx|violet-otter/);
+    expect(JSON.stringify(issue)).not.toContain(fixture.blockerId);
+    expect(JSON.stringify(issue)).not.toContain(fixture.projectId);
+    expect((await tool("read_assigned_issue_description", {
+      expectedRevision: issue.revision, limit: 15,
+    })).body.result.structuredContent).toMatchObject({
+      body: "Fixture marker:", offset: 0, nextOffset: 15,
+    });
+  });
+
+  it("keeps a large plan body out of the issue overview and pages its content", async () => {
+    const { fixture, tool } = await reviewFixture();
+    const body = `Plan marker: topaz-marten. ${"P".repeat(30_000)}`;
+    await documentService(server.db).upsertIssueDocument({
+      issueId: fixture.issueId, key: "plan", title: "Acceptance plan",
+      format: "markdown", body, baseRevisionId: null, changeSummary: null,
+      createdByAgentId: fixture.agentId, createdByRunId: fixture.runId,
+    });
+    const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
+    expect(issue.planDocument).toMatchObject({ key: "plan", bodyCharacters: body.length });
+    expect(JSON.stringify(issue)).not.toContain("topaz-marten");
+    expect(JSON.stringify(issue).length).toBeLessThan(10_000);
+    const page = (await tool("read_assigned_issue_document", {
+      key: "plan", expectedRevision: issue.revision, limit: 16_000,
+    })).body.result.structuredContent;
+    expect(page.body).toBe(body.slice(0, 16_000));
+    expect(page.nextOffset).toBe(16_000);
   });
 
   it("reads bounded non-plan document pages only through the assigned issue", async () => {
@@ -88,6 +154,52 @@ describe("run-bound QA review MCP", () => {
     const noteId = issue.documentSummaries.find((item: { key: string }) => item.key === "notes")?.id;
     await server.db.update(documents).set({ latestBody: "Updated acceptance evidence." }).where(eq(documents.id, noteId));
     expect((await tool("read_assigned_issue_document", { key: "notes", expectedRevision })).body.result.isError).toBe(true);
+  });
+
+  it("reads assigned-document annotations and rejects a stale annotation revision", async () => {
+    const { fixture, tool } = await reviewFixture();
+    const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
+    const documentId = issue.documentSummaries.find((item: { key: string }) => item.key === "notes")?.id;
+    const [doc] = await server.db.select().from(documents).where(eq(documents.id, documentId));
+    const [thread] = await server.db.insert(documentAnnotationThreads).values({
+      companyId: fixture.companyId, issueId: fixture.issueId, documentId,
+      documentKey: "notes", originalRevisionNumber: doc!.latestRevisionNumber,
+      currentRevisionNumber: doc!.latestRevisionNumber,
+      selectedText: "Document", normalizedStart: 0, normalizedEnd: 8,
+      markdownStart: 0, markdownEnd: 8,
+      anchorSelector: {
+        quote: { exact: "Document", prefix: "", suffix: "" },
+        position: { normalizedStart: 0, normalizedEnd: 8, markdownStart: 0, markdownEnd: 8 },
+      },
+    }).returning();
+    const [comment] = await server.db.insert(documentAnnotationComments).values({
+      companyId: fixture.companyId, issueId: fixture.issueId,
+      documentId, threadId: thread!.id,
+      body: "Annotation requirement: verify the source before approval.", authorType: "agent",
+      authorAgentId: fixture.agentId,
+    }).returning();
+    const current = (await tool("read_assigned_issue")).body.result.structuredContent;
+    expect(current.revision).toBeGreaterThan(issue.revision);
+    const args = { key: "notes", expectedRevision: current.revision, limit: 1 };
+    const page = (await tool("list_assigned_issue_annotations", args)).body.result.structuredContent;
+    expect(page).toMatchObject({ total: 1, offset: 0, nextOffset: null,
+      annotations: [{ threadId: thread!.id, commentId: comment!.id,
+        body: "Annotation requirement: verify the source before approval." }],
+    });
+    expect((await tool("list_assigned_issue_annotations", {
+      key: "other-issue-only", expectedRevision: current.revision,
+    })).body.result.isError).toBe(true);
+    await server.db.update(documentAnnotationComments).set({
+      body: "Changed annotation requirement.",
+    }).where(eq(documentAnnotationComments.id, comment!.id));
+    expect((await tool("list_assigned_issue_annotations", args)).body.result.isError).toBe(true);
+    await server.db.update(documentAnnotationComments).set({
+      body: "A".repeat(16_001),
+    }).where(eq(documentAnnotationComments.id, comment!.id));
+    const oversizedRevision = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
+    expect((await tool("list_assigned_issue_annotations", {
+      key: "notes", expectedRevision: oversizedRevision,
+    })).body.result.isError).toBe(true);
   });
 
   it("lists assigned attachments and reads only bounded text content", async () => {
@@ -137,8 +249,52 @@ describe("run-bound QA review MCP", () => {
     expect(await rows()).toEqual([expect.objectContaining({
       issueId: fixture.issueId, stageId, actorAgentId: fixture.agentId, outcome: "approved",
     })]);
-    expect((await tool("submit_review_decision", args)).status).toBe(403);
+    expect((await tool("submit_review_decision", args)).body.result.isError).toBe(true);
     expect(await rows()).toHaveLength(1);
+  });
+
+  it("recovers only this run's formal receipt after a verdict response is lost", async () => {
+    const { fixture, stageId, tool } = await reviewFixture();
+    const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
+    const summary = "QA checked the assigned evidence.";
+    const submitted = await tool("submit_review_decision", {
+      decision: "approve", summary, expectedStageId: stageId,
+      expectedStatusVersion: issue.statusVersion, expectedRevision: issue.revision,
+      expectedLastDecisionId: null,
+    });
+    expect(submitted.body.result.isError).not.toBe(true);
+    // Model the caller losing the successful PATCH response and reconnecting.
+    const receipt = (await tool("read_assigned_review_receipt", {
+      expectedStageId: stageId, decision: "approve", summary,
+    })).body.result.structuredContent;
+    expect(receipt).toMatchObject({
+      recorded: true, issueId: fixture.issueId, stageId,
+      decisionOutcome: "approved", decisionId: expect.any(String),
+    });
+    expect((await tool("read_assigned_review_receipt", {
+      expectedStageId: stageId, decision: "approve", summary: "Different verdict text",
+    })).body.result.structuredContent).toMatchObject({ recorded: false });
+    const anotherRunId = randomUUID();
+    await server.db.insert(heartbeatRuns).values({
+      id: anotherRunId, companyId: fixture.companyId, agentId: fixture.agentId,
+      status: "running", nativeIssueId: fixture.issueId,
+      invocationSource: "assignment", triggerDetail: "system",
+      contextSnapshot: { issueId: fixture.issueId },
+    });
+    const anotherToken = createLocalAgentJwt(fixture.agentId, fixture.companyId, "paperclip_runner", anotherRunId)!;
+    const anotherRunReceipt = await fetch(`${server.apiUrl}/api/mcp/qa-review`, {
+      method: "POST", headers: { Authorization: `Bearer ${anotherToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: randomUUID(), method: "tools/call", params: {
+        name: "read_assigned_review_receipt", arguments: { expectedStageId: stageId, decision: "approve", summary },
+      } }),
+    });
+    expect(anotherRunReceipt.status).toBe(403);
+    expect((await tool("read_assigned_issue")).body.result.isError).toBe(true);
+    expect((await tool("submit_review_decision", {
+      decision: "approve", summary, expectedStageId: stageId,
+      expectedStatusVersion: issue.statusVersion, expectedRevision: issue.revision,
+      expectedLastDecisionId: null,
+    })).body.result.isError).toBe(true);
   });
 
   it("records a changes-requested decision through the same formal issue route", async () => {

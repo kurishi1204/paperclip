@@ -78,7 +78,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
 });
 
 import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
-import { execute } from "./execute.js";
+import { execute, runClaudeLogin } from "./execute.js";
 import { resetClaudeCliCapabilitiesCacheForTests } from "./cli-capabilities.js";
 
 describe("claude remote execution", () => {
@@ -99,7 +99,9 @@ describe("claude remote execution", () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-qa-"));
     cleanupDirs.push(rootDir);
     vi.stubEnv("PAPERCLIP_HOME", rootDir);
+    vi.stubEnv("HOME", path.join(rootDir, "operator-home"));
     vi.stubEnv("HOST_ONLY_QA_SECRET", "must-not-reach-child");
+    const managedHome = path.join(rootDir, "managed-home");
     const qaServer = {
       name: "paperclip_qa", connectionId: "paperclip-qa-review",
       url: "http://127.0.0.1:3100/api/mcp/qa-review", token: "run-bound-token",
@@ -112,7 +114,12 @@ describe("claude remote execution", () => {
         engine: "cli", qaReviewToolsOnly: true, dangerouslySkipPermissions: false,
         managedAiConnection: { provider: "anthropic" },
         cwd: rootDir,
-        env: { ANTHROPIC_API_KEY: "provider-test-key", PAPERCLIP_AGENT_PRIVATE_KEY: "must-not-reach-child" },
+        env: {
+          HOME: managedHome, XDG_CONFIG_HOME: path.join(managedHome, "config"),
+          XDG_DATA_HOME: path.join(managedHome, "data"),
+          CLAUDE_CONFIG_DIR: path.join(managedHome, "provider"),
+          ANTHROPIC_API_KEY: "provider-test-key", PAPERCLIP_AGENT_PRIVATE_KEY: "must-not-reach-child",
+        },
       },
       context: {}, authToken: "run-bound-token",
       runtimeMcp: { getServers: () => [qaServer, { name: "unrelated", connectionId: "other", url: "http://127.0.0.1:3100/other", token: "other-token" }] },
@@ -126,9 +133,13 @@ describe("claude remote execution", () => {
     const args = invocation![2], options = invocation![3];
     expect(args).toEqual(expect.arrayContaining(["--restricted", "--tools", "", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--strict-mcp-config"]));
     expect(args).not.toEqual(expect.arrayContaining(["--dangerously-skip-permissions", "--add-dir", "--resume", "--append-system-prompt-file"]));
-    expect(args[args.indexOf("--allowedTools") + 1]).toBe("mcp__paperclip_qa__read_assigned_issue,mcp__paperclip_qa__list_assigned_issue_comments,mcp__paperclip_qa__read_assigned_issue_document,mcp__paperclip_qa__list_assigned_issue_attachments,mcp__paperclip_qa__read_assigned_issue_attachment_text,mcp__paperclip_qa__submit_review_decision");
+    expect(args[args.indexOf("--allowedTools") + 1]).toBe("mcp__paperclip_qa__read_assigned_issue,mcp__paperclip_qa__list_assigned_issue_comments,mcp__paperclip_qa__read_assigned_issue_document,mcp__paperclip_qa__list_assigned_issue_attachments,mcp__paperclip_qa__read_assigned_issue_attachment_text,mcp__paperclip_qa__submit_review_decision,mcp__paperclip_qa__read_assigned_issue_description,mcp__paperclip_qa__list_assigned_issue_annotations,mcp__paperclip_qa__read_assigned_review_receipt");
     expect(options.inheritHostEnv).toBe(false);
     expect(options.env.ANTHROPIC_API_KEY).toBe("provider-test-key");
+    expect(options.env.HOME).toBe(managedHome);
+    expect(options.env.CLAUDE_CONFIG_DIR).toBe(path.join(managedHome, "provider"));
+    expect(options.env.XDG_CONFIG_HOME).toBe(path.join(managedHome, "config"));
+    expect(options.env.XDG_DATA_HOME).toBe(path.join(managedHome, "data"));
     for (const key of ["PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY", "HOST_ONLY_QA_SECRET"]) expect(options.env[key]).toBeUndefined();
     const mcpConfig = JSON.parse(await readFile(args[args.indexOf("--mcp-config") + 1]!, "utf8"));
     expect(Object.keys(mcpConfig.mcpServers)).toEqual(["paperclip_qa"]);
@@ -140,6 +151,12 @@ describe("claude remote execution", () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-qa-invalid-"));
     cleanupDirs.push(rootDir);
     vi.stubEnv("PAPERCLIP_HOME", rootDir);
+    const managedHome = path.join(rootDir, "managed-home");
+    const managedEnv = {
+      HOME: managedHome, XDG_CONFIG_HOME: path.join(managedHome, "config"),
+      XDG_DATA_HOME: path.join(managedHome, "data"),
+      CLAUDE_CONFIG_DIR: path.join(managedHome, "provider"),
+    };
     const base = {
       runId: "qa-run-invalid",
       agent: { id: "qa-agent", companyId: "company-1", name: "QA", adapterType: "claude_local" as const, adapterConfig: {} },
@@ -147,11 +164,20 @@ describe("claude remote execution", () => {
       context: {}, runtimeMcp: { getServers: () => [] }, onLog: async () => {},
     };
     const bypass = await execute({ ...base, config: { engine: "cli", qaReviewToolsOnly: true, dangerouslySkipPermissions: true,
-      managedAiConnection: { provider: "anthropic" }, cwd: rootDir } });
+      managedAiConnection: { provider: "anthropic" }, cwd: rootDir, env: managedEnv } });
     expect(bypass.errorCode).toBe("qa_review_configuration_invalid");
     const missing = await execute({ ...base, config: { engine: "cli", qaReviewToolsOnly: true, dangerouslySkipPermissions: false,
-      managedAiConnection: { provider: "anthropic" }, cwd: rootDir } });
+      managedAiConnection: { provider: "anthropic" }, cwd: rootDir, env: managedEnv } });
     expect(missing.errorCode).toBe("qa_review_tools_unavailable");
+    const hostHome = process.env.HOME!;
+    const unsafe = await execute({ ...base, config: { engine: "cli", qaReviewToolsOnly: true, dangerouslySkipPermissions: false,
+      managedAiConnection: { provider: "anthropic" }, cwd: rootDir,
+      env: { ...managedEnv, HOME: hostHome, CLAUDE_CONFIG_DIR: path.join(hostHome, "provider"),
+        XDG_CONFIG_HOME: path.join(hostHome, "config"), XDG_DATA_HOME: path.join(hostHome, "data") },
+    } });
+    expect(unsafe.errorCode).toBe("qa_review_configuration_invalid");
+    await expect(runClaudeLogin({ runId: "qa-login-rejected", agent: base.agent,
+      config: { qaReviewToolsOnly: true, env: managedEnv } })).rejects.toThrow("cannot use interactive Claude login");
     expect(runChildProcess.mock.calls.some(call => (call[2] as string[]).includes("--print"))).toBe(false);
   });
 

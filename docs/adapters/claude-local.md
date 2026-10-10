@@ -48,9 +48,15 @@ tools disabled, ignores user and project settings, and passes only the
 run-bound `paperclip_qa` MCP server. Extra CLI arguments, Chrome, custom
 commands, and remote execution targets fail configuration validation.
 
-The six MCP tools read the assigned issue, page through its comments and
-non-plan documents, list assigned attachments, read bounded UTF-8 text pages
-from those attachments, and submit `approve` or `request_changes`. Evidence
+The nine MCP tools read only an explicit projection of the assigned issue,
+page through its description and document bodies (including the plan), comments,
+document annotations, and UTF-8 attachment text, list assigned attachments,
+submit `approve` or `request_changes`, and read back this run's matching formal
+decision receipt if the response is lost. The issue overview contains only
+document metadata and assigned work-product identifiers, status, and URLs; it
+does not return related issues, project records, adapter overrides, or full
+plan bodies. A legacy plan embedded in the description is read through the
+description page tool. Evidence
 pages and the verdict carry the whole requirement revision read from the issue;
 the verdict also carries the stage, status version, and last decision ID.
 Issue PATCH rechecks all four while holding the Issue row lock in the
@@ -62,9 +68,16 @@ the host environment or the Paperclip run token; its MCP config contains the
 run token for the named QA server only. A stopped run or changed assignment
 loses access. Document bodies are returned in pages of at most 16,000
 characters. Attachment metadata is paged, and text content is returned in
-pages of at most 16,384 bytes. Binary or invalid UTF-8 attachments are
+pages of at most 16,384 bytes. Annotation pages contain at most 16,000
+characters and fail closed when one annotation exceeds that size. Binary or invalid UTF-8 attachments are
 identified but not interpreted: their acceptance evidence must be available
 through an assigned issue document/comment or handled by a human reviewer.
+After a missing verdict response, the agent checks the receipt with the exact
+stage, decision, and summary from its attempt. A missing receipt remains
+unknown and does not authorize resubmission. Only that receipt remains readable
+after the review stage closes, while the same run is active. The QA subprocess
+uses the disposable HOME and provider configuration minted for its managed AI
+connection; it cannot use interactive Claude login in this mode.
 This mode still requires a live test of the agent's managed
 Anthropic login and its actual QA run before operational acceptance.
 

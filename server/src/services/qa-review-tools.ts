@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { and, eq } from "drizzle-orm";
+import { issueExecutionDecisions, type Db } from "@paperclipai/db";
 import { issueDocumentKeySchema } from "@paperclipai/shared";
 import { conflict, forbidden } from "../errors.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
@@ -7,6 +9,57 @@ const commentPageSchema = z.object({
   expectedRevision: z.number().int().nonnegative(),
   afterCommentId: z.string().uuid().optional(),
 }).strict();
+
+const descriptionPageSchema = z.object({
+  expectedRevision: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative().max(10_000_000).default(0),
+  limit: z.number().int().min(1).max(16_000).default(8_000),
+}).strict();
+
+const annotationPageSchema = z.object({
+  key: issueDocumentKeySchema,
+  expectedRevision: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative().max(1_000_000).default(0),
+  limit: z.number().int().min(1).max(25).default(10),
+}).strict();
+
+const annotationThreadSchema = z.object({
+  id: z.string().uuid(), issueId: z.string().uuid(), documentKey: z.string(),
+  status: z.string(), anchorState: z.string(), selectedText: z.string(),
+  comments: z.array(z.object({
+    id: z.string().uuid(), threadId: z.string().uuid(), issueId: z.string().uuid(), body: z.string(),
+  })),
+});
+
+const receiptSchema = z.object({
+  expectedStageId: z.string().uuid(),
+  decision: z.enum(["approve", "request_changes"]),
+  summary: z.string().trim().min(1).max(10_000),
+}).strict();
+
+const documentSummarySchema = z.object({
+  id: z.string().uuid(), issueId: z.string().uuid(), key: z.string(),
+  title: z.string().nullable(), format: z.string(),
+  latestRevisionNumber: z.number().int().nonnegative(),
+});
+
+// The ordinary Issue GET is intentionally broad. Never pass its object or a
+// nested object through to a QA subprocess: a relation, project, runtime
+// workspace, or adapter override may include another task's private data.
+const assignedIssueSourceSchema = z.object({
+  id: z.string().uuid(), identifier: z.string(), title: z.string(),
+  description: z.string().nullable(), status: z.string(), workMode: z.string(),
+  statusVersion: z.number().int().nonnegative(), revision: z.number().int().nonnegative(),
+  planDocument: documentSummarySchema.extend({ body: z.string() }).nullable(),
+  legacyPlanDocument: z.object({ key: z.literal("plan"), body: z.string(), source: z.literal("issue_description") }).nullable(),
+  documentSummaries: z.array(documentSummarySchema),
+  workProducts: z.array(z.object({
+    id: z.string().uuid(), issueId: z.string().uuid(), type: z.string(),
+    provider: z.string(), title: z.string(), url: z.string().nullable(),
+    status: z.string(), reviewState: z.string(), healthStatus: z.string(),
+    isPrimary: z.boolean(),
+  })),
+});
 
 const documentPageSchema = z.object({
   key: issueDocumentKeySchema,
@@ -46,12 +99,15 @@ export const QA_REVIEW_TOOL_NAMES = [
   "list_assigned_issue_attachments",
   "read_assigned_issue_attachment_text",
   "submit_review_decision",
+  "read_assigned_issue_description",
+  "list_assigned_issue_annotations",
+  "read_assigned_review_receipt",
 ] as const;
 
 export const qaReviewToolDefinitions = [
   {
     name: QA_REVIEW_TOOL_NAMES[0],
-    description: "Read the issue assigned to this live QA run, including its plan, work products, review stage, status version, and requirement revision. No issue ID can be supplied.",
+    description: "Read bounded metadata for the assigned issue, document keys, work products, review stage, status version, and requirement revision. Page the issue description and every document body through their dedicated tools. No issue ID can be supplied.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -79,6 +135,21 @@ export const qaReviewToolDefinitions = [
     description: "Record the current review-stage decision with a reason. Copy expectedStageId, expectedStatusVersion, expectedRevision and expectedLastDecisionId from read_assigned_issue. A request for changes returns the issue to its recorded assignee.",
     inputSchema: z.toJSONSchema(reviewDecisionSchema),
   },
+  {
+    name: QA_REVIEW_TOOL_NAMES[6],
+    description: "Read a bounded page of the assigned issue description, including any legacy embedded plan, at the expected issue revision. Continue with nextOffset until null.",
+    inputSchema: z.toJSONSchema(descriptionPageSchema),
+  },
+  {
+    name: QA_REVIEW_TOOL_NAMES[7],
+    description: "Read bounded pages of every annotation and comment on one assigned-issue document at the expected issue revision. Use status=all implicitly; continue with nextOffset until null. An oversized single annotation fails closed.",
+    inputSchema: z.toJSONSchema(annotationPageSchema),
+  },
+  {
+    name: QA_REVIEW_TOOL_NAMES[8],
+    description: "After a verdict response is missing, read only this run's matching formal review decision. Supply the original stage, decision, and summary. A missing receipt is unknown; do not resend the verdict.",
+    inputSchema: z.toJSONSchema(receiptSchema),
+  },
 ];
 
 export function assertActiveQaParticipant(issue: {
@@ -98,6 +169,9 @@ export function assertActiveQaParticipant(issue: {
 }
 
 type QaToolInput = {
+  db: Db;
+  runId: string;
+  companyId: string;
   name: string;
   arguments: unknown;
   apiUrl: string;
@@ -112,6 +186,20 @@ type QaToolInput = {
   };
   agentId: string;
 };
+
+export async function hasOwnQaDecision(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; runId: string;
+}) {
+  const [decision] = await db.select({ id: issueExecutionDecisions.id })
+    .from(issueExecutionDecisions).where(and(
+      eq(issueExecutionDecisions.companyId, input.companyId),
+      eq(issueExecutionDecisions.issueId, input.issueId),
+      eq(issueExecutionDecisions.actorAgentId, input.agentId),
+      eq(issueExecutionDecisions.createdByRunId, input.runId),
+      eq(issueExecutionDecisions.stageType, "review"),
+    )).limit(1);
+  return Boolean(decision);
+}
 
 function apiOrigin(input: QaToolInput) {
   return input.apiUrl.replace(/\/+$/, "").replace(/\/api$/, "");
@@ -202,12 +290,120 @@ function assertExpectedRevision(input: QaToolInput, expectedRevision: number) {
   }
 }
 
+function projectAssignedIssue(input: QaToolInput, raw: unknown, stage: ReturnType<typeof assertActiveQaParticipant>) {
+  const issue = assignedIssueSourceSchema.parse(raw);
+  if (issue.id !== input.issue.id || issue.revision !== input.issue.revision ||
+      issue.documentSummaries.some((doc) => doc.issueId !== input.issue.id) ||
+      (issue.planDocument && issue.planDocument.issueId !== input.issue.id) ||
+      issue.workProducts.some((product) => product.issueId !== input.issue.id)) {
+    throw conflict("Assigned issue projection changed or contains another issue");
+  }
+  return {
+    id: issue.id, identifier: issue.identifier, title: issue.title,
+    descriptionCharacters: Array.from(issue.description ?? "").length,
+    status: issue.status, workMode: issue.workMode,
+    statusVersion: issue.statusVersion, revision: issue.revision,
+    reviewStage: { stageId: stage.currentStageId, lastDecisionId: stage.lastDecisionId },
+    planDocument: issue.planDocument ? {
+      id: issue.planDocument.id, key: issue.planDocument.key,
+      title: issue.planDocument.title, format: issue.planDocument.format,
+      latestRevisionNumber: issue.planDocument.latestRevisionNumber,
+      bodyCharacters: Array.from(issue.planDocument.body).length,
+    } : null,
+    legacyPlanDocument: issue.legacyPlanDocument ? {
+      key: "plan", source: "issue_description",
+      bodyCharacters: Array.from(issue.legacyPlanDocument.body).length,
+    } : null,
+    documentSummaries: issue.documentSummaries.map((doc) => ({
+      id: doc.id, key: doc.key, title: doc.title, format: doc.format,
+      latestRevisionNumber: doc.latestRevisionNumber,
+    })),
+    workProducts: issue.workProducts.map((product) => ({
+      id: product.id, type: product.type, provider: product.provider,
+      title: product.title, url: product.url, status: product.status,
+      reviewState: product.reviewState, healthStatus: product.healthStatus,
+      isPrimary: product.isPrimary,
+    })),
+  };
+}
+
+function reviewComment(decision: "approve" | "request_changes", summary: string) {
+  return decision === "approve"
+    ? `kind: review\ndecision: approved\nsummary: ${summary}`
+    : `kind: review\ndecision: changes_requested\nsummary: ${summary}`;
+}
+
+async function readAssignedReviewReceipt(input: QaToolInput) {
+  const args = receiptSchema.parse(input.arguments);
+  const [row] = await input.db.select({
+    id: issueExecutionDecisions.id, stageId: issueExecutionDecisions.stageId,
+    outcome: issueExecutionDecisions.outcome, createdAt: issueExecutionDecisions.createdAt,
+  }).from(issueExecutionDecisions).where(and(
+    eq(issueExecutionDecisions.companyId, input.companyId),
+    eq(issueExecutionDecisions.issueId, input.issue.id),
+    eq(issueExecutionDecisions.actorAgentId, input.agentId),
+    eq(issueExecutionDecisions.createdByRunId, input.runId),
+    eq(issueExecutionDecisions.stageId, args.expectedStageId),
+    eq(issueExecutionDecisions.stageType, "review"),
+    eq(issueExecutionDecisions.outcome, args.decision === "approve" ? "approved" : "changes_requested"),
+    eq(issueExecutionDecisions.body, reviewComment(args.decision, args.summary)),
+  )).limit(1);
+  return row ? { recorded: true, issueId: input.issue.id, stageId: row.stageId,
+    decisionId: row.id, decisionOutcome: row.outcome, createdAt: row.createdAt } :
+    { recorded: false, issueId: input.issue.id, stageId: args.expectedStageId };
+}
+
 /** Use the existing issue routes for authorization, redaction, activity and formal decisions. */
 export async function callQaReviewTool(input: QaToolInput) {
+  if (input.name === QA_REVIEW_TOOL_NAMES[8]) return readAssignedReviewReceipt(input);
   const stage = assertActiveQaParticipant(input.issue, input.agentId);
   if (input.name === QA_REVIEW_TOOL_NAMES[0]) {
     z.object({}).strict().parse(input.arguments);
-    return issueApi(input, "GET", "");
+    return projectAssignedIssue(input, await issueApi(input, "GET", ""), stage);
+  }
+  if (input.name === QA_REVIEW_TOOL_NAMES[6]) {
+    const args = descriptionPageSchema.parse(input.arguments);
+    assertExpectedRevision(input, args.expectedRevision);
+    const issue = assignedIssueSourceSchema.parse(await issueApi(input, "GET", ""));
+    if (issue.id !== input.issue.id || issue.revision !== args.expectedRevision) {
+      throw conflict("Assigned issue changed during description read");
+    }
+    const characters = Array.from(issue.description ?? "");
+    if (args.offset > characters.length) throw conflict("Description offset is beyond the current body");
+    const nextOffset = args.offset + args.limit < characters.length ? args.offset + args.limit : null;
+    return { issueId: issue.id, issueRevision: args.expectedRevision,
+      body: characters.slice(args.offset, args.offset + args.limit).join(""),
+      offset: args.offset, nextOffset, totalCharacters: characters.length };
+  }
+  if (input.name === QA_REVIEW_TOOL_NAMES[7]) {
+    const args = annotationPageSchema.parse(input.arguments);
+    assertExpectedRevision(input, args.expectedRevision);
+    const raw = await issueApi(input, "GET", `/documents/${encodeURIComponent(args.key)}/annotations?status=all&includeComments=true`);
+    const threads = z.array(annotationThreadSchema).parse(raw);
+    if (threads.some((thread) => thread.issueId !== input.issue.id || thread.documentKey !== args.key ||
+        thread.comments.some((comment) => comment.issueId !== input.issue.id || comment.threadId !== thread.id))) {
+      throw conflict("Assigned issue annotations contain another issue or document");
+    }
+    const entries = threads.flatMap((thread): Array<{ threadId: string; status: string; anchorState: string;
+      selectedText: string; commentId: string | null; body: string | null }> => thread.comments.length > 0
+      ? thread.comments.map((comment) => ({ threadId: thread.id, status: thread.status,
+        anchorState: thread.anchorState, selectedText: thread.selectedText,
+        commentId: comment.id, body: comment.body }))
+      : [{ threadId: thread.id, status: thread.status, anchorState: thread.anchorState,
+        selectedText: thread.selectedText, commentId: null, body: null }]);
+    if (args.offset > entries.length) throw conflict("Annotation offset is beyond the current page set");
+    const page: typeof entries = [];
+    let characters = 0;
+    for (const entry of entries.slice(args.offset, args.offset + args.limit)) {
+      const entryCharacters = Array.from(entry.selectedText).length + Array.from(entry.body ?? "").length;
+      if (entryCharacters > 16_000) throw conflict("One annotation exceeds the QA page size; use human review");
+      if (characters + entryCharacters > 16_000) break;
+      page.push(entry);
+      characters += entryCharacters;
+    }
+    const nextOffset = args.offset + page.length < entries.length ? args.offset + page.length : null;
+    return { key: args.key, issueRevision: args.expectedRevision, annotations: page,
+      offset: args.offset, nextOffset, total: entries.length };
   }
   if (input.name === QA_REVIEW_TOOL_NAMES[1]) {
     const args = commentPageSchema.parse(input.arguments);
@@ -257,9 +453,7 @@ export async function callQaReviewTool(input: QaToolInput) {
       stage.lastDecisionId !== args.expectedLastDecisionId) {
     throw conflict("Issue revision or review stage changed; read the issue again before deciding");
   }
-  const comment = args.decision === "approve"
-    ? `kind: review\ndecision: approved\nsummary: ${args.summary}`
-    : `kind: review\ndecision: changes_requested\nsummary: ${args.summary}`;
+  const comment = reviewComment(args.decision, args.summary);
   const result = await issueApi(input, "PATCH", "", {
     status: args.decision === "approve" ? "done" : "in_progress",
     comment,
