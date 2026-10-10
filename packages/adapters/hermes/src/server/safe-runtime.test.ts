@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -110,6 +111,53 @@ describe("Hermes child boundary", () => {
       await fs.writeFile(path.join(home, ".env"), "HERMES_YOLO_MODE=1\n", { mode: 0o600 });
       await expect(validateBoundedHermesHome(home)).rejects.toThrow(/unsupported setting/);
     } finally {
+      await fs.rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("checks the actual dedicated-home inputs before each bounded launch", async () => {
+    const created = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-home-inputs-"));
+    const home = await fs.realpath(created);
+    const priorHash = process.env.PAPERCLIP_HERMES_CONFIG_SHA256;
+    try {
+      await fs.chmod(home, 0o700);
+      for (const directory of ["plugins", "hooks", "skills", "memories", "cron"]) {
+        await fs.mkdir(path.join(home, directory), { mode: 0o700 });
+      }
+      await fs.writeFile(path.join(home, "active_profile"), "default\n", { mode: 0o600 });
+      await fs.writeFile(path.join(home, ".skills_prompt_snapshot.json"), JSON.stringify({
+        version: 1, manifest: {}, skills: [], category_descriptions: {},
+      }), { mode: 0o600 });
+      const config = "onboarding:\n  seen:\n    busy_input_prompt: true\n    tool_progress_prompt: true\n    openclaw_residue_cleanup: true\n";
+      await fs.writeFile(path.join(home, "config.yaml"), config, { mode: 0o600 });
+      process.env.PAPERCLIP_HERMES_CONFIG_SHA256 = createHash("sha256").update(config).digest("hex");
+      await expect(validateBoundedHermesHome(home)).resolves.toBeUndefined();
+
+      await fs.writeFile(path.join(home, "plugins", "unexpected.py"), "print('unexpected')");
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/plugins must be empty/);
+      await fs.rm(path.join(home, "plugins", "unexpected.py"));
+
+      await fs.writeFile(path.join(home, "active_profile"), "other\n");
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/active_profile must be default/);
+      await fs.writeFile(path.join(home, "active_profile"), "default\n");
+
+      await fs.writeFile(path.join(home, ".skills_prompt_snapshot.json"), JSON.stringify({
+        version: 1, manifest: {}, skills: ["injected instructions"], category_descriptions: {},
+      }));
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/skills snapshot must be empty/);
+      await fs.writeFile(path.join(home, ".skills_prompt_snapshot.json"), JSON.stringify({
+        version: 1, manifest: {}, skills: [], category_descriptions: {},
+      }));
+
+      await fs.appendFile(path.join(home, "config.yaml"), "plugins:\n  enabled: true\n");
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/operator pin/);
+      await fs.writeFile(path.join(home, "config.yaml"), config);
+
+      await fs.writeFile(path.join(home, "mcp.json"), "{}");
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/mcp.json is not supported/);
+    } finally {
+      if (priorHash === undefined) delete process.env.PAPERCLIP_HERMES_CONFIG_SHA256;
+      else process.env.PAPERCLIP_HERMES_CONFIG_SHA256 = priorHash;
       await fs.rm(home, { recursive: true, force: true });
     }
   });

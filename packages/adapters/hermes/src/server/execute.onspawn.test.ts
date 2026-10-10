@@ -38,7 +38,7 @@ vi.mock("node:fs/promises", () => ({
   readdir: vi.fn(async () => []),
   stat: vi.fn(async () => ({ isFile: () => true, isDirectory: () => false })),
   lstat: vi.fn(async (target: string) => {
-    if (target.endsWith("/.env") || target.endsWith("/auth.json")) {
+    if (["/.env", "/auth.json", "/active_profile", "/.skills_prompt_snapshot.json", "/config.yaml", "/mcp.json"].some((suffix) => target.endsWith(suffix))) {
       const error = new Error("not found") as NodeJS.ErrnoException;
       error.code = "ENOENT";
       throw error;
@@ -269,7 +269,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
       const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
       const args = call[2];
       expect(args).not.toContain("--yolo");
-      expect(args).not.toContain("--ignore-rules");
+      expect(args).toContain("--ignore-rules");
       expect(args).toContain("--ignore-user-config");
       expect(args).toContainEqual("web");
       expect(call[3].env?.HOME).not.toBe("/private/qa/hermes");

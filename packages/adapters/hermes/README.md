@@ -273,16 +273,36 @@ host home, and `.env` and
 `auth.json`, when present, must be private regular files. The only supported
 toolset is `web`; all `extraArgs` and agent-configured command overrides are
 rejected. Custom `promptTemplate` is ignored in bounded mode so a configured
-terminal instruction cannot override the web-only task contract. The adapter passes `--ignore-user-config` so a changed
-`config.yaml` cannot disable approvals. On Mini Hermes v0.14.0 this flag does
-not suppress `SOUL.md`, memory or home plugins; provision a clean dedicated
-home and review its contents before enabling it. Its `.env` accepts only provider and
+terminal instruction cannot override the web-only task contract. The adapter passes `--ignore-user-config` and
+`--ignore-rules`; the latter suppresses home instructions and memories without
+disabling tool approvals. On Mini Hermes v0.14.0 plugins can load before those
+flags take effect, so the dedicated home's plugins, hooks, skills, memories,
+and cron directories must stay private and empty. Any skills prompt snapshot
+must contain the exact empty structure. `active_profile` may only be absent or
+`default`, and any `config.yaml` requires a matching operator-owned SHA-256 in
+`PAPERCLIP_HERMES_CONFIG_SHA256`. A present `mcp.json` blocks startup. These
+checks run before every bounded execution and environment probe. Its `.env` accepts only provider and
 search connection keys. Server-added scratch and Git environment fields are
 ignored. Bounded mode requires an explicit provider other than
 `auto`, an explicit model, and a positive `maxTurnsPerRun`. The operator may
 pin an absolute Hermes executable with the Paperclip server environment
 variable `PAPERCLIP_HERMES_TRUSTED_COMMAND`; this value is not taken from agent
 config or forwarded to Hermes.
+
+On Mini Hermes v0.14.0, fresh `hermes auth add openai-codex --type oauth
+--no-browser` stores a dedicated OAuth credential pool in `auth.json`, but the
+first-run setup gate does not count that pool by itself. Provision a private
+`config.yaml` with `model.provider: openai-codex` and only the three observed
+`onboarding.seen` flags (`busy_input_prompt`, `tool_progress_prompt`,
+`openclaw_residue_cleanup`) set to `true`. Compute the file's SHA-256 and set
+`PAPERCLIP_HERMES_CONFIG_SHA256` in the Paperclip service environment to that
+exact value. The CLI still receives an explicit `-m` and `--provider`; do not
+put a token or API key in `config.yaml`. The current Hermes version reads some
+home configuration before it applies `--ignore-user-config`, so changing the
+config or upgrading Hermes requires a new source review and hash pin. For an
+OAuth renewal that cannot refresh, list and remove the old dedicated-home
+credential ID before running a fresh `auth add`; do not import the shared
+`~/.codex/auth.json` into this home.
 
 For sustained web research, configure an official Hermes search backend in
 that dedicated `.env`, such as `TAVILY_API_KEY`. Enabling the `web` toolset

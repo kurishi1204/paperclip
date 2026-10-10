@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 
@@ -226,5 +227,118 @@ export async function validateBoundedHermesHome(home: string): Promise<void> {
         throw new Error("Bounded Hermes .env contains an unsupported setting");
       }
     }
+  }
+
+  // Hermes discovers these from HERMES_HOME before its chat flags have taken
+  // effect. Keep the bounded web worker's extension surface empty.
+  for (const directory of ["plugins", "hooks", "skills", "memories", "cron"]) {
+    const target = path.join(home, directory);
+    let entry;
+    try {
+      entry = await fs.lstat(target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new Error("Bounded Hermes " + directory + " must be a real directory");
+    }
+    if (process.platform !== "win32" &&
+        ((typeof process.getuid === "function" && entry.uid !== process.getuid()) ||
+         (entry.mode & 0o077) !== 0)) {
+      throw new Error("Bounded Hermes " + directory + " must be private to the runtime user");
+    }
+    if ((await fs.readdir(target)).length !== 0) {
+      throw new Error("Bounded Hermes " + directory + " must be empty");
+    }
+  }
+
+  // A non-default active profile can replace HERMES_HOME at CLI startup.
+  const profile = path.join(home, "active_profile");
+  let profileStat;
+  try {
+    profileStat = await fs.lstat(profile);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (profileStat) {
+    if (!profileStat.isFile() || profileStat.isSymbolicLink() ||
+        (process.platform !== "win32" &&
+         ((typeof process.getuid === "function" && profileStat.uid !== process.getuid()) ||
+          (profileStat.mode & 0o077) !== 0))) {
+      throw new Error("Bounded Hermes active_profile must be a private regular file");
+    }
+    if ((await fs.readFile(profile, "utf8")).trim() !== "default") {
+      throw new Error("Bounded Hermes active_profile must be default");
+    }
+  }
+
+  // An empty skills home may create this cache after the first chat. Hermes
+  // validates only the manifest on reload, so also inspect the cached prompt.
+  const snapshot = path.join(home, ".skills_prompt_snapshot.json");
+  let snapshotStat;
+  try {
+    snapshotStat = await fs.lstat(snapshot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (snapshotStat) {
+    if (!snapshotStat.isFile() || snapshotStat.isSymbolicLink() ||
+        (process.platform !== "win32" &&
+         ((typeof process.getuid === "function" && snapshotStat.uid !== process.getuid()) ||
+          (snapshotStat.mode & 0o077) !== 0))) {
+      throw new Error("Bounded Hermes skills snapshot must be a private regular file");
+    }
+    let data: unknown;
+    try {
+      data = JSON.parse(await fs.readFile(snapshot, "utf8"));
+    } catch {
+      throw new Error("Bounded Hermes skills snapshot must be empty");
+    }
+    const emptyRecord = (value: unknown): boolean =>
+      typeof value === "object" && value !== null && !Array.isArray(value) && Object.keys(value).length === 0;
+    if (typeof data !== "object" || data === null || Array.isArray(data) ||
+        Object.keys(data).sort().join(",") !== "category_descriptions,manifest,skills,version" ||
+        (data as Record<string, unknown>).version !== 1 ||
+        !emptyRecord((data as Record<string, unknown>).manifest) ||
+        !emptyRecord((data as Record<string, unknown>).category_descriptions) ||
+        !Array.isArray((data as Record<string, unknown>).skills) ||
+        ((data as Record<string, unknown>).skills as unknown[]).length !== 0) {
+      throw new Error("Bounded Hermes skills snapshot must be empty");
+    }
+  }
+
+  // config.yaml may be created by Hermes onboarding. The operator pins its
+  // exact bytes; agents cannot approve an arbitrary plugin/MCP configuration.
+  const config = path.join(home, "config.yaml");
+  let configStat;
+  try {
+    configStat = await fs.lstat(config);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const expectedHash = process.env.PAPERCLIP_HERMES_CONFIG_SHA256;
+  if (configStat) {
+    if (!configStat.isFile() || configStat.isSymbolicLink() ||
+        (process.platform !== "win32" &&
+         ((typeof process.getuid === "function" && configStat.uid !== process.getuid()) ||
+          (configStat.mode & 0o077) !== 0))) {
+      throw new Error("Bounded Hermes config.yaml must be a private regular file");
+    }
+    if (!expectedHash || !/^[a-f0-9]{64}$/.test(expectedHash) ||
+        createHash("sha256").update(await fs.readFile(config)).digest("hex") !== expectedHash) {
+      throw new Error("Bounded Hermes config.yaml does not match the operator pin");
+    }
+  } else if (expectedHash) {
+    throw new Error("Bounded Hermes pinned config.yaml is missing");
+  }
+
+  // Current Hermes loads MCP from config.yaml, but a future CLI may load this
+  // file directly. Do not silently adopt it for the web-only worker.
+  try {
+    await fs.lstat(path.join(home, "mcp.json"));
+    throw new Error("Bounded Hermes mcp.json is not supported");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 }

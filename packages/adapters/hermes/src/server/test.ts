@@ -359,7 +359,7 @@ export async function testEnvironment(
       checks.push({ level: "error", code: "hermes_remote_probe_unsupported", message: "Hermes connection testing requires a local execution environment." });
     } else {
       const args = ["chat", "-Q", "-q", "Respond with hello. Do not use tools.", "--max-turns", "1", "--source", "tool"];
-      if (bounded) args.push("--ignore-user-config");
+      if (bounded) args.push("--ignore-user-config", "--ignore-rules");
       const toolsets = asString(config.toolsets);
       if (toolsets) args.push("-t", toolsets);
       if (asString(config.model)) args.push("-m", asString(config.model)!);

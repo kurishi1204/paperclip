@@ -498,7 +498,7 @@ export async function execute(
   if (useQuiet) args.push("-Q");
   // Preserve unattended standard-mode behavior while bounded runs use only
   // web tools with normal Hermes approval handling.
-  if (bounded) args.push("--ignore-user-config");
+  if (bounded) args.push("--ignore-user-config", "--ignore-rules");
   else args.push("--yolo");
 
   if (model) {

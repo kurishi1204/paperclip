@@ -112,7 +112,7 @@ test("bounded environment check exercises a real hello with an empty HOME", asyn
   const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   try {
     await mkdir(home, { mode: 0o700 });
-    await writeFile(cli, "#!/bin/sh\n[ \"$HOME\" != \"$HERMES_HOME\" ] || exit 7\n[ \"$1\" = chat ] || exit 7\ncase \" $* \" in *\" --ignore-user-config \"*) ;; *) exit 7;; esac\necho hello\n");
+    await writeFile(cli, "#!/bin/sh\n[ \"$HOME\" != \"$HERMES_HOME\" ] || exit 7\n[ \"$1\" = chat ] || exit 7\ncase \" $* \" in *\" --ignore-user-config \"*) ;; *) exit 7;; esac\ncase \" $* \" in *\" --ignore-rules \"*) ;; *) exit 7;; esac\necho hello\n");
     await chmod(cli, 0o755);
     process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID = "bounded-probe-agent";
     process.env.PAPERCLIP_HERMES_BOUNDED_HOME = home;
