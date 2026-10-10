@@ -175,6 +175,7 @@ function resolveClaudeBillingType(env: Record<string, string>): "api" | "subscri
 async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<ClaudeRuntimeConfig> {
   const { runId, agent, config, context, runtimeCommandSpec, executionTarget, authToken } = input;
   const onLog = input.onLog ?? (async () => {});
+  const qaReviewToolsOnly = asBoolean(config.qaReviewToolsOnly, false);
 
   const command = asString(config.command, "claude");
   const workspaceContext = parseObject(context.paperclipWorkspace);
@@ -307,12 +308,22 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     env[key] = value;
   }
 
-  if (authToken) {
+  if (authToken && !qaReviewToolsOnly) {
     env.PAPERCLIP_API_KEY = authToken;
   }
 
+  if (qaReviewToolsOnly) {
+    // The Claude subprocess and its command preflight share this environment.
+    // The run JWT stays only in the server-written MCP config, never in env.
+    const allowed = new Set(["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"]);
+    for (const key of Object.keys(env)) if (!allowed.has(key)) delete env[key];
+    for (const key of ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] as const) {
+      if (typeof process.env[key] === "string") env[key] = process.env[key]!;
+    }
+  }
+
   const runtimeEnv = Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
+    Object.entries(ensurePathInEnv(qaReviewToolsOnly ? env : { ...process.env, ...env })).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
@@ -416,6 +427,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       },
     };
   }
+  const qaReviewToolsOnly = asBoolean(ctx.config.qaReviewToolsOnly, false);
+  if (qaReviewToolsOnly && engineSelection.engine !== "cli") {
+    return { exitCode: 1, signal: null, timedOut: false, errorCode: "qa_review_configuration_invalid",
+      errorMessage: "QA review tools require the Claude CLI engine.",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } };
+  }
   if (engineSelection.engine === "acp") {
     return executeClaudeAcp(ctx);
   }
@@ -439,6 +456,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
   const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
   const configEnv = parseObject(config.env);
+  const managedConnection = parseObject(config.managedAiConnection);
+  if (qaReviewToolsOnly && (dangerouslySkipPermissions || executionTargetIsRemote || chrome ||
+      (typeof config.command === "string" && config.command !== "claude") ||
+      managedConnection.provider !== "anthropic")) {
+    return { exitCode: 1, signal: null, timedOut: false, errorCode: "qa_review_configuration_invalid",
+      errorMessage: "QA review tools require a local, non-bypass Claude CLI with a managed Anthropic connection, no Chrome and no custom command.",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } };
+  }
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const workspaceSource = asString(workspaceContext.source, "");
@@ -456,7 +481,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
   const hasExplicitClaudeConfigDir =
     typeof configEnv.CLAUDE_CONFIG_DIR === "string" && configEnv.CLAUDE_CONFIG_DIR.trim().length > 0;
-  const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
+  const instructionsFilePath = qaReviewToolsOnly ? "" : asString(config.instructionsFilePath, "").trim();
   const instructionsFileDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
   const runtimeConfig = await buildClaudeRuntimeConfig({
     agentIdentity: ctx.agentIdentity,
@@ -482,6 +507,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     graceSec,
     extraArgs,
   } = runtimeConfig;
+  if (qaReviewToolsOnly && extraArgs.length > 0) {
+    return { exitCode: 1, signal: null, timedOut: false, errorCode: "qa_review_configuration_invalid",
+      errorMessage: "QA review tools do not accept extra CLI arguments.",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } };
+  }
   Object.assign(env, claudeSandboxPermissionEnv({ dangerouslySkipPermissions, targetIsSandbox: executionTargetIsSandbox }));
   let loggedEnv = initialLoggedEnv;
   let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
@@ -490,15 +520,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     asNumber(config.terminalResultCleanupGraceMs, 5_000),
   );
   const effectiveEnv = Object.fromEntries(
-    Object.entries({ ...process.env, ...env }).filter(
+    Object.entries(qaReviewToolsOnly ? env : { ...process.env, ...env }).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
   const modelEnv = executionTargetIsRemote ? env : effectiveEnv;
   const model = resolveClaudeModel(config.model, modelEnv);
   const billingType = resolveClaudeBillingType(effectiveEnv);
-  const claudeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
-  const desiredSkillNames = new Set(resolveClaudeDesiredSkillNames(config, claudeSkillEntries));
+  const claudeSkillEntries = qaReviewToolsOnly ? [] : await readPaperclipRuntimeSkillEntries(config, __moduleDir);
+  const desiredSkillNames = new Set(qaReviewToolsOnly ? [] : resolveClaudeDesiredSkillNames(config, claudeSkillEntries));
   // When instructionsFilePath is configured, build a stable content-addressed
   // file that includes both the file content and the path directive, so we only
   // need --append-system-prompt-file (Claude CLI forbids using both flags together).
@@ -553,7 +583,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     instructionsContents: combinedInstructionsContents,
     onLog,
   });
-  const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
+  const runtimeMcpServers = qaReviewToolsOnly
+    ? (ctx.runtimeMcp?.getServers() ?? []).filter((server) =>
+        server.name === "paperclip_qa" && server.connectionId === "paperclip-qa-review")
+    : ctx.runtimeMcp?.getServers() ?? [];
+  if (qaReviewToolsOnly && runtimeMcpServers.length !== 1) {
+    return { exitCode: 1, signal: null, timedOut: false, errorCode: "qa_review_tools_unavailable",
+      errorMessage: "The run-bound Paperclip QA MCP server is unavailable.",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } };
+  }
   const runtimeMcpIdentity = JSON.stringify(
     runtimeMcpServers.map(({ name, url, connectionId }) => ({ name, url, connectionId })),
   );
@@ -652,7 +690,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     effectiveExecutionCwd = preparedExecutionTargetRuntime.workspaceRemoteDir;
   }
   const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
-  refreshPaperclipWorkspaceEnvForExecution({
+  if (!qaReviewToolsOnly) refreshPaperclipWorkspaceEnvForExecution({
     env,
     envConfig: configEnv,
     workspaceCwd: effectiveWorkspaceCwd,
@@ -790,7 +828,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       executionTargetIsRemote,
     }) &&
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
-  const sessionId = canResumeSession ? runtimeSessionId : null;
+  const sessionId = !qaReviewToolsOnly && canResumeSession ? runtimeSessionId : null;
   if (runtimeSessionId && !isValidUuid) {
     await onLog(
       "stdout",
@@ -854,8 +892,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     attemptInstructionsFilePath: string | undefined,
   ) => {
     const args = ["--print", "--output-format", "stream-json", "--verbose"];
-    if (config.managedAiConnection) args.push("--setting-sources", "user");
+    if (config.managedAiConnection && !qaReviewToolsOnly) args.push("--setting-sources", "user");
     if (resumeSessionId) args.push("--resume", resumeSessionId);
+    if (qaReviewToolsOnly) {
+      args.push("--restricted", "--tools", "", "--permission-mode", "dontAsk", "--permission-prompts", "none");
+      args.push("--allowedTools", "mcp__paperclip_qa__read_assigned_issue,mcp__paperclip_qa__list_assigned_issue_comments,mcp__paperclip_qa__submit_review_decision");
+    }
     args.push(...buildClaudeExecutionPermissionArgs({
       dangerouslySkipPermissions,
       targetIsRemote: executionTargetIsRemote,
@@ -879,7 +921,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (runtimeMcpServers.length > 0) {
       args.push("--mcp-config", effectiveMcpConfigPath, "--strict-mcp-config");
     }
-    args.push("--add-dir", effectivePromptBundleAddDir);
+    if (!qaReviewToolsOnly) args.push("--add-dir", effectivePromptBundleAddDir);
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;
   };
@@ -916,6 +958,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : renderTemplate(promptTemplate, templateData);
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
     const prompt = joinPromptSections([
+      qaReviewToolsOnly ? "Use only the Paperclip QA MCP tools. Read the assigned issue and all relevant comment pages before deciding. A failed or missing decision receipt means the result is unknown: read the issue again before any retry. Do not use shell, curl, files or a host credential." : "",
       renderedBootstrapPrompt,
       selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
       wakePrompt,
@@ -931,7 +974,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       taskContextChars: taskContextNote.length,
       heartbeatPromptChars: renderedPrompt.length,
     };
-    const attemptInstructionsFilePath = resumeSessionId ? undefined : effectiveInstructionsFilePath;
+    const attemptInstructionsFilePath = qaReviewToolsOnly || resumeSessionId ? undefined : effectiveInstructionsFilePath;
     const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath);
     const commandNotes: string[] = [];
     if (!resumeSessionId) {
@@ -978,6 +1021,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       onProcessStopped: providerStop.beginInvocation(),
       cwd,
       env,
+      inheritHostEnv: !qaReviewToolsOnly,
       stdin: prompt,
       timeoutSec,
       graceSec,

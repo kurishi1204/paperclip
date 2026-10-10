@@ -35,7 +35,28 @@ subscription quota exhaustion merely because ACP labels them `limit`.
 | `timeoutSec` | number | No | Process timeout (0 = no timeout) |
 | `graceSec` | number | No | Grace period before force-kill |
 | `maxTurnsPerRun` | number | No | Max agentic turns per heartbeat (defaults to `300`) |
-| `dangerouslySkipPermissions` | boolean | No | Skip permission prompts (default: `true`); required for headless runs where interactive approval is impossible |
+| `dangerouslySkipPermissions` | boolean | No | Skip permission prompts (default: `true`); the QA review mode below runs headlessly with `false` |
+| `qaReviewToolsOnly` | boolean | No | Run a local, restricted Claude CLI session with only the assigned-issue QA MCP tools (default: `false`) |
+
+## Headless formal QA review
+
+For a dedicated QA agent, set `engine: "cli"`, `qaReviewToolsOnly: true`,
+`dangerouslySkipPermissions: false`, and a managed Anthropic AI connection.
+The agent must be the current participant and assignee of a pending `review`
+stage on its assigned issue. The adapter starts a fresh session with built-in
+tools disabled, ignores user and project settings, and passes only the
+run-bound `paperclip_qa` MCP server. Extra CLI arguments, Chrome, custom
+commands, and remote execution targets fail configuration validation.
+
+The three MCP tools read the assigned issue, page through its comments, and
+submit `approve` or `request_changes` with an expected stage and issue version.
+The decision uses the existing Issue PATCH route and produces a formal
+`issue_execution_decisions` record. The tool accepts no issue ID, arbitrary
+endpoint, shell command, or credential path. The Claude child does not inherit
+the host environment or the Paperclip run token; its MCP config contains the
+run token for the named QA server only. A stopped run or changed assignment
+loses access. This mode still requires a live test of the agent's managed
+Anthropic login and its actual QA run before operational acceptance.
 
 ## Default model
 

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -93,6 +93,66 @@ describe("claude remote execution", () => {
       if (!dir) continue;
       await rm(dir, { recursive: true, force: true }).catch(() => undefined);
     }
+  });
+
+  it("starts local QA with only its run-bound MCP tools and without inherited host credentials", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-qa-"));
+    cleanupDirs.push(rootDir);
+    vi.stubEnv("PAPERCLIP_HOME", rootDir);
+    vi.stubEnv("HOST_ONLY_QA_SECRET", "must-not-reach-child");
+    const qaServer = {
+      name: "paperclip_qa", connectionId: "paperclip-qa-review",
+      url: "http://127.0.0.1:3100/api/mcp/qa-review", token: "run-bound-token",
+    };
+    const result = await execute({
+      runId: "qa-run-1",
+      agent: { id: "qa-agent", companyId: "company-1", name: "QA", adapterType: "claude_local", adapterConfig: {} },
+      runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        engine: "cli", qaReviewToolsOnly: true, dangerouslySkipPermissions: false,
+        managedAiConnection: { provider: "anthropic" },
+        cwd: rootDir,
+        env: { ANTHROPIC_API_KEY: "provider-test-key", PAPERCLIP_AGENT_PRIVATE_KEY: "must-not-reach-child" },
+      },
+      context: {}, authToken: "run-bound-token",
+      runtimeMcp: { getServers: () => [qaServer, { name: "unrelated", connectionId: "other", url: "http://127.0.0.1:3100/other", token: "other-token" }] },
+      onLog: async () => {},
+    });
+    expect(result.exitCode).toBe(0);
+    const invocation = (runChildProcess.mock.calls as unknown as Array<[string, string, string[], {
+      env: Record<string, string>; inheritHostEnv?: boolean;
+    }]>).find(call => call[2].includes("--print"));
+    expect(invocation).toBeDefined();
+    const args = invocation![2], options = invocation![3];
+    expect(args).toEqual(expect.arrayContaining(["--restricted", "--tools", "", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--strict-mcp-config"]));
+    expect(args).not.toEqual(expect.arrayContaining(["--dangerously-skip-permissions", "--add-dir", "--resume", "--append-system-prompt-file"]));
+    expect(args[args.indexOf("--allowedTools") + 1]).toBe("mcp__paperclip_qa__read_assigned_issue,mcp__paperclip_qa__list_assigned_issue_comments,mcp__paperclip_qa__submit_review_decision");
+    expect(options.inheritHostEnv).toBe(false);
+    expect(options.env.ANTHROPIC_API_KEY).toBe("provider-test-key");
+    for (const key of ["PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY", "HOST_ONLY_QA_SECRET"]) expect(options.env[key]).toBeUndefined();
+    const mcpConfig = JSON.parse(await readFile(args[args.indexOf("--mcp-config") + 1]!, "utf8"));
+    expect(Object.keys(mcpConfig.mcpServers)).toEqual(["paperclip_qa"]);
+    expect(mcpConfig.mcpServers.paperclip_qa.headers.Authorization).toBe("Bearer run-bound-token");
+    expect(JSON.stringify(mcpConfig)).not.toContain("other-token");
+  });
+
+  it("fails closed if the QA agent requests bypass or has no QA MCP", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-qa-invalid-"));
+    cleanupDirs.push(rootDir);
+    vi.stubEnv("PAPERCLIP_HOME", rootDir);
+    const base = {
+      runId: "qa-run-invalid",
+      agent: { id: "qa-agent", companyId: "company-1", name: "QA", adapterType: "claude_local" as const, adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      context: {}, runtimeMcp: { getServers: () => [] }, onLog: async () => {},
+    };
+    const bypass = await execute({ ...base, config: { engine: "cli", qaReviewToolsOnly: true, dangerouslySkipPermissions: true,
+      managedAiConnection: { provider: "anthropic" }, cwd: rootDir } });
+    expect(bypass.errorCode).toBe("qa_review_configuration_invalid");
+    const missing = await execute({ ...base, config: { engine: "cli", qaReviewToolsOnly: true, dangerouslySkipPermissions: false,
+      managedAiConnection: { provider: "anthropic" }, cwd: rootDir } });
+    expect(missing.errorCode).toBe("qa_review_tools_unavailable");
+    expect(runChildProcess.mock.calls.some(call => (call[2] as string[]).includes("--print"))).toBe(false);
   });
 
   it("prepares the workspace, syncs Claude runtime assets, and restores workspace changes for remote SSH execution", async () => {

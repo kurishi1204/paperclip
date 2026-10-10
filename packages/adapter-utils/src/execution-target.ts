@@ -275,6 +275,8 @@ export interface PreparedAdapterExecutionTargetRuntime {
 export interface AdapterExecutionTargetProcessOptions {
   cwd: string;
   env: Record<string, string>;
+  /** Local-only: avoid copying the Paperclip server's host credentials into a constrained child. */
+  inheritHostEnv?: boolean;
   stdin?: string;
   timeoutSec: number;
   graceSec: number;
@@ -916,6 +918,7 @@ export async function runAdapterExecutionTargetProcess(
   const result = await runChildProcess(runId, command, args, {
     cwd: options.cwd,
     env,
+    inheritHostEnv: options.inheritHostEnv,
     stdin: options.stdin,
     timeoutSec: options.timeoutSec,
     graceSec: options.graceSec,

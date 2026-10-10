@@ -69,6 +69,7 @@ Core fields:
 - promptTemplate (string, optional): run prompt template
 - maxTurnsPerRun (number, optional): max turns for one run
 - dangerouslySkipPermissions (boolean, optional, default true): allow non-interactive Claude runs to proceed without approval prompts. Local and remote targets receive --dangerously-skip-permissions for all built-in and connected tools. Managed sandbox targets also identify themselves to Claude so root container launches support bypass. Non-sandbox root processes must run Claude as a non-root user; Paperclip does not silently downgrade the requested mode.
+- qaReviewToolsOnly (boolean, optional, default false): local CLI-only, requires dangerouslySkipPermissions=false. Starts a fresh restricted Claude run with no built-in tools, no host environment inheritance, and only the three run-bound Paperclip QA MCP tools. It accepts no chrome or extraArgs. This mode can read its assigned issue and record the current formal review-stage decision, but cannot inspect host files or use shell/curl.
 - command (string, optional): defaults to "claude"
 - extraArgs (string[], optional): additional CLI args
 - env (object, optional): KEY=VALUE environment variables
