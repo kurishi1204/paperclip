@@ -14,11 +14,11 @@
  *   -w/--worktree      isolated git worktree
  *   -v/--verbose       verbose output
  *   --checkpoints      filesystem checkpoints
- *   --yolo             bypass dangerous-command approval prompts (agents have no TTY)
  *   --source           session source tag for filtering
  */
 
-import fs from "node:fs/promises";
+import * as fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import type {
@@ -42,7 +42,6 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 
 import {
-  HERMES_CLI,
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
   DEFAULT_MODEL,
@@ -54,6 +53,17 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
+import { parseBoundedWebResult } from "./bounded-output.js";
+import {
+  buildHermesChildEnv,
+  isBoundedHermesExecution,
+  resolveHermesCommandForConfig,
+  validateBoundedHermesCommand,
+  validateBoundedHermesHome,
+  validateBoundedRuntimeOptions,
+  validateBoundedToolsets,
+  validateHermesExtraArgs,
+} from "./safe-runtime.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -75,7 +85,7 @@ function cfgStringArray(v: unknown): string[] | undefined {
 }
 
 export function resolveHermesCommand(config: Record<string, unknown>): string {
-  return cfgString(config.hermesCommand) || cfgString(config.command) || HERMES_CLI;
+  return resolveHermesCommandForConfig(config);
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +132,14 @@ const HERMES_DEFAULT_PROMPT_TEMPLATE = [
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
 ].join("\n");
 
+const HERMES_BOUNDED_RESEARCH_PROMPT_TEMPLATE = [
+  'You are "{{agent.name}}", a Paperclip research agent.',
+  "Use only web_search to investigate the assigned question; do not extract URLs.",
+  "Return concise findings with source URLs, uncertainties, and what remains to verify.",
+  "Your response is captured in the Paperclip Run; a separate reviewer records QA and issue acceptance.",
+  "Do not attempt to call Paperclip APIs or use terminal, file, browser, or MCP tools.",
+].join("\n");
+
 function renderConditionalSections(template: string, vars: Record<string, unknown>): string {
   const isTruthy = (key: string) => {
     if (key === "noTask") return !vars.taskId;
@@ -140,10 +158,23 @@ export function buildPrompt(
   config: Record<string, unknown>,
   options: { resumedSession?: boolean } = {},
 ): string {
-  const context = (ctx as any).context || {};
-  const template = cfgString(config.promptTemplate) || (context.conversationMode === true
-    ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
-    : HERMES_DEFAULT_PROMPT_TEMPLATE);
+  const rawContext = (ctx as any).context || {};
+  const bounded = cfgBoolean(config.boundedExecution) === true;
+  // A web-only run cannot use connector APIs. Do not place connector
+  // instructions in its wake prompt even when the server delivers them.
+  const context = bounded ? {
+    ...rawContext,
+    paperclipWake: {
+      ...(rawContext.paperclipWake && typeof rawContext.paperclipWake === "object" ? rawContext.paperclipWake : {}),
+      connectorSkillInstructions: undefined,
+      connectionInstructions: undefined,
+    },
+  } : rawContext;
+  const template = bounded
+    ? HERMES_BOUNDED_RESEARCH_PROMPT_TEMPLATE
+    : cfgString(config.promptTemplate) || (context.conversationMode === true
+      ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
+      : HERMES_DEFAULT_PROMPT_TEMPLATE);
   const taskId = cfgString(context.taskId) || cfgString(context.issueId) || cfgString(ctx.config?.taskId);
   const taskTitle = cfgString(context.taskTitle) || cfgString(ctx.config?.taskTitle) || "";
   const taskBody = cfgString(context.taskBody) || cfgString(ctx.config?.taskBody) || "";
@@ -165,7 +196,7 @@ export function buildPrompt(
 
   const { taskContextNote: taskContextMarkdown, wakePrompt } = selectPaperclipPromptSections(context, {
     resumedSession: options.resumedSession === true,
-    includeCommunicationGuidance: true,
+    includeCommunicationGuidance: !bounded,
   });
   // Keep the historical variable available to custom templates. Automatic
   // assembly uses the ownership-aware assignment variant below.
@@ -215,11 +246,11 @@ export function buildPrompt(
 // Output parsing
 // ---------------------------------------------------------------------------
 
-/** Regex to extract session ID from Hermes quiet-mode output: "session_id: <id>" */
-const SESSION_ID_REGEX = /^session_id:\s*(\S+)/m;
+/** Hermes appends the session marker after the model response. */
+const SESSION_ID_REGEX = /(?:^|\n)session_id:\s*([a-zA-Z0-9_][a-zA-Z0-9_-]*)\s*$/;
 
 /** Regex for legacy session output format */
-const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
+const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_][a-zA-Z0-9_-]*)/i;
 
 /** Regex to extract token usage from Hermes output. */
 const TOKEN_USAGE_REGEX =
@@ -269,7 +300,7 @@ function cleanResponse(raw: string): string {
 // Output parsing
 // ---------------------------------------------------------------------------
 
-function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
+function parseHermesOutput(stdout: string, stderr: string, allowLegacySession = true): ParsedOutput {
   const combined = stdout + "\n" + stderr;
   const result: ParsedOutput = {};
 
@@ -277,9 +308,9 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   //   <response text>
   //
   //   session_id: <id>
-  const sessionMatch = stdout.match(SESSION_ID_REGEX);
+  const sessionMatch = stdout.trimEnd().match(SESSION_ID_REGEX);
   if (sessionMatch?.[1]) {
-    result.sessionId = sessionMatch?.[1] ?? null;
+    result.sessionId = sessionMatch[1];
     // The response is everything before the session_id line
     const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
     if (sessionLineIdx > 0) {
@@ -287,7 +318,7 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
     }
   } else {
     // Legacy format (non-quiet mode)
-    const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
+    const legacyMatch = allowLegacySession ? combined.match(SESSION_ID_REGEX_LEGACY) : null;
     if (legacyMatch?.[1]) {
       result.sessionId = legacyMatch?.[1] ?? null;
     }
@@ -335,27 +366,49 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
 export async function execute(
   ctx: AdapterExecutionContext,
 ): Promise<AdapterExecutionResult> {
-  const config = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
+  const rawConfig = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
+  const bounded = isBoundedHermesExecution(rawConfig, ctx.agent?.id);
+  const config = bounded ? { ...rawConfig, boundedExecution: true } : rawConfig;
 
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = resolveHermesCommand(config);
   const model = cfgString(config.model) || DEFAULT_MODEL;
-  const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
+  const timeoutSec = cfgNumber(config.timeoutSec) || (bounded ? 300 : DEFAULT_TIMEOUT_SEC);
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
-  const extraArgs = cfgStringArray(config.extraArgs);
-  const persistSession = cfgBoolean(config.persistSession) !== false;
+  const extraArgs = validateHermesExtraArgs(config.extraArgs, bounded);
+  const inheritHostEnv = !bounded && config.managedAiRouting !== true;
+  const env: Record<string, string> = {
+    ...buildHermesChildEnv(config.env, bounded, process.env, process.platform, inheritHostEnv),
+    ...(!bounded ? buildPaperclipEnv(ctx.agent, ctx.agentIdentity) : {}),
+    ...(!bounded ? buildRuntimeToolsEnv(ctx.runtimeTools) : {}),
+  };
+  if (bounded && (!cfgString(config.provider) || !cfgString(config.model) ||
+      !toolsets || !maxTurns || maxTurns < 2 || !Number.isInteger(maxTurns))) {
+    throw new Error("Bounded Hermes execution requires explicit provider, model, toolsets and maxTurnsPerRun of at least 2");
+  }
+  if (bounded) {
+    if (config.provider === "auto" || config.model === "auto") {
+      throw new Error("Bounded Hermes execution requires a pinned provider and model");
+    }
+    validateBoundedToolsets(toolsets);
+    validateBoundedRuntimeOptions(config);
+    await validateBoundedHermesCommand(hermesCmd);
+    await validateBoundedHermesHome(env.HERMES_HOME);
+  }
+  // Hermes restores saved CWD and /yolo when resuming. A bounded research wake
+  // must start fresh even if an earlier adapter version persisted a session.
+  const persistSession = !bounded && cfgBoolean(config.persistSession) !== false;
   const worktreeMode = cfgBoolean(config.worktreeMode) === true;
   const checkpoints = cfgBoolean(config.checkpoints) === true;
-  const prevSessionId = cfgString(
-    (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
-  );
+  const previousParams = ctx.runtime?.sessionParams as Record<string, unknown> | null;
+  const prevSessionId = bounded ? undefined : cfgString(previousParams?.sessionId);
 
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
   // library calls that did not opt into Paperclip runtime skills.
-  if (Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills")) {
+  if (!bounded && Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills")) {
     try {
       const selectedSkills = await reconcileHermesPaperclipSkills(config);
       if (selectedSkills.length > 0) {
@@ -386,7 +439,9 @@ export async function execute(
 
   if (!explicitProvider) {
     try {
-      detectedConfig = await detectModel();
+      detectedConfig = await detectModel(env.HERMES_HOME
+        ? path.join(env.HERMES_HOME, "config.yaml")
+        : undefined);
     } catch {
       // Non-fatal — detection failure shouldn't block execution
     }
@@ -407,7 +462,7 @@ export async function execute(
   // when present, inject that bundle into the Hermes prompt.
   const instructionsFilePath = cfgString(config.instructionsFilePath);
   let agentInstructions = "";
-  if (instructionsFilePath) {
+  if (!bounded && instructionsFilePath) {
     try {
       agentInstructions = await fs.readFile(instructionsFilePath, "utf-8");
       const loadedInstructionsLength = agentInstructions.length;
@@ -436,10 +491,15 @@ export async function execute(
   }
 
   // ── Build command args ─────────────────────────────────────────────────
-  // Use -Q (quiet) to get clean output: just response + session_id line
-  const useQuiet = cfgBoolean(config.quiet) === true; // default false
+  // Standard mode retains its historical text output. Bounded mode requires
+  // CLI-authored JSONL tool evidence on every business run.
+  const useQuiet = bounded || cfgBoolean(config.quiet) === true; // legacy default false
   const args: string[] = ["chat", "-q", prompt];
   if (useQuiet) args.push("-Q");
+  // Preserve unattended standard-mode behavior while bounded runs use only
+  // web tools with normal Hermes approval handling.
+  if (bounded) args.push("--ignore-user-config", "--ignore-rules", "--format", "stream-json");
+  else args.push("--yolo");
 
   if (model) {
     args.push("-m", model);
@@ -461,65 +521,52 @@ export async function execute(
 
   if (worktreeMode) args.push("-w");
   if (checkpoints) args.push("--checkpoints");
-  if (cfgBoolean(config.verbose) === true) args.push("-v");
+  if (!bounded && cfgBoolean(config.verbose) === true) args.push("-v");
 
   // Tag sessions as "tool" source so they don't clutter the user's session history.
   // Requires hermes-agent >= PR #3255 (feat/session-source-tag).
   args.push("--source", "tool");
 
-  // Bypass Hermes dangerous-command approval prompts.
-  // Paperclip agents run as non-interactive subprocesses with no TTY,
-  // so approval prompts would always timeout and deny legitimate commands
-  // (curl, python3 -c, etc.). Agents operate in a sandbox — the approval
-  // system is designed for human-attended interactive sessions.
-  args.push("--yolo");
-
   if (persistSession && prevSessionId) {
     args.push("--resume", prevSessionId);
   }
 
-  if (extraArgs?.length) {
+  if (extraArgs.length) {
     args.push(...extraArgs);
   }
 
   // ── Build environment ──────────────────────────────────────────────────
-  const userEnv = config.env as Record<string, string> | undefined;
-  const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
-    ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
-    ...buildPaperclipEnv(ctx.agent, ctx.agentIdentity),
-    ...buildRuntimeToolsEnv(ctx.runtimeTools),
-  };
-
-  if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
+  if (!bounded && ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
   // PAPERCLIP_API_KEY is never accepted from config — the harness-minted run
   // token is the only source of Paperclip API identity.
   delete env.PAPERCLIP_API_KEY;
   // Wake context travels in the prompt; drop both inherited and configured copies.
   delete env.PAPERCLIP_WAKE_PAYLOAD_JSON;
-  if ((ctx as any).authToken) env.PAPERCLIP_API_KEY = (ctx as any).authToken;
+  if (!bounded && (ctx as any).authToken) env.PAPERCLIP_API_KEY = (ctx as any).authToken;
 
   // BUG FIX: Read task context from ctx.context (wake context), not ctx.config (adapter config)
   const ctxContext = (ctx as any).context || {};
   const envTaskId = cfgString(ctxContext.taskId) || cfgString(ctxContext.issueId) || cfgString(ctx.config?.taskId);
-  if (envTaskId) env.PAPERCLIP_TASK_ID = envTaskId;
+  if (!bounded && envTaskId) env.PAPERCLIP_TASK_ID = envTaskId;
   const envWakeReason = cfgString(ctxContext.wakeReason) || cfgString(ctx.config?.wakeReason);
-  if (envWakeReason) env.PAPERCLIP_WAKE_REASON = envWakeReason;
+  if (!bounded && envWakeReason) env.PAPERCLIP_WAKE_REASON = envWakeReason;
   const envCommentId = cfgString(ctxContext.commentId) || cfgString(ctxContext.wakeCommentId) || cfgString(ctx.config?.commentId);
-  if (envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
+  if (!bounded && envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
 
   // ── Resolve working directory ──────────────────────────────────────────
   const workspace = ctx.context?.paperclipWorkspace;
   const workspaceCwd = workspace && typeof workspace === "object"
     ? cfgString((workspace as Record<string, unknown>).cwd)
     : undefined;
-  const cwd =
+  const standardCwd =
     cfgString(config.cwd) || workspaceCwd || cfgString(ctx.config?.workspaceDir) || ".";
-  try {
-    await ensureAbsoluteDirectory(cwd);
-  } catch {
-    // Non-fatal
+  if (!bounded) {
+    try {
+      await ensureAbsoluteDirectory(standardCwd);
+    } catch {
+      // Non-fatal for the legacy standard mode.
+    }
   }
 
   // ── Log start ──────────────────────────────────────────────────────────
@@ -558,36 +605,69 @@ export async function execute(
     return ctx.onLog(stream, chunk);
   };
 
-  const result = await runChildProcess(ctx.runId, hermesCmd, args, {
-    cwd,
-    env,
-    timeoutSec,
-    graceSec,
-    onLog: wrappedOnLog,
-    onSpawn: ctx.onSpawn,
-  });
+  // A fresh empty CWD keeps repository/server instruction files out of the
+  // Hermes prompt. Remove it after the child has exited or been reaped.
+  const boundedCwd = bounded ? await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-web-")) : undefined;
+  if (boundedCwd) {
+    env.HOME = boundedCwd;
+    if (process.platform === "win32") env.USERPROFILE = boundedCwd;
+  }
+  let result: Awaited<ReturnType<typeof runChildProcess>>;
+  try {
+    result = await runChildProcess(ctx.runId, hermesCmd, args, {
+      cwd: boundedCwd ?? standardCwd,
+      env,
+      inheritHostEnv,
+      timeoutSec,
+      graceSec,
+      onLog: wrappedOnLog,
+      onSpawn: ctx.onSpawn,
+    });
+  } finally {
+    if (boundedCwd) await fs.rm(boundedCwd, { recursive: true, force: true });
+  }
+  if (bounded) {
+    // Hermes may create home files on its first launch. Do not accept a run
+    // whose post-run extension surface no longer matches the preflight.
+    await validateBoundedHermesHome(env.HERMES_HOME);
+    await validateBoundedHermesCommand(hermesCmd);
+  }
 
   // ── Parse output ───────────────────────────────────────────────────────
-  const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
+  const boundedProof = bounded && result.exitCode === 0 && !result.timedOut
+    ? parseBoundedWebResult(result.stdout || "", { requireText: true })
+    : null;
+  const parsed: ParsedOutput = bounded
+    ? boundedProof ? { sessionId: boundedProof.sessionId, response: boundedProof.text } : {}
+    : parseHermesOutput(result.stdout || "", result.stderr || "");
+  const effectiveExitCode = bounded && result.exitCode === 0 && !boundedProof ? 1 : result.exitCode;
+  const acceptedSessionId = !bounded || (result.exitCode === 0 && !result.timedOut)
+    ? parsed.sessionId
+    : undefined;
 
   await ctx.onLog(
     "stdout",
-    `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`,
+    `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}${bounded ? `, structured web evidence: ${boundedProof ? "verified" : "unverified"}` : ""}\n`,
   );
-  if (parsed.sessionId) {
-    await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
+  if (acceptedSessionId) {
+    await ctx.onLog("stdout", `[hermes] Session: ${acceptedSessionId}\n`);
   }
 
   // ── Build result ───────────────────────────────────────────────────────
   const executionResult: AdapterExecutionResult = {
-    exitCode: result.exitCode,
+    exitCode: effectiveExitCode,
     signal: result.signal,
     timedOut: result.timedOut,
     provider: resolvedProvider,
     model,
+    // The heartbeat consumer treats this as a clear even on a failed run.
+    // sessionParams: {} alone would retain old canonical Hermes sessions.
+    ...(bounded ? { clearSession: true } : {}),
   };
 
-  if (parsed.errorMessage) {
+  if (bounded && result.exitCode === 0 && !boundedProof) {
+    executionResult.errorMessage = "Hermes structured web_search result could not be verified";
+  } else if (parsed.errorMessage) {
     executionResult.errorMessage = parsed.errorMessage;
   } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
     executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
@@ -609,15 +689,18 @@ export async function execute(
   // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
   executionResult.resultJson = {
     result: parsed.response || "",
-    session_id: parsed.sessionId || null,
+    session_id: acceptedSessionId || null,
     usage: parsed.usage || null,
     cost_usd: parsed.costUsd ?? null,
+    ...(bounded ? { web_search_count: boundedProof?.searches ?? 0,
+      source_urls: boundedProof?.sourceUrls ?? [] } : {}),
   };
 
-  // Store session ID for next run
-  if (persistSession && parsed.sessionId) {
-    executionResult.sessionParams = { sessionId: parsed.sessionId };
-    executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
+  // Only standard mode may resume. The bounded clearSession flag above removes
+  // older task-session rows through the canonical heartbeat consumer.
+  if (persistSession && acceptedSessionId) {
+    executionResult.sessionParams = { sessionId: acceptedSessionId };
+    executionResult.sessionDisplayId = acceptedSessionId.slice(0, 16);
   }
 
   return executionResult;

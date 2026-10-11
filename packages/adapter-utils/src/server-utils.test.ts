@@ -589,6 +589,34 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
+  it("spawns with only explicit env when host inheritance is disabled", async () => {
+    const key = "COLO_CHILD_ENV_TEST_HOST_ONLY";
+    const previous = process.env[key];
+    const previousYolo = process.env.HERMES_YOLO_MODE;
+    process.env[key] = "synthetic-host-marker";
+    process.env.HERMES_YOLO_MODE = "1";
+    const script = "process.stdout.write(JSON.stringify({ host: process.env.COLO_CHILD_ENV_TEST_HOST_ONLY ?? null, yolo: process.env.HERMES_YOLO_MODE ?? null, explicit: process.env.COLO_CHILD_ENV_TEST_EXPLICIT ?? null }))";
+    const invoke = (inheritHostEnv?: boolean) => runChildProcess(
+      randomUUID(), process.execPath, ["-e", script], {
+        cwd: process.cwd(), env: { COLO_CHILD_ENV_TEST_EXPLICIT: "yes" },
+        inheritHostEnv, timeoutSec: 5, graceSec: 1, onLog: async () => {},
+      },
+    );
+    try {
+      const legacy = await invoke();
+      const isolated = await invoke(false);
+      expect(legacy.exitCode).toBe(0);
+      expect(isolated.exitCode).toBe(0);
+      expect(JSON.parse(legacy.stdout)).toEqual({ host: "synthetic-host-marker", yolo: "1", explicit: "yes" });
+      expect(JSON.parse(isolated.stdout)).toEqual({ host: null, yolo: null, explicit: "yes" });
+    } finally {
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+      if (previousYolo === undefined) delete process.env.HERMES_YOLO_MODE;
+      else process.env.HERMES_YOLO_MODE = previousYolo;
+    }
+  });
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),

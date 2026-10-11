@@ -21,8 +21,8 @@ function readNonEmptyString(value: unknown): string | null {
 /**
  * Session codec for structured validation and migration of session parameters.
  *
- * Hermes Agent uses a single `sessionId` for cross-heartbeat session continuity
- * via the `--resume` CLI flag. The codec validates and normalizes this field.
+ * Standard Hermes mode uses a single `sessionId` for cross-heartbeat
+ * continuity. Bounded research mode clears its session and never resumes.
  */
 export const sessionCodec: AdapterSessionCodec = {
   deserialize(raw: unknown) {
