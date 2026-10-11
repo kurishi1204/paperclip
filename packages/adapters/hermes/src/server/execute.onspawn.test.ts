@@ -109,6 +109,14 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID = "agent-1";
     process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND = "/usr/bin/hermes";
   });
+  it("keeps adapter start and exit diagnostics outside machine evidence stdout", async () => {
+    const {ctx}=makeCtx();
+    await execute(ctx as never);
+    const diagnostics=ctx.onLog.mock.calls.filter((call: unknown[]) =>
+      String(call[1]).startsWith("[hermes] Starting Hermes Agent") || String(call[1]).startsWith("[hermes] Exit code:"));
+    expect(diagnostics).toHaveLength(2);
+    expect(diagnostics.every((call: unknown[]) => call[0] === "stderr")).toBe(true);
+  });
   afterEach(() => {
     if (previousBoundedHome === undefined) delete process.env.PAPERCLIP_HERMES_BOUNDED_HOME;
     else process.env.PAPERCLIP_HERMES_BOUNDED_HOME = previousBoundedHome;

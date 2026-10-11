@@ -55,3 +55,18 @@ test("rejects unknown, reused, absent, mixed, malformed, and unfinished call IDs
     [identifiedUse(7), identifiedResult(7)], [use, use, success, success],
   ]) expect(parseBoundedWebResult(lines(init, ...events, final))).toBeNull();
 });
+
+const emptySuccess = { ...success, output: JSON.stringify({success:true,data:{web:[]}}) };
+test("accepts successful empty queries only when the completed run has real HTTPS evidence", () => {
+  expect(parseBoundedWebResult(lines(init,identifiedUse("empty"),identifiedUse("found"),
+    {...emptySuccess,tool_call_id:"empty"},identifiedResult("found"),final))?.searches).toBe(2);
+  expect(parseBoundedWebResult(lines(init,use,emptySuccess,use,success,final))?.searches).toBe(2);
+  expect(parseBoundedWebResult(lines(init,use,emptySuccess,final))).toBeNull();
+});
+test("rejects malformed or unsafe source rows even beside a valid HTTPS row", () => {
+  for(const invalid of [null,7,{}, {url:7}, {url:"http://example.org/"},{url:"not a URL"}]) {
+    const mixed={...success,output:JSON.stringify({success:true,data:{web:[{url:"https://example.org/source"},invalid]}})};
+    expect(parseBoundedWebResult(lines(init,use,mixed,final))).toBeNull();
+  }
+  expect(parseBoundedWebResult(lines(init,use,success,final)+"[hermes] diagnostic\n")).toBeNull();
+});

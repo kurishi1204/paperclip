@@ -571,7 +571,7 @@ export async function execute(
 
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
-    "stdout",
+    "stderr",
     `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
   );
   if (prevSessionId) {
@@ -646,7 +646,7 @@ export async function execute(
     : undefined;
 
   await ctx.onLog(
-    "stdout",
+    "stderr",
     `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}${bounded ? `, structured web evidence: ${boundedProof ? "verified" : "unverified"}` : ""}\n`,
   );
   if (acceptedSessionId) {
