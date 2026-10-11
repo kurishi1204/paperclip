@@ -331,6 +331,13 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     for (const key of ["PATH", "TMPDIR", "LANG", "LC_ALL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR"] as const) {
       if (typeof process.env[key] === "string") env[key] = process.env[key]!;
     }
+    // The QA MCP uses a loopback URL with a run-bound bearer token. Keep that
+    // request off an operator proxy even when the provider uses the proxy.
+    const noProxy = [process.env.NO_PROXY, process.env.no_proxy, "127.0.0.1", "localhost", "::1", "[::1]"]
+      .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+      .join(",");
+    env.NO_PROXY = noProxy;
+    env.no_proxy = noProxy;
   }
 
   const runtimeEnv = Object.fromEntries(

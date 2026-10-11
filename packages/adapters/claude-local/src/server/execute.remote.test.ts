@@ -1,6 +1,10 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 
@@ -81,6 +85,8 @@ import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixt
 import { execute, runClaudeLogin } from "./execute.js";
 import { resetClaudeCliCapabilitiesCacheForTests } from "./cli-capabilities.js";
 
+const execFileAsync = promisify(execFile);
+
 describe("claude remote execution", () => {
   const cleanupDirs: string[] = [];
 
@@ -102,6 +108,9 @@ describe("claude remote execution", () => {
     vi.stubEnv("HOME", path.join(rootDir, "operator-home"));
     vi.stubEnv("HOST_ONLY_QA_SECRET", "must-not-reach-child");
     vi.stubEnv("HTTPS_PROXY", "http://operator-proxy.test:8080");
+    vi.stubEnv("ALL_PROXY", "http://operator-all-proxy.test:8080");
+    vi.stubEnv("NO_PROXY", "operator.internal");
+    vi.stubEnv("no_proxy", "another.internal");
     vi.stubEnv("NODE_EXTRA_CA_CERTS", "/operator/ca.pem");
     const managedHome = path.join(rootDir, "managed-home");
     await writeFile(path.join(rootDir, "CLAUDE.md"), "Untrusted project instructions must not be loaded");
@@ -122,7 +131,8 @@ describe("claude remote execution", () => {
           XDG_DATA_HOME: path.join(managedHome, "data"),
           CLAUDE_CONFIG_DIR: path.join(managedHome, "provider"),
           ANTHROPIC_API_KEY: "provider-test-key", PAPERCLIP_AGENT_PRIVATE_KEY: "must-not-reach-child",
-          HTTPS_PROXY: "http://agent-proxy.test:8080", NODE_EXTRA_CA_CERTS: "/agent/ca.pem",
+          HTTPS_PROXY: "http://agent-proxy.test:8080", NO_PROXY: "agent-controlled.invalid",
+          NODE_EXTRA_CA_CERTS: "/agent/ca.pem",
         },
       },
       context: {}, authToken: "run-bound-token",
@@ -149,7 +159,50 @@ describe("claude remote execution", () => {
     expect(options.env.XDG_CONFIG_HOME).toBe(path.join(managedHome, "config"));
     expect(options.env.XDG_DATA_HOME).toBe(path.join(managedHome, "data"));
     expect(options.env.HTTPS_PROXY).toBe("http://operator-proxy.test:8080");
+    expect(options.env.ALL_PROXY).toBe("http://operator-all-proxy.test:8080");
+    expect(options.env.NO_PROXY).toBe("operator.internal,another.internal,127.0.0.1,localhost,::1,[::1]");
+    expect(options.env.no_proxy).toBe(options.env.NO_PROXY);
+    expect(options.env.NO_PROXY).not.toContain("agent-controlled.invalid");
     expect(options.env.NODE_EXTRA_CA_CERTS).toBe("/operator/ca.pem");
+    // Node's environment proxy support is available on the Mini runtime.
+    // Exercise the adapter's actual child env: a provider URL may reach the
+    // operator proxy, while a bearer-bearing loopback QA request must not.
+    if ((await execFileAsync(process.execPath, ["--help"])).stdout.includes("--use-env-proxy")) {
+      const proxyRequests: Array<{ url: string | undefined; authorization: string | undefined }> = [];
+      let qaAuthorization: string | undefined;
+      const qaListener = createServer((req, res) => {
+        qaAuthorization = req.headers.authorization;
+        res.end("qa-ok");
+      });
+      const proxyListener = createServer((req, res) => {
+        proxyRequests.push({ url: req.url, authorization: req.headers.authorization });
+        res.end("provider-ok");
+      });
+      const listen = (server: typeof qaListener) => new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      try {
+        await Promise.all([listen(qaListener), listen(proxyListener)]);
+        const qaUrl = `http://127.0.0.1:${(qaListener.address() as AddressInfo).port}/qa`;
+        const proxyUrl = `http://127.0.0.1:${(proxyListener.address() as AddressInfo).port}`;
+        const providerUrl = "http://provider.invalid/probe";
+        const probe = `
+          const qa = await fetch(${JSON.stringify(qaUrl)}, { headers: { Authorization: "Bearer run-bound-token" } });
+          if (await qa.text() !== "qa-ok") throw new Error("QA request left loopback");
+          const provider = await fetch(${JSON.stringify(providerUrl)});
+          if (await provider.text() !== "provider-ok") throw new Error("Provider request missed proxy");
+        `;
+        await execFileAsync(process.execPath, ["--use-env-proxy", "--input-type=module", "-e", probe], {
+          env: { ...options.env, HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, ALL_PROXY: proxyUrl },
+          timeout: 10_000,
+        });
+        expect(qaAuthorization).toBe("Bearer run-bound-token");
+        expect(proxyRequests).toEqual([{ url: providerUrl, authorization: undefined }]);
+      } finally {
+        await Promise.all([qaListener, proxyListener].map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+      }
+    }
     for (const key of ["PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY", "HOST_ONLY_QA_SECRET"]) expect(options.env[key]).toBeUndefined();
     const mcpConfig = JSON.parse(await readFile(args[args.indexOf("--mcp-config") + 1]!, "utf8"));
     expect(Object.keys(mcpConfig.mcpServers)).toEqual(["paperclip_qa"]);
