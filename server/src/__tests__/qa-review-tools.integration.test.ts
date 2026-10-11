@@ -312,29 +312,33 @@ describe("run-bound QA review MCP", () => {
   });
 
   it("treats a server error after a verdict request as outcome-unknown", async () => {
-    const { stageId, tool, rows } = await reviewFixture();
+    const { fixture, stageId, token, tool, rows } = await reviewFixture();
     const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
-    const realFetch = globalThis.fetch;
-    const intercepted = vi.spyOn(globalThis, "fetch").mockImplementation((url, init) => {
-      if (typeof url === "string" && url.includes("/api/issues/") && init?.method === "PATCH") {
-        return Promise.resolve(new Response(JSON.stringify({ error: "upstream failure" }), {
-          status: 500, headers: { "Content-Type": "application/json" },
-        }));
-      }
-      return realFetch(url, init);
+    const [boundIssue] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    const requests: string[] = [];
+    const failureServer = http.createServer((req, res) => {
+      requests.push(req.method ?? "");
+      res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "upstream failure" }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      failureServer.once("error", reject);
+      failureServer.listen(0, "127.0.0.1", resolve);
     });
     try {
-      const response = await tool("submit_review_decision", {
-        decision: "approve", summary: "Evidence reviewed.", expectedStageId: stageId,
-        expectedStatusVersion: issue.statusVersion, expectedRevision: issue.revision,
-        expectedLastDecisionId: issue.reviewStage.lastDecisionId,
-      });
-      expect(response.body.result.isError).toBe(true);
-      expect(response.body.result.content[0].text).toContain("read_assigned_review_receipt");
-      expect(response.body.result.content[0].text).toContain("do not resubmit");
+      await expect(qaReviewTools.callQaReviewTool({
+        db: server.db, runId: fixture.runId, companyId: fixture.companyId,
+        agentId: fixture.agentId, token, issue: boundIssue!,
+        apiUrl: `http://127.0.0.1:${(failureServer.address() as import("node:net").AddressInfo).port}`,
+        name: "submit_review_decision", arguments: {
+          decision: "approve", summary: "Evidence reviewed.", expectedStageId: stageId,
+          expectedStatusVersion: issue.statusVersion, expectedRevision: issue.revision,
+          expectedLastDecisionId: issue.reviewStage.lastDecisionId,
+        },
+      })).rejects.toBeInstanceOf(qaReviewTools.QaDecisionOutcomeUnknownError);
+      expect(requests).toEqual(["PATCH"]);
       expect(await rows()).toHaveLength(0);
     } finally {
-      intercepted.mockRestore();
+      await new Promise<void>(resolve => failureServer.close(() => resolve()));
     }
   });
 
