@@ -53,10 +53,12 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
+import { parseBoundedWebResult } from "./bounded-output.js";
 import {
   buildHermesChildEnv,
   isBoundedHermesExecution,
   resolveHermesCommandForConfig,
+  validateBoundedHermesCommand,
   validateBoundedHermesHome,
   validateBoundedRuntimeOptions,
   validateBoundedToolsets,
@@ -132,7 +134,7 @@ const HERMES_DEFAULT_PROMPT_TEMPLATE = [
 
 const HERMES_BOUNDED_RESEARCH_PROMPT_TEMPLATE = [
   'You are "{{agent.name}}", a Paperclip research agent.',
-  "Use only the enabled public web tools to investigate the assigned question.",
+  "Use only web_search to investigate the assigned question; do not extract URLs.",
   "Return concise findings with source URLs, uncertainties, and what remains to verify.",
   "Your response is captured in the Paperclip Run; a separate reviewer records QA and issue acceptance.",
   "Do not attempt to call Paperclip APIs or use terminal, file, browser, or MCP tools.",
@@ -371,7 +373,7 @@ export async function execute(
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = resolveHermesCommand(config);
   const model = cfgString(config.model) || DEFAULT_MODEL;
-  const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
+  const timeoutSec = cfgNumber(config.timeoutSec) || (bounded ? 300 : DEFAULT_TIMEOUT_SEC);
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
@@ -392,6 +394,7 @@ export async function execute(
     }
     validateBoundedToolsets(toolsets);
     validateBoundedRuntimeOptions(config);
+    await validateBoundedHermesCommand(hermesCmd);
     await validateBoundedHermesHome(env.HERMES_HOME);
   }
   // Hermes restores saved CWD and /yolo when resuming. A bounded research wake
@@ -488,13 +491,14 @@ export async function execute(
   }
 
   // ── Build command args ─────────────────────────────────────────────────
-  // Use -Q (quiet) to get clean output: just response + session_id line
+  // Standard mode retains its historical text output. Bounded mode requires
+  // CLI-authored JSONL tool evidence on every business run.
   const useQuiet = bounded || cfgBoolean(config.quiet) === true; // legacy default false
   const args: string[] = ["chat", "-q", prompt];
   if (useQuiet) args.push("-Q");
   // Preserve unattended standard-mode behavior while bounded runs use only
   // web tools with normal Hermes approval handling.
-  if (bounded) args.push("--ignore-user-config", "--ignore-rules");
+  if (bounded) args.push("--ignore-user-config", "--ignore-rules", "--format", "stream-json");
   else args.push("--yolo");
 
   if (model) {
@@ -622,16 +626,28 @@ export async function execute(
   } finally {
     if (boundedCwd) await fs.rm(boundedCwd, { recursive: true, force: true });
   }
+  if (bounded) {
+    // Hermes may create home files on its first launch. Do not accept a run
+    // whose post-run extension surface no longer matches the preflight.
+    await validateBoundedHermesHome(env.HERMES_HOME);
+    await validateBoundedHermesCommand(hermesCmd);
+  }
 
   // ── Parse output ───────────────────────────────────────────────────────
-  const parsed = parseHermesOutput(result.stdout || "", result.stderr || "", !bounded);
+  const boundedProof = bounded && result.exitCode === 0 && !result.timedOut
+    ? parseBoundedWebResult(result.stdout || "", { requireText: true })
+    : null;
+  const parsed: ParsedOutput = bounded
+    ? boundedProof ? { sessionId: boundedProof.sessionId, response: boundedProof.text } : {}
+    : parseHermesOutput(result.stdout || "", result.stderr || "");
+  const effectiveExitCode = bounded && result.exitCode === 0 && !boundedProof ? 1 : result.exitCode;
   const acceptedSessionId = !bounded || (result.exitCode === 0 && !result.timedOut)
     ? parsed.sessionId
     : undefined;
 
   await ctx.onLog(
     "stdout",
-    `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`,
+    `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}${bounded ? `, structured web evidence: ${boundedProof ? "verified" : "unverified"}` : ""}\n`,
   );
   if (acceptedSessionId) {
     await ctx.onLog("stdout", `[hermes] Session: ${acceptedSessionId}\n`);
@@ -639,7 +655,7 @@ export async function execute(
 
   // ── Build result ───────────────────────────────────────────────────────
   const executionResult: AdapterExecutionResult = {
-    exitCode: result.exitCode,
+    exitCode: effectiveExitCode,
     signal: result.signal,
     timedOut: result.timedOut,
     provider: resolvedProvider,
@@ -649,7 +665,9 @@ export async function execute(
     ...(bounded ? { clearSession: true } : {}),
   };
 
-  if (parsed.errorMessage) {
+  if (bounded && result.exitCode === 0 && !boundedProof) {
+    executionResult.errorMessage = "Hermes structured web_search result could not be verified";
+  } else if (parsed.errorMessage) {
     executionResult.errorMessage = parsed.errorMessage;
   } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
     executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
@@ -674,6 +692,8 @@ export async function execute(
     session_id: acceptedSessionId || null,
     usage: parsed.usage || null,
     cost_usd: parsed.costUsd ?? null,
+    ...(bounded ? { web_search_count: boundedProof?.searches ?? 0,
+      source_urls: boundedProof?.sourceUrls ?? [] } : {}),
   };
 
   // Only standard mode may resume. The bounded clearSession flag above removes

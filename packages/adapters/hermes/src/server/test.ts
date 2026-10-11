@@ -21,54 +21,15 @@ import { promisify } from "node:util";
 import { HERMES_CLI, DEFAULT_MODEL, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
 import { resolveHermesCommand } from "./execute.js";
-import { buildHermesChildEnv, isBoundedHermesExecution, validateBoundedHermesHome, validateBoundedRuntimeOptions, validateBoundedToolsets, validateHermesExtraArgs } from "./safe-runtime.js";
+import { parseBoundedWebResult } from "./bounded-output.js";
+import { buildHermesChildEnv, isBoundedHermesExecution, validateBoundedHermesCommand, validateBoundedHermesHome, validateBoundedRuntimeOptions, validateBoundedToolsets, validateHermesExtraArgs } from "./safe-runtime.js";
 
 const execFileAsync = promisify(execFile);
 
 // Hermes 0.21.6 emits JSON lines in stream-json mode. A model response alone
 // cannot prove that its web tool was exposed or that the search backend worked.
 export function verifyBoundedWebProbe(stdout: string): boolean {
-  let initSession: string | undefined;
-  let finalSession: string | undefined;
-  let finalExit: number | undefined;
-  let uses = 0;
-  let successes = 0;
-  try {
-    for (const line of stdout.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      const event = JSON.parse(line) as Record<string, unknown>;
-      if (event.type === "system" && event.subtype === "init") {
-        if (initSession || typeof event.session_id !== "string" || !event.session_id) return false;
-        initSession = event.session_id;
-      } else if (event.type === "tool_use") {
-        if (!initSession || uses !== 0 || event.name !== "web_search") return false;
-        uses += 1;
-      } else if (event.type === "tool_result") {
-        if (uses !== 1 || successes !== 0 || event.name !== "web_search" || event.is_error !== false ||
-            typeof event.output !== "string" || event.output.endsWith("...")) return false;
-        const output = JSON.parse(event.output) as Record<string, unknown>;
-        const data = output.data as Record<string, unknown> | undefined;
-        const web = data?.web;
-        if (output.success !== true || !Array.isArray(web) ||
-            !web.some((item: unknown) => {
-              if (!item || typeof item !== "object") return false;
-              const url = (item as Record<string, unknown>).url;
-              if (typeof url !== "string") return false;
-              try { return new URL(url).protocol === "https:"; } catch { return false; }
-            })) return false;
-        successes += 1;
-      } else if (event.type === "result") {
-        if (finalSession || successes !== 1 || typeof event.session_id !== "string" || !event.session_id ||
-            typeof event.exit_code !== "number") return false;
-        finalSession = event.session_id;
-        finalExit = event.exit_code;
-      }
-    }
-  } catch {
-    return false;
-  }
-  return Boolean(initSession && initSession === finalSession && finalExit === 0 &&
-    uses === 1 && successes === 1);
+  return parseBoundedWebResult(stdout, { exactlyOneSearch: true }) !== null;
 }
 
 function boundedProbeFailure(error: unknown): string {
@@ -393,6 +354,7 @@ export async function testEnvironment(
       const toolsets = asString(config.toolsets) ||
         (Array.isArray(config.enabledToolsets) ? config.enabledToolsets.join(",") : undefined);
       validateBoundedToolsets(toolsets);
+      await validateBoundedHermesCommand(command);
       await validateBoundedHermesHome(childEnv.HERMES_HOME);
     }
   } catch (error) {
@@ -441,6 +403,10 @@ export async function testEnvironment(
         });
         if (bounded) {
           if (!verifyBoundedWebProbe(stdout)) throw new Error("structured_web_result_unverified");
+          // A first launch may create skills/SOUL after the preflight. It is
+          // never a passing probe until the resulting home remains valid.
+          await validateBoundedHermesHome(childEnv.HERMES_HOME);
+          await validateBoundedHermesCommand(command);
           checks.push({ level: "info", code: "hermes_web_probe_passed", message: "Hermes completed a web_search with a successful structured result and HTTPS source." });
         } else {
           if (!/\bhello\b/i.test(stdout)) throw new Error("No hello response");

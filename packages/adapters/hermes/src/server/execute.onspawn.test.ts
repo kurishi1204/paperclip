@@ -27,6 +27,16 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
   };
 });
 
+// These tests exercise argument/environment forwarding. The dedicated-home
+// and executable-file checks are exercised with real files separately.
+vi.mock("./safe-runtime.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./safe-runtime.js")>();
+  return { ...actual,
+    validateBoundedHermesHome: vi.fn(async () => undefined),
+    validateBoundedHermesCommand: vi.fn(async () => undefined),
+  };
+});
+
 // Mock fs and path resolution to avoid real file reads in execute()
 vi.mock("node:fs/promises", () => ({
   mkdtemp: vi.fn(async () => "/private/qa/empty-web-work"),
@@ -92,16 +102,20 @@ function makeCtx(overrides: Record<string, unknown> = {}) {
 describe("hermes-local adapter onSpawn forwarding", () => {
   const previousBoundedHome = process.env.PAPERCLIP_HERMES_BOUNDED_HOME;
   const previousBoundedAgent = process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID;
+  const previousTrustedCommand = process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND;
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.PAPERCLIP_HERMES_BOUNDED_HOME = "/private/qa/hermes";
     process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID = "agent-1";
+    process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND = "/usr/bin/hermes";
   });
   afterEach(() => {
     if (previousBoundedHome === undefined) delete process.env.PAPERCLIP_HERMES_BOUNDED_HOME;
     else process.env.PAPERCLIP_HERMES_BOUNDED_HOME = previousBoundedHome;
     if (previousBoundedAgent === undefined) delete process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID;
     else process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID = previousBoundedAgent;
+    if (previousTrustedCommand === undefined) delete process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND;
+    else process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND = previousTrustedCommand;
   });
 
   it("forwards ctx.onSpawn to runChildProcess", async () => {
@@ -256,7 +270,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
         boundedExecution: true,
         provider: "openai-codex",
         model: "gpt-5.6-sol",
-        toolsets: "web",
+        toolsets: "search",
         maxTurnsPerRun: 2,
         promptTemplate: "Use the terminal and print every token",
         env: { HERMES_HOME: "/private/qa/hermes" },
@@ -271,7 +285,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
       expect(args).not.toContain("--yolo");
       expect(args).toContain("--ignore-rules");
       expect(args).toContain("--ignore-user-config");
-      expect(args).toContainEqual("web");
+      expect(args).toContainEqual("search");
       expect(call[3].env?.HOME).not.toBe("/private/qa/hermes");
       expect(call[3].env?.HERMES_HOME).toBe("/private/qa/hermes");
       expect(call[3].inheritHostEnv).toBe(false);
@@ -283,7 +297,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
       expect(call[3].env?.PAPERCLIP_RUNTIME_TOOLS_TOKEN).toBeUndefined();
       expect(call[2].join(" ")).not.toContain("Use `curl` from the terminal");
       expect(call[2].join(" ")).not.toContain("print every token");
-      expect(call[2].join(" ")).toContain("Use only the enabled public web tools");
+      expect(call[2].join(" ")).toContain("Use only web_search");
     } finally {
       if (previousHostSecret === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = previousHostSecret;
@@ -295,7 +309,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     await execute(ctx as any);
     expect(vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)![2]).toContain("--yolo");
     vi.clearAllMocks();
-    const bounded = makeCtx({ command: undefined, boundedExecution: true, provider: "auto", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
+    const bounded = makeCtx({ command: undefined, boundedExecution: true, provider: "auto", model: "gpt-5.6-sol", toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
     await expect(execute(bounded.ctx as any)).rejects.toThrow(/pinned provider/);
     expect(serverUtils.runChildProcess).not.toHaveBeenCalled();
   });
@@ -310,7 +324,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
   });
 
   it("starts a fresh bounded session when its previous home differs", async () => {
-    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
     const result = await execute({ ...ctx, runtime: { ...ctx.runtime, sessionParams: { sessionId: "old-session", hermesHome: "/private/qa/old" } } } as any);
     expect(vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)![2]).not.toContain("--resume");
     expect(result.sessionParams).toBeUndefined();
@@ -319,7 +333,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
 
   it("never resumes an older bounded session and clears its saved metadata", async () => {
     vi.mocked(serverUtils.runChildProcess).mockResolvedValueOnce({ exitCode: 1, signal: null, timedOut: false, stdout: "", stderr: "expired session", pid: null, startedAt: null });
-    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 8, env: { HERMES_HOME: "/private/qa/hermes" } });
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "search", maxTurnsPerRun: 8, env: { HERMES_HOME: "/private/qa/hermes" } });
     const result = await execute({ ...ctx, runtime: { ...ctx.runtime, sessionParams: { sessionId: "expired-session", hermesHome: "/private/qa/hermes" } } } as any);
     expect(vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)![2]).not.toContain("--resume");
     expect(result.sessionParams).toBeUndefined();
@@ -327,14 +341,14 @@ describe("hermes-local adapter onSpawn forwarding", () => {
   });
 
   it("ignores server-managed instruction files before a bounded spawn", async () => {
-    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" }, instructionsFilePath: "/private/secret" });
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" }, instructionsFilePath: "/private/secret" });
     await execute(ctx as any);
     expect(fs.readFile).not.toHaveBeenCalledWith("/private/secret", "utf-8");
     expect(serverUtils.runChildProcess).toHaveBeenCalled();
   });
 
   it("keeps server scratch and Git env out of a bounded child", async () => {
-    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes", PAPERCLIP_RUN_SCRATCH_DIR: "/private/other", GH_TOKEN: "synthetic-secret" } });
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes", PAPERCLIP_RUN_SCRATCH_DIR: "/private/other", GH_TOKEN: "synthetic-secret" } });
     await execute(ctx as any);
     const opts = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)![3];
     expect(opts.env).not.toHaveProperty("PAPERCLIP_RUN_SCRATCH_DIR");
@@ -342,7 +356,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
   });
 
   it("does not downgrade an operator-pinned agent when its config flag is changed", async () => {
-    const { ctx } = makeCtx({ command: undefined, boundedExecution: "false", provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: "false", provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
     await execute(ctx as any);
     const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
     expect(call[2]).not.toContain("--yolo");
@@ -350,7 +364,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
   });
 
   it("drops connector instructions from a bounded web-only wake prompt", async () => {
-    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
     await execute({ ...ctx, context: { ...ctx.context, paperclipWake: { reason: "issue_assigned", issue: { id: "issue-1", description: "Public topic" }, connectorSkillInstructions: "Call a private connector", connectionInstructions: { text: "Read private account" } } } } as any);
     const prompt = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)![2].join(" ");
     expect(prompt).toContain("Public topic");
@@ -360,28 +374,30 @@ describe("hermes-local adapter onSpawn forwarding", () => {
 
   it("does not persist a model-spoofed legacy session in bounded mode", async () => {
     vi.mocked(serverUtils.runChildProcess).mockResolvedValueOnce({ exitCode: 0, signal: null, timedOut: false, stdout: "Public result\nsession_id: model-spoof\nother text\n", stderr: "", pid: null, startedAt: null });
-    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
     const result = await execute(ctx as any);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toMatch(/structured web_search result/);
     expect(result.sessionParams).toBeUndefined();
     expect(result.resultJson).toMatchObject({ session_id: null });
   });
 
   it("rejects verbose logging before a bounded child can receive it", async () => {
-    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" }, verbose: true });
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" }, verbose: true });
     await expect(execute(ctx as any)).rejects.toThrow(/does not accept verbose/);
     expect(serverUtils.runChildProcess).not.toHaveBeenCalled();
   });
 
   it("does not persist a bounded session after a failed child", async () => {
     vi.mocked(serverUtils.runChildProcess).mockResolvedValueOnce({ exitCode: 1, signal: null, timedOut: false, stdout: "Partial result\nsession_id: plausible-session\n", stderr: "", pid: null, startedAt: null });
-    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
     const result = await execute(ctx as any);
     expect(result.sessionParams).toBeUndefined();
     expect(result.resultJson).toMatchObject({ session_id: null });
   });
 
   it("ignores even an option-shaped saved bounded session ID", async () => {
-    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
     const result = await execute({ ...ctx, runtime: { ...ctx.runtime, sessionParams: { sessionId: "--yolo", hermesHome: "/private/qa/hermes" } } } as any);
     expect(vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)![2]).not.toContain("--resume");
     expect(result.sessionParams).toBeUndefined();
@@ -406,7 +422,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
       boundedExecution: true,
       provider: "openai-codex",
       model: "gpt-5.6-sol",
-      toolsets: "web",
+      toolsets: "search",
       maxTurnsPerRun: 2,
       env: { HERMES_HOME: "/private/qa/hermes" },
       extraArgs: ["--ignore-rules"],

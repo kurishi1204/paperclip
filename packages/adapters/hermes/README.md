@@ -270,8 +270,9 @@ to standard mode. Without the pin, a requested bounded run fails closed.
 Use one dedicated home per bounded agent and a separate service process when
 multiple agents require different homes. The home must be separate from the
 host home, and `.env` and
-`auth.json`, when present, must be private regular files. The only supported
-toolset is `web`; all `extraArgs` and agent-configured command overrides are
+`auth.json`, when present, must be private, single-link regular files with
+bounded sizes. The only supported
+toolset is `search` (`web_search` only); all `extraArgs` and agent-configured command overrides are
 rejected. Custom `promptTemplate` is ignored in bounded mode so a configured
 terminal instruction cannot override the web-only task contract. The adapter passes `--ignore-user-config` and
 `--ignore-rules`; the latter suppresses home instructions and memories without
@@ -288,9 +289,10 @@ every relative path, entry type, owner, group, mode, file size, and file
 SHA-256. An added, edited, linked, or missing entry stops the next bounded
 launch. The skills directory itself remains private; bundled child directories
 may be readable but not writable by other users. Recompute and review this
-pin after a Hermes update. The observed v0.21.6 web-only CLI exposed only
-`web_search` and `web_extract`, and its skill instructions were absent from
-the saved model prompt. This does not authorize a broader toolset.
+pin after a Hermes update. Hermes v0.21.6 defines `search` as only
+`web_search`; the broader `web` toolset also includes `web_extract` and is
+rejected for bounded runs. Its skill instructions were absent from the saved
+model prompt. This does not authorize a broader toolset.
 Any skills prompt snapshot must contain the exact empty structure. The
 auto-generated `SOUL.md` also requires its exact file SHA-256 in the service
 environment as `PAPERCLIP_HERMES_SOUL_SHA256`; the observed v0.21.6
@@ -298,19 +300,26 @@ environment as `PAPERCLIP_HERMES_SOUL_SHA256`; the observed v0.21.6
 `active_profile` may only be absent or
 `default`, and any `config.yaml` requires a matching operator-owned SHA-256 in
 `PAPERCLIP_HERMES_CONFIG_SHA256`. A present `mcp.json` blocks startup. These
-checks run before every bounded execution and environment probe. A home without
-the skills and SOUL pins may pass an empty-home check, but Hermes v0.21.6 will
-populate it on first use; treat that as bootstrap incomplete and seed the
-bundled files and pins before enabling Paperclip. Its `.env` accepts only provider and
+checks run before and after every bounded execution and environment probe. A
+first launch that generates unpinned skills or SOUL is rejected even when its
+search succeeded. Seed the bundled files and pins before enabling Paperclip.
+Its `.env` accepts only provider and
 search connection keys. Server-added scratch and Git environment fields are
 ignored. Bounded mode requires an explicit provider other than
-`auto`, an explicit model, and `maxTurnsPerRun` of at least 2. The environment
+`auto`, an explicit model, 2–8 turns, a timeout of at most 900 seconds, and a
+grace period of at most 10 seconds. The bounded timeout defaults to 300 seconds.
+The environment
 test uses a fixed public query, requires a successful structured `web_search`
 result with an HTTPS URL, and checks the CLI's final exit status. A plain model
-response is not enough. The operator may
-pin an absolute Hermes executable with the Paperclip server environment
-variable `PAPERCLIP_HERMES_TRUSTED_COMMAND`; this value is not taken from agent
-config or forwarded to Hermes.
+response is not enough. Every bounded business run also parses the CLI's
+structured events and requires a successful `web_search` and final exit 0
+before returning success to Paperclip. Its observed HTTPS source URLs are
+stored in the Run result for independent QA. The operator must pin an absolute
+Hermes executable with `PAPERCLIP_HERMES_TRUSTED_COMMAND` and its exact bytes
+with `PAPERCLIP_HERMES_TRUSTED_COMMAND_SHA256`. Neither value is taken from
+agent config or forwarded to Hermes. Keep the executable and its Python
+installation in a versioned root-owned tree on Mini; the executable digest
+alone does not seal imported Python libraries.
 
 On Mini Hermes v0.14.0, fresh `hermes auth add openai-codex --type oauth
 --no-browser` stores a dedicated OAuth credential pool in `auth.json`, but the
@@ -328,11 +337,16 @@ credential ID before running a fresh `auth add`; do not import the shared
 `~/.codex/auth.json` into this home.
 
 For sustained web research, configure an official Hermes search backend in
-that dedicated `.env`, such as `TAVILY_API_KEY`. Enabling the `web` toolset
+that dedicated `.env`, such as `TAVILY_API_KEY`. Enabling the `search` toolset
 alone does not provide search. Store the key outside agent instructions and
 never put it in an issue or a run prompt. Bounded mode currently returns
 research output to Paperclip; issue updates and independent QA require a
 separate control-plane path. See the [Hermes web-search guide](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/web-search.md).
+Hermes 0.21.6 exposes `web_extract` in the broader `web` toolset. Bounded
+mode selects only `search`, and the structured-result parser rejects any
+unexpected tool call. As a second guard, bounded children inherit no HTTP(S),
+ALL, or NO proxy variables and reject `allow_private_urls` and
+`fake_ip_ranges` in the pinned `config.yaml`.
 It does not give Hermes the Paperclip run API token or runtime connector token.
 The adapter ignores managed instruction files, connector guidance and agent
 working directories, creates a fresh empty directory for each run, and refuses

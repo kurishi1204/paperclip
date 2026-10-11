@@ -92,7 +92,7 @@ export function resolveHermesCommandForConfig(
     throw new Error("Bounded Hermes execution does not accept a command override");
   }
   const trusted = hostEnv.PAPERCLIP_HERMES_TRUSTED_COMMAND;
-  if (!trusted) return HERMES_CLI;
+  if (!trusted) throw new Error("Bounded Hermes execution requires an operator-pinned command");
   const paths = platformPath(platform);
   if (!paths.isAbsolute(trusted) || paths.normalize(trusted) !== trusted) {
     throw new Error("PAPERCLIP_HERMES_TRUSTED_COMMAND must be an absolute normalized path");
@@ -119,6 +119,9 @@ export function buildHermesChildEnv(
     ? [...HOST_ENV_KEYS, ...WINDOWS_HOST_ENV_KEYS]
     : HOST_ENV_KEYS;
   for (const key of hostKeys) {
+    // Hermes may delegate unresolved DNS names to a proxy. Its private-URL
+    // guard is only a useful boundary when the bounded child resolves itself.
+    if (bounded && /^(?:http|https|all|no)_proxy$/i.test(key)) continue;
     const value = hostValue(hostEnv, key, platform);
     if (typeof value === "string") env[key] = value;
   }
@@ -175,10 +178,10 @@ export function buildHermesChildEnv(
 }
 
 export function validateBoundedToolsets(raw: string | undefined): void {
-  // Until a sandboxed control-plane tool exists, bounded runs are research
-  // only. Terminal/file/browser/MCP toolsets can modify the credential home.
-  if (raw !== "web") {
-    throw new Error("Bounded Hermes execution currently supports only the web toolset");
+  // Hermes 0.21.6 defines `search` as web_search only. Its broader `web`
+  // toolset also exposes web_extract and must not be available here.
+  if (raw !== "search") {
+    throw new Error("Bounded Hermes execution currently supports only the search toolset");
   }
 }
 
@@ -191,6 +194,14 @@ export function validateBoundedRuntimeOptions(config: Record<string, unknown>): 
     if (config[key] !== undefined && config[key] !== null && config[key] !== false && config[key] !== "") {
       throw new Error("Bounded Hermes execution does not accept " + key);
     }
+  }
+  const turns = config.maxTurnsPerRun;
+  const timeout = config.timeoutSec ?? 300;
+  const grace = config.graceSec ?? 10;
+  if (!Number.isInteger(turns) || (turns as number) < 2 || (turns as number) > 8 ||
+      !Number.isInteger(timeout) || (timeout as number) < 1 || (timeout as number) > 900 ||
+      !Number.isInteger(grace) || (grace as number) < 1 || (grace as number) > 10) {
+    throw new Error("Bounded Hermes requires 2-8 turns, 1-900 timeout seconds, and 1-10 grace seconds");
   }
 }
 
@@ -238,6 +249,20 @@ async function readSealedFile(file: string, before: import("node:fs").Stats, max
   }
 }
 
+export async function validateBoundedHermesCommand(command: string): Promise<void> {
+  const expected = pinnedSha256("PAPERCLIP_HERMES_TRUSTED_COMMAND_SHA256");
+  if (!expected) throw new Error("Bounded Hermes requires an operator-pinned command SHA-256");
+  const file = await fs.lstat(command);
+  if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1 || file.size > 4_000_000 ||
+      (file.mode & 0o111) === 0 || (file.mode & 0o022) !== 0 ||
+      await fs.realpath(command) !== command) {
+    throw new Error("Bounded Hermes trusted command is not a sealed executable file");
+  }
+  if (createHash("sha256").update(await readSealedFile(command, file, 4_000_000)).digest("hex") !== expected) {
+    throw new Error("Bounded Hermes trusted command does not match the operator pin");
+  }
+}
+
 // Hermes 0.21.6 copies its bundled skills into HERMES_HOME on first startup.
 // The web-only CLI does not expose skill tools, but a later launch must still
 // reject additions or edits in this same-UID extension surface.
@@ -259,7 +284,19 @@ export async function hashBoundedHermesSkillsTree(skillsHome: string): Promise<s
     if (before.isDirectory()) {
       hash.update(JSON.stringify({ path: relative, type: "directory", uid: before.uid,
         gid: before.gid, mode: before.mode & 0o7777 }) + "\n");
-      const children = await fs.readdir(full);
+      const children: string[] = [];
+      const dir = await fs.opendir(full);
+      try {
+        let child;
+        while ((child = await dir.read()) !== null) {
+          children.push(child.name);
+          if (entriesSeen + children.length > 5000) {
+            throw new Error("Bounded Hermes skills tree exceeds entry limit");
+          }
+        }
+      } finally {
+        await dir.close();
+      }
       children.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
       for (const name of children) {
         await visit(path.join(full, name), relative ? relative + "/" + name : name);
@@ -281,6 +318,8 @@ export async function hashBoundedHermesSkillsTree(skillsHome: string): Promise<s
 }
 
 export async function validateBoundedHermesHome(home: string): Promise<void> {
+  const expectedSkills = pinnedSha256("PAPERCLIP_HERMES_SKILLS_TREE_SHA256");
+  const expectedSoul = pinnedSha256("PAPERCLIP_HERMES_SOUL_SHA256");
   const stat = await fs.lstat(home);
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Bounded HERMES_HOME must be a real directory");
   if (await fs.realpath(home) !== home) throw new Error("Bounded HERMES_HOME cannot traverse symlinks");
@@ -299,14 +338,14 @@ export async function validateBoundedHermesHome(home: string): Promise<void> {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
       throw error;
     }
-    if (!fileStat.isFile() || fileStat.isSymbolicLink()) throw new Error("Bounded Hermes " + file + " must be a regular file");
+    if (!fileStat.isFile() || fileStat.isSymbolicLink() || fileStat.nlink !== 1) throw new Error("Bounded Hermes " + file + " must be a regular unlinked file");
     if (process.platform !== "win32" &&
         ((typeof process.getuid === "function" && fileStat.uid !== process.getuid()) ||
          (fileStat.mode & 0o077) !== 0)) {
       throw new Error("Bounded Hermes " + file + " must be private to the runtime user");
     }
+    const content = (await readSealedFile(target, fileStat, file === ".env" ? 65536 : 1_000_000)).toString("utf8");
     if (file !== ".env") continue;
-    const content = (await readSealedFile(target, fileStat, 65536)).toString("utf8");
     for (const line of content.split(/\r?\n/)) {
       if (!line.trim() || /^\s*#/.test(line)) continue;
       const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/.exec(line);
@@ -325,7 +364,7 @@ export async function validateBoundedHermesHome(home: string): Promise<void> {
       entry = await fs.lstat(target);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        if (directory === "skills" && pinnedSha256("PAPERCLIP_HERMES_SKILLS_TREE_SHA256")) {
+        if (directory === "skills" && expectedSkills) {
           throw new Error("Bounded Hermes pinned skills tree is missing");
         }
         continue;
@@ -340,16 +379,25 @@ export async function validateBoundedHermesHome(home: string): Promise<void> {
          (entry.mode & 0o077) !== 0)) {
       throw new Error("Bounded Hermes " + directory + " must be private to the runtime user");
     }
-    const entries = await fs.readdir(target);
-    if (directory === "skills" && entries.length > 0) {
-      const expected = pinnedSha256("PAPERCLIP_HERMES_SKILLS_TREE_SHA256");
-      if (!expected || await hashBoundedHermesSkillsTree(target) !== expected) {
+    if (directory === "skills") {
+      const dir = await fs.opendir(target);
+      try {
+        const first = await dir.read();
+        if (!first && expectedSkills) throw new Error("Bounded Hermes pinned skills tree is empty");
+        if (first && !expectedSkills) throw new Error("Bounded Hermes skills tree does not match the operator pin");
+      } finally {
+        await dir.close();
+      }
+      if (expectedSkills && await hashBoundedHermesSkillsTree(target) !== expectedSkills) {
         throw new Error("Bounded Hermes skills tree does not match the operator pin");
       }
-    } else if (entries.length !== 0) {
-      throw new Error("Bounded Hermes " + directory + " must be empty");
-    } else if (directory === "skills" && pinnedSha256("PAPERCLIP_HERMES_SKILLS_TREE_SHA256")) {
-      throw new Error("Bounded Hermes pinned skills tree is missing");
+    } else {
+      const dir = await fs.opendir(target);
+      try {
+        if (await dir.read()) throw new Error("Bounded Hermes " + directory + " must be empty");
+      } finally {
+        await dir.close();
+      }
     }
   }
 
@@ -357,7 +405,6 @@ export async function validateBoundedHermesHome(home: string): Promise<void> {
   // default file generated by Hermes anyway so later CLI behavior cannot
   // silently start consuming an altered identity.
   const soul = path.join(home, "SOUL.md");
-  const expectedSoul = pinnedSha256("PAPERCLIP_HERMES_SOUL_SHA256");
   let soulStat;
   try {
     soulStat = await fs.lstat(soul);
@@ -449,8 +496,15 @@ export async function validateBoundedHermesHome(home: string): Promise<void> {
           (configStat.mode & 0o077) !== 0))) {
       throw new Error("Bounded Hermes config.yaml must be a private regular file");
     }
+    const configBytes = await readSealedFile(config, configStat, 1_000_000);
+    // This Hermes version also accepts a config escape hatch for private
+    // URL extraction. Reject the key entirely, including YAML aliases whose
+    // target defines it, even when the file has an operator SHA pin.
+    if (/allow_private_urls|fake_ip_ranges/i.test(configBytes.toString("utf8"))) {
+      throw new Error("Bounded Hermes config.yaml cannot override URL safety");
+    }
     if (!expectedHash || !/^[a-f0-9]{64}$/.test(expectedHash) ||
-        createHash("sha256").update(await readSealedFile(config, configStat, 1_000_000)).digest("hex") !== expectedHash) {
+        createHash("sha256").update(configBytes).digest("hex") !== expectedHash) {
       throw new Error("Bounded Hermes config.yaml does not match the operator pin");
     }
   } else if (expectedHash) {

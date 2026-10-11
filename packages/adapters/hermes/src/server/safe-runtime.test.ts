@@ -8,6 +8,7 @@ import {
   hashBoundedHermesSkillsTree,
   isBoundedHermesExecution,
   resolveHermesCommandForConfig,
+  validateBoundedHermesCommand,
   validateBoundedHermesHome,
   validateBoundedRuntimeOptions,
   validateBoundedToolsets,
@@ -20,6 +21,7 @@ describe("Hermes child boundary", () => {
     PATH: "/usr/bin:/bin",
     LANG: "en_US.UTF-8",
     ANTHROPIC_API_KEY: "unrelated-host-secret",
+    HTTPS_PROXY: "http://127.0.0.1:8123",
     PAPERCLIP_API_KEY: "unrelated-paperclip-secret",
     HERMES_YOLO_MODE: "1",
     PAPERCLIP_HERMES_BOUNDED_HOME: "/private/qa/hermes",
@@ -28,6 +30,7 @@ describe("Hermes child boundary", () => {
   it("preserves the legacy standard host environment except Paperclip identity", () => {
     const env = buildHermesChildEnv(undefined, false, host);
     expect(env.ANTHROPIC_API_KEY).toBe("unrelated-host-secret");
+    expect(env.HTTPS_PROXY).toBe("http://127.0.0.1:8123");
     expect(env.HERMES_YOLO_MODE).toBe("1");
     expect(env.PAPERCLIP_API_KEY).toBeUndefined();
   });
@@ -39,6 +42,7 @@ describe("Hermes child boundary", () => {
     expect(env.OPENAI_API_KEY).toBe("selected-key");
     expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
     expect(env).not.toHaveProperty("HERMES_YOLO_MODE");
+    expect(env).not.toHaveProperty("HTTPS_PROXY");
   });
 
   it("rejects a global home and unknown control variables in bounded mode", () => {
@@ -63,22 +67,45 @@ describe("Hermes child boundary", () => {
 
   it("pins bounded commands to the operator, not the agent config", () => {
     expect(() => resolveHermesCommandForConfig({ boundedExecution: true, command: "/tmp/fake" }, {})).toThrow(/command override/);
+    expect(() => resolveHermesCommandForConfig({ boundedExecution: true }, {})).toThrow(/operator-pinned command/);
     expect(resolveHermesCommandForConfig({ boundedExecution: true }, { PAPERCLIP_HERMES_TRUSTED_COMMAND: "/opt/homebrew/bin/hermes" })).toBe("/opt/homebrew/bin/hermes");
     expect(() => resolveHermesCommandForConfig({ boundedExecution: true }, { PAPERCLIP_HERMES_TRUSTED_COMMAND: "relative/hermes" })).toThrow(/absolute normalized/);
   });
 
+  it("rejects a changed executable after its operator SHA-256 was pinned", async () => {
+    const stage = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "hermes-command-pin-")));
+    const command = path.join(stage, "hermes");
+    const prior = process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND_SHA256;
+    try {
+      await fs.writeFile(command, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND_SHA256 = createHash("sha256").update(await fs.readFile(command)).digest("hex");
+      await expect(validateBoundedHermesCommand(command)).resolves.toBeUndefined();
+      await fs.writeFile(command, "#!/bin/sh\nexit 1\n");
+      await expect(validateBoundedHermesCommand(command)).rejects.toThrow(/operator pin/);
+    } finally {
+      if (prior === undefined) delete process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND_SHA256;
+      else process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND_SHA256 = prior;
+      await fs.rm(stage, { recursive: true, force: true });
+    }
+  });
+
   it("keeps bounded toolsets research-only", () => {
-    expect(() => validateBoundedToolsets("web")).not.toThrow();
-    expect(() => validateBoundedToolsets("terminal,file,web")).toThrow(/only the web toolset/);
+    expect(() => validateBoundedToolsets("search")).not.toThrow();
+    expect(() => validateBoundedToolsets("web")).toThrow(/only the search toolset/);
+    expect(() => validateBoundedToolsets("terminal,file,search")).toThrow(/only the search toolset/);
   });
 
   it("tolerates server-managed instructions but rejects workspace options for bounded research", () => {
-    expect(() => validateBoundedRuntimeOptions({ instructionsFilePath: "/private/managed" })).not.toThrow();
+    const bounded = { maxTurnsPerRun: 2 };
+    expect(() => validateBoundedRuntimeOptions({ ...bounded, instructionsFilePath: "/private/managed" })).not.toThrow();
     for (const option of ["cwd", "worktreeMode", "checkpoints"]) {
       const value = option === "cwd" ? "/private/other" : true;
-      expect(() => validateBoundedRuntimeOptions({ [option]: value })).toThrow(/does not accept/);
+      expect(() => validateBoundedRuntimeOptions({ ...bounded, [option]: value })).toThrow(/does not accept/);
     }
-    expect(() => validateBoundedRuntimeOptions({ boundedExecution: true, quiet: true })).not.toThrow();
+    expect(() => validateBoundedRuntimeOptions({ ...bounded, boundedExecution: true, quiet: true })).not.toThrow();
+    expect(() => validateBoundedRuntimeOptions({ maxTurnsPerRun: 9 })).toThrow(/2-8 turns/);
+    expect(() => validateBoundedRuntimeOptions({ ...bounded, timeoutSec: 901 })).toThrow(/timeout seconds/);
+    expect(() => validateBoundedRuntimeOptions({ ...bounded, graceSec: 11 })).toThrow(/grace seconds/);
   });
 
   it("passes Windows process settings but blocks case-variant approval flags", () => {
@@ -160,6 +187,15 @@ describe("Hermes child boundary", () => {
 
       await fs.appendFile(path.join(home, "config.yaml"), "plugins:\n  enabled: true\n");
       await expect(validateBoundedHermesHome(home)).rejects.toThrow(/operator pin/);
+      const privateConfig = config + "security:\n  allow_private_urls: true\n";
+      await fs.writeFile(path.join(home, "config.yaml"), privateConfig);
+      process.env.PAPERCLIP_HERMES_CONFIG_SHA256 = createHash("sha256").update(privateConfig).digest("hex");
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/cannot override URL safety/);
+      const fakeRangeConfig = config + "security:\n  fake_ip_ranges: [10.0.0.0/8]\n";
+      await fs.writeFile(path.join(home, "config.yaml"), fakeRangeConfig);
+      process.env.PAPERCLIP_HERMES_CONFIG_SHA256 = createHash("sha256").update(fakeRangeConfig).digest("hex");
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/cannot override URL safety/);
+      process.env.PAPERCLIP_HERMES_CONFIG_SHA256 = createHash("sha256").update(config).digest("hex");
       await fs.writeFile(path.join(home, "config.yaml"), config);
 
       await fs.writeFile(path.join(home, "mcp.json"), "{}");

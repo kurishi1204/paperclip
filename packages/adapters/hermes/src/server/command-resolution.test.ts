@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { expect, test } from "vitest";
 
 import { HERMES_CLI } from "../shared/constants.js";
@@ -106,7 +107,7 @@ test("bounded environment check fails before a probe when home or arguments are 
       boundedExecution: true,
       provider: "openai-codex",
       model: "gpt-5.6-sol",
-      toolsets: "web",
+      toolsets: "search",
       maxTurnsPerRun: 2,
       env: { HERMES_HOME: "/private/qa/hermes" },
     },
@@ -124,7 +125,7 @@ test("bounded environment check exercises a real web search with an empty HOME",
   const stage = await realpath(await mkdtemp(path.join(os.tmpdir(), "hermes-bounded-probe-")));
   const home = path.join(stage, "home");
   const cli = path.join(stage, "fake-hermes");
-  const keys = ["PAPERCLIP_HERMES_BOUNDED_AGENT_ID", "PAPERCLIP_HERMES_BOUNDED_HOME", "PAPERCLIP_HERMES_TRUSTED_COMMAND"] as const;
+  const keys = ["PAPERCLIP_HERMES_BOUNDED_AGENT_ID", "PAPERCLIP_HERMES_BOUNDED_HOME", "PAPERCLIP_HERMES_TRUSTED_COMMAND", "PAPERCLIP_HERMES_TRUSTED_COMMAND_SHA256"] as const;
   const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   try {
     await mkdir(home, { mode: 0o700 });
@@ -133,9 +134,10 @@ test("bounded environment check exercises a real web search with an empty HOME",
     process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID = "bounded-probe-agent";
     process.env.PAPERCLIP_HERMES_BOUNDED_HOME = home;
     process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND = cli;
+    process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND_SHA256 = createHash("sha256").update(await readFile(cli)).digest("hex");
     const result = await testEnvironment({
       companyId: "test", adapterType: "hermes_local", agentId: "bounded-probe-agent",
-      config: { boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 2, env: { HERMES_HOME: home } },
+      config: { boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: home } },
     });
     expect(result.status).toBe("pass");
     expect(result.checks.some((check) => check.code === "hermes_web_probe_passed")).toBe(true);
@@ -152,20 +154,50 @@ test("bounded environment probe passes enabledToolsets to the real CLI", async (
   const stage = await realpath(await mkdtemp(path.join(os.tmpdir(), "hermes-bounded-toolsets-")));
   const home = path.join(stage, "home");
   const cli = path.join(stage, "fake-hermes");
-  const keys = ["PAPERCLIP_HERMES_BOUNDED_AGENT_ID", "PAPERCLIP_HERMES_BOUNDED_HOME", "PAPERCLIP_HERMES_TRUSTED_COMMAND"] as const;
+  const keys = ["PAPERCLIP_HERMES_BOUNDED_AGENT_ID", "PAPERCLIP_HERMES_BOUNDED_HOME", "PAPERCLIP_HERMES_TRUSTED_COMMAND", "PAPERCLIP_HERMES_TRUSTED_COMMAND_SHA256"] as const;
   const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   try {
     await mkdir(home, { mode: 0o700 });
-    await writeFile(cli, '#!/bin/sh\ncase " $* " in *" -t web "*) ;; *) exit 7;; esac\ncat <<\x27JSONL\x27\n' + boundedWebProbe + 'JSONL\n');
+    await writeFile(cli, '#!/bin/sh\ncase " $* " in *" -t search "*) ;; *) exit 7;; esac\ncat <<\x27JSONL\x27\n' + boundedWebProbe + 'JSONL\n');
     await chmod(cli, 0o755);
     process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID = "bounded-toolsets-agent";
     process.env.PAPERCLIP_HERMES_BOUNDED_HOME = home;
     process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND = cli;
+    process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND_SHA256 = createHash("sha256").update(await readFile(cli)).digest("hex");
     const result = await testEnvironment({
       companyId: "test", adapterType: "hermes_local", agentId: "bounded-toolsets-agent",
-      config: { boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", enabledToolsets: ["web"], maxTurnsPerRun: 8, env: { HERMES_HOME: home } },
+      config: { boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", enabledToolsets: ["search"], maxTurnsPerRun: 8, env: { HERMES_HOME: home } },
     });
     expect(result.status).toBe("pass");
+  } finally {
+    for (const key of keys) {
+      if (original[key] === undefined) delete process.env[key];
+      else process.env[key] = original[key];
+    }
+    await rm(stage, { recursive: true, force: true });
+  }
+});
+
+test("bounded probe rejects a first launch that creates unpinned home instructions", async () => {
+  const stage = await realpath(await mkdtemp(path.join(os.tmpdir(), "hermes-bounded-first-use-")));
+  const home = path.join(stage, "home");
+  const cli = path.join(stage, "fake-hermes");
+  const keys = ["PAPERCLIP_HERMES_BOUNDED_AGENT_ID", "PAPERCLIP_HERMES_BOUNDED_HOME", "PAPERCLIP_HERMES_TRUSTED_COMMAND", "PAPERCLIP_HERMES_TRUSTED_COMMAND_SHA256"] as const;
+  const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    await mkdir(home, { mode: 0o700 });
+    await writeFile(cli, "#!/bin/sh\numask 077\nmkdir -m 700 -p \"$HERMES_HOME/skills\"\nprintf 'unreviewed\\n' > \"$HERMES_HOME/skills/SKILL.md\"\nprintf 'unreviewed\\n' > \"$HERMES_HOME/SOUL.md\"\ncat <<'JSONL'\n" + boundedWebProbe + "JSONL\n");
+    await chmod(cli, 0o755);
+    process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID = "first-use-agent";
+    process.env.PAPERCLIP_HERMES_BOUNDED_HOME = home;
+    process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND = cli;
+    process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND_SHA256 = createHash("sha256").update(await readFile(cli)).digest("hex");
+    const result = await testEnvironment({
+      companyId: "test", adapterType: "hermes_local", agentId: "first-use-agent",
+      config: { boundedExecution: true, provider: "openai-codex", model: "fixture-model", toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: home } },
+    });
+    expect(result.status).toBe("fail");
+    expect(result.checks.some((check) => check.code === "hermes_web_probe_failed")).toBe(true);
   } finally {
     for (const key of keys) {
       if (original[key] === undefined) delete process.env[key];
