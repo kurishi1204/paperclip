@@ -1,4 +1,5 @@
-import { commanderPolicySchema, admissionMatches, commanderPrompt, parseCommanderSelection, type CommanderAdmission, type CommanderPolicy } from "./commander-cycle.js";
+import {captureCommanderHermesClaim,completeCommanderHermesResult,pendingCommanderResultHandoffs} from "./commander-result.js";
+import { commanderReservesTodo,commanderPolicySchema, admissionMatches, commanderPrompt, parseCommanderSelection, type CommanderAdmission, type CommanderPolicy } from "./commander-cycle.js";
 import { activeIssueInteractionCondition, TASK_QUESTION_GUIDANCE } from "./issue-question-context.js";
 import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
 import { agentIdentityService, supportsManagedAgentIdentity } from "./agent-identity.js";
@@ -19957,7 +19958,14 @@ export function heartbeatService(
     return { scanned: pending.length, enqueued, alreadyQueued, invalid };
   }
 
+  async function reconcileCommanderResultHandoffs(){
+    const pending=await pendingCommanderResultHandoffs(db);
+    for(const h of pending)await enqueueWakeup(h.reviewerAgentId,{source:"assignment",triggerDetail:"system",reason:"execution_review_requested",payload:{issueId:h.issueId,executionStage:h.executionStage},contextSnapshot:{issueId:h.issueId,taskId:h.issueId,source:"issue.execution_stage",executionStage:h.executionStage},requestedByActorType:"user",requestedByActorId:h.ownerUserId,idempotencyKey:`commander-result-review:${h.runId}`,issueStateGuard:{statuses:["in_review"],assigneeAgentId:h.reviewerAgentId,revision:h.revision,statusVersion:h.statusVersion}});
+    return {scanned:pending.length};
+  }
+
   async function reconcileStrandedAssignedIssues() {
+    await reconcileCommanderResultHandoffs();
     return recovery.reconcileStrandedAssignedIssues({
       issueCreatedAtGte: await getWorktreeExecutionCutoff(),
     });
@@ -24870,6 +24878,7 @@ export function heartbeatService(
               revision:a.revision,statusVersion:a.statusVersion,title:companyIssues.find(i=>i.id===a.issueId)?.title})),
             excluded: companyIssues.filter(i=>!eligible.some(a=>a.issueId===i.id)).map(i=>({issueId:i.id,status:i.status,reason:"No current explicit admission"})) });
         }
+        const commanderResultClaim = await captureCommanderHermesClaim(db, run.id).catch(error=>{throw new ConfigurationIncompleteFailure(error instanceof Error?error.message:"Commander admission changed",{configurationIncomplete:{reason:"commander_admission_changed",companyId:run.companyId,agentId:run.agentId,actionUrl:`/issues/${issueId}`},commanderHandoffHold:{phase:"before_provider",runId:run.id}});});
         let adapterResult: AdapterExecutionResult;
         const runGoalControlRequestId = readNonEmptyString(
           context.goalControlRequestId,
@@ -25279,7 +25288,7 @@ export function heartbeatService(
             const dispatch = admitted ? await enqueueWakeup(admitted.workerAgentId, {
               source:"automation", triggerDetail:"system", reason:"commander_admitted_task",
               requestedByActorType:"agent", requestedByActorId:agent.id,
-              payload:{issueId:admitted.issueId},contextSnapshot:{issueId:admitted.issueId,commanderRunId:run.id},
+              payload:{issueId:admitted.issueId},contextSnapshot:{issueId:admitted.issueId,commanderRunId:run.id,commanderAdmission:admitted},
               idempotencyKey:`commander-admission:${commanderCycle.policy.companyId}:${admitted.id}`,
               issueStateGuard:{statuses:["todo"],assigneeAgentId:admitted.workerAgentId,statusVersion:admitted.statusVersion,revision:admitted.revision},
               commanderGuard:{parentRunId:run.id,commanderAgentId:agent.id,policy:commanderCycle.policy,admission:admitted},
@@ -25288,6 +25297,11 @@ export function heartbeatService(
               dispatchRunId:dispatch?.id ?? null, outcome:admitted ? dispatch ? "dispatched" : "held" : "idle"}};
           }
           adapterResult = identityRedactor.redact(adapterResult);
+          if(commanderResultClaim && adapterResult.exitCode===0 && !adapterResult.timedOut) {
+            const handoff=await completeCommanderHermesResult(db,run.id,commanderResultClaim,adapterResult.resultJson ?? {}).catch(error=>{throw new ConfigurationIncompleteFailure(error instanceof Error?error.message:"Commander result handoff changed",{...adapterResult.resultJson,configurationIncomplete:{reason:"commander_handoff_changed",companyId:run.companyId,agentId:run.agentId,responsibleUserId:commanderResultClaim.admission.resultHandoff!.ownerUserId,actionUrl:`/issues/${issueId}`},commanderHandoffHold:{phase:"after_provider_before_handoff",runId:run.id,issueId},executionRecovery:{providerWorkStarted:true}});});
+            adapterResult.resultJson={...adapterResult.resultJson,commanderHandoff:handoff.receipt};
+            await reconcileCommanderResultHandoffs();
+          }
           for (const stream of ["stdout", "stderr"] as const) {
             const tail = identityRedactor.finish(stream);
             if (tail) await appendIdentityRedactedLog(stream, tail);
@@ -27937,6 +27951,13 @@ export function heartbeatService(
             return { kind: "skipped" as const };
           }
 
+          if (!opts.commanderGuard && issue.status === "todo" && issue.assigneeAgentId === agentId) {
+            const commanders=await tx.select({adapterConfig:agents.adapterConfig}).from(agents).where(eq(agents.companyId,agent.companyId));
+            if(commanders.some(c=>commanderReservesTodo(parseObject(c.adapterConfig),issue,agentId))) {
+              await tx.insert(agentWakeupRequests).values({...durableReceiptFields,companyId:agent.companyId,agentId,source,triggerDetail,reason:"commander_reserved_task",payload,status:"skipped",requestedByActorType:opts.requestedByActorType??null,requestedByActorId:opts.requestedByActorId??null,idempotencyKey:opts.idempotencyKey??null,finishedAt:new Date()});
+              return {kind:"skipped" as const};
+            }
+          }
           if (opts.commanderGuard) {
             const guard = opts.commanderGuard;
             const [commander] = await tx.select().from(agents).where(and(eq(agents.id,guard.commanderAgentId),eq(agents.companyId,agent.companyId))).for("update");
