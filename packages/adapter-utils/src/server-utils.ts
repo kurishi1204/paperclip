@@ -4688,6 +4688,7 @@ export async function runChildProcess(
   opts: {
     cwd: string;
     env: Record<string, string>;
+    /** Opt out of the legacy host environment merge for isolated agents. */
     inheritHostEnv?: boolean;
     timeoutSec: number;
     graceSec: number;

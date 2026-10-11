@@ -370,6 +370,8 @@ export interface AdapterEnvironmentTestContext {
   companyId: string;
   adapterType: string;
   config: Record<string, unknown>;
+  /** Saved agent identity, used by adapters with operator-pinned run modes. */
+  agentId?: string;
   /**
    * Optional execution target the adapter should run probes against.
    *

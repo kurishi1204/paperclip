@@ -57,6 +57,13 @@ export function getConfigSchema(): AdapterConfigSchema {
         hint: "Optional comma-separated Hermes toolsets, such as terminal,file,web.",
       },
       {
+        key: "boundedExecution",
+        label: "Bounded execution",
+        type: "toggle",
+        default: false,
+        hint: "Research-only mode: require a pinned provider/model, web toolset, turn limit and private HERMES_HOME. Reject agent command overrides and extra arguments.",
+      },
+      {
         key: "persistSession",
         label: "Persist session",
         type: "toggle",
