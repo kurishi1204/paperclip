@@ -12,7 +12,7 @@ const lines = (...events: unknown[]) => events.map((event) => JSON.stringify(eve
 test("accepts actual CLI evidence and returns only the final answer", () => {
   expect(parseBoundedWebResult(lines(init, use, success, final), { requireText: true })).toEqual({
     sessionId: "cli-session", text: "Finding with source.", searches: 1,
-    sourceUrls: ["https://example.org/source"],
+    sourceUrls: ["https://example.org/source"], rejectedSourceUrls: [],
   });
   expect(parseBoundedWebResult(lines(init, use, success, use, success, final), { requireText: true })?.searches).toBe(2);
   expect(parseBoundedWebResult(lines(init, use, success, use, success, final), { exactlyOneSearch: true })).toBeNull();
@@ -64,9 +64,22 @@ test("accepts successful empty queries only when the completed run has real HTTP
   expect(parseBoundedWebResult(lines(init,use,emptySuccess,final))).toBeNull();
 });
 test("rejects malformed or unsafe source rows even beside a valid HTTPS row", () => {
-  for(const invalid of [null,7,{}, {url:7}, {url:"http://example.org/"},{url:"not a URL"}]) {
+  for(const invalid of [null,7,{}, {url:7}, {url:"not a URL"}]) {
     const mixed={...success,output:JSON.stringify({success:true,data:{web:[{url:"https://example.org/source"},invalid]}})};
     expect(parseBoundedWebResult(lines(init,use,mixed,final))).toBeNull();
   }
   expect(parseBoundedWebResult(lines(init,use,success,final)+"[hermes] diagnostic\n")).toBeNull();
+});
+
+test("preserves every HTTP source as an explicit rejected disposition beside verified HTTPS sources", () => {
+  const mixed={...success,output:JSON.stringify({success:true,data:{web:[{url:"http://example.org/unverified"},{url:"https://example.org/verified"}]}})};
+  const result=parseBoundedWebResult(lines(init,use,mixed,final));
+  expect(result?.sourceUrls).toEqual(["https://example.org/verified"]);
+  expect(result?.rejectedSourceUrls).toEqual([{url:"http://example.org/unverified",reason:"non_https"}]);
+  const onlyHttp={...success,output:JSON.stringify({success:true,data:{web:[{url:"http://example.org/unverified"}]}})};
+  expect(parseBoundedWebResult(lines(init,use,onlyHttp,final))).toBeNull();
+  for(const url of ["javascript:alert(1)","file:///tmp/private","data:text/plain,untrusted"]){
+    const unsafe={...success,output:JSON.stringify({success:true,data:{web:[{url:"https://example.org/verified"},{url}]}})};
+    expect(parseBoundedWebResult(lines(init,use,unsafe,final))).toBeNull();
+  }
 });

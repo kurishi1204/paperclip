@@ -694,7 +694,7 @@ export async function execute(
     usage: parsed.usage || null,
     cost_usd: parsed.costUsd ?? null,
     ...(bounded ? { web_search_count: boundedProof?.searches ?? 0,
-      source_urls: boundedProof?.sourceUrls ?? [] } : {}),
+      source_urls: boundedProof?.sourceUrls ?? [], rejected_source_urls: boundedProof?.rejectedSourceUrls ?? [] } : {}),
   };
 
   // Only standard mode may resume. The bounded clearSession flag above removes
