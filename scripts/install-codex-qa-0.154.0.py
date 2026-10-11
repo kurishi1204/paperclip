@@ -2,6 +2,9 @@ import os,stat,hashlib,subprocess
 SOURCE='/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex'
 TARGET='/opt/colo-codex-qa/0.154.0/bin/codex'
 SHA='4f85982624b3898c8991cb80c0981b2aa71070e3537046c9a95950318a95afcc'
+def assert_no_quarantine(source):
+ attributes=subprocess.check_output(['/usr/bin/xattr',source],env={'PATH':'/usr/bin:/bin'},text=True,timeout=10)
+ assert 'com.apple.quarantine' not in attributes.splitlines(), 'HOLD: source quarantined; do not strip'
 assert os.geteuid()==0, 'HOLD: root required'
 def checked(p,directory):
  s=os.lstat(p);assert s.st_uid==0 and not stat.S_ISLNK(s.st_mode) and s.st_mode&0o022==0 and (stat.S_ISDIR(s.st_mode) if directory else stat.S_ISREG(s.st_mode)), 'HOLD: target metadata'
@@ -17,7 +20,7 @@ for p in ['/', '/opt']:checked(p,True)
 f=os.open(SOURCE,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC);s=os.fstat(f)
 assert stat.S_ISREG(s.st_mode) and s.st_uid==501 and s.st_nlink==1 and s.st_mode&0o022==0 and s.st_size==222655232, 'HOLD: official source metadata'
 assert digest(f)==SHA, 'HOLD: official source SHA'
-assert 'com.apple.quarantine' not in os.listxattr(SOURCE), 'HOLD: source quarantined; do not strip'
+assert_no_quarantine(SOURCE)
 for p in ['/opt/colo-codex-qa','/opt/colo-codex-qa/0.154.0','/opt/colo-codex-qa/0.154.0/bin']:
  try:os.mkdir(p,0o755)
  except FileExistsError:pass
