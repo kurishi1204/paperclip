@@ -359,6 +359,12 @@ import {
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
+  boardReviewExpected: z.object({
+    stageId: z.string().uuid(),
+    reviewerAgentId: z.string().uuid(),
+    revision: z.number().int().nonnegative(),
+    statusVersion: z.number().int().nonnegative(),
+  }).strict().optional(),
   // Only the run-bound QA tool uses this precondition. The normal Issue PATCH
   // keeps its existing behavior when this field is absent.
   qaReviewExpected: z.object({
@@ -12883,6 +12889,40 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!existing) return;
+      const boardReviewExpected = req.body.boardReviewExpected as { stageId: string; reviewerAgentId: string; revision: number; statusVersion: number } | undefined;
+      if (boardReviewExpected && (req.actor.type !== "board" || req.actor.source === "mcp_oauth" ||
+          req.body.status !== "in_review" || !req.body.executionPolicy ||
+          req.body.executionPolicy.mode !== "normal" || req.body.executionPolicy.monitor != null ||
+          req.body.executionPolicy.stages?.[0]?.type !== "review" ||
+          typeof req.body.comment !== "string" || !req.body.comment.trim() ||
+          Object.keys(req.body).some(key => !["status", "executionPolicy", "comment", "commentClientRequestId", "boardReviewExpected"].includes(key)))) {
+        throw forbidden("Board review start requires a conditional review-only patch");
+      }
+      if (boardReviewExpected) {
+        const effectivePolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
+        const firstStage = effectivePolicy?.stages[0];
+        if (!effectivePolicy || effectivePolicy.mode !== "normal" || effectivePolicy.monitor != null ||
+            firstStage?.id !== boardReviewExpected.stageId || firstStage.type !== "review" ||
+            firstStage.approvalsNeeded !== 1 || firstStage.participants.length !== 1 ||
+            firstStage.participants[0]?.type !== "agent" ||
+            firstStage.participants[0].agentId !== boardReviewExpected.reviewerAgentId) {
+          throw conflict("Effective review policy does not match the expected independent QA stage and participant");
+        }
+      }
+      const assertBoardReviewStart = async (query: IssueQueueDb, locked: NonNullable<typeof existing> | null) => {
+        if (!boardReviewExpected) return;
+        if (!locked || locked.revision !== boardReviewExpected.revision ||
+            locked.statusVersion !== boardReviewExpected.statusVersion || locked.status !== "in_progress" ||
+            locked.executionPolicy != null || locked.executionState != null) {
+          throw conflict("Issue revision or execution state changed; read the issue before starting review");
+        }
+        const [active] = await query.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, locked.companyId), inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+          sql`(${heartbeatRuns.id} = ${locked.checkoutRunId ?? null}::uuid or ${heartbeatRuns.id} = ${locked.executionRunId ?? null}::uuid or ${heartbeatRuns.nativeIssueId} = ${locked.id}::uuid or ${heartbeatRuns.contextSnapshot}->>'issueId' = ${locked.id})`,
+        )).limit(1);
+        if (active) throw conflict("Active execution must finish before conditional review start");
+      };
+      await assertBoardReviewStart(db, existing);
       const qaReviewExpected = req.body.qaReviewExpected as {
         stageId: string;
         statusVersion: number;
@@ -12967,6 +13007,7 @@ export function issueRoutes(
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         expectedRevision: _expectedRevision,
         qaReviewExpected: _qaReviewExpected,
+        boardReviewExpected: _boardReviewExpected,
         ...updateFields
       } = req.body;
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
@@ -13562,7 +13603,7 @@ export function issueRoutes(
       // Only this request may finish a mutation that intentionally stops its
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
-      if (req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
+      if (!boardReviewExpected && req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
         await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,
@@ -13801,6 +13842,7 @@ export function issueRoutes(
       // issue stays terminal and the reaper then skips the leaked workspace.
       let reopenedWorkspace: Pick<ExecutionWorkspace, "id"> | null = null;
       let reopenedGeneration: number | null = null;
+      if (boardReviewExpected && closedExecutionWorkspace) throw conflict("Closed execution workspace must be reopened before conditional review start");
       if (closedExecutionWorkspace && (commentBody || isAgentWorkUpdate)) {
         const reopenOutcome =
           await reopenClosedIssueExecutionWorkspaceOrRespond(
@@ -13840,7 +13882,7 @@ export function issueRoutes(
       const commentWithAdapterOverrides = Boolean(
         commentBody && updateFields.assigneeAdapterOverrides !== undefined,
       );
-      const transactionalCommentSourceTrust = commentAttachmentIds?.length || commentWithAdapterOverrides
+      const transactionalCommentSourceTrust = commentAttachmentIds?.length || commentWithAdapterOverrides || boardReviewExpected
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
@@ -13850,10 +13892,11 @@ export function issueRoutes(
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
         reviewPolicySensitiveMutationRequested ||
-        Boolean(qaReviewExpected);
+        Boolean(qaReviewExpected) || Boolean(boardReviewExpected);
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
+            if (boardReviewExpected) await assertBoardReviewStart(tx, await svc.getByIdForUpdate(id, tx));
             await assertLockedQaReviewExpectation(tx);
             if (
               reviewPolicySensitiveMutationRequested &&
@@ -13862,7 +13905,7 @@ export function issueRoutes(
               return null;
             const updated = await updateIssue(tx);
             if (!updated) return null;
-            if (commentAttachmentIds?.length || commentWithAdapterOverrides) {
+            if (commentAttachmentIds?.length || commentWithAdapterOverrides || boardReviewExpected) {
               // Adapter settings, reassignment, comment and upload binding commit together.
               // A failed comment or invalid receipt rolls back the issue update.
               transactionalComment = await svc.addComment(
