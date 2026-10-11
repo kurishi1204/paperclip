@@ -14,6 +14,7 @@ export const commanderAdmissionSchema = z.object({
   revision: z.number().int().nonnegative(), statusVersion: z.number().int().nonnegative(),
   descriptionSha256: z.string().regex(/^[a-f0-9]{64}$/),
   expiresAt: z.string().datetime(),
+  resultHandoff:z.object({reviewerAgentId:z.string().uuid(),ownerUserId:z.string().min(1),documentKey:z.string().regex(/^[a-z][a-z0-9-]{0,63}$/)}).strict().optional(),
 }).strict();
 export const commanderPolicySchema = z.object({
   version: z.literal(1), companyId: z.string().uuid(), commanderAgentId: z.string().uuid(),
@@ -55,7 +56,7 @@ export function commanderPrompt(snapshot: unknown) {
 }
 
 export const prepareCommanderAdmissionSchema = z.object({
-  commanderAgentId:z.string().uuid(), admissionId:z.string().uuid(),
+  commanderAgentId:z.string().uuid(), admissionId:z.string().uuid(),workerAgentId:z.string().uuid(),admissionSha256:z.string().regex(/^[a-f0-9]{64}$/),
   revision:z.number().int().nonnegative(), statusVersion:z.number().int().nonnegative(),
 }).strict();
 /** Reservation survives expiry and edits. Only an explicit board removal releases it. */
@@ -63,4 +64,9 @@ export function commanderReservesTodo(config:Record<string,unknown>, issue:Comma
   if(config.commanderCycleToolsOnly!==true || issue.status!=="todo" || issue.assigneeAgentId!==workerId) return false;
   const p=commanderPolicySchema.safeParse(config.commanderCyclePolicy);
   return p.success && p.data.companyId===issue.companyId && p.data.admissions.some(a=>a.issueId===issue.id && a.workerAgentId===workerId);
+}
+
+export function commanderAdmissionDigest(a:CommanderAdmission){
+ const canonical=(v:unknown):unknown=>Array.isArray(v)?v.map(canonical):v&&typeof v==="object"?Object.fromEntries(Object.entries(v).sort(([a],[b])=>a.localeCompare(b)).map(([k,x])=>[k,canonical(x)])):v;
+ return createHash("sha256").update(JSON.stringify(canonical(a))).digest("hex");
 }
