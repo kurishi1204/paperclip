@@ -14,8 +14,9 @@ describe("conditional board review start", () => {
   await server.db.insert(agents).values({ id: reviewer, companyId: f.companyId, name: "Independent reviewer", adapterType: "paperclip_runner", runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } }, status: "idle" });
   if (!active) await server.db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId));
   const [read] = await server.db.select().from(issues).where(eq(issues.id, f.issueId));
-  const body = { status: "in_review", executionPolicy: { stages: [{ id: randomUUID(), type: "review", participants: [{ type: "agent", agentId: reviewer }] }] }, comment: "Review the exact successful execution.", boardReviewExpected: { revision: read!.revision, statusVersion: read!.statusVersion } };
-  const patch = (extra = {}) => fetch(`${server.apiUrl}/api/issues/${f.issueId}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...body, ...extra }) });
+  const stageId = randomUUID();
+  const body = { status: "in_review", executionPolicy: { stages: [{ id: stageId, type: "review", participants: [{ type: "agent", agentId: reviewer }] }] }, comment: "Review the exact successful execution.", boardReviewExpected: { stageId, reviewerAgentId: reviewer, revision: read!.revision, statusVersion: read!.statusVersion } };
+  const patch = (extra = {}) => fetch(`${server.apiUrl}/api/issues/${f.issueId}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify((() => { const request = { ...body, ...extra }; if (process.env.BOARD_REVIEW_OLD_CONTRACT === "1") { const expected = request.boardReviewExpected as Record<string, unknown>; delete expected.stageId; delete expected.reviewerAgentId; } return request; })()) });
   return { f, reviewer, read: read!, body, patch };
  }
  it("starts exactly one pending stage and preserves the completed execution", async () => {
@@ -66,6 +67,23 @@ describe("conditional board review start", () => {
   const [run] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, concurrentRun)); expect(run!.status).toBe("queued");
   const [issue] = await server.db.select().from(issues).where(eq(issues.id, f.issueId)); expect(issue!.status).toBe("in_progress"); expect(issue!.executionPolicy).toBeNull();
  }, 30_000);
+ it("rejects a dropped empty review stage instead of leaving an orphan in_review issue", async () => {
+  const { f, body, patch } = await fixture();
+  expect((await patch({ executionPolicy: { stages: [{ ...body.executionPolicy.stages[0], participants: [] }] } })).status).toBe(409);
+  const [issue] = await server.db.select().from(issues).where(eq(issues.id, f.issueId));
+  expect(issue!.status).toBe("in_progress"); expect(issue!.executionPolicy).toBeNull(); expect(issue!.executionState).toBeNull();
+  expect(await server.db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.body, body.comment)))).toHaveLength(0);
+ });
+ it("rolls back review start when the comment idempotency key has a different body", async () => {
+  const { f, body, patch } = await fixture(); const requestId = randomUUID();
+  const prior = await fetch(`${server.apiUrl}/api/issues/${f.issueId}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ comment: "Existing different comment", commentClientRequestId: requestId }) });
+  expect(prior.status).toBe(200);
+  const [read] = await server.db.select().from(issues).where(eq(issues.id, f.issueId));
+  expect((await patch({ commentClientRequestId: requestId, boardReviewExpected: { ...body.boardReviewExpected, revision: read!.revision, statusVersion: read!.statusVersion } })).status).toBe(409);
+  const [issue] = await server.db.select().from(issues).where(eq(issues.id, f.issueId));
+  expect(issue!.status).toBe("in_progress"); expect(issue!.executionPolicy).toBeNull(); expect(issue!.executionState).toBeNull(); expect(issue!.assigneeAgentId).toBe(f.agentId);
+  expect(await server.db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.body, body.comment)))).toHaveLength(0);
+ });
  it("does not allow arbitrary edits through the review precondition", async () => {
   const { patch } = await fixture(); expect((await patch({ description: "Unreviewed replacement" })).status).toBe(403);
  });

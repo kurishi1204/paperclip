@@ -1,6 +1,6 @@
 # Conditional board review start
 
-Use normal `PATCH /api/issues/:id` with `boardReviewExpected: {revision, statusVersion}` to start the first review of a completed execution. The caller must be the board, the issue must still be `in_progress`, and its execution policy/state must be unset. Only `status: in_review`, `executionPolicy`, a nonempty `comment`, and optional `commentClientRequestId` accompany this precondition.
+Use normal `PATCH /api/issues/:id` with `boardReviewExpected: {revision, statusVersion, stageId, reviewerAgentId}` to start the first review of a completed execution. The caller must be the board, the issue must still be `in_progress`, and its execution policy/state must be unset. The normalized policy must keep that exact first review stage with one agent participant and one required approval. Empty or dropped stages are refused. The review comment is written in the same transaction as the stage; an idempotency conflict rolls back the entire start. Only `status: in_review`, `executionPolicy`, a nonempty `comment`, and optional `commentClientRequestId` accompany this precondition.
 
 The server checks the version and absence of active issue runs before preparing the transition, then again under the issue row lock in the transaction that writes the pending stage. A stale request fails with 409. This path does not stop the old worker or cancel a run. Closed execution workspaces require a separate reopen action. Dispatch and run-bound QA verdicts retain their existing contracts.
 

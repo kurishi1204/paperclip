@@ -360,6 +360,8 @@ const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
   boardReviewExpected: z.object({
+    stageId: z.string().uuid(),
+    reviewerAgentId: z.string().uuid(),
     revision: z.number().int().nonnegative(),
     statusVersion: z.number().int().nonnegative(),
   }).strict().optional(),
@@ -12887,7 +12889,7 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!existing) return;
-      const boardReviewExpected = req.body.boardReviewExpected as { revision: number; statusVersion: number } | undefined;
+      const boardReviewExpected = req.body.boardReviewExpected as { stageId: string; reviewerAgentId: string; revision: number; statusVersion: number } | undefined;
       if (boardReviewExpected && (req.actor.type !== "board" || req.actor.source === "mcp_oauth" ||
           req.body.status !== "in_review" || !req.body.executionPolicy ||
           req.body.executionPolicy.mode !== "normal" || req.body.executionPolicy.monitor != null ||
@@ -12895,6 +12897,17 @@ export function issueRoutes(
           typeof req.body.comment !== "string" || !req.body.comment.trim() ||
           Object.keys(req.body).some(key => !["status", "executionPolicy", "comment", "commentClientRequestId", "boardReviewExpected"].includes(key)))) {
         throw forbidden("Board review start requires a conditional review-only patch");
+      }
+      if (boardReviewExpected) {
+        const effectivePolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
+        const firstStage = effectivePolicy?.stages[0];
+        if (!effectivePolicy || effectivePolicy.mode !== "normal" || effectivePolicy.monitor != null ||
+            firstStage?.id !== boardReviewExpected.stageId || firstStage.type !== "review" ||
+            firstStage.approvalsNeeded !== 1 || firstStage.participants.length !== 1 ||
+            firstStage.participants[0]?.type !== "agent" ||
+            firstStage.participants[0].agentId !== boardReviewExpected.reviewerAgentId) {
+          throw conflict("Effective review policy does not match the expected independent QA stage and participant");
+        }
       }
       const assertBoardReviewStart = async (query: IssueQueueDb, locked: NonNullable<typeof existing> | null) => {
         if (!boardReviewExpected) return;
@@ -13869,7 +13882,7 @@ export function issueRoutes(
       const commentWithAdapterOverrides = Boolean(
         commentBody && updateFields.assigneeAdapterOverrides !== undefined,
       );
-      const transactionalCommentSourceTrust = commentAttachmentIds?.length || commentWithAdapterOverrides
+      const transactionalCommentSourceTrust = commentAttachmentIds?.length || commentWithAdapterOverrides || boardReviewExpected
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
@@ -13892,7 +13905,7 @@ export function issueRoutes(
               return null;
             const updated = await updateIssue(tx);
             if (!updated) return null;
-            if (commentAttachmentIds?.length || commentWithAdapterOverrides) {
+            if (commentAttachmentIds?.length || commentWithAdapterOverrides || boardReviewExpected) {
               // Adapter settings, reassignment, comment and upload binding commit together.
               // A failed comment or invalid receipt rolls back the issue update.
               transactionalComment = await svc.addComment(
