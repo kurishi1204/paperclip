@@ -584,9 +584,10 @@ export async function execute(
   // ── Execute ────────────────────────────────────────────────────────────
   // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
   // Paperclip renders all stderr as red/error in the UI.
-  // Wrap onLog to reclassify benign stderr lines as stdout.
+  // Only ordinary interactive runs reclassify benign stderr as stdout.
+  // Bounded machine evidence preserves the provider stdout channel unchanged.
   const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
-    if (stream === "stderr") {
+    if (!bounded && stream === "stderr") {
       const trimmed = chunk.trimEnd();
       // Benign patterns that should NOT appear as errors:
       // - Structured log lines: [timestamp] INFO/DEBUG/WARN: ...
@@ -650,7 +651,7 @@ export async function execute(
     `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}${bounded ? `, structured web evidence: ${boundedProof ? "verified" : "unverified"}` : ""}\n`,
   );
   if (acceptedSessionId) {
-    await ctx.onLog("stdout", `[hermes] Session: ${acceptedSessionId}\n`);
+    await ctx.onLog("stderr", `[hermes] Session: ${acceptedSessionId}\n`);
   }
 
   // ── Build result ───────────────────────────────────────────────────────
