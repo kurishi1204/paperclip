@@ -109,6 +109,33 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID = "agent-1";
     process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND = "/usr/bin/hermes";
   });
+  it("keeps adapter start and exit diagnostics outside machine evidence stdout", async () => {
+    const {ctx}=makeCtx();
+    await execute(ctx as never);
+    const diagnostics=ctx.onLog.mock.calls.filter((call: unknown[]) =>
+      String(call[1]).startsWith("[hermes] Starting Hermes Agent") || String(call[1]).startsWith("[hermes] Exit code:"));
+    expect(diagnostics).toHaveLength(2);
+    expect(diagnostics.every((call: unknown[]) => call[0] === "stderr")).toBe(true);
+  });
+  it("keeps bounded live Run stdout strictly reparseable including provider stderr and session diagnostic", async () => {
+    const events=[{type:"system",subtype:"init",session_id:"fixture-session"},
+      {type:"tool_use",name:"web_search",tool_call_id:"A"},
+      {type:"tool_result",name:"web_search",tool_call_id:"A",is_error:false,output:JSON.stringify({success:true,data:{web:[{url:"https://example.org/source"},{url:"http://example.org/rejected"}]}})},
+      {type:"result",session_id:"fixture-session",exit_code:0,text:"Public finding"}];
+    const stdout=events.map(e=>JSON.stringify(e)).join("\n")+"\n";
+    vi.mocked(serverUtils.runChildProcess).mockImplementationOnce(async (_id,_command,_args,opts) => {
+      await opts.onLog("stderr","MCP Server Application initialized\n");
+      await opts.onLog("stdout",stdout);
+      return {exitCode:0,signal:null,timedOut:false,stdout,stderr:"",pid:null,startedAt:null};
+    });
+    const {ctx}=makeCtx({command:undefined,boundedExecution:true,provider:"openai-codex",model:"gpt-5.6-sol",toolsets:"search",maxTurnsPerRun:2,env:{HERMES_HOME:"/private/qa/hermes"}});
+    const result=await execute(ctx as never);
+    expect(result.exitCode).toBe(0);
+    expect(result.resultJson).toMatchObject({source_urls:["https://example.org/source"],rejected_source_urls:[{url:"http://example.org/rejected",reason:"non_https"}]});
+    const captured=ctx.onLog.mock.calls.filter((c:unknown[])=>c[0]==="stdout").map((c:unknown[])=>c[1]).join("");
+    expect(captured).toBe(stdout);
+    expect(ctx.onLog.mock.calls.filter((c:unknown[])=>String(c[1]).startsWith("[hermes] Session:"))).toHaveLength(1);
+  });
   afterEach(() => {
     if (previousBoundedHome === undefined) delete process.env.PAPERCLIP_HERMES_BOUNDED_HOME;
     else process.env.PAPERCLIP_HERMES_BOUNDED_HOME = previousBoundedHome;
