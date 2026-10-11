@@ -312,6 +312,7 @@ import type {
 } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { createRuntimeToolsToken } from "../runtime-tools-token.js";
+import { QA_REVIEW_MCP_CONNECTION_ID, QA_REVIEW_MCP_NAME, qaReviewLocalApiUrl } from "./qa-review-tools.js";
 import {
   parseObject,
   asBoolean,
@@ -25097,13 +25098,14 @@ export function heartbeatService(
                   }
                 : {}),
             };
-            const runtimeTools = createAdapterRuntimeToolAccess({
+            const qaReviewMode = agent.adapterType === "claude_local" && runtimeConfig.qaReviewToolsOnly === true;
+            const runtimeTools = qaReviewMode ? undefined : createAdapterRuntimeToolAccess({
               agentId: agent.id,
               companyId: agent.companyId,
               runId: run.id,
               responsibleUserId: run.responsibleUserId,
             });
-            if (!runtimeTools) {
+            if (!runtimeTools && !qaReviewMode) {
               logger.warn(
                 {
                   companyId: agent.companyId,
@@ -25113,7 +25115,7 @@ export function heartbeatService(
                 "runtime connection tools could not be delivered",
               );
             }
-            const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
+            const runtimeMcpServers = qaReviewMode ? [] : await buildPaperclipRuntimeMcpServers({
               db,
               agent,
               runId: run.id,
@@ -25128,15 +25130,25 @@ export function heartbeatService(
                 connectionId: "paperclip-runtime-tools",
               });
             }
-            if (authToken && configuredPaperclipApiBaseUrl() && issueRef) {
-              runtimeMcpServers.unshift({ name: "Paperclip projects", url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
-                token: authToken, connectionId: "paperclip-project-tools" });
+            const qaLocalApiUrl = qaReviewMode ? qaReviewLocalApiUrl() : null;
+            if (authToken && issueRef && (qaReviewMode ? qaLocalApiUrl : configuredPaperclipApiBaseUrl())) {
+              if (qaReviewMode) {
+                runtimeMcpServers.unshift({
+                  name: QA_REVIEW_MCP_NAME,
+                  url: `${qaLocalApiUrl}/api/mcp/qa-review`,
+                  token: authToken,
+                  connectionId: QA_REVIEW_MCP_CONNECTION_ID,
+                });
+              } else {
+                runtimeMcpServers.unshift({ name: "Paperclip projects", url: `${paperclipApiBaseUrl()}/api/mcp/project-tools`,
+                  token: authToken, connectionId: "paperclip-project-tools" });
+              }
             }
             const runtimeMcp = createAdapterRuntimeMcpAccess(runtimeMcpServers);
             if (runtimeTools && runtimeToolDelivery === "invocation_context") {
               adapterContext.paperclipRuntimeTools = runtimeTools;
             }
-            const managedMcpConfig = await createManagedMcpRunConfig({
+            const managedMcpConfig = qaReviewMode ? null : await createManagedMcpRunConfig({
               db,
               agent,
               runId: run.id,

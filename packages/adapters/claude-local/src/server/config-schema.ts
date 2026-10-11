@@ -23,6 +23,14 @@ export function getConfigSchema(): AdapterConfigSchema {
         hint: "Default uses ACP. If ACP is unavailable, the run fails with a setup error. Choose CLI explicitly to use it.",
       },
       {
+        key: "qaReviewToolsOnly",
+        label: "Formal QA review tools only",
+        type: "toggle",
+        default: false,
+        hint: "Local CLI only. Requires managed Anthropic auth and dangerouslySkipPermissions=false. Allows only assigned-issue read and formal review decision tools.",
+        meta: { visibleWhen: { key: "engine", values: ["cli"] } },
+      },
+      {
         key: "agentCommand",
         label: "ACP server command",
         type: "text",

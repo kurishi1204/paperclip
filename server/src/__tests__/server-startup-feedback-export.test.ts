@@ -132,6 +132,7 @@ const {
     on: vi.fn().mockReturnThis(),
     once: vi.fn().mockReturnThis(),
     off: vi.fn().mockReturnThis(),
+    address: vi.fn(() => ({ address: "127.0.0.1", family: "IPv4", port: 3210 })),
     listen: vi.fn((_port: number, _host: string, callback?: () => void) => {
       callback?.();
       return fakeServer;
@@ -842,6 +843,17 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
 
     expect(started.apiUrl).toBe("http://127.0.0.1:3210");
     expect(process.env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3210");
+  });
+
+  it("publishes the actual IPv6 loopback listener when localhost binds on IPv6", async () => {
+    loadConfigMock.mockReturnValueOnce(buildTestConfig({ host: "localhost" }));
+    fakeServer.address.mockReturnValueOnce({ address: "::1", family: "IPv6", port: 3210 });
+
+    await startServer();
+
+    expect(fakeServer.listen).toHaveBeenCalledWith(3210, "localhost", expect.any(Function));
+    expect(process.env.PAPERCLIP_LISTEN_HOST).toBe("::1");
+    expect(process.env.PAPERCLIP_LISTEN_PORT).toBe("3210");
   });
 
   it("keeps loopback as the runtime API URL when allowed hostnames are present", async () => {

@@ -84,6 +84,26 @@ async function poolFixture(f: Awaited<ReturnType<typeof fixture>>, extraMembers:
 }
 
 describe("agent-created hires use managed AI connections", () => {
+  it("rejects a QA agent endpoint override before minting its managed Anthropic credential", async () => {
+    const f = await fixture("anthropic");
+    await expect(prepareManagedAiRuntime(db, {
+      companyId: f.companyId, agentId: f.agentId, responsibleUserId: f.userId,
+      adapterType: "claude_local", binding: f.binding,
+      config: { qaReviewToolsOnly: true, cwd: home, env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:9999" } },
+    })).rejects.toMatchObject({ details: { code: "ai_connection_incompatible" } });
+    const managed = await prepareManagedAiRuntime(db, {
+      companyId: f.companyId, agentId: f.agentId, responsibleUserId: f.userId,
+      adapterType: "claude_local", binding: f.binding,
+      config: { qaReviewToolsOnly: true, cwd: home },
+    });
+    try {
+      expect((managed.config.env as Record<string, string>).ANTHROPIC_BASE_URL).toBe("");
+      expect((managed.config.env as Record<string, string>).ANTHROPIC_API_KEY).toBe("fixture-api-key");
+    } finally {
+      await managed.cleanup();
+    }
+  });
+
   it.each(["agent-hires", "agents"])("%s inherits a manager's pool without copying legacy credentials", async (endpoint) => {
     const f = await fixture("openai");
     const p = await poolFixture(f);

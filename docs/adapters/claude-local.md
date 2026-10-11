@@ -35,7 +35,68 @@ subscription quota exhaustion merely because ACP labels them `limit`.
 | `timeoutSec` | number | No | Process timeout (0 = no timeout) |
 | `graceSec` | number | No | Grace period before force-kill |
 | `maxTurnsPerRun` | number | No | Max agentic turns per heartbeat (defaults to `300`) |
-| `dangerouslySkipPermissions` | boolean | No | Skip permission prompts (default: `true`); required for headless runs where interactive approval is impossible |
+| `dangerouslySkipPermissions` | boolean | No | Skip permission prompts (default: `true`); the QA review mode below runs headlessly with `false` |
+| `qaReviewToolsOnly` | boolean | No | Run a local, restricted Claude CLI session with only the assigned-issue QA MCP tools (default: `false`) |
+
+## Headless formal QA review
+
+For a dedicated QA agent, set `engine: "cli"`, `qaReviewToolsOnly: true`,
+`dangerouslySkipPermissions: false`, and a managed Anthropic AI connection.
+The agent must be the current participant and assignee of a pending `review`
+stage on its assigned issue. The adapter starts a fresh session with built-in
+tools disabled, ignores user and project settings, and passes only the
+run-bound `paperclip_qa` MCP server. Extra CLI arguments, Chrome, custom
+commands, and remote execution targets fail configuration validation.
+
+The eleven MCP tools read only an explicit projection of the assigned issue,
+page through its description and document bodies (including the plan), comments,
+document annotations, and UTF-8 attachment text, list assigned attachments,
+submit `approve` or `request_changes`, and read back this run's matching formal
+decision receipt if the response is lost. The issue overview contains only
+document metadata and assigned work-product identifiers, status, and URLs; it
+does not return related issues, project records, adapter overrides, or full
+plan bodies. The overview fails closed above 16,000 UTF-8 bytes, including
+large or numerous work-product titles and URLs; it does not silently truncate
+evidence. A legacy plan embedded in the description is read through the
+description page tool. Evidence
+pages and the verdict carry the whole requirement revision read from the issue;
+the verdict also carries the stage, status version, and last decision ID.
+Work-product create, update, and delete also increment that requirement
+revision. Issue PATCH rechecks all four while holding the Issue row lock in the
+transaction that records the decision. A competing or stale-content
+verdict receives a conflict. A successful decision produces a formal
+`issue_execution_decisions` record. The tool accepts no issue ID, arbitrary
+endpoint, shell command, or credential path. The Claude child does not inherit
+the host environment or the Paperclip run token; its MCP config contains the
+run token for the named QA server only. A stopped run or changed assignment
+loses access. Document bodies are returned in pages of at most 16,000
+characters. Comment and annotation lists budget their serialized UTF-8 response.
+Large text is marked omitted with its character count and can be read in pages
+of at most 2,000 Unicode characters through the corresponding text tool.
+Attachment metadata is paged, and text content is returned in pages of at most
+16,384 bytes. Binary or invalid UTF-8 attachments are
+identified but not interpreted: their acceptance evidence must be available
+through an assigned issue document/comment or handled by a human reviewer.
+Every QA MCP tool response is also bounded to 64,000 UTF-8 bytes on the
+serialized JSON-RPC wire body, including both `content.text` and
+`structuredContent`. An oversized response fails closed with a generic error;
+the caller can request a smaller evidence page or use human review. An
+oversized decision response may occur after the decision was recorded, so the
+agent must check `read_assigned_review_receipt` with the original stage,
+decision, and summary and must not resubmit the decision.
+Validation errors and explicit client/precondition PATCH rejections are definite
+failures: the agent can re-read the issue and submit a new verdict if the review
+stage remains pending. Transport loss, server or gateway errors, and an
+unverified successful response remain outcome-unknown until a matching receipt
+is read.
+After a missing verdict response, the agent checks the receipt with the exact
+stage, decision, and summary from its attempt. A missing receipt remains
+unknown and does not authorize resubmission. Only that receipt remains readable
+after the review stage closes, while the same run is active. The QA subprocess
+uses the disposable HOME and provider configuration minted for its managed AI
+connection; it cannot use interactive Claude login in this mode.
+This mode still requires a live test of the agent's managed
+Anthropic login and its actual QA run before operational acceptance.
 
 ## Default model
 

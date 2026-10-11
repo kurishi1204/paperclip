@@ -1,6 +1,10 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 
@@ -78,8 +82,10 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
 });
 
 import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
-import { execute } from "./execute.js";
+import { execute, runClaudeLogin } from "./execute.js";
 import { resetClaudeCliCapabilitiesCacheForTests } from "./cli-capabilities.js";
+
+const execFileAsync = promisify(execFile);
 
 describe("claude remote execution", () => {
   const cleanupDirs: string[] = [];
@@ -93,6 +99,168 @@ describe("claude remote execution", () => {
       if (!dir) continue;
       await rm(dir, { recursive: true, force: true }).catch(() => undefined);
     }
+  });
+
+  it("starts local QA with only its run-bound MCP tools and without inherited host credentials", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-qa-"));
+    cleanupDirs.push(rootDir);
+    vi.stubEnv("PAPERCLIP_HOME", rootDir);
+    vi.stubEnv("HOME", path.join(rootDir, "operator-home"));
+    vi.stubEnv("HOST_ONLY_QA_SECRET", "must-not-reach-child");
+    vi.stubEnv("HTTPS_PROXY", "http://operator-proxy.test:8080");
+    vi.stubEnv("ALL_PROXY", "http://operator-all-proxy.test:8080");
+    vi.stubEnv("http_proxy", "http://operator-lower-proxy.test:8080");
+    vi.stubEnv("https_proxy", "http://operator-lower-secure-proxy.test:8080");
+    vi.stubEnv("all_proxy", "http://operator-lower-all-proxy.test:8080");
+    vi.stubEnv("NO_PROXY", "operator.internal");
+    vi.stubEnv("no_proxy", "another.internal");
+    vi.stubEnv("NODE_EXTRA_CA_CERTS", "/operator/ca.pem");
+    const managedHome = path.join(rootDir, "managed-home");
+    await writeFile(path.join(rootDir, "CLAUDE.md"), "Untrusted project instructions must not be loaded");
+    const qaServer = {
+      name: "paperclip_qa", connectionId: "paperclip-qa-review",
+      url: "http://127.0.0.1:3100/api/mcp/qa-review", token: "run-bound-token",
+    };
+    const result = await execute({
+      runId: "qa-run-1",
+      agent: { id: "qa-agent", companyId: "company-1", name: "QA", adapterType: "claude_local", adapterConfig: {} },
+      runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        engine: "cli", qaReviewToolsOnly: true, dangerouslySkipPermissions: false,
+        managedAiConnection: { provider: "anthropic" },
+        cwd: rootDir,
+        env: {
+          HOME: managedHome, XDG_CONFIG_HOME: path.join(managedHome, "config"),
+          XDG_DATA_HOME: path.join(managedHome, "data"),
+          CLAUDE_CONFIG_DIR: path.join(managedHome, "provider"),
+          ANTHROPIC_API_KEY: "provider-test-key", PAPERCLIP_AGENT_PRIVATE_KEY: "must-not-reach-child",
+          HTTPS_PROXY: "http://agent-proxy.test:8080", NO_PROXY: "agent-controlled.invalid",
+          http_proxy: "http://agent-lower-proxy.test:8080",
+          NODE_EXTRA_CA_CERTS: "/agent/ca.pem",
+        },
+      },
+      context: {}, authToken: "run-bound-token",
+      runtimeMcp: { getServers: () => [qaServer, { name: "unrelated", connectionId: "other", url: "http://127.0.0.1:3100/other", token: "other-token" }] },
+      onLog: async () => {},
+    });
+    expect(result.exitCode).toBe(0);
+    const invocation = (runChildProcess.mock.calls as unknown as Array<[string, string, string[], {
+      env: Record<string, string>; inheritHostEnv?: boolean; cwd: string;
+    }]>).find(call => call[2].includes("--print"));
+    expect(invocation).toBeDefined();
+    const args = invocation![2], options = invocation![3];
+    expect(args).toEqual(expect.arrayContaining(["--restricted", "--setting-sources", "", "--tools", "", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--strict-mcp-config"]));
+    expect(args.filter(arg => arg === "--permission-mode")).toHaveLength(1);
+    expect(args.filter(arg => arg === "--permission-prompts")).toHaveLength(1);
+    expect(args).not.toEqual(expect.arrayContaining(["--dangerously-skip-permissions", "--add-dir", "--resume", "--append-system-prompt-file"]));
+    expect(args[args.indexOf("--allowedTools") + 1]).toBe("mcp__paperclip_qa__read_assigned_issue,mcp__paperclip_qa__list_assigned_issue_comments,mcp__paperclip_qa__read_assigned_issue_document,mcp__paperclip_qa__list_assigned_issue_attachments,mcp__paperclip_qa__read_assigned_issue_attachment_text,mcp__paperclip_qa__submit_review_decision,mcp__paperclip_qa__read_assigned_issue_description,mcp__paperclip_qa__list_assigned_issue_annotations,mcp__paperclip_qa__read_assigned_review_receipt,mcp__paperclip_qa__read_assigned_issue_comment,mcp__paperclip_qa__read_assigned_issue_annotation_text");
+    expect(options.cwd).toBe(path.join(managedHome, "qa-working-directory"));
+    expect(await readFile(path.join(options.cwd, "CLAUDE.md"), "utf8").catch(() => null)).toBeNull();
+    expect(options.inheritHostEnv).toBe(false);
+    expect(options.env.ANTHROPIC_API_KEY).toBe("provider-test-key");
+    expect(options.env.HOME).toBe(managedHome);
+    expect(options.env.CLAUDE_CONFIG_DIR).toBe(path.join(managedHome, "provider"));
+    expect(options.env.XDG_CONFIG_HOME).toBe(path.join(managedHome, "config"));
+    expect(options.env.XDG_DATA_HOME).toBe(path.join(managedHome, "data"));
+    expect(options.env.HTTPS_PROXY).toBe("http://operator-proxy.test:8080");
+    expect(options.env.ALL_PROXY).toBe("http://operator-all-proxy.test:8080");
+    expect(options.env.http_proxy).toBe("http://operator-lower-proxy.test:8080");
+    expect(options.env.https_proxy).toBe("http://operator-lower-secure-proxy.test:8080");
+    expect(options.env.all_proxy).toBe("http://operator-lower-all-proxy.test:8080");
+    expect(options.env.NO_PROXY).toBe("operator.internal,another.internal,127.0.0.1,localhost,::1,[::1]");
+    expect(options.env.no_proxy).toBe(options.env.NO_PROXY);
+    expect(options.env.NO_PROXY).not.toContain("agent-controlled.invalid");
+    expect(options.env.NODE_EXTRA_CA_CERTS).toBe("/operator/ca.pem");
+    // Node's environment proxy support is available on the Mini runtime.
+    // Exercise the adapter's actual child env: a provider URL may reach the
+    // operator proxy, while a bearer-bearing loopback QA request must not.
+    if ((await execFileAsync(process.execPath, ["--help"])).stdout.includes("--use-env-proxy")) {
+      const proxyRequests: Array<{ url: string | undefined; authorization: string | undefined }> = [];
+      let qaAuthorization: string | undefined;
+      const qaListener = createServer((req, res) => {
+        qaAuthorization = req.headers.authorization;
+        res.end("qa-ok");
+      });
+      const proxyListener = createServer((req, res) => {
+        proxyRequests.push({ url: req.url, authorization: req.headers.authorization });
+        res.end("provider-ok");
+      });
+      const listen = (server: typeof qaListener) => new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      try {
+        await Promise.all([listen(qaListener), listen(proxyListener)]);
+        const qaUrl = `http://127.0.0.1:${(qaListener.address() as AddressInfo).port}/qa`;
+        const proxyUrl = `http://127.0.0.1:${(proxyListener.address() as AddressInfo).port}`;
+        const providerUrl = "http://provider.invalid/probe";
+        const probe = `
+          import { get } from "node:http";
+          const request = (url, headers = {}) => new Promise((resolve, reject) => {
+            const req = get(url, { headers, timeout: 3000 }, res => {
+              let body = "";
+              res.setEncoding("utf8");
+              res.on("data", chunk => { body += chunk; });
+              res.on("end", () => resolve(body));
+            });
+            req.on("timeout", () => req.destroy(new Error("proxy probe timed out")));
+            req.on("error", reject);
+          });
+          const qa = await request(${JSON.stringify(qaUrl)}, { Authorization: "Bearer run-bound-token" });
+          if (qa !== "qa-ok") throw new Error("QA request left loopback");
+          const provider = await request(${JSON.stringify(providerUrl)});
+          if (provider !== "provider-ok") throw new Error("Provider request missed proxy");
+        `;
+        await execFileAsync(process.execPath, ["--use-env-proxy", "--input-type=module", "-e", probe], {
+          env: { ...options.env, HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, ALL_PROXY: proxyUrl,
+            http_proxy: proxyUrl, https_proxy: proxyUrl, all_proxy: proxyUrl },
+          timeout: 10_000,
+        });
+        expect(qaAuthorization).toBe("Bearer run-bound-token");
+        expect(proxyRequests).toEqual([{ url: providerUrl, authorization: undefined }]);
+      } finally {
+        await Promise.all([qaListener, proxyListener].map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+      }
+    }
+    for (const key of ["PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY", "HOST_ONLY_QA_SECRET"]) expect(options.env[key]).toBeUndefined();
+    const mcpConfig = JSON.parse(await readFile(args[args.indexOf("--mcp-config") + 1]!, "utf8"));
+    expect(Object.keys(mcpConfig.mcpServers)).toEqual(["paperclip_qa"]);
+    expect(mcpConfig.mcpServers.paperclip_qa.headers.Authorization).toBe("Bearer run-bound-token");
+    expect(JSON.stringify(mcpConfig)).not.toContain("other-token");
+  }, 20_000);
+
+  it("fails closed if the QA agent requests bypass or has no QA MCP", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-qa-invalid-"));
+    cleanupDirs.push(rootDir);
+    vi.stubEnv("PAPERCLIP_HOME", rootDir);
+    const managedHome = path.join(rootDir, "managed-home");
+    const managedEnv = {
+      HOME: managedHome, XDG_CONFIG_HOME: path.join(managedHome, "config"),
+      XDG_DATA_HOME: path.join(managedHome, "data"),
+      CLAUDE_CONFIG_DIR: path.join(managedHome, "provider"),
+    };
+    const base = {
+      runId: "qa-run-invalid",
+      agent: { id: "qa-agent", companyId: "company-1", name: "QA", adapterType: "claude_local" as const, adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      context: {}, runtimeMcp: { getServers: () => [] }, onLog: async () => {},
+    };
+    const bypass = await execute({ ...base, config: { engine: "cli", qaReviewToolsOnly: true, dangerouslySkipPermissions: true,
+      managedAiConnection: { provider: "anthropic" }, cwd: rootDir, env: managedEnv } });
+    expect(bypass.errorCode).toBe("qa_review_configuration_invalid");
+    const missing = await execute({ ...base, config: { engine: "cli", qaReviewToolsOnly: true, dangerouslySkipPermissions: false,
+      managedAiConnection: { provider: "anthropic" }, cwd: rootDir, env: managedEnv } });
+    expect(missing.errorCode).toBe("qa_review_tools_unavailable");
+    const hostHome = process.env.HOME!;
+    const unsafe = await execute({ ...base, config: { engine: "cli", qaReviewToolsOnly: true, dangerouslySkipPermissions: false,
+      managedAiConnection: { provider: "anthropic" }, cwd: rootDir,
+      env: { ...managedEnv, HOME: hostHome, CLAUDE_CONFIG_DIR: path.join(hostHome, "provider"),
+        XDG_CONFIG_HOME: path.join(hostHome, "config"), XDG_DATA_HOME: path.join(hostHome, "data") },
+    } });
+    expect(unsafe.errorCode).toBe("qa_review_configuration_invalid");
+    await expect(runClaudeLogin({ runId: "qa-login-rejected", agent: base.agent,
+      config: { qaReviewToolsOnly: true, env: managedEnv } })).rejects.toThrow("cannot use interactive Claude login");
+    expect(runChildProcess.mock.calls.some(call => (call[2] as string[]).includes("--print"))).toBe(false);
   });
 
   it("prepares the workspace, syncs Claude runtime assets, and restores workspace changes for remote SSH execution", async () => {
