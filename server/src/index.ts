@@ -1006,6 +1006,12 @@ async function startServerWithDatabaseTeardown(
     });
   });
   startupListenerBound = true;
+  // A hostname such as localhost may bind only on ::1. Publish the address
+  // actually accepted by the listener so the run-bound QA token stays on a
+  // reachable local socket. A missing address leaves QA self-reads disabled.
+  const boundAddress = server.address();
+  process.env.PAPERCLIP_LISTEN_HOST = boundAddress && typeof boundAddress !== "string"
+    ? boundAddress.address : "";
 
   try {
     const result = await workspaceOperationService(db as any)

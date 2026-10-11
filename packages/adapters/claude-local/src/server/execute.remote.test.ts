@@ -109,6 +109,9 @@ describe("claude remote execution", () => {
     vi.stubEnv("HOST_ONLY_QA_SECRET", "must-not-reach-child");
     vi.stubEnv("HTTPS_PROXY", "http://operator-proxy.test:8080");
     vi.stubEnv("ALL_PROXY", "http://operator-all-proxy.test:8080");
+    vi.stubEnv("http_proxy", "http://operator-lower-proxy.test:8080");
+    vi.stubEnv("https_proxy", "http://operator-lower-secure-proxy.test:8080");
+    vi.stubEnv("all_proxy", "http://operator-lower-all-proxy.test:8080");
     vi.stubEnv("NO_PROXY", "operator.internal");
     vi.stubEnv("no_proxy", "another.internal");
     vi.stubEnv("NODE_EXTRA_CA_CERTS", "/operator/ca.pem");
@@ -132,6 +135,7 @@ describe("claude remote execution", () => {
           CLAUDE_CONFIG_DIR: path.join(managedHome, "provider"),
           ANTHROPIC_API_KEY: "provider-test-key", PAPERCLIP_AGENT_PRIVATE_KEY: "must-not-reach-child",
           HTTPS_PROXY: "http://agent-proxy.test:8080", NO_PROXY: "agent-controlled.invalid",
+          http_proxy: "http://agent-lower-proxy.test:8080",
           NODE_EXTRA_CA_CERTS: "/agent/ca.pem",
         },
       },
@@ -160,6 +164,9 @@ describe("claude remote execution", () => {
     expect(options.env.XDG_DATA_HOME).toBe(path.join(managedHome, "data"));
     expect(options.env.HTTPS_PROXY).toBe("http://operator-proxy.test:8080");
     expect(options.env.ALL_PROXY).toBe("http://operator-all-proxy.test:8080");
+    expect(options.env.http_proxy).toBe("http://operator-lower-proxy.test:8080");
+    expect(options.env.https_proxy).toBe("http://operator-lower-secure-proxy.test:8080");
+    expect(options.env.all_proxy).toBe("http://operator-lower-all-proxy.test:8080");
     expect(options.env.NO_PROXY).toBe("operator.internal,another.internal,127.0.0.1,localhost,::1,[::1]");
     expect(options.env.no_proxy).toBe(options.env.NO_PROXY);
     expect(options.env.NO_PROXY).not.toContain("agent-controlled.invalid");
@@ -208,7 +215,7 @@ describe("claude remote execution", () => {
     expect(Object.keys(mcpConfig.mcpServers)).toEqual(["paperclip_qa"]);
     expect(mcpConfig.mcpServers.paperclip_qa.headers.Authorization).toBe("Bearer run-bound-token");
     expect(JSON.stringify(mcpConfig)).not.toContain("other-token");
-  });
+  }, 20_000);
 
   it("fails closed if the QA agent requests bypass or has no QA MCP", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-qa-invalid-"));

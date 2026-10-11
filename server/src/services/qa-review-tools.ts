@@ -67,7 +67,10 @@ export function qaReviewLocalApiUrl(env: NodeJS.ProcessEnv = process.env): strin
   const rawPort = env.PAPERCLIP_LISTEN_PORT?.trim() ?? "";
   const port = Number(rawPort);
   if (!/^\d+$/.test(rawPort) || !Number.isInteger(port) || port < 1 || port > 65535) return null;
-  if (host === "127.0.0.1" || host === "localhost" || host === "0.0.0.0") {
+  // The startup path replaces hostnames with server.address().address after
+  // bind. A bare localhost value does not say which address family accepted
+  // connections, so a QA bearer must not be sent to a guessed listener.
+  if (host === "127.0.0.1" || host === "0.0.0.0") {
     return `http://127.0.0.1:${port}`;
   }
   if (host === "::1" || host === "::") return `http://[::1]:${port}`;

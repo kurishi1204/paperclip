@@ -328,7 +328,7 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     // A managed host may need its operator-supplied proxy or CA to reach
     // Anthropic. Copy these only from the server process, never from an agent's
     // adapter config, so a task cannot redirect the QA credential to its proxy.
-    for (const key of ["PATH", "TMPDIR", "LANG", "LC_ALL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR"] as const) {
+    for (const key of ["PATH", "TMPDIR", "LANG", "LC_ALL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR"] as const) {
       if (typeof process.env[key] === "string") env[key] = process.env[key]!;
     }
     // The QA MCP uses a loopback URL with a run-bound bearer token. Keep that

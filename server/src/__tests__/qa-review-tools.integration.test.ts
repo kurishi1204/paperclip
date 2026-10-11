@@ -9,6 +9,15 @@ import { createWakeQueue } from "../modules/wake-queue/index.js";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 import * as qaReviewTools from "../services/qa-review-tools.js";
 
+it("requires the bound numeric loopback family for its bearer URL", () => {
+  expect(qaReviewTools.qaReviewLocalApiUrl({
+    PAPERCLIP_LISTEN_HOST: "localhost", PAPERCLIP_LISTEN_PORT: "3317",
+  })).toBeNull();
+  expect(qaReviewTools.qaReviewLocalApiUrl({
+    PAPERCLIP_LISTEN_HOST: "::1", PAPERCLIP_LISTEN_PORT: "3317",
+  })).toBe("http://[::1]:3317");
+});
+
 describe("run-bound QA review MCP", () => {
   let server: Awaited<ReturnType<typeof startRunnerApiTestServer>>;
   beforeAll(async () => {
