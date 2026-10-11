@@ -12,11 +12,13 @@ import type {
 } from "@paperclipai/adapter-utils";
 
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs/promises";
 import { promisify } from "node:util";
+import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 
 import { HERMES_CLI, DEFAULT_MODEL, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
@@ -30,6 +32,34 @@ const execFileAsync = promisify(execFile);
 // cannot prove that its web tool was exposed or that the search backend worked.
 export function verifyBoundedWebProbe(stdout: string): boolean {
   return parseBoundedWebResult(stdout, { exactlyOneSearch: true }) !== null;
+}
+
+export async function runBoundedWebProbeProcess(
+  command: string,
+  args: string[],
+  env: Record<string, string>,
+  cwd: string,
+  timeoutSec = 90,
+  graceSec = 5,
+): Promise<string> {
+  // Use the heartbeat's process-group timeout and SIGKILL escalation. Node's
+  // execFile timeout sends only SIGTERM and can wait forever for a defiant CLI.
+  const result = await runChildProcess(`hermes-probe-${randomUUID()}`, command, args, {
+    cwd, env, inheritHostEnv: false, timeoutSec, graceSec,
+    onLog: async () => {},
+  });
+  if (result.timedOut || result.exitCode !== 0) {
+    const error = new Error("Hermes bounded probe process failed") as Error & {
+      code: number | string | null;
+      signal: string | null;
+      stderr: string;
+    };
+    error.code = result.timedOut ? "ETIMEDOUT" : result.exitCode;
+    error.signal = result.signal;
+    error.stderr = result.stderr;
+    throw error;
+  }
+  return result.stdout;
 }
 
 function boundedProbeFailure(error: unknown): string {
@@ -398,9 +428,11 @@ export async function testEnvironment(
         if (process.platform === "win32") childEnv.USERPROFILE = isolatedCwd;
       }
       try {
-        const { stdout } = await execFileAsync(command, args, {
-          env: childEnv, cwd: isolatedCwd ?? asString(config.cwd), timeout: bounded ? 90_000 : 45_000, maxBuffer: 1024 * 1024,
-        });
+        const stdout = bounded
+          ? await runBoundedWebProbeProcess(command, args, childEnv, isolatedCwd!)
+          : (await execFileAsync(command, args, {
+            env: childEnv, cwd: asString(config.cwd), timeout: 45_000, maxBuffer: 1024 * 1024,
+          })).stdout;
         if (bounded) {
           if (!verifyBoundedWebProbe(stdout)) throw new Error("structured_web_result_unverified");
           // A first launch may create skills/SOUL after the preflight. It is

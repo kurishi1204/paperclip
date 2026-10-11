@@ -6,7 +6,7 @@ import { expect, test } from "vitest";
 
 import { HERMES_CLI } from "../shared/constants.js";
 import { resolveHermesCommand } from "./execute.js";
-import { testEnvironment, verifyBoundedWebProbe } from "./test.js";
+import { runBoundedWebProbeProcess, testEnvironment, verifyBoundedWebProbe } from "./test.js";
 
 const boundedWebProbe = [
   { type: "system", subtype: "init", session_id: "fixture-session" },
@@ -23,6 +23,21 @@ test("bounded web evidence requires a real successful tool result and matching t
   expect(verifyBoundedWebProbe(boundedWebProbe.replace('"exit_code":0', '"exit_code":1'))).toBe(false);
   expect(verifyBoundedWebProbe(boundedWebProbe.replace('"fixture-session","exit_code":0', '"different-session","exit_code":0'))).toBe(false);
 });
+
+test("bounded probe reaps a CLI that ignores SIGTERM", async () => {
+  const cwd = await realpath(await mkdtemp(path.join(os.tmpdir(), "hermes-probe-timeout-")));
+  try {
+    const start = Date.now();
+    await expect(runBoundedWebProbeProcess(
+      process.execPath,
+      ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+      { PATH: process.env.PATH ?? "", HOME: cwd }, cwd, 1, 1,
+    )).rejects.toMatchObject({ code: "ETIMEDOUT" });
+    expect(Date.now() - start).toBeLessThan(5_000);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+}, 10_000);
 
 test("resolveHermesCommand prefers hermesCommand over command", () => {
   expect(resolveHermesCommand({ hermesCommand: "hermes_maximus", command: "hermes_backup" }))
