@@ -5,7 +5,6 @@ SHA='4f85982624b3898c8991cb80c0981b2aa71070e3537046c9a95950318a95afcc'
 def assert_no_quarantine(source):
  attributes=subprocess.check_output(['/usr/bin/xattr',source],env={'PATH':'/usr/bin:/bin'},text=True,timeout=10)
  assert 'com.apple.quarantine' not in attributes.splitlines(), 'HOLD: source quarantined; do not strip'
-assert os.geteuid()==0, 'HOLD: root required'
 def checked(p,directory):
  s=os.lstat(p);assert s.st_uid==0 and not stat.S_ISLNK(s.st_mode) and s.st_mode&0o022==0 and (stat.S_ISDIR(s.st_mode) if directory else stat.S_ISREG(s.st_mode)), 'HOLD: target metadata'
  out=subprocess.check_output(['/bin/ls','-lde',p],env={'PATH':'/usr/bin:/bin'},text=True).strip();assert len(out.splitlines())==1 and '+' not in out.split()[0], 'HOLD: target ACL'
@@ -16,32 +15,45 @@ def digest(fd):
   if not b:break
   h.update(b)
  return h.hexdigest()
-for p in ['/', '/opt']:checked(p,True)
-f=os.open(SOURCE,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC);s=os.fstat(f)
-assert stat.S_ISREG(s.st_mode) and s.st_uid==501 and s.st_nlink==1 and s.st_mode&0o022==0 and s.st_size==222655232, 'HOLD: official source metadata'
-assert digest(f)==SHA, 'HOLD: official source SHA'
-assert_no_quarantine(SOURCE)
-for p in ['/opt/colo-codex-qa','/opt/colo-codex-qa/0.154.0','/opt/colo-codex-qa/0.154.0/bin']:
- try:os.mkdir(p,0o755)
+def ensure_directory(p):
+ created=False
+ try:os.mkdir(p,0o755);created=True
  except FileExistsError:pass
  checked(p,True)
-if os.path.lexists(TARGET):
- checked(TARGET,False);d=os.open(TARGET,os.O_RDONLY|os.O_NOFOLLOW);assert os.fstat(d).st_nlink==1 and digest(d)==SHA,'HOLD: existing target';os.close(d)
-else:
- temp=TARGET+'.stage';d=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600);os.lseek(f,0,0);h=hashlib.sha256()
- try:
-  while True:
-   b=os.read(f,1024*1024)
-   if not b:break
-   h.update(b);view=memoryview(b)
-   while view:view=view[os.write(d,view):]
-  a=os.fstat(f);assert h.hexdigest()==SHA and (s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)==(a.st_dev,a.st_ino,a.st_size,a.st_mtime_ns,a.st_ctime_ns),'HOLD: source changed'
-  os.fsync(d);os.fchmod(d,0o555);os.close(d);d=None;os.link(temp,TARGET);os.unlink(temp)
- finally:
-  if d is not None:os.close(d)
-  if os.path.lexists(temp):os.unlink(temp)
-os.close(f);checked(TARGET,False)
-subprocess.run(['/usr/bin/codesign','--verify','--strict',TARGET],check=True,env={'PATH':'/usr/bin:/bin'},capture_output=True)
+ if created:
+  fd=os.open(p,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+  try:os.fchmod(fd,0o755)
+  finally:os.close(fd)
+ checked(p,True)
+ assert stat.S_IMODE(os.lstat(p).st_mode)&0o555==0o555, 'HOLD: service traversal permissions'
+def install_file(SOURCE,TARGET,SHA,size):
+ f=os.open(SOURCE,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC);s=os.fstat(f)
+ assert stat.S_ISREG(s.st_mode) and s.st_uid==501 and s.st_nlink==1 and s.st_mode&0o022==0 and s.st_size==size, 'HOLD: official source metadata'
+ assert digest(f)==SHA, 'HOLD: official source SHA'
+ assert_no_quarantine(SOURCE)
+ if os.path.lexists(TARGET):
+  checked(TARGET,False);d=os.open(TARGET,os.O_RDONLY|os.O_NOFOLLOW);assert os.fstat(d).st_nlink==1 and digest(d)==SHA,'HOLD: existing target';os.close(d)
+ else:
+  temp=TARGET+'.stage';d=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600);os.lseek(f,0,0);h=hashlib.sha256()
+  try:
+   while True:
+    b=os.read(f,1024*1024)
+    if not b:break
+    h.update(b);view=memoryview(b)
+    while view:view=view[os.write(d,view):]
+   a=os.fstat(f);assert h.hexdigest()==SHA and (s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)==(a.st_dev,a.st_ino,a.st_size,a.st_mtime_ns,a.st_ctime_ns),'HOLD: source changed'
+   os.fsync(d);os.fchmod(d,0o555);os.close(d);d=None;os.link(temp,TARGET);os.unlink(temp)
+  finally:
+   if d is not None:os.close(d)
+   if os.path.lexists(temp):os.unlink(temp)
+ os.close(f);checked(TARGET,False)
+ subprocess.run(['/usr/bin/codesign','--verify','--strict',TARGET],check=True,env={'PATH':'/usr/bin:/bin'},capture_output=True)
+ print('CODE_SIGNATURE_VERIFIED '+TARGET+' sha256='+SHA)
+assert os.geteuid()==0, 'HOLD: root required'
+for p in ['/', '/opt']:checked(p,True)
+for p in ['/opt/colo-codex-qa','/opt/colo-codex-qa/0.154.0','/opt/colo-codex-qa/0.154.0/bin']:ensure_directory(p)
+install_file(SOURCE,TARGET,SHA,222655232)
+install_file(SOURCE+'-code-mode-host',TARGET+'-code-mode-host','426d73aaeb2aeef45e98b5add99e8ef9594a31673d281489bb2cb06b38c27423',62786144)
 version=subprocess.check_output([TARGET,'--version'],env={'HOME':'/var/empty','PATH':'/usr/bin:/bin'},text=True,timeout=15).strip();assert version=='codex-cli 0.154.0','HOLD: version'
 print('CODE_SIGNATURE_VERIFIED_VERSION '+version)
 print('CODE_INSTALLED_ONLY '+TARGET+' sha256='+SHA)
