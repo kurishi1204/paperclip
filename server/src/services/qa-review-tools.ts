@@ -1,3 +1,4 @@
+import { request as directHttpRequest } from "node:http";
 import { z } from "zod";
 import { and, eq } from "drizzle-orm";
 import { issueExecutionDecisions, type Db } from "@paperclipai/db";
@@ -275,14 +276,63 @@ function apiOrigin(input: QaToolInput) {
   return input.apiUrl.replace(/\/+$/, "").replace(/\/api$/, "");
 }
 
+/** Keep a run JWT on the numeric loopback listener even with Node env proxies. */
+function directQaApiRequest(input: QaToolInput, path: string, options: {
+  method?: "GET" | "PATCH";
+  body?: string;
+  range?: string;
+  maxBytes?: number;
+} = {}): Promise<Response> {
+  const url = new URL(path, `${apiOrigin(input)}/`);
+  if (url.protocol !== "http:" || !["127.0.0.1", "[::1]", "[::ffff:127.0.0.1]"].includes(url.hostname) ||
+      url.username || url.password || url.hash || !url.pathname.startsWith("/api/")) {
+    throw forbidden("QA local API listener is invalid");
+  }
+  const headers: Record<string, string> = { Authorization: `Bearer ${input.token}` };
+  if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  if (options.range !== undefined) headers.Range = options.range;
+  const maxBytes = options.maxBytes ?? 16_000_000;
+  return new Promise<Response>((resolve, reject) => {
+    // agent:false creates a private direct Agent. In particular, it does not
+    // reuse http.globalAgent when Node --use-env-proxy has configured it.
+    const req = directHttpRequest(url, {
+      method: options.method ?? "GET", headers, agent: false,
+      signal: AbortSignal.timeout(60_000),
+    }, (res) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      res.on("data", (chunk: Buffer) => {
+        size += chunk.byteLength;
+        if (size > maxBytes) {
+          res.destroy(new Error("QA local API response exceeds the size limit"));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on("error", reject);
+      res.on("end", () => {
+        const status = res.statusCode;
+        if (status === undefined) return reject(new Error("QA local API response has no status"));
+        const responseHeaders = new Headers();
+        for (const name of ["content-type", "content-range"] as const) {
+          const value = res.headers[name];
+          if (typeof value === "string") responseHeaders.set(name, value);
+        }
+        resolve(new Response(size === 0 ? null : Buffer.concat(chunks), {
+          status, headers: responseHeaders,
+        }));
+      });
+    });
+    req.on("error", reject);
+    req.end(options.body);
+  });
+}
+
 async function issueApi(input: QaToolInput, method: "GET" | "PATCH", suffix: string, body?: object) {
   let response: Response;
   try {
-    response = await fetch(`${apiOrigin(input)}/api/issues/${input.issue.id}${suffix}`, {
-      method,
-      headers: { Authorization: `Bearer ${input.token}`, "Content-Type": "application/json" },
-      ...(body ? { body: JSON.stringify(body) } : {}),
-      signal: AbortSignal.timeout(60_000),
+    response = await directQaApiRequest(input, `/api/issues/${input.issue.id}${suffix}`, {
+      method, ...(body ? { body: JSON.stringify(body) } : {}),
     });
   } catch (error) {
     if (method === "PATCH") throw new QaDecisionOutcomeUnknownError("QA decision transport failed", { cause: error });
@@ -352,9 +402,8 @@ async function readAssignedAttachmentText(input: QaToolInput, args: z.infer<type
   if (args.offset > attachment.byteSize) throw conflict("Attachment offset is beyond the current content");
   if (args.offset === attachment.byteSize) return { attachmentId: attachment.id, issueRevision: args.expectedRevision, sha256: attachment.sha256, text: "", offset: args.offset, nextOffset: null, totalBytes: attachment.byteSize };
   const end = Math.min(attachment.byteSize - 1, args.offset + args.limit + 2);
-  const response = await fetch(`${apiOrigin(input)}/api/attachments/${attachment.id}/content`, {
-    headers: { Authorization: `Bearer ${input.token}`, Range: `bytes=${args.offset}-${end}` },
-    signal: AbortSignal.timeout(60_000),
+  const response = await directQaApiRequest(input, `/api/attachments/${attachment.id}/content`, {
+    range: `bytes=${args.offset}-${end}`, maxBytes: 64_000,
   });
   if (response.status !== 206 || !isReadableTextType(response.headers.get("content-type") ?? "") ||
       response.headers.get("content-range") !== `bytes ${args.offset}-${end}/${attachment.byteSize}`) {

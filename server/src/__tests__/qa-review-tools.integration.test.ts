@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import http from "node:http";
 import { and, eq, sql } from "drizzle-orm";
 import { agentWakeupRequests, agents, assets, documentAnnotationComments, documentAnnotationThreads, documents, heartbeatRuns, issueAttachments, issueComments, issueExecutionDecisions, issueRelations, issues, issueWorkProducts } from "@paperclipai/db";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -94,6 +95,96 @@ describe("run-bound QA review MCP", () => {
       expect(read.body.result.structuredContent.id).toBe(fixture.issueId);
     } finally {
       vi.stubEnv("PAPERCLIP_API_URL", server.apiUrl);
+    }
+  });
+
+  it("keeps MCP self GET, attachment GET and verdict PATCH off an ambient fetch proxy", async () => {
+    const { fixture, stageId, token, rows } = await reviewFixture();
+    const proxyHits: Array<{ authorization: string | undefined; url: string | undefined }> = [];
+    const proxy = http.createServer((req, res) => {
+      proxyHits.push({ authorization: req.headers.authorization, url: req.url });
+      res.writeHead(502).end("proxy must not receive the QA JWT");
+    });
+    await new Promise<void>((resolve, reject) => {
+      proxy.once("error", reject);
+      proxy.listen(0, "127.0.0.1", resolve);
+    });
+    const proxyUrl = `http://127.0.0.1:${(proxy.address() as import("node:net").AddressInfo).port}`;
+    const previousAgent = http.globalAgent;
+    const poisonedAgent = new http.Agent({ proxyEnv: { HTTP_PROXY: proxyUrl, ALL_PROXY: proxyUrl, NO_PROXY: "" } });
+    http.globalAgent = poisonedAgent;
+    const priorEnv = Object.fromEntries(["HTTP_PROXY", "ALL_PROXY", "NO_PROXY"].map(key => [key, process.env[key]]));
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.ALL_PROXY = proxyUrl;
+    process.env.NO_PROXY = "";
+    // Model a runtime configured to proxy global fetch. The MCP caller below
+    // connects directly; only the server's internal self-request is probed.
+    const fetchProxy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const header = new Headers(init?.headers).get("authorization") ?? undefined;
+      return new Promise<Response>((resolve, reject) => {
+        const req = http.request(proxyUrl, { agent: false, headers: header ? { Authorization: header } : {} }, res => {
+          res.resume();
+          res.on("end", () => resolve(new Response(null, { status: res.statusCode ?? 502 })));
+        });
+        req.on("error", reject);
+        req.end();
+      });
+    });
+    const tool = async (name: string, args: object = {}) => {
+      const payload = JSON.stringify({ jsonrpc: "2.0", id: randomUUID(), method: "tools/call",
+        params: { name, arguments: args } });
+      const url = new URL("/api/mcp/qa-review", server.apiUrl);
+      return new Promise<any>((resolve, reject) => {
+        const req = http.request(url, { method: "POST", agent: false, headers: {
+          Authorization: `Bearer ${token}`, "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        } }, res => {
+          const chunks: Buffer[] = [];
+          res.on("data", chunk => chunks.push(chunk));
+          res.on("error", reject);
+          res.on("end", () => {
+            try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
+            catch (error) { reject(error); }
+          });
+        });
+        req.on("error", reject);
+        req.end(payload);
+      });
+    };
+    try {
+      const stored = await server.storage.putFile({ companyId: fixture.companyId,
+        namespace: "qa-evidence", originalFilename: "proxy-proof.txt",
+        contentType: "text/plain", body: Buffer.from("review proof") });
+      const [asset] = await server.db.insert(assets).values({ companyId: fixture.companyId, ...stored }).returning();
+      const [attachment] = await server.db.insert(issueAttachments).values({
+        companyId: fixture.companyId, issueId: fixture.issueId, assetId: asset!.id,
+      }).returning();
+      const issue = (await tool("read_assigned_issue")).result;
+      expect(issue.isError).not.toBe(true);
+      const read = issue.structuredContent;
+      const content = (await tool("read_assigned_issue_attachment_text", {
+        attachmentId: attachment!.id, expectedRevision: read.revision, limit: 8,
+      })).result;
+      expect(content.isError).not.toBe(true);
+      expect(content.structuredContent.text).toBe("review p");
+      const verdict = (await tool("submit_review_decision", {
+        decision: "approve", summary: "Local evidence checked.", expectedStageId: stageId,
+        expectedStatusVersion: read.statusVersion, expectedRevision: read.revision,
+        expectedLastDecisionId: read.reviewStage.lastDecisionId,
+      })).result;
+      expect(verdict.isError).not.toBe(true);
+      expect(await rows()).toHaveLength(1);
+      expect(fetchProxy).not.toHaveBeenCalled();
+      expect(proxyHits).toEqual([]);
+    } finally {
+      fetchProxy.mockRestore();
+      http.globalAgent = previousAgent;
+      poisonedAgent.destroy();
+      for (const [key, value] of Object.entries(priorEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await new Promise<void>(resolve => proxy.close(() => resolve()));
     }
   });
 
