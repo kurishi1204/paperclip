@@ -103,4 +103,31 @@ describe("conditional board review start", () => {
  it("does not allow arbitrary edits through the review precondition", async () => {
   const { patch } = await fixture(); expect((await patch({ description: "Unreviewed replacement" })).status).toBe(403);
  });
+ async function changedFixture() {
+  const x=await fixture();expect((await x.patch()).status).toBe(200);
+  const [pending]=await server.db.select().from(issues).where(eq(issues.id,x.f.issueId));
+  const state={...pending!.executionState!,status:"changes_requested" as const,lastDecisionId:randomUUID(),lastDecisionOutcome:"changes_requested" as const,changesRequestedCount:1};
+  await server.db.update(issues).set({status:"in_progress",assigneeAgentId:x.f.agentId,executionState:state}).where(eq(issues.id,x.f.issueId));
+  const [read]=await server.db.select().from(issues).where(eq(issues.id,x.f.issueId));
+  const expected={...x.body.boardReviewExpected,resubmit:true,lastDecisionId:state.lastDecisionId,workerAgentId:x.f.agentId,changesRequestedCount:1,revision:read!.revision,statusVersion:read!.statusVersion};
+  const send=(extra={})=>fetch(`${server.apiUrl}/api/issues/${x.f.issueId}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:"in_review",comment:"Primary evidence added; resubmit same QA decision.",boardReviewExpected:{...expected,...extra}})});
+  return {...x,read:read!,expected,send};
+ }
+ it("resubmits the same change request with decision-bound CAS and one transactional comment",async()=>{
+  const {f,reviewer,expected,send}=await changedFixture();const r=await send();expect(r.status).toBe(200);
+  const updated=await r.json();expect(updated.status).toBe("in_review");expect(updated.assigneeAgentId).toBe(reviewer);expect(updated.executionState.status).toBe("pending");expect(updated.executionState.currentStageId).toBe(expected.stageId);expect(updated.executionState.lastDecisionId).toBe(expected.lastDecisionId);expect(updated.executionState.changesRequestedCount).toBe(1);
+  expect((await send()).status).toBe(409);expect(await server.db.select().from(issueComments).where(and(eq(issueComments.issueId,f.issueId),eq(issueComments.body,"Primary evidence added; resubmit same QA decision.")))).toHaveLength(1);
+ });
+ it("rejects stale revision, another decision, reviewer, worker or review round without side effects",async()=>{
+  const {f,read,send}=await changedFixture();for(const extra of [{revision:read.revision-1},{lastDecisionId:randomUUID()},{workerAgentId:randomUUID()},{reviewerAgentId:randomUUID()},{changesRequestedCount:2}])expect((await send(extra)).status).toBe(409);
+  const [after]=await server.db.select().from(issues).where(eq(issues.id,f.issueId));expect(after!.status).toBe("in_progress");expect(after!.executionState).toEqual(read.executionState);expect(await server.db.select().from(issueComments).where(and(eq(issueComments.issueId,f.issueId),eq(issueComments.body,"Primary evidence added; resubmit same QA decision.")))).toHaveLength(0);
+ });
+ it("refuses active execution on resubmission without cancelling the Run",async()=>{
+  const {f,send}=await changedFixture();await server.db.update(heartbeatRuns).set({status:"running"}).where(eq(heartbeatRuns.id,f.runId));expect((await send()).status).toBe(409);const [run]=await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,f.runId));expect(run!.status).toBe("running");
+ });
+ it("rechecks the decision after waiting for the row lock",async()=>{
+  const {f,read,send}=await changedFixture();let pending!:Promise<Response>;
+  await server.db.transaction(async tx=>{await tx.select({id:issues.id}).from(issues).where(eq(issues.id,f.issueId)).for("update");pending=send();await expect.poll(async()=>{const rows=await server.db.execute(sql<{count:string}>`SELECT count(*)::text AS count FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query NOT LIKE '%pg_stat_activity%'`);return Number(rows[0]?.count??0);},{timeout:15000}).toBeGreaterThanOrEqual(1);await tx.update(issues).set({executionState:{...read.executionState!,lastDecisionId:randomUUID()}}).where(eq(issues.id,f.issueId));});expect((await pending).status).toBe(409);
+ },30000);
+
 });

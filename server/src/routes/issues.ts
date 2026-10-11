@@ -363,6 +363,10 @@ const updateIssueRouteSchema = updateIssueSchema.extend({
     stageId: z.string().uuid(),
     reviewerAgentId: z.string().uuid(),
     resume: z.boolean().optional(),
+    resubmit: z.boolean().optional(),
+    lastDecisionId: z.string().uuid().optional(),
+    workerAgentId: z.string().uuid().optional(),
+    changesRequestedCount: z.number().int().positive().optional(),
     revision: z.number().int().nonnegative(),
     statusVersion: z.number().int().nonnegative(),
   }).strict().optional(),
@@ -12890,10 +12894,17 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!existing) return;
-      const boardReviewExpected = req.body.boardReviewExpected as { stageId: string; reviewerAgentId: string; resume?: boolean; revision: number; statusVersion: number } | undefined;
+      const boardReviewExpected = req.body.boardReviewExpected as { stageId: string; reviewerAgentId: string; resume?: boolean; resubmit?: boolean; lastDecisionId?: string; workerAgentId?: string; changesRequestedCount?: number; revision: number; statusVersion: number } | undefined;
       const boardReviewResume = boardReviewExpected?.resume === true;
+      const boardReviewResubmit = boardReviewExpected?.resubmit === true;
+      const boardReviewExisting = boardReviewResume || boardReviewResubmit;
+      if (boardReviewExpected && (boardReviewResume && boardReviewResubmit ||
+          boardReviewResubmit && (!boardReviewExpected.lastDecisionId || !boardReviewExpected.workerAgentId || !boardReviewExpected.changesRequestedCount) ||
+          !boardReviewResubmit && (boardReviewExpected.lastDecisionId !== undefined || boardReviewExpected.workerAgentId !== undefined || boardReviewExpected.changesRequestedCount !== undefined))) {
+        throw forbidden("Conditional review mode and decision-bound resubmission fields must match");
+      }
       if (boardReviewExpected && (req.actor.type !== "board" || req.actor.source === "mcp_oauth" ||
-          req.body.status !== "in_review" || (boardReviewResume ? req.body.executionPolicy !== undefined :
+          req.body.status !== "in_review" || (boardReviewExisting ? req.body.executionPolicy !== undefined :
           !req.body.executionPolicy || req.body.executionPolicy.mode !== "normal" || req.body.executionPolicy.monitor != null ||
           req.body.executionPolicy.stages?.[0]?.type !== "review") ||
           typeof req.body.comment !== "string" || !req.body.comment.trim() ||
@@ -12901,8 +12912,8 @@ export function issueRoutes(
         throw forbidden("Board review start requires a conditional review-only patch");
       }
       if (boardReviewExpected) {
-        const effectivePolicy = normalizeIssueExecutionPolicy(boardReviewResume ? existing.executionPolicy : req.body.executionPolicy);
-        const firstStage = boardReviewResume ? effectivePolicy?.stages.find(stage => stage.id === boardReviewExpected.stageId) : effectivePolicy?.stages[0];
+        const effectivePolicy = normalizeIssueExecutionPolicy(boardReviewExisting ? existing.executionPolicy : req.body.executionPolicy);
+        const firstStage = boardReviewExisting ? effectivePolicy?.stages.find(stage => stage.id === boardReviewExpected.stageId) : effectivePolicy?.stages[0];
         if (!effectivePolicy || effectivePolicy.mode !== "normal" || effectivePolicy.monitor != null ||
             firstStage?.id !== boardReviewExpected.stageId || firstStage.type !== "review" ||
             firstStage.approvalsNeeded !== 1 || firstStage.participants.length !== 1 ||
@@ -12914,7 +12925,18 @@ export function issueRoutes(
       const assertBoardReviewStart = async (query: IssueQueueDb, locked: NonNullable<typeof existing> | null) => {
         if (!boardReviewExpected) return;
         if (!locked || locked.revision !== boardReviewExpected.revision ||
-            locked.statusVersion !== boardReviewExpected.statusVersion || (boardReviewResume ?
+            locked.statusVersion !== boardReviewExpected.statusVersion || (boardReviewResubmit ?
+              locked.status !== "in_progress" || parseIssueExecutionState(locked.executionState)?.status !== "changes_requested" ||
+              parseIssueExecutionState(locked.executionState)?.currentStageType !== "review" ||
+              parseIssueExecutionState(locked.executionState)?.currentStageId !== boardReviewExpected.stageId ||
+              parseIssueExecutionState(locked.executionState)?.currentParticipant?.type !== "agent" ||
+              parseIssueExecutionState(locked.executionState)?.currentParticipant?.agentId !== boardReviewExpected.reviewerAgentId ||
+              parseIssueExecutionState(locked.executionState)?.lastDecisionId !== boardReviewExpected.lastDecisionId ||
+              parseIssueExecutionState(locked.executionState)?.lastDecisionOutcome !== "changes_requested" ||
+              parseIssueExecutionState(locked.executionState)?.changesRequestedCount !== boardReviewExpected.changesRequestedCount ||
+              parseIssueExecutionState(locked.executionState)?.returnAssignee?.type !== "agent" ||
+              parseIssueExecutionState(locked.executionState)?.returnAssignee?.agentId !== boardReviewExpected.workerAgentId ||
+              locked.assigneeAgentId !== boardReviewExpected.workerAgentId || locked.assigneeUserId !== null : boardReviewResume ?
               locked.status !== "blocked" || parseIssueExecutionState(locked.executionState)?.status !== "pending" ||
               parseIssueExecutionState(locked.executionState)?.currentStageType !== "review" ||
               parseIssueExecutionState(locked.executionState)?.currentStageId !== boardReviewExpected.stageId ||
