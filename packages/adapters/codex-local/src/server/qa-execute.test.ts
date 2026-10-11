@@ -30,10 +30,10 @@ it("isolates managed credentials and launches only the pinned, restricted QA sur
   expect(target).toBeNull(); expect(command).toBe(process.env.PAPERCLIP_CODEX_QA_TRUSTED_COMMAND); expect(opts.inheritHostEnv).toBe(false);
   expect(args).toContain("features.shell_tool=false"); expect(args).toContain("features.apps=false");
   expect(args).toContain('web_search="disabled"'); expect(args).not.toContain("resume");
-  expect(opts.env.CODEX_HOME).not.toBe((ctx.config.env as Record<string,string>).CODEX_HOME);
+  expect(opts.env.CODEX_HOME).toBe((ctx.config.env as Record<string,string>).CODEX_HOME);
   expect(Object.keys(opts.env).sort()).toEqual(["CODEX_HOME", "HOME", "PAPERCLIP_QA_TOKEN", "PATH", "XDG_CONFIG_HOME", "XDG_DATA_HOME"].sort());
   const config=capturedConfig;
-  await expect(fs.access(opts.env.CODEX_HOME)).rejects.toThrow();
+  await expect(fs.access(opts.env.HOME)).rejects.toThrow();await expect(fs.access(path.join(opts.env.CODEX_HOME,"auth.json"))).resolves.toBeUndefined();
   expect(config).toContain('cli_auth_credentials_store="file"');expect(config).toContain(JSON.stringify(QA_TOOLS)); expect(config).not.toContain("fixture-token");
 });
 it("refuses an unverified CLI version before starting provider work", async () => {
@@ -91,4 +91,10 @@ it("rejects a non-root parent before executing the trusted leaf",async()=>{
 it("returns rotated subscription credentials to managed cleanup before deleting disposable HOME",async()=>{
  const ctx=await context();run.mockResolvedValueOnce({exitCode:0,stdout:"codex-cli 0.154.0"}).mockImplementationOnce(async(...args)=>{await fs.writeFile(path.join(args[4].env.CODEX_HOME,"auth.json"),'{"fixture":"rotated"}');return {exitCode:0,stdout:'{"type":"turn.completed"}\n',stderr:""};});
  await executeCodexQa(ctx);expect(await fs.readFile(path.join((ctx.config.env as Record<string,string>).CODEX_HOME,"auth.json"),"utf8")).toBe('{"fixture":"rotated"}');await expect(fs.access(run.mock.calls[1][4].env.HOME)).rejects.toThrow();
+});
+
+it.each(["ENOSPC","EIO"])("keeps the sole managed credential without a copyback failure path: %s",async code=>{
+ const ctx=await context();const realCopy=fs.copyFile.bind(fs);let copies=0;const copy=vi.spyOn(fs,"copyFile").mockImplementation(async(...args)=>{if(++copies===1)return realCopy(...args);throw Object.assign(new Error("fixture copyback failure"),{code});});
+ run.mockResolvedValueOnce({exitCode:0,stdout:"codex-cli 0.154.0"}).mockImplementationOnce(async(...args)=>{await fs.writeFile(path.join(args[4].env.CODEX_HOME,"auth.json"),'{"fixture":"rotated"}');return {exitCode:0,stdout:'{"type":"turn.completed"}\n',stderr:""};});
+ let result;try{result=await executeCodexQa(ctx);}catch{}expect(await fs.readFile(path.join((ctx.config.env as Record<string,string>).CODEX_HOME,"auth.json"),"utf8")).toBe('{"fixture":"rotated"}');expect(result?.exitCode).toBe(0);expect(copy).not.toHaveBeenCalled();
 });

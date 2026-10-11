@@ -64,15 +64,11 @@ export async function executeCodexQa(ctx: AdapterExecutionContext): Promise<Adap
   if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.pathname !== "/api/mcp/qa-review" || url.search || url.hash || url.username || url.password) return invalid("QA MCP must be the numeric loopback endpoint.");
   const runHome = await fs.mkdtemp(path.join(home, "qa-run-"));
   await fs.chmod(runHome, 0o700);
-  const cwd = path.join(runHome, "working-directory"), codexHome = path.join(runHome, "codex");
+  const cwd = path.join(runHome, "working-directory"), codexHome = provider;
   await fs.mkdir(cwd, { mode: 0o700 });
-  await fs.mkdir(codexHome, { mode: 0o700 });
-  let credentialCopied=false;
   try {
-  // Copy only the managed connection credential. Never seed host configuration or instructions.
-  await fs.copyFile(path.join(provider, "auth.json"), path.join(codexHome, "auth.json"));
-  await fs.chmod(path.join(codexHome, "auth.json"), 0o600);
-  credentialCopied=true;
+  // The managed runtime owns the sole credential and preserves it on failed rotation write-back.
+  // Do not duplicate credentials or seed host configuration/instructions.
   await fs.writeFile(path.join(codexHome, "config.toml"), `cli_auth_credentials_store="file"\n[mcp_servers.paperclip_qa]\nurl=${JSON.stringify(url.href)}\nbearer_token_env_var="PAPERCLIP_QA_TOKEN"\nenabled_tools=${JSON.stringify(QA_TOOLS)}\n${QA_TOOLS.map(tool => `[mcp_servers.paperclip_qa.tools.${tool}]\napproval_mode="approve"\n`).join("")}`, { mode: 0o600 });
   const childEnv: Record<string, string> = { HOME: runHome, CODEX_HOME: codexHome, XDG_CONFIG_HOME: path.join(runHome, "config"), XDG_DATA_HOME: path.join(runHome, "data"), PATH: "/usr/bin:/bin", PAPERCLIP_QA_TOKEN: ctx.authToken };
   const options = { cwd, env: childEnv, inheritHostEnv: false, timeoutSec: 300, graceSec: 10, onLog: ctx.onLog, onSpawn: ctx.onSpawn };
@@ -83,10 +79,5 @@ export async function executeCodexQa(ctx: AdapterExecutionContext): Promise<Adap
   const proc = await runAdapterExecutionTargetProcess(ctx.runId, null, command, qaCodexArgs(cwd, asString(config.model, "gpt-5.6-sol")), { ...options, stdin: prompt, onProcessStopped: stopped.beginInvocation(), onRuntimeProgress: ctx.onRuntimeProgress });
   const parsed = parseCodexJsonl(proc.stdout);
   return { ...proc, clearSession: true, summary: parsed.summary, usage: parsed.usage, errorMessage: parsed.errorMessage ?? undefined, errorCode: proc.exitCode === 0 && !parsed.sawProtocolTerminalEvent ? "qa_review_protocol_incomplete" : undefined, exitCode: proc.exitCode === 0 && !parsed.sawProtocolTerminalEvent ? 1 : proc.exitCode };
-  } finally {
-    try {
-      // Managed connection cleanup persists refresh-token rotation from this file.
-      if(credentialCopied){await fs.copyFile(path.join(codexHome,"auth.json"),path.join(provider,"auth.json"));await fs.chmod(path.join(provider,"auth.json"),0o600);}
-    } finally {await fs.rm(runHome,{recursive:true,force:true});}
-  }
+  } finally {await fs.rm(runHome,{recursive:true,force:true});}
 }

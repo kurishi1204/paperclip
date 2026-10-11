@@ -6,7 +6,7 @@ Scope: the existing company independent QA assignment, using the managed OpenAI 
 
 1. Select the dedicated QA entry before ordinary Codex workspace, skills, runtime tools and session setup.
 2. Require the root-owned fixed `/opt/colo-codex-qa/0.154.0/bin/codex`, every parent entry free of symlinks, group/other writes and ACLs, and the operator's SHA-256 seal, and the observed CLI version 0.154.0. Never resolve executable authority from agent PATH.
-3. Copy only the managed provider credential into a disposable private HOME; configure one run-bound loopback Paperclip QA MCP server and the server's eleven QA tools. Remove the disposable HOME after the provider stops.
+3. Use the sole credential in the existing disposable managed provider HOME; create a separate empty QA HOME/cwd and configure one run-bound loopback Paperclip QA MCP server and the server's eleven QA tools. Remove the empty QA HOME after the provider stops. The existing managed runtime owns credential rotation and preserves its sole updated auth on write-back failure; QA never copies or deletes that auth.
 4. Verify all actual executors, including inherited child executors, rather than infer isolation from configuration flags or model-facing wrapper names.
 5. Independently review the fixed implementation, adopt and deploy it, then use the existing COL17 assignment for formal QA. Read the server's issue revision, review receipt and stopped-run behavior separately. Human business acceptance remains pending until its owner accepts the result.
 
