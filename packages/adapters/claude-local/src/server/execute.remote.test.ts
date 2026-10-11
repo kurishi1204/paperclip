@@ -195,10 +195,21 @@ describe("claude remote execution", () => {
         const proxyUrl = `http://127.0.0.1:${(proxyListener.address() as AddressInfo).port}`;
         const providerUrl = "http://provider.invalid/probe";
         const probe = `
-          const qa = await fetch(${JSON.stringify(qaUrl)}, { headers: { Authorization: "Bearer run-bound-token" } });
-          if (await qa.text() !== "qa-ok") throw new Error("QA request left loopback");
-          const provider = await fetch(${JSON.stringify(providerUrl)});
-          if (await provider.text() !== "provider-ok") throw new Error("Provider request missed proxy");
+          import { get } from "node:http";
+          const request = (url, headers = {}) => new Promise((resolve, reject) => {
+            const req = get(url, { headers, timeout: 3000 }, res => {
+              let body = "";
+              res.setEncoding("utf8");
+              res.on("data", chunk => { body += chunk; });
+              res.on("end", () => resolve(body));
+            });
+            req.on("timeout", () => req.destroy(new Error("proxy probe timed out")));
+            req.on("error", reject);
+          });
+          const qa = await request(${JSON.stringify(qaUrl)}, { Authorization: "Bearer run-bound-token" });
+          if (qa !== "qa-ok") throw new Error("QA request left loopback");
+          const provider = await request(${JSON.stringify(providerUrl)});
+          if (provider !== "provider-ok") throw new Error("Provider request missed proxy");
         `;
         await execFileAsync(process.execPath, ["--use-env-proxy", "--input-type=module", "-e", probe], {
           env: { ...options.env, HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, ALL_PROXY: proxyUrl,
