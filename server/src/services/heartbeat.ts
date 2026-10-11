@@ -25108,7 +25108,7 @@ export function heartbeatService(
                   }
                 : {}),
             };
-            const qaReviewMode = agent.adapterType === "claude_local" && runtimeConfig.qaReviewToolsOnly === true;
+            const qaReviewMode = ["claude_local", "codex_local"].includes(agent.adapterType) && runtimeConfig.qaReviewToolsOnly === true;
             const runtimeTools = qaReviewMode ? undefined : createAdapterRuntimeToolAccess({
               agentId: agent.id,
               companyId: agent.companyId,

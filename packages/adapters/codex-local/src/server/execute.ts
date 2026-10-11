@@ -1,4 +1,5 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
+import { executeCodexQa } from "./qa-execute.js";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -570,6 +571,7 @@ export async function ensureCodexSkillsInjected(
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  if (ctx.config.qaReviewToolsOnly === true) return executeCodexQa(ctx);
   const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
   const engineSelection = await resolveCodexExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {
