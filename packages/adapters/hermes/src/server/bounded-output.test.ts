@@ -31,3 +31,27 @@ test("rejects missing, failed, spoofed, or incomplete web evidence", () => {
     "Model prose only\n", lines(init, use, final),
   ]) expect(parseBoundedWebResult(output, { requireText: true })).toBeNull();
 });
+
+const identifiedUse = (id: unknown) => ({ ...use, tool_call_id: id });
+const identifiedResult = (id: unknown) => ({ ...success, tool_call_id: id });
+
+test("correlates parallel searches by executor call ID, including reverse completion", () => {
+  expect(parseBoundedWebResult(lines(init, identifiedUse("a"), identifiedUse("b"),
+    identifiedResult("b"), identifiedResult("a"), final))?.searches).toBe(2);
+});
+
+test("rejects unknown, reused, absent, mixed, malformed, and unfinished call IDs", () => {
+  for (const events of [
+    [identifiedUse("a"), identifiedResult("b")],
+    [identifiedUse("a"), identifiedUse("a"), identifiedResult("a")],
+    [identifiedUse("a"), identifiedResult("a"), identifiedResult("a")],
+    [identifiedUse("a"), identifiedResult("a"), identifiedUse("a"), identifiedResult("a")],
+    [identifiedUse("a"), success], [use, identifiedResult("a")],
+    [identifiedUse("a"), identifiedResult("a"), use, success],
+    [use, success, identifiedUse("a"), identifiedResult("a")],
+    [identifiedUse("a"), identifiedUse("b"), identifiedResult("a")],
+    [identifiedUse(""), identifiedResult("")],
+    [identifiedUse(null), identifiedResult(null)],
+    [identifiedUse(7), identifiedResult(7)], [use, use, success, success],
+  ]) expect(parseBoundedWebResult(lines(init, ...events, final))).toBeNull();
+});
