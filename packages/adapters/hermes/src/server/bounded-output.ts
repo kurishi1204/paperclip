@@ -10,7 +10,8 @@ export interface BoundedWebResult {
  * Parse the CLI's JSONL events, not the model's prose. The run is accepted
  * only when every observed tool call is a successful web_search, the CLI
  * supplies a final exit 0 for the same session, and a search returns an
- * HTTPS source. Executor call IDs correlate parallel results. Legacy events
+ * HTTPS source somewhere in the completed run. Successful empty query results
+ * are counted, but malformed or unsafe source rows are never dropped. Executor call IDs correlate parallel results. Legacy events
  * without IDs remain strictly sequential; the two schemas cannot be mixed.
  */
 export function parseBoundedWebResult(
@@ -61,13 +62,14 @@ export function parseBoundedWebResult(
         const data = output.data as Record<string, unknown> | undefined;
         const web = data?.web;
         if (output.success !== true || !Array.isArray(web)) return null;
-        const urls = web.flatMap((item: unknown) => {
-          if (!item || typeof item !== "object") return [];
+        const urls: string[] = [];
+        for (const item of web) {
+          if (!item || typeof item !== "object" || Array.isArray(item)) return null;
           const url = (item as Record<string, unknown>).url;
-          if (typeof url !== "string") return [];
-          try { return new URL(url).protocol === "https:" ? [url] : []; } catch { return []; }
-        });
-        if (urls.length === 0) return null;
+          if (typeof url !== "string") return null;
+          try { if (new URL(url).protocol !== "https:") return null; } catch { return null; }
+          urls.push(url);
+        }
         sourceUrls.push(...urls);
         searches += 1;
         pendingSearch = false;
@@ -84,7 +86,7 @@ export function parseBoundedWebResult(
   } catch {
     return null;
   }
-  if (!initSession || !finalSession || !finished || pendingSearch || pendingIds.size !== 0 ||
+  if (!initSession || !finalSession || !finished || pendingSearch || pendingIds.size !== 0 || sourceUrls.length === 0 ||
       (options.exactlyOneSearch && searches !== 1) ||
       (options.requireText && !finalText.trim())) return null;
   return { sessionId: finalSession, text: finalText, searches, sourceUrls };
