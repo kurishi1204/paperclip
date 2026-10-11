@@ -19,3 +19,7 @@ The operator pin is a deployment setting, not agent configuration. Missing, chan
 ## Acceptance
 
 Unit tests and executor fixtures establish only the adapter boundary. Formal QA requires the real assigned reviewer to obtain evidence and submit/read back a scoped review receipt. An exit-zero provider process without its terminal protocol event is failure. Ordinary worker output, successful research, authentication, installation and merge are not formal QA or business acceptance.
+
+## Required executable closure
+
+Codex 0.154.0 code-mode execution requires the adjacent `codex-code-mode-host` as well as the CLI. The installer copies both from the existing official package, validates exact hashes and strict codesign, and creates service-traversable root directories with explicit descriptor chmod despite umask 077. The QA adapter verifies both root-owned executable seals before provider work. Operator pin `PAPERCLIP_CODEX_QA_TRUSTED_CODE_MODE_HOST_SHA256` must match the installed companion. A CLI version result alone is not QA tool-host acceptance.

@@ -4,6 +4,7 @@ import { constants } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 const execFileAsync=promisify(execFile);
+export const QA_TRUSTED_CODE_MODE_HOST="/opt/colo-codex-qa/0.154.0/bin/codex-code-mode-host";
 export const QA_TRUSTED_COMMAND="/opt/colo-codex-qa/0.154.0/bin/codex";
 import { createHash } from "node:crypto";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -24,6 +25,12 @@ async function sealedQaCommand(): Promise<string | null> {
   const command=process.env.PAPERCLIP_CODEX_QA_TRUSTED_COMMAND;
   const expected=process.env.PAPERCLIP_CODEX_QA_TRUSTED_COMMAND_SHA256;
   if(!command || command!==QA_TRUSTED_COMMAND || !expected || !/^[a-f0-9]{64}$/.test(expected)) return null;
+  const companionHash=process.env.PAPERCLIP_CODEX_QA_TRUSTED_CODE_MODE_HOST_SHA256;
+  if(!companionHash || !/^[a-f0-9]{64}$/.test(companionHash)) return null;
+  if(!await sealedQaFile(command, expected) || !await sealedQaFile(QA_TRUSTED_CODE_MODE_HOST, companionHash)) return null;
+  return command;
+}
+async function sealedQaFile(command: string, expected: string): Promise<string | null> {
   // Every path entry is immutable to the non-root service, including the leaf.
   const entries=["/","/opt","/opt/colo-codex-qa","/opt/colo-codex-qa/0.154.0","/opt/colo-codex-qa/0.154.0/bin",command];
   try {
