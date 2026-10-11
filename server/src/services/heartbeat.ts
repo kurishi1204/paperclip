@@ -1,4 +1,4 @@
-import { commanderPolicySchema, admissionMatches, commanderPrompt, parseCommanderSelection, type CommanderAdmission, type CommanderPolicy } from "./commander-cycle.js";
+import { commanderReservesTodo,commanderPolicySchema, admissionMatches, commanderPrompt, parseCommanderSelection, type CommanderAdmission, type CommanderPolicy } from "./commander-cycle.js";
 import { activeIssueInteractionCondition, TASK_QUESTION_GUIDANCE } from "./issue-question-context.js";
 import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
 import { agentIdentityService, supportsManagedAgentIdentity } from "./agent-identity.js";
@@ -27937,6 +27937,13 @@ export function heartbeatService(
             return { kind: "skipped" as const };
           }
 
+          if (!opts.commanderGuard && issue.status === "todo" && issue.assigneeAgentId === agentId) {
+            const commanders=await tx.select({adapterConfig:agents.adapterConfig}).from(agents).where(eq(agents.companyId,agent.companyId));
+            if(commanders.some(c=>commanderReservesTodo(parseObject(c.adapterConfig),issue,agentId))) {
+              await tx.insert(agentWakeupRequests).values({...durableReceiptFields,companyId:agent.companyId,agentId,source,triggerDetail,reason:"commander_reserved_task",payload,status:"skipped",requestedByActorType:opts.requestedByActorType??null,requestedByActorId:opts.requestedByActorId??null,idempotencyKey:opts.idempotencyKey??null,finishedAt:new Date()});
+              return {kind:"skipped" as const};
+            }
+          }
           if (opts.commanderGuard) {
             const guard = opts.commanderGuard;
             const [commander] = await tx.select().from(agents).where(and(eq(agents.id,guard.commanderAgentId),eq(agents.companyId,agent.companyId))).for("update");

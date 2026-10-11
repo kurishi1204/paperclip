@@ -1,0 +1,19 @@
+# Commander reservation and board preparation
+
+## Observed failure
+
+On the adopted first cycle, a new task started through its normal system assignment before the commander selected it. The real worker result is valid research, but it is not commander dispatch proof. Disabling and later enabling demand wakes is not a dispatch reservation.
+
+## Contract
+
+The board first configures an admission for the predicted next revision of one existing, unassigned backlog task. The new normal API route compares issue revision, status version, description hash, company, commander policy, worker and active runs under issue and commander row locks. It changes that task to TODO with the admitted worker, writes one audit event, and creates no assignment wake. No task or run is created by preparation.
+
+An admitted TODO task is reserved in the common enqueue transaction. Other wake sources get a durable skipped receipt. Expiry or a body edit cannot release the task to an ordinary wake. The board must remove its admission to release the reservation. A valid commander guard still follows normal enqueue; it rechecks the active parent and exact policy and task state. Independent QA and owner approval follow separately.
+
+## Commission
+
+Use one suitable existing company backlog task. Do not repeat the completed initial business task. Keep worker settings stable. Prepare once with board CAS, then enable the commander timer and observe a source=timer commander Run, its exact dispatch receipt, worker execution, independent QA and owner acceptance. A skipped normal assignment and a passed fixture are separate evidence from that live sequence.
+
+## Model
+
+Claude Code Opus 5.5 returned the weekly quota limit in the current session. The user approved Codex fallback. Codex performs this batch; exact current model ID is not available in tool context. Independent review occurs after the full implementation and meaningful old-red/new-green tests.

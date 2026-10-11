@@ -1,3 +1,5 @@
+import {prepareCommanderAdmission} from "../services/commander-admission.js";
+import {prepareCommanderAdmissionSchema,commanderPolicySchema} from "../services/commander-cycle.js";
 import { activeIssueInteractionCondition, readTaskQuestionContext } from "../services/issue-question-context.js";
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
@@ -12867,6 +12869,20 @@ export function issueRoutes(
     )).limit(1);
     if (active) throw conflict("An agent currently owns execution. Wait for it to finish, or manage execution in Paperclip.", { code: "MCP_ACTIVE_EXECUTION" });
   }
+
+  router.post("/issues/:id/commander-admission", validateIssueMutationBody(prepareCommanderAdmissionSchema), async (req,res)=>{
+    assertBoard(req);
+    const existing=await getAccessibleResource(req,res,svc.getById(req.params.id as string),"Issue not found");
+    if(!existing)return;
+    const input=prepareCommanderAdmissionSchema.parse(req.body);
+    const [commander]=await db.select().from(agents).where(and(eq(agents.id,input.commanderAgentId),eq(agents.companyId,existing.companyId)));
+    const policy=commanderPolicySchema.safeParse(commander?.adapterConfig?.commanderCyclePolicy);
+    const admission=policy.success?policy.data.admissions.find(a=>a.id===input.admissionId):undefined;
+    if(!admission)throw conflict("Commander admission not found");
+    await assertCanAssignTasks(req,existing.companyId,{issueId:existing.id,projectId:existing.projectId,parentIssueId:existing.parentId,assigneeAgentId:admission.workerAgentId,assigneeUserId:null});
+    const actor=getActorInfo(req);
+    res.json(await prepareCommanderAdmission(db,existing.companyId,existing.id,actor.actorId,input));
+  });
 
   router.patch(
     "/issues/:id",

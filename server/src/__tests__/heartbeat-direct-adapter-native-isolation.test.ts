@@ -32,6 +32,7 @@ import {
   registerServerAdapter,
   unregisterServerAdapter,
 } from "../adapters/index.js";
+import {prepareCommanderAdmission} from "../services/commander-admission.js";
 import { heartbeatService } from "../services/heartbeat.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -92,18 +93,20 @@ describeEmbeddedPostgres("direct adapter native-runner isolation", () => {
     },testEnvironment:async()=>({adapterType:"claude_local",status:"pass",checks:[],testedAt:new Date(0).toISOString()})});
     await db.insert(companies).values({id:companyId,name:"Commander fixture",issuePrefix:"CF",defaultResponsibleUserId:"responsible-user"});
     await db.insert(agents).values([
-      {id:commander,companyId,name:"commander",adapterType:"claude_local",role:"engineer",status:"idle",adapterConfig:{commanderCycleToolsOnly:true,commanderCyclePolicy:policy},runtimeConfig:{heartbeat:{enabled:false,wakeOnDemand:true,maxConcurrentRuns:1}},permissions:{}},
+      {id:commander,companyId,name:"commander",adapterType:"claude_local",role:"engineer",status:"idle",adapterConfig:{commanderCycleToolsOnly:true,commanderCyclePolicy:policy},runtimeConfig:{heartbeat:{enabled:true,wakeOnDemand:true,maxConcurrentRuns:1}},permissions:{}},
       {id:worker,companyId,name:"worker",adapterType:"claude_local",role:"engineer",status:"idle",adapterConfig:{},runtimeConfig:{heartbeat:{enabled:false,wakeOnDemand:true,maxConcurrentRuns:1}},permissions:{}},
     ]);
     await db.insert(issues).values({id:issueId,companyId,issueNumber:1,identifier:"CF-1",title:"bounded fixture",description:"public bounded fixture",status:"todo",assigneeAgentId:worker});
     expect(await heartbeat.invoke(commander,"on_demand",{issueId},"manual")).toBeNull();
+    expect(workerCalls).toBe(0);
+    expect(await heartbeat.invoke(worker,"assignment",{issueId},"system")).toBeNull();
     expect(workerCalls).toBe(0);
     let previousRunId:string|null=null;
     if(mode==="existing_receipt"){
       previousRunId=randomUUID();await db.insert(heartbeatRuns).values({id:previousRunId,companyId,agentId:worker,status:"succeeded",exitCode:0,finishedAt:new Date(),contextSnapshot:{issueId}});
       await db.insert(agentWakeupRequests).values({companyId,agentId:worker,source:"automation",status:"processed",runId:previousRunId,idempotencyKey:`commander-admission:${companyId}:${admissionId}`,payload:{issueId}});
     }
-    const queued=await heartbeat.invoke(commander,"on_demand",{},"manual");expect(queued).not.toBeNull();
+    const queued=await heartbeat.invoke(commander,"timer",{},"system");expect(queued).not.toBeNull();
     const result=await waitForRunToFinish(heartbeat,queued!.id);
     if(mode==="success") {
       expect(result?.status).toBe("succeeded");expect(result?.resultJson?.commanderCycle).toMatchObject({outcome:"dispatched",admissionId});
@@ -113,6 +116,30 @@ describeEmbeddedPostgres("direct adapter native-runner isolation", () => {
       await drainHeartbeatRunsToQuiescence(db,heartbeat);expect(workerCalls).toBe(1);
     }else if(mode==="existing_receipt"){expect(result?.status).toBe("succeeded");expect(result?.resultJson?.commanderCycle).toMatchObject({dispatchRunId:previousRunId});expect(workerCalls).toBe(0);}
     else {expect(result?.status).not.toBe("succeeded");expect(workerCalls).toBe(0);}
+  },30_000);
+
+  it.each(["success","revision","status_version","hash","expired","assigned","active","other_company"])("board commander preparation CAS: %s",async mode=>{
+    const companyId=randomUUID(),commander=randomUUID(),worker=randomUUID(),issueId=randomUUID(),admissionId=randomUUID();
+    const admission={id:admissionId,issueId,workerAgentId:worker,revision:1,statusVersion:1,descriptionSha256:createHash("sha256").update("approved fixture").digest("hex"),expiresAt:new Date(Date.now()+60_000).toISOString()};
+    if(mode==="hash")admission.descriptionSha256="0".repeat(64);
+    if(mode==="expired")admission.expiresAt=new Date(Date.now()-1000).toISOString();
+    const policy={version:1,companyId:mode==="other_company"?randomUUID():companyId,commanderAgentId:commander,admissions:[admission]};
+    await db.insert(companies).values({id:companyId,name:"Prepare fixture",issuePrefix:companyId.replace(/-/g,"").toUpperCase(),defaultResponsibleUserId:"responsible-user"});
+    await db.insert(agents).values([{id:commander,companyId,name:"commander",role:"engineer",adapterType:"claude_local",status:"idle",adapterConfig:{commanderCycleToolsOnly:true,commanderCyclePolicy:policy}},{id:worker,companyId,name:"worker",role:"engineer",adapterType:"claude_local",status:"idle"}]);
+    await db.insert(issues).values({id:issueId,companyId,issueNumber:1,identifier:companyId.replace(/-/g,"").toUpperCase()+"-1",title:"fixture",description:"approved fixture",status:"backlog",assigneeAgentId:mode==="assigned"?worker:null});
+    if(mode==="active")await db.insert(heartbeatRuns).values({companyId,agentId:worker,status:"running",contextSnapshot:{issueId}});
+    const request={commanderAgentId:commander,admissionId,revision:mode==="revision"?1:0,statusVersion:mode==="status_version"?1:0};
+    if(mode==="success"){
+      const prepared=await prepareCommanderAdmission(db,companyId,issueId,"board-user",request);expect(prepared).toMatchObject({status:"todo",assigneeAgentId:worker,revision:1,statusVersion:1});
+      expect(await heartbeat.invoke(worker,"assignment",{issueId},"system")).toBeNull();
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId,companyId))).toEqual([expect.objectContaining({status:"skipped",reason:"commander_reserved_task",runId:null})]);
+      await expect(prepareCommanderAdmission(db,companyId,issueId,"board-user",request)).rejects.toThrow();
+    }else{
+      await expect(prepareCommanderAdmission(db,companyId,issueId,"board-user",request)).rejects.toThrow();
+      const [current]=await db.select().from(issues).where(eq(issues.id,issueId));expect(current).toMatchObject({status:"backlog",revision:0,statusVersion:0});
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId,companyId))).toEqual([]);
+      if(mode==="active")await db.update(heartbeatRuns).set({status:"cancelled",finishedAt:new Date()}).where(eq(heartbeatRuns.companyId,companyId));
+    }
   },30_000);
 
   beforeAll(async () => {
