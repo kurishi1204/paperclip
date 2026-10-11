@@ -1,6 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { constants } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+const execFileAsync=promisify(execFile);
+export const QA_TRUSTED_COMMAND="/opt/colo-codex-qa/0.154.0/bin/codex";
 import { createHash } from "node:crypto";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
@@ -19,12 +23,23 @@ const invalid = (message: string): AdapterExecutionResult => ({ exitCode: 1, sig
 async function sealedQaCommand(): Promise<string | null> {
   const command=process.env.PAPERCLIP_CODEX_QA_TRUSTED_COMMAND;
   const expected=process.env.PAPERCLIP_CODEX_QA_TRUSTED_COMMAND_SHA256;
-  if(!command || !path.isAbsolute(command) || !expected || !/^[a-f0-9]{64}$/.test(expected)) return null;
+  if(!command || command!==QA_TRUSTED_COMMAND || !expected || !/^[a-f0-9]{64}$/.test(expected)) return null;
+  // Every path entry is immutable to the non-root service, including the leaf.
+  const entries=["/","/opt","/opt/colo-codex-qa","/opt/colo-codex-qa/0.154.0","/opt/colo-codex-qa/0.154.0/bin",command];
+  try {
+    for(const entry of entries){
+      const stat=await fs.lstat(entry);
+      if(stat.isSymbolicLink() || stat.uid!==0 || (stat.mode&0o022)!==0 ||
+        (entry===command ? !stat.isFile() : !stat.isDirectory())) return null;
+      const acl=await execFileAsync("/bin/ls",["-lde",entry],{env:{PATH:"/usr/bin:/bin"},timeout:3000,maxBuffer:16384});
+      if(acl.stdout.trim().split("\n").length!==1 || acl.stdout.trim().split(/\s+/)[0]?.includes("+")) return null;
+    }
+  } catch { return null; }
   let file: Awaited<ReturnType<typeof fs.open>> | undefined;
   try {
     file=await fs.open(command,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
     const before=await file.stat();
-    if(!before.isFile() || before.nlink!==1 || ![0,process.getuid?.()].includes(before.uid) ||
+    if(!before.isFile() || before.nlink!==1 || before.uid!==0 ||
       (before.mode&0o022)!==0 || (before.mode&0o111)===0 || before.size<=0) return null;
     const hash=createHash("sha256"), buffer=Buffer.alloc(1024*1024);
     let read=0;
@@ -40,7 +55,7 @@ async function sealedQaCommand(): Promise<string | null> {
 export async function executeCodexQa(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const config = ctx.config, env = parseObject(config.env), managed = parseObject(config.managedAiConnection);
   const home = asString(env.HOME, ""), provider = asString(env.CODEX_HOME, "");
-  if (!path.isAbsolute(home) || home === process.env.HOME || provider !== path.join(home, "provider") || env.XDG_CONFIG_HOME !== path.join(home, "config") || env.XDG_DATA_HOME !== path.join(home, "data") || managed.provider !== "openai" || config.dangerouslyBypassApprovalsAndSandbox === true || config.dangerouslySkipPermissions === true || config.command && config.command !== "codex" || Array.isArray(config.extraArgs) && config.extraArgs.length || ctx.executionTarget || ctx.executionTransport?.remoteExecution || config.engine && config.engine !== "cli") return invalid("QA requires a disposable managed OpenAI home, local pinned CLI and no bypass, remote target or extra arguments.");
+  if (!path.isAbsolute(home) || home === process.env.HOME || provider !== path.join(home, "provider") || env.XDG_CONFIG_HOME !== path.join(home, "config") || env.XDG_DATA_HOME !== path.join(home, "data") || managed.provider !== "openai" || config.dangerouslyBypassApprovalsAndSandbox === true || config.dangerouslySkipPermissions === true || config.command && config.command !== "codex" || Array.isArray(config.extraArgs) && config.extraArgs.length || ctx.executionTarget && ctx.executionTarget.kind!=="local" || ctx.executionTransport?.remoteExecution || config.engine && config.engine !== "cli") return invalid("QA requires a disposable managed OpenAI home, local pinned CLI and no bypass, remote target or extra arguments.");
   const command=await sealedQaCommand();
   if(!command) return invalid("QA requires the operator's exact executable SHA-256 seal; PATH lookup is forbidden.");
   const servers = ctx.runtimeMcp?.getServers() ?? [];
@@ -52,11 +67,13 @@ export async function executeCodexQa(ctx: AdapterExecutionContext): Promise<Adap
   const cwd = path.join(runHome, "working-directory"), codexHome = path.join(runHome, "codex");
   await fs.mkdir(cwd, { mode: 0o700 });
   await fs.mkdir(codexHome, { mode: 0o700 });
+  let credentialCopied=false;
   try {
   // Copy only the managed connection credential. Never seed host configuration or instructions.
   await fs.copyFile(path.join(provider, "auth.json"), path.join(codexHome, "auth.json"));
   await fs.chmod(path.join(codexHome, "auth.json"), 0o600);
-  await fs.writeFile(path.join(codexHome, "config.toml"), `[mcp_servers.paperclip_qa]\nurl=${JSON.stringify(url.href)}\nbearer_token_env_var="PAPERCLIP_QA_TOKEN"\nenabled_tools=${JSON.stringify(QA_TOOLS)}\n${QA_TOOLS.map(tool => `[mcp_servers.paperclip_qa.tools.${tool}]\napproval_mode="approve"\n`).join("")}`, { mode: 0o600 });
+  credentialCopied=true;
+  await fs.writeFile(path.join(codexHome, "config.toml"), `cli_auth_credentials_store="file"\n[mcp_servers.paperclip_qa]\nurl=${JSON.stringify(url.href)}\nbearer_token_env_var="PAPERCLIP_QA_TOKEN"\nenabled_tools=${JSON.stringify(QA_TOOLS)}\n${QA_TOOLS.map(tool => `[mcp_servers.paperclip_qa.tools.${tool}]\napproval_mode="approve"\n`).join("")}`, { mode: 0o600 });
   const childEnv: Record<string, string> = { HOME: runHome, CODEX_HOME: codexHome, XDG_CONFIG_HOME: path.join(runHome, "config"), XDG_DATA_HOME: path.join(runHome, "data"), PATH: "/usr/bin:/bin", PAPERCLIP_QA_TOKEN: ctx.authToken };
   const options = { cwd, env: childEnv, inheritHostEnv: false, timeoutSec: 300, graceSec: 10, onLog: ctx.onLog, onSpawn: ctx.onSpawn };
   const version = await runAdapterExecutionTargetProcess(ctx.runId, null, command, ["--version"], options);
@@ -66,5 +83,10 @@ export async function executeCodexQa(ctx: AdapterExecutionContext): Promise<Adap
   const proc = await runAdapterExecutionTargetProcess(ctx.runId, null, command, qaCodexArgs(cwd, asString(config.model, "gpt-5.6-sol")), { ...options, stdin: prompt, onProcessStopped: stopped.beginInvocation(), onRuntimeProgress: ctx.onRuntimeProgress });
   const parsed = parseCodexJsonl(proc.stdout);
   return { ...proc, clearSession: true, summary: parsed.summary, usage: parsed.usage, errorMessage: parsed.errorMessage ?? undefined, errorCode: proc.exitCode === 0 && !parsed.sawProtocolTerminalEvent ? "qa_review_protocol_incomplete" : undefined, exitCode: proc.exitCode === 0 && !parsed.sawProtocolTerminalEvent ? 1 : proc.exitCode };
-  } finally { await fs.rm(runHome, {recursive:true,force:true}); }
+  } finally {
+    try {
+      // Managed connection cleanup persists refresh-token rotation from this file.
+      if(credentialCopied){await fs.copyFile(path.join(codexHome,"auth.json"),path.join(provider,"auth.json"));await fs.chmod(path.join(provider,"auth.json"),0o600);}
+    } finally {await fs.rm(runHome,{recursive:true,force:true});}
+  }
 }
