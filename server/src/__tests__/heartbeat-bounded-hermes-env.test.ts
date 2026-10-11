@@ -11,6 +11,10 @@ vi.mock("../adapters/index.js", () => ({
   findActiveServerAdapter: () => ({ type: "hermes_local", execute, supportsLocalAgentJwt: false }),
   runningProcesses: new Map(),
 }));
+vi.mock("../services/git-credentials.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../services/git-credentials.js")>(),
+  resolveManagedGitHubIdentitySelection: async () => ({ configured: true, connections: [] }),
+}));
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("bounded Hermes real heartbeat environment", () => {
   let db!: ReturnType<typeof createDb>;
