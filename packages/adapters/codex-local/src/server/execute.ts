@@ -571,7 +571,7 @@ export async function ensureCodexSkillsInjected(
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-  if (ctx.config.qaReviewToolsOnly === true) return executeCodexQa(ctx);
+  if (ctx.config.qaReviewToolsOnly === true || ctx.config.commanderCycleToolsOnly === true) return executeCodexQa(ctx);
   const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
   const engineSelection = await resolveCodexExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {
