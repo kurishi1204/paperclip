@@ -30,7 +30,7 @@ describe("bounded Hermes real child boundary", () => {
       const result = await execute({
         runId: "bounded-real-child-fixture",
         agent: { id: "bounded-fixture-agent", companyId: "fixture-company", name: "Research", adapterType: "hermes_local", adapterConfig: {} },
-        config: { boundedExecution: true, provider: "openai-codex", model: "fixture-model", toolsets: "web", maxTurnsPerRun: 1, env: { HERMES_HOME: home, PAPERCLIP_RUN_SCRATCH_DIR: stage, GH_TOKEN: "synthetic-git-key" } },
+        config: { boundedExecution: true, provider: "openai-codex", model: "fixture-model", toolsets: "web", maxTurnsPerRun: 2, env: { HERMES_HOME: home, PAPERCLIP_RUN_SCRATCH_DIR: stage, GH_TOKEN: "synthetic-git-key" } },
         context: { issueId: "fixture-issue", paperclipWorkspace: { cwd: stage } },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
         authToken: "synthetic-paperclip-token",
@@ -50,7 +50,9 @@ describe("bounded Hermes real child boundary", () => {
       expect(seen.HERMES_HOME).toBe(home);
       expect(seen.HOME).not.toBe(process.env.HOME);
       expect(seen.HOME).not.toBe(stage);
-      expect(result.sessionParams).toEqual({ sessionId: "actual-cli-session", hermesHome: home });
+      expect(result.sessionParams).toBeUndefined();
+      expect(result.clearSession).toBe(true);
+      expect((result.resultJson as { session_id: string }).session_id).toBe("actual-cli-session");
       await expect(fs.stat(seen.HOME)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       for (const name of names) {

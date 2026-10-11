@@ -142,6 +142,14 @@ describe("Hermes child boundary", () => {
       await expect(validateBoundedHermesHome(home)).rejects.toThrow(/active_profile must be default/);
       await fs.writeFile(path.join(home, "active_profile"), "default\n");
 
+      await fs.writeFile(path.join(home, ".env"), "A".repeat(65_537), { mode: 0o600 });
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/inspection limit/);
+      await fs.rm(path.join(home, ".env"));
+
+      await fs.writeFile(path.join(home, "active_profile"), "A".repeat(1_025));
+      await expect(validateBoundedHermesHome(home)).rejects.toThrow(/inspection limit/);
+      await fs.writeFile(path.join(home, "active_profile"), "default\n");
+
       await fs.writeFile(path.join(home, ".skills_prompt_snapshot.json"), JSON.stringify({
         version: 1, manifest: {}, skills: ["injected instructions"], category_descriptions: {},
       }));

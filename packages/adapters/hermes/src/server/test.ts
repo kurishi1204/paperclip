@@ -25,6 +25,67 @@ import { buildHermesChildEnv, isBoundedHermesExecution, validateBoundedHermesHom
 
 const execFileAsync = promisify(execFile);
 
+// Hermes 0.21.6 emits JSON lines in stream-json mode. A model response alone
+// cannot prove that its web tool was exposed or that the search backend worked.
+export function verifyBoundedWebProbe(stdout: string): boolean {
+  let initSession: string | undefined;
+  let finalSession: string | undefined;
+  let finalExit: number | undefined;
+  let uses = 0;
+  let successes = 0;
+  try {
+    for (const line of stdout.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line) as Record<string, unknown>;
+      if (event.type === "system" && event.subtype === "init") {
+        if (initSession || typeof event.session_id !== "string" || !event.session_id) return false;
+        initSession = event.session_id;
+      } else if (event.type === "tool_use") {
+        if (!initSession || uses !== 0 || event.name !== "web_search") return false;
+        uses += 1;
+      } else if (event.type === "tool_result") {
+        if (uses !== 1 || successes !== 0 || event.name !== "web_search" || event.is_error !== false ||
+            typeof event.output !== "string" || event.output.endsWith("...")) return false;
+        const output = JSON.parse(event.output) as Record<string, unknown>;
+        const data = output.data as Record<string, unknown> | undefined;
+        const web = data?.web;
+        if (output.success !== true || !Array.isArray(web) ||
+            !web.some((item: unknown) => {
+              if (!item || typeof item !== "object") return false;
+              const url = (item as Record<string, unknown>).url;
+              if (typeof url !== "string") return false;
+              try { return new URL(url).protocol === "https:"; } catch { return false; }
+            })) return false;
+        successes += 1;
+      } else if (event.type === "result") {
+        if (finalSession || successes !== 1 || typeof event.session_id !== "string" || !event.session_id ||
+            typeof event.exit_code !== "number") return false;
+        finalSession = event.session_id;
+        finalExit = event.exit_code;
+      }
+    }
+  } catch {
+    return false;
+  }
+  return Boolean(initSession && initSession === finalSession && finalExit === 0 &&
+    uses === 1 && successes === 1);
+}
+
+function boundedProbeFailure(error: unknown): string {
+  const failure = error as { code?: unknown; signal?: unknown; killed?: unknown; stderr?: unknown };
+  if (failure.killed === true || failure.code === "ETIMEDOUT") return "timeout";
+  const stderr = typeof failure.stderr === "string" ? failure.stderr : "";
+  const category = /No web search provider configured/i.test(stderr) ? "search_backend_missing" :
+    /onboard|setup required/i.test(stderr) ? "onboarding_required" :
+    /auth|login|credential|api.key/i.test(stderr) ? "authentication_failed" :
+    /approval|permission denied/i.test(stderr) ? "tool_approval_failed" :
+    "cli_or_search_failed";
+  const exit = typeof failure.code === "number" ? `; exit=${failure.code}` :
+    typeof failure.signal === "string" ? `; signal=${failure.signal}` : "";
+  // Never copy raw stderr into a Paperclip check: a provider may echo tokens.
+  return category + exit;
+}
+
 function asString(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
@@ -345,8 +406,8 @@ export async function testEnvironment(
       (!asString(config.provider) || config.provider === "auto" ||
        !asString(config.model) || config.model === "auto" ||
        !hasToolsets || !Number.isInteger(config.maxTurnsPerRun) ||
-       (config.maxTurnsPerRun as number) <= 0)) {
-    checks.push({ level: "error", code: "hermes_bounded_config_incomplete", message: "Bounded Hermes execution requires explicit provider, model, toolsets and positive maxTurnsPerRun." });
+       (config.maxTurnsPerRun as number) < 2)) {
+    checks.push({ level: "error", code: "hermes_bounded_config_incomplete", message: "Bounded Hermes execution requires explicit provider, model, toolsets and maxTurnsPerRun of at least 2." });
     return { adapterType: ADAPTER_TYPE, status: "fail", checks, testedAt: new Date().toISOString() };
   }
 
@@ -358,7 +419,10 @@ export async function testEnvironment(
     if (remote) {
       checks.push({ level: "error", code: "hermes_remote_probe_unsupported", message: "Hermes connection testing requires a local execution environment." });
     } else {
-      const args = ["chat", "-Q", "-q", "Respond with hello. Do not use tools.", "--max-turns", "1", "--source", "tool"];
+      const args = ["chat", "-Q", "-q", bounded
+        ? "Call web_search exactly once for 'OpenAI API overview official site' with limit 1. Summarize the official URL."
+        : "Respond with hello. Do not use tools.", "--max-turns", bounded ? "2" : "1", "--source", "tool"];
+      if (bounded) args.push("--format", "stream-json");
       if (bounded) args.push("--ignore-user-config", "--ignore-rules");
       const toolsets = asString(config.toolsets) ||
         (Array.isArray(config.enabledToolsets) ? config.enabledToolsets.join(",") : undefined);
@@ -373,12 +437,25 @@ export async function testEnvironment(
       }
       try {
         const { stdout } = await execFileAsync(command, args, {
-          env: childEnv, cwd: isolatedCwd ?? asString(config.cwd), timeout: 45_000, maxBuffer: 1024 * 1024,
+          env: childEnv, cwd: isolatedCwd ?? asString(config.cwd), timeout: bounded ? 90_000 : 45_000, maxBuffer: 1024 * 1024,
         });
-        if (!/\bhello\b/i.test(stdout)) throw new Error("No hello response");
-        checks.push({ level: "info", code: "hermes_hello_probe_passed", message: "Hermes responded through the selected connection." });
-      } catch {
-        checks.push({ level: "error", code: "hermes_hello_probe_failed", message: "Hermes could not complete a request through this connection.", hint: "Check the Hermes installation, endpoint, credential, and model, then test again." });
+        if (bounded) {
+          if (!verifyBoundedWebProbe(stdout)) throw new Error("structured_web_result_unverified");
+          checks.push({ level: "info", code: "hermes_web_probe_passed", message: "Hermes completed a web_search with a successful structured result and HTTPS source." });
+        } else {
+          if (!/\bhello\b/i.test(stdout)) throw new Error("No hello response");
+          checks.push({ level: "info", code: "hermes_hello_probe_passed", message: "Hermes responded through the selected connection." });
+        }
+      } catch (error) {
+        if (bounded) {
+          const detail = error instanceof Error && error.message === "structured_web_result_unverified"
+            ? "structured_web_result_unverified" : boundedProbeFailure(error);
+          checks.push({ level: "error", code: "hermes_web_probe_failed",
+            message: `Hermes web_search could not be verified (${detail}).`,
+            hint: "Check the pinned Hermes version, selected OAuth credential, web search backend, and tool approval." });
+        } else {
+          checks.push({ level: "error", code: "hermes_hello_probe_failed", message: "Hermes could not complete a request through this connection.", hint: "Check the Hermes installation, endpoint, credential, and model, then test again." });
+        }
       } finally {
         if (isolatedCwd) await fs.rm(isolatedCwd, { recursive: true, force: true });
       }

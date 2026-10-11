@@ -383,8 +383,8 @@ export async function execute(
     ...(!bounded ? buildRuntimeToolsEnv(ctx.runtimeTools) : {}),
   };
   if (bounded && (!cfgString(config.provider) || !cfgString(config.model) ||
-      !toolsets || !maxTurns || maxTurns <= 0 || !Number.isInteger(maxTurns))) {
-    throw new Error("Bounded Hermes execution requires explicit provider, model, toolsets and positive maxTurnsPerRun");
+      !toolsets || !maxTurns || maxTurns < 2 || !Number.isInteger(maxTurns))) {
+    throw new Error("Bounded Hermes execution requires explicit provider, model, toolsets and maxTurnsPerRun of at least 2");
   }
   if (bounded) {
     if (config.provider === "auto" || config.model === "auto") {
@@ -394,17 +394,13 @@ export async function execute(
     validateBoundedRuntimeOptions(config);
     await validateBoundedHermesHome(env.HERMES_HOME);
   }
-  const persistSession = cfgBoolean(config.persistSession) !== false;
+  // Hermes restores saved CWD and /yolo when resuming. A bounded research wake
+  // must start fresh even if an earlier adapter version persisted a session.
+  const persistSession = !bounded && cfgBoolean(config.persistSession) !== false;
   const worktreeMode = cfgBoolean(config.worktreeMode) === true;
   const checkpoints = cfgBoolean(config.checkpoints) === true;
   const previousParams = ctx.runtime?.sessionParams as Record<string, unknown> | null;
-  const previousHome = cfgString(previousParams?.hermesHome);
-  const prevSessionId = (!bounded || previousHome === env.HERMES_HOME)
-    ? cfgString(previousParams?.sessionId)
-    : undefined;
-  if (bounded && prevSessionId && !/^[A-Za-z0-9_][A-Za-z0-9_-]*$/.test(prevSessionId)) {
-    throw new Error("Bounded Hermes session ID is not a valid resume argument");
-  }
+  const prevSessionId = bounded ? undefined : cfgString(previousParams?.sessionId);
 
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
@@ -648,6 +644,9 @@ export async function execute(
     timedOut: result.timedOut,
     provider: resolvedProvider,
     model,
+    // The heartbeat consumer treats this as a clear even on a failed run.
+    // sessionParams: {} alone would retain old canonical Hermes sessions.
+    ...(bounded ? { clearSession: true } : {}),
   };
 
   if (parsed.errorMessage) {
@@ -677,16 +676,11 @@ export async function execute(
     cost_usd: parsed.costUsd ?? null,
   };
 
-  // Store session ID for next run
+  // Only standard mode may resume. The bounded clearSession flag above removes
+  // older task-session rows through the canonical heartbeat consumer.
   if (persistSession && acceptedSessionId) {
-    executionResult.sessionParams = bounded
-      ? { sessionId: acceptedSessionId, hermesHome: env.HERMES_HOME }
-      : { sessionId: acceptedSessionId };
+    executionResult.sessionParams = { sessionId: acceptedSessionId };
     executionResult.sessionDisplayId = acceptedSessionId.slice(0, 16);
-  } else if (bounded && previousParams?.sessionId &&
-             (previousHome !== env.HERMES_HOME || result.exitCode !== 0 || result.timedOut)) {
-    // A legacy, moved, or failed session must not trap the next bounded wake.
-    executionResult.sessionParams = {};
   }
 
   return executionResult;

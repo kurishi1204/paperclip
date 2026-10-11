@@ -209,14 +209,25 @@ function pinnedSha256(name: string): string | undefined {
   return value;
 }
 
-async function readSealedFile(file: string, before: import("node:fs").Stats): Promise<Buffer> {
+async function readSealedFile(file: string, before: import("node:fs").Stats, maxBytes: number): Promise<Buffer> {
+  if (before.size > maxBytes) throw new Error("Bounded Hermes file exceeds inspection limit");
   const handle = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
   try {
     const opened = await handle.stat();
     if (!opened.isFile() || !sameFile(before, opened)) {
       throw new Error("Bounded Hermes file changed during inspection");
     }
-    const data = await handle.readFile();
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (true) {
+      const block = Buffer.alloc(Math.min(65536, maxBytes + 1 - total));
+      const { bytesRead } = await handle.read(block, 0, block.length, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > maxBytes) throw new Error("Bounded Hermes file exceeds inspection limit");
+      chunks.push(block.subarray(0, bytesRead));
+    }
+    const data = Buffer.concat(chunks, total);
     if (!sameFile(opened, await handle.stat()) || data.length !== opened.size ||
         !sameFile(opened, await fs.lstat(file))) {
       throw new Error("Bounded Hermes file changed during inspection");
@@ -260,7 +271,7 @@ export async function hashBoundedHermesSkillsTree(skillsHome: string): Promise<s
     }
     bytesSeen += before.size;
     if (bytesSeen > 50_000_000) throw new Error("Bounded Hermes skills tree exceeds byte limit");
-    const data = await readSealedFile(full, before);
+    const data = await readSealedFile(full, before, 50_000_000 - (bytesSeen - before.size));
     hash.update(JSON.stringify({ path: relative, type: "file", uid: before.uid,
       gid: before.gid, mode: before.mode & 0o7777, size: data.length,
       sha256: createHash("sha256").update(data).digest("hex") }) + "\n");
@@ -295,7 +306,7 @@ export async function validateBoundedHermesHome(home: string): Promise<void> {
       throw new Error("Bounded Hermes " + file + " must be private to the runtime user");
     }
     if (file !== ".env") continue;
-    const content = await fs.readFile(target, "utf8");
+    const content = (await readSealedFile(target, fileStat, 65536)).toString("utf8");
     for (const line of content.split(/\r?\n/)) {
       if (!line.trim() || /^\s*#/.test(line)) continue;
       const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/.exec(line);
@@ -359,7 +370,7 @@ export async function validateBoundedHermesHome(home: string): Promise<void> {
         (process.platform !== "win32" &&
          ((typeof process.getuid === "function" && soulStat.uid !== process.getuid()) ||
           (soulStat.mode & 0o077) !== 0)) || !expectedSoul ||
-        createHash("sha256").update(await readSealedFile(soul, soulStat)).digest("hex") !== expectedSoul) {
+        createHash("sha256").update(await readSealedFile(soul, soulStat, 1_000_000)).digest("hex") !== expectedSoul) {
       throw new Error("Bounded Hermes SOUL.md does not match the operator pin");
     }
   } else if (expectedSoul) {
@@ -381,7 +392,7 @@ export async function validateBoundedHermesHome(home: string): Promise<void> {
           (profileStat.mode & 0o077) !== 0))) {
       throw new Error("Bounded Hermes active_profile must be a private regular file");
     }
-    if ((await fs.readFile(profile, "utf8")).trim() !== "default") {
+    if ((await readSealedFile(profile, profileStat, 1024)).toString("utf8").trim() !== "default") {
       throw new Error("Bounded Hermes active_profile must be default");
     }
   }
@@ -404,7 +415,7 @@ export async function validateBoundedHermesHome(home: string): Promise<void> {
     }
     let data: unknown;
     try {
-      data = JSON.parse(await fs.readFile(snapshot, "utf8"));
+      data = JSON.parse((await readSealedFile(snapshot, snapshotStat, 1_000_000)).toString("utf8"));
     } catch {
       throw new Error("Bounded Hermes skills snapshot must be empty");
     }
@@ -439,7 +450,7 @@ export async function validateBoundedHermesHome(home: string): Promise<void> {
       throw new Error("Bounded Hermes config.yaml must be a private regular file");
     }
     if (!expectedHash || !/^[a-f0-9]{64}$/.test(expectedHash) ||
-        createHash("sha256").update(await fs.readFile(config)).digest("hex") !== expectedHash) {
+        createHash("sha256").update(await readSealedFile(config, configStat, 1_000_000)).digest("hex") !== expectedHash) {
       throw new Error("Bounded Hermes config.yaml does not match the operator pin");
     }
   } else if (expectedHash) {

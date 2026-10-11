@@ -5,7 +5,23 @@ import { expect, test } from "vitest";
 
 import { HERMES_CLI } from "../shared/constants.js";
 import { resolveHermesCommand } from "./execute.js";
-import { testEnvironment } from "./test.js";
+import { testEnvironment, verifyBoundedWebProbe } from "./test.js";
+
+const boundedWebProbe = [
+  { type: "system", subtype: "init", session_id: "fixture-session" },
+  { type: "tool_use", name: "web_search", input: { query: "official source", limit: 1 } },
+  { type: "tool_result", name: "web_search", is_error: false,
+    output: JSON.stringify({ success: true, data: { web: [{ url: "https://platform.openai.com/docs/overview" }] } }) },
+  { type: "result", session_id: "fixture-session", exit_code: 0 },
+].map((event) => JSON.stringify(event)).join("\n") + "\n";
+
+test("bounded web evidence requires a real successful tool result and matching terminal session", () => {
+  expect(verifyBoundedWebProbe(boundedWebProbe)).toBe(true);
+  expect(verifyBoundedWebProbe("hello\n")).toBe(false);
+  expect(verifyBoundedWebProbe(boundedWebProbe.replace('"success\\\":true', '"success\\\":false'))).toBe(false);
+  expect(verifyBoundedWebProbe(boundedWebProbe.replace('"exit_code":0', '"exit_code":1'))).toBe(false);
+  expect(verifyBoundedWebProbe(boundedWebProbe.replace('"fixture-session","exit_code":0', '"different-session","exit_code":0'))).toBe(false);
+});
 
 test("resolveHermesCommand prefers hermesCommand over command", () => {
   expect(resolveHermesCommand({ hermesCommand: "hermes_maximus", command: "hermes_backup" }))
@@ -91,7 +107,7 @@ test("bounded environment check fails before a probe when home or arguments are 
       provider: "openai-codex",
       model: "gpt-5.6-sol",
       toolsets: "web",
-      maxTurnsPerRun: 1,
+      maxTurnsPerRun: 2,
       env: { HERMES_HOME: "/private/qa/hermes" },
     },
   };
@@ -104,7 +120,7 @@ test("bounded environment check fails before a probe when home or arguments are 
   expect(missingHome.checks[0]?.code).toBe("hermes_environment_invalid");
 });
 
-test("bounded environment check exercises a real hello with an empty HOME", async () => {
+test("bounded environment check exercises a real web search with an empty HOME", async () => {
   const stage = await realpath(await mkdtemp(path.join(os.tmpdir(), "hermes-bounded-probe-")));
   const home = path.join(stage, "home");
   const cli = path.join(stage, "fake-hermes");
@@ -112,17 +128,17 @@ test("bounded environment check exercises a real hello with an empty HOME", asyn
   const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   try {
     await mkdir(home, { mode: 0o700 });
-    await writeFile(cli, "#!/bin/sh\n[ \"$HOME\" != \"$HERMES_HOME\" ] || exit 7\n[ \"$1\" = chat ] || exit 7\ncase \" $* \" in *\" --ignore-user-config \"*) ;; *) exit 7;; esac\ncase \" $* \" in *\" --ignore-rules \"*) ;; *) exit 7;; esac\necho hello\n");
+    await writeFile(cli, "#!/bin/sh\n[ \"$HOME\" != \"$HERMES_HOME\" ] || exit 7\n[ \"$1\" = chat ] || exit 7\ncase \" $* \" in *\" --ignore-user-config \"*) ;; *) exit 7;; esac\ncase \" $* \" in *\" --ignore-rules \"*) ;; *) exit 7;; esac\ncase \" $* \" in *\" --format stream-json \"*) ;; *) exit 7;; esac\ncat <<'JSONL'\n" + boundedWebProbe + "JSONL\n");
     await chmod(cli, 0o755);
     process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID = "bounded-probe-agent";
     process.env.PAPERCLIP_HERMES_BOUNDED_HOME = home;
     process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND = cli;
     const result = await testEnvironment({
       companyId: "test", adapterType: "hermes_local", agentId: "bounded-probe-agent",
-      config: { boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 1, env: { HERMES_HOME: home } },
+      config: { boundedExecution: true, provider: "openai-codex", model: "gpt-5.6-sol", toolsets: "web", maxTurnsPerRun: 2, env: { HERMES_HOME: home } },
     });
     expect(result.status).toBe("pass");
-    expect(result.checks.some((check) => check.code === "hermes_hello_probe_passed")).toBe(true);
+    expect(result.checks.some((check) => check.code === "hermes_web_probe_passed")).toBe(true);
   } finally {
     for (const key of keys) {
       if (original[key] === undefined) delete process.env[key];
@@ -140,7 +156,7 @@ test("bounded environment probe passes enabledToolsets to the real CLI", async (
   const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   try {
     await mkdir(home, { mode: 0o700 });
-    await writeFile(cli, '#!/bin/sh\ncase " $* " in *" -t web "*) echo hello;; *) exit 7;; esac\n');
+    await writeFile(cli, '#!/bin/sh\ncase " $* " in *" -t web "*) ;; *) exit 7;; esac\ncat <<\x27JSONL\x27\n' + boundedWebProbe + 'JSONL\n');
     await chmod(cli, 0o755);
     process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID = "bounded-toolsets-agent";
     process.env.PAPERCLIP_HERMES_BOUNDED_HOME = home;

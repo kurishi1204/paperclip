@@ -298,10 +298,16 @@ environment as `PAPERCLIP_HERMES_SOUL_SHA256`; the observed v0.21.6
 `active_profile` may only be absent or
 `default`, and any `config.yaml` requires a matching operator-owned SHA-256 in
 `PAPERCLIP_HERMES_CONFIG_SHA256`. A present `mcp.json` blocks startup. These
-checks run before every bounded execution and environment probe. Its `.env` accepts only provider and
+checks run before every bounded execution and environment probe. A home without
+the skills and SOUL pins may pass an empty-home check, but Hermes v0.21.6 will
+populate it on first use; treat that as bootstrap incomplete and seed the
+bundled files and pins before enabling Paperclip. Its `.env` accepts only provider and
 search connection keys. Server-added scratch and Git environment fields are
 ignored. Bounded mode requires an explicit provider other than
-`auto`, an explicit model, and a positive `maxTurnsPerRun`. The operator may
+`auto`, an explicit model, and `maxTurnsPerRun` of at least 2. The environment
+test uses a fixed public query, requires a successful structured `web_search`
+result with an HTTPS URL, and checks the CLI's final exit status. A plain model
+response is not enough. The operator may
 pin an absolute Hermes executable with the Paperclip server environment
 variable `PAPERCLIP_HERMES_TRUSTED_COMMAND`; this value is not taken from agent
 config or forwarded to Hermes.
@@ -332,10 +338,17 @@ The adapter ignores managed instruction files, connector guidance and agent
 working directories, creates a fresh empty directory for each run, and refuses
 worktree creation and checkpoints. Bounded runs use the server-owned task brief and
 return their answer in the Run result for later review.
-The bounded process runs under the Paperclip service user, so it can still
+Bounded mode starts a fresh Hermes session for every wake. Hermes v0.21.6
+restores the saved working directory and `/yolo` state on `--resume`, so the
+adapter ignores and clears older bounded session metadata. Paperclip's issue
+context supplies continuity between wakes. The bounded process runs under the Paperclip service user, so it can still
 read its own provider authentication files. Protecting those credentials from
 arbitrary code running as that same OS user requires a separate UID or a
 credential broker; this mode does not promise such isolation.
+The home checks detect changes to stable files at rest. A same-UID process can
+still replace a path after the check and before Hermes opens it; these checks
+are not a race-safe filesystem containment boundary. Use a root-owned runtime
+and a separate service UID or broker where that threat is in scope.
 The operator pin applies while this agent uses the Hermes adapter. An actor
 authorized to change its adapter type can move the agent to another runtime;
 restrict that permission for the pinned agent or use a separate service user.
