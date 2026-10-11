@@ -120,7 +120,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
   it("keeps bounded live Run stdout strictly reparseable including provider stderr and session diagnostic", async () => {
     const events=[{type:"system",subtype:"init",session_id:"fixture-session"},
       {type:"tool_use",name:"web_search",tool_call_id:"A"},
-      {type:"tool_result",name:"web_search",tool_call_id:"A",is_error:false,output:JSON.stringify({success:true,data:{web:[{url:"https://example.org/source"}]}})},
+      {type:"tool_result",name:"web_search",tool_call_id:"A",is_error:false,output:JSON.stringify({success:true,data:{web:[{url:"https://example.org/source"},{url:"http://example.org/rejected"}]}})},
       {type:"result",session_id:"fixture-session",exit_code:0,text:"Public finding"}];
     const stdout=events.map(e=>JSON.stringify(e)).join("\n")+"\n";
     vi.mocked(serverUtils.runChildProcess).mockImplementationOnce(async (_id,_command,_args,opts) => {
@@ -131,6 +131,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     const {ctx}=makeCtx({command:undefined,boundedExecution:true,provider:"openai-codex",model:"gpt-5.6-sol",toolsets:"search",maxTurnsPerRun:2,env:{HERMES_HOME:"/private/qa/hermes"}});
     const result=await execute(ctx as never);
     expect(result.exitCode).toBe(0);
+    expect(result.resultJson).toMatchObject({source_urls:["https://example.org/source"],rejected_source_urls:[{url:"http://example.org/rejected",reason:"non_https"}]});
     const captured=ctx.onLog.mock.calls.filter((c:unknown[])=>c[0]==="stdout").map((c:unknown[])=>c[1]).join("");
     expect(captured).toBe(stdout);
     expect(ctx.onLog.mock.calls.filter((c:unknown[])=>String(c[1]).startsWith("[hermes] Session:"))).toHaveLength(1);

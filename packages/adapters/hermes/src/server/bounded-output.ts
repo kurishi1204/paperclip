@@ -4,6 +4,7 @@ export interface BoundedWebResult {
   text: string;
   searches: number;
   sourceUrls: string[];
+  rejectedSourceUrls: { url: string; reason: "non_https" }[];
 }
 
 /**
@@ -11,7 +12,8 @@ export interface BoundedWebResult {
  * only when every observed tool call is a successful web_search, the CLI
  * supplies a final exit 0 for the same session, and a search returns an
  * HTTPS source somewhere in the completed run. Successful empty query results
- * are counted, but malformed or unsafe source rows are never dropped. Executor call IDs correlate parallel results. Legacy events
+ * are counted. HTTP source rows are retained as rejected dispositions; malformed
+ * rows and unknown schemes fail the run. No observed source row is silently dropped. Executor call IDs correlate parallel results. Legacy events
  * without IDs remain strictly sequential; the two schemas cannot be mixed.
  */
 export function parseBoundedWebResult(
@@ -28,6 +30,7 @@ export function parseBoundedWebResult(
   let searches = 0;
   let finished = false;
   const sourceUrls: string[] = [];
+  const rejectedSourceUrls: BoundedWebResult["rejectedSourceUrls"] = [];
   try {
     for (const line of stdout.split(/\r?\n/)) {
       if (!line.trim()) continue;
@@ -67,8 +70,11 @@ export function parseBoundedWebResult(
           if (!item || typeof item !== "object" || Array.isArray(item)) return null;
           const url = (item as Record<string, unknown>).url;
           if (typeof url !== "string") return null;
-          try { if (new URL(url).protocol !== "https:") return null; } catch { return null; }
-          urls.push(url);
+          let protocol: string;
+          try { protocol = new URL(url).protocol; } catch { return null; }
+          if (protocol === "https:") urls.push(url);
+          else if (protocol === "http:") rejectedSourceUrls.push({ url, reason: "non_https" });
+          else return null;
         }
         sourceUrls.push(...urls);
         searches += 1;
@@ -89,5 +95,5 @@ export function parseBoundedWebResult(
   if (!initSession || !finalSession || !finished || pendingSearch || pendingIds.size !== 0 || sourceUrls.length === 0 ||
       (options.exactlyOneSearch && searches !== 1) ||
       (options.requireText && !finalText.trim())) return null;
-  return { sessionId: finalSession, text: finalText, searches, sourceUrls };
+  return { sessionId: finalSession, text: finalText, searches, sourceUrls, rejectedSourceUrls };
 }
