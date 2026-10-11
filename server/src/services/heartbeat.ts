@@ -23026,7 +23026,8 @@ export function heartbeatService(
       // managed Git launchers (BASH_ENV/ENV) into its validated child config.
       // Keep the original config intact so explicit forbidden values still fail.
       const boundedHermesResearch = agent.adapterType === HERMES_ADAPTER_TYPE &&
-        runtimeConfig.boundedExecution === true;
+        (runtimeConfig.boundedExecution === true ||
+          process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID === agent.id);
       if (!boundedHermesResearch) {
         const gitExecutionEnv = await prepareGitHubExecutionEnvironment({
           target: executionTarget,

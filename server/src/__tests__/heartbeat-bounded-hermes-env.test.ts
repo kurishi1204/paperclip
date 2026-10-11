@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb } from "@paperclipai/db";
 import { buildHermesChildEnv } from "../../../packages/adapters/hermes/src/server/safe-runtime.ts";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -25,10 +25,12 @@ const support = await getEmbeddedPostgresTestSupport();
     db = createDb(started.connectionString);
   }, 20_000);
   afterAll(async () => { await db.$client.end(); await stopDb?.(); });
-  it("does not inject forbidden Git shell hooks into bounded research", async () => {
+  afterEach(() => { vi.unstubAllEnvs(); execute.mockClear(); });
+  it.each([true, false, undefined])("does not inject Git hooks when pinned bounded config is %s", async (boundedExecution) => {
     const companyId = randomUUID(), agentId = randomUUID();
+    vi.stubEnv("PAPERCLIP_HERMES_BOUNDED_AGENT_ID", agentId);
     await db.insert(companies).values({ id: companyId, name: "Bounded research", issuePrefix: `T${companyId.slice(0,6).toUpperCase()}`, status: "active", defaultResponsibleUserId: "responsible-user" });
-    await db.insert(agents).values({ id: agentId, companyId, name: "Research", role: "general", status: "idle", adapterType: "hermes_local", adapterConfig: { boundedExecution: true, env: { HERMES_HOME: "/safe/research" } }, runtimeConfig: {}, permissions: {} });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Research", role: "general", status: "idle", adapterType: "hermes_local", adapterConfig: { boundedExecution, env: { HERMES_HOME: "/safe/research" } }, runtimeConfig: {}, permissions: {} });
     execute.mockImplementation(async (context) => {
       const env = buildHermesChildEnv(context.config.env, true, { PAPERCLIP_HERMES_BOUNDED_HOME: "/safe/research" }, process.platform, false);
       expect(env.HERMES_HOME).toBe("/safe/research");
