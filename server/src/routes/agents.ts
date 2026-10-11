@@ -33,6 +33,7 @@ import type { ChatChannelService } from "../services/chat-channels.js";
 import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import { sha256Digest } from "../services/feedback-redaction.js";
+import { assertBoardCommanderConfiguration } from "../services/commander-cycle.js";
 import {
   agentSkillSyncSchema,
   agentMineInboxQuerySchema,
@@ -2912,6 +2913,7 @@ export function agentRoutes(
     adapterConfig: Record<string, unknown>,
     path = "adapterConfig",
   ) {
+    assertBoardCommanderConfiguration(req.actor.type,adapterConfig);
     assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
     assertNoAgentHostWorkspaceCommandMutation(
       req,

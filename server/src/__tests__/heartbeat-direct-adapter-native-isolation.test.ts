@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   afterAll,
   afterEach,
@@ -8,9 +8,10 @@ import {
   it,
   vi,
 } from "vitest";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   agents,
+  agentWakeupRequests,
   companies,
   completionContracts,
   createDb,
@@ -71,6 +72,49 @@ describeEmbeddedPostgres("direct adapter native-runner isolation", () => {
   > | null = null;
   const execute = vi.fn<ServerAdapterModule["execute"]>();
 
+  it.each(["success", "existing_receipt", "revision_changed", "policy_revoked", "parent_stopped"])("commander dispatch admission: %s",async mode=>{
+    const companyId=randomUUID(), commander=randomUUID(),worker=randomUUID(),issueId=randomUUID(),admissionId=randomUUID();
+    const admission={id:admissionId,issueId,workerAgentId:worker,revision:0,statusVersion:0,
+      descriptionSha256:createHash("sha256").update("public bounded fixture").digest("hex"),expiresAt:new Date(Date.now()+60_000).toISOString()};
+    const policy={version:1,companyId,commanderAgentId:commander,admissions:[admission]};
+    let workerCalls=0;
+    registerServerAdapter({type:"claude_local",supportsLocalAgentJwt:false,execute:async ctx=>{
+      if(ctx.agent.id===worker){workerCalls++;await db.update(issues).set({status:"done",revision:1,statusVersion:1}).where(eq(issues.id,issueId));return {exitCode:0,signal:null,timedOut:false,summary:"worker fixture"};}
+      expect(ctx.runtimeTools).toBeUndefined();expect(ctx.runtimeMcp?.getServers()??[]).toEqual([]);
+      expect(ctx.context.paperclipManagedMcp).toBeUndefined();expect(ctx.authToken).toBeUndefined();
+      const snapshot=String(ctx.context.paperclipCommanderPrompt);
+      if(mode==="success" && workerCalls>0)return {exitCode:0,signal:null,timedOut:false,summary:JSON.stringify({schema:"PAPERCLIP_COMMANDER_CYCLE_V1",admissionId:null,reason:"completed task excluded"})};
+      expect(snapshot).toContain(admissionId);
+      if(mode==="revision_changed")await db.update(issues).set({revision:1}).where(eq(issues.id,issueId));
+      if(mode==="policy_revoked")await db.update(agents).set({adapterConfig:{commanderCycleToolsOnly:true,commanderCyclePolicy:{...policy,admissions:[]}}}).where(eq(agents.id,commander));
+      if(mode==="parent_stopped")await db.update(heartbeatRuns).set({status:"cancelled"}).where(eq(heartbeatRuns.id,ctx.runId));
+      return {exitCode:0,signal:null,timedOut:false,summary:JSON.stringify({schema:"PAPERCLIP_COMMANDER_CYCLE_V1",admissionId,reason:"approved existing fixture"})};
+    },testEnvironment:async()=>({adapterType:"claude_local",status:"pass",checks:[],testedAt:new Date(0).toISOString()})});
+    await db.insert(companies).values({id:companyId,name:"Commander fixture",issuePrefix:"CF",defaultResponsibleUserId:"responsible-user"});
+    await db.insert(agents).values([
+      {id:commander,companyId,name:"commander",adapterType:"claude_local",role:"engineer",status:"idle",adapterConfig:{commanderCycleToolsOnly:true,commanderCyclePolicy:policy},runtimeConfig:{heartbeat:{enabled:false,wakeOnDemand:true,maxConcurrentRuns:1}},permissions:{}},
+      {id:worker,companyId,name:"worker",adapterType:"claude_local",role:"engineer",status:"idle",adapterConfig:{},runtimeConfig:{heartbeat:{enabled:false,wakeOnDemand:true,maxConcurrentRuns:1}},permissions:{}},
+    ]);
+    await db.insert(issues).values({id:issueId,companyId,issueNumber:1,identifier:"CF-1",title:"bounded fixture",description:"public bounded fixture",status:"todo",assigneeAgentId:worker});
+    expect(await heartbeat.invoke(commander,"on_demand",{issueId},"manual")).toBeNull();
+    expect(workerCalls).toBe(0);
+    let previousRunId:string|null=null;
+    if(mode==="existing_receipt"){
+      previousRunId=randomUUID();await db.insert(heartbeatRuns).values({id:previousRunId,companyId,agentId:worker,status:"succeeded",exitCode:0,finishedAt:new Date(),contextSnapshot:{issueId}});
+      await db.insert(agentWakeupRequests).values({companyId,agentId:worker,source:"automation",status:"processed",runId:previousRunId,idempotencyKey:`commander-admission:${companyId}:${admissionId}`,payload:{issueId}});
+    }
+    const queued=await heartbeat.invoke(commander,"on_demand",{},"manual");expect(queued).not.toBeNull();
+    const result=await waitForRunToFinish(heartbeat,queued!.id);
+    if(mode==="success") {
+      expect(result?.status).toBe("succeeded");expect(result?.resultJson?.commanderCycle).toMatchObject({outcome:"dispatched",admissionId});
+      await drainHeartbeatRunsToQuiescence(db,heartbeat);expect(workerCalls).toBe(1);
+      const again=await heartbeat.invoke(commander,"on_demand",{},"manual");expect(again).not.toBeNull();
+      expect((await waitForRunToFinish(heartbeat,again!.id))?.status).toBe("succeeded");
+      await drainHeartbeatRunsToQuiescence(db,heartbeat);expect(workerCalls).toBe(1);
+    }else if(mode==="existing_receipt"){expect(result?.status).toBe("succeeded");expect(result?.resultJson?.commanderCycle).toMatchObject({dispatchRunId:previousRunId});expect(workerCalls).toBe(0);}
+    else {expect(result?.status).not.toBe("succeeded");expect(workerCalls).toBe(0);}
+  },30_000);
+
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase(
       "heartbeat-direct-adapter-isolation-",
@@ -102,6 +146,8 @@ describeEmbeddedPostgres("direct adapter native-runner isolation", () => {
     );
     expect(pendingRuns).toEqual([]);
     vi.clearAllMocks();
+    for (const [type] of DIRECT_ADAPTERS) registerServerAdapter({type,supportsLocalAgentJwt:false,execute,
+      testEnvironment:async()=>({adapterType:type,status:"pass",checks:[],testedAt:new Date(0).toISOString()})});
     await db.execute(
       sql.raw(`
       TRUNCATE TABLE

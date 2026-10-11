@@ -1,3 +1,4 @@
+import { commanderPolicySchema, admissionMatches, commanderPrompt, parseCommanderSelection, type CommanderAdmission, type CommanderPolicy } from "./commander-cycle.js";
 import { activeIssueInteractionCondition, TASK_QUESTION_GUIDANCE } from "./issue-question-context.js";
 import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
 import { agentIdentityService, supportsManagedAgentIdentity } from "./agent-identity.js";
@@ -3770,6 +3771,7 @@ function normalizeMaxConcurrentRuns(value: unknown) {
 }
 
 interface WakeupOptions {
+  commanderGuard?: { parentRunId: string; commanderAgentId: string; policy: CommanderPolicy; admission: CommanderAdmission };
   /** Set only by authenticated board wake routes; never copied from caller payloads. */
   manualUserWake?: boolean;
   /** Internal resume of a queue with persisted board interruption intent. */
@@ -3791,6 +3793,7 @@ interface WakeupOptions {
     statuses: string[];
     assigneeAgentId: string;
     statusVersion?: number;
+    revision?: number;
   };
   /** Keep causally distinct external chat continuations out of an existing run. */
   allowRunCoalescing?: boolean;
@@ -24854,6 +24857,19 @@ export function heartbeatService(
           adapterFinalizeOutcome = status;
         };
 
+        let commanderCycle: { policy: CommanderPolicy; eligible: CommanderAdmission[] } | null = null;
+        if (runtimeConfig.commanderCycleToolsOnly === true) {
+          if (!["claude_local","codex_local"].includes(agent.adapterType) || run.runtimeMode === "native") throw new Error("Commander requires an isolated local Claude or sealed Codex CLI");
+          const policy = commanderPolicySchema.parse(parseObject(agent.adapterConfig).commanderCyclePolicy);
+          if (policy.companyId !== agent.companyId || policy.commanderAgentId !== agent.id) throw new Error("Commander policy identity mismatch");
+          const companyIssues = await db.select().from(issues).where(eq(issues.companyId, agent.companyId));
+          const eligible = policy.admissions.filter(a => companyIssues.some(i => admissionMatches(a, i, agent.companyId, new Date())));
+          commanderCycle = { policy, eligible };
+          context.paperclipCommanderPrompt = commanderPrompt({ version:1, companyId:agent.companyId, runId:run.id,
+            eligible: eligible.map(a=>({admissionId:a.id, issueId:a.issueId, workerAgentId:a.workerAgentId,
+              revision:a.revision,statusVersion:a.statusVersion,title:companyIssues.find(i=>i.id===a.issueId)?.title})),
+            excluded: companyIssues.filter(i=>!eligible.some(a=>a.issueId===i.id)).map(i=>({issueId:i.id,status:i.status,reason:"No current explicit admission"})) });
+        }
         let adapterResult: AdapterExecutionResult;
         const runGoalControlRequestId = readNonEmptyString(
           context.goalControlRequestId,
@@ -25109,13 +25125,14 @@ export function heartbeatService(
                 : {}),
             };
             const qaReviewMode = ["claude_local", "codex_local"].includes(agent.adapterType) && runtimeConfig.qaReviewToolsOnly === true;
-            const runtimeTools = qaReviewMode ? undefined : createAdapterRuntimeToolAccess({
+            const cycleMode = runtimeConfig.commanderCycleToolsOnly === true;
+            const runtimeTools = qaReviewMode || cycleMode ? undefined : createAdapterRuntimeToolAccess({
               agentId: agent.id,
               companyId: agent.companyId,
               runId: run.id,
               responsibleUserId: run.responsibleUserId,
             });
-            if (!runtimeTools && !qaReviewMode) {
+            if (!runtimeTools && !qaReviewMode && !cycleMode) {
               logger.warn(
                 {
                   companyId: agent.companyId,
@@ -25125,7 +25142,7 @@ export function heartbeatService(
                 "runtime connection tools could not be delivered",
               );
             }
-            const runtimeMcpServers = qaReviewMode ? [] : await buildPaperclipRuntimeMcpServers({
+            const runtimeMcpServers = qaReviewMode || cycleMode ? [] : await buildPaperclipRuntimeMcpServers({
               db,
               agent,
               runId: run.id,
@@ -25141,7 +25158,7 @@ export function heartbeatService(
               });
             }
             const qaLocalApiUrl = qaReviewMode ? qaReviewLocalApiUrl() : null;
-            if (authToken && issueRef && (qaReviewMode ? qaLocalApiUrl : configuredPaperclipApiBaseUrl())) {
+            if (!cycleMode && authToken && issueRef && (qaReviewMode ? qaLocalApiUrl : configuredPaperclipApiBaseUrl())) {
               if (qaReviewMode) {
                 runtimeMcpServers.unshift({
                   name: QA_REVIEW_MCP_NAME,
@@ -25158,7 +25175,7 @@ export function heartbeatService(
             if (runtimeTools && runtimeToolDelivery === "invocation_context") {
               adapterContext.paperclipRuntimeTools = runtimeTools;
             }
-            const managedMcpConfig = qaReviewMode ? null : await createManagedMcpRunConfig({
+            const managedMcpConfig = qaReviewMode || cycleMode ? null : await createManagedMcpRunConfig({
               db,
               agent,
               runId: run.id,
@@ -25249,12 +25266,26 @@ export function heartbeatService(
                         startedAt: meta.startedAt,
                       });
                     },
-                    authToken: authToken ?? undefined,
+                    authToken: cycleMode ? undefined : authToken ?? undefined,
                   }));
                 },
               );
             if (!guardedDispatch.dispatched) return;
             adapterResult = await guardedDispatch.resultPromise;
+          }
+          if (commanderCycle && adapterResult.exitCode === 0 && !adapterResult.timedOut) {
+            const choice = parseCommanderSelection(adapterResult.summary ?? "", commanderCycle.eligible);
+            const admitted = commanderCycle.eligible.find(a=>a.id===choice.admissionId);
+            const dispatch = admitted ? await enqueueWakeup(admitted.workerAgentId, {
+              source:"automation", triggerDetail:"system", reason:"commander_admitted_task",
+              requestedByActorType:"agent", requestedByActorId:agent.id,
+              payload:{issueId:admitted.issueId},contextSnapshot:{issueId:admitted.issueId,commanderRunId:run.id},
+              idempotencyKey:`commander-admission:${commanderCycle.policy.companyId}:${admitted.id}`,
+              issueStateGuard:{statuses:["todo"],assigneeAgentId:admitted.workerAgentId,statusVersion:admitted.statusVersion,revision:admitted.revision},
+              commanderGuard:{parentRunId:run.id,commanderAgentId:agent.id,policy:commanderCycle.policy,admission:admitted},
+            }) : null;
+            adapterResult.resultJson = {...adapterResult.resultJson, commanderCycle:{...choice, eligibleCount:commanderCycle.eligible.length,
+              dispatchRunId:dispatch?.id ?? null, outcome:admitted ? dispatch ? "dispatched" : "held" : "idle"}};
           }
           adapterResult = identityRedactor.redact(adapterResult);
           for (const stream of ["stdout", "stderr"] as const) {
@@ -27548,6 +27579,11 @@ export function heartbeatService(
       });
     }
 
+    if (parseObject(agent.adapterConfig).commanderCycleToolsOnly === true &&
+        (issueId || wakeCommentId || readNonEmptyString(enrichedContextSnapshot.taskId) || readNonEmptyString(enrichedContextSnapshot.taskKey))) {
+      await writeSkippedRequest("commander_cycle_requires_company_wake", {}, { issueId });
+      return null;
+    }
     const policy = parseHeartbeatPolicy(agent);
 
     if (source === "timer" && !policy.enabled) {
@@ -27861,6 +27897,9 @@ export function heartbeatService(
               conversationState: issues.conversationState,
               status: issues.status,
               statusVersion: issues.statusVersion,
+              revision: issues.revision,
+              assigneeUserId: issues.assigneeUserId,
+              description: issues.description,
               projectId: issues.projectId,
               projectWorkspaceId: issues.projectWorkspaceId,
               executionWorkspaceId: issues.executionWorkspaceId,
@@ -27898,6 +27937,24 @@ export function heartbeatService(
             return { kind: "skipped" as const };
           }
 
+          if (opts.commanderGuard) {
+            const guard = opts.commanderGuard;
+            const [commander] = await tx.select().from(agents).where(and(eq(agents.id,guard.commanderAgentId),eq(agents.companyId,agent.companyId))).for("update");
+            const [parent] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,guard.parentRunId),eq(heartbeatRuns.companyId,agent.companyId),eq(heartbeatRuns.agentId,guard.commanderAgentId))).for("update");
+            const [priorWake] = await tx.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId,agent.companyId),eq(agentWakeupRequests.idempotencyKey,opts.idempotencyKey!))).limit(1);
+            if (priorWake) {
+              const priorRun = priorWake.runId ? await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,priorWake.runId)).then(rows=>rows[0]) : null;
+              return priorRun ? {kind:"replayed" as const,run:priorRun} : {kind:"skipped" as const};
+            }
+            const [activeChild] = await tx.select({id:heartbeatRuns.id}).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId,agent.companyId),inArray(heartbeatRuns.status,["running","queued","scheduled_retry"]),
+              sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issueId}`)).limit(1);
+            if (activeChild) throw new HttpError(409,"Admitted task already has an active run");
+            const currentPolicy = commanderPolicySchema.safeParse(parseObject(commander?.adapterConfig).commanderCyclePolicy);
+            if (!commander || !["running","idle"].includes(commander.status) || !parent || parent.status !== "running" ||
+                parseObject(commander.adapterConfig).commanderCycleToolsOnly !== true || !currentPolicy.success ||
+                JSON.stringify(currentPolicy.data) !== JSON.stringify(guard.policy) ||
+                !admissionMatches(guard.admission,issue,agent.companyId,new Date())) throw new HttpError(409,"Commander admission changed or stopped before dispatch");
+          }
           if (opts.failedRunId) {
             // The issue lock makes double-clicks and network retries adopt the
             // same successor, including after it has already finished.
@@ -28101,7 +28158,8 @@ export function heartbeatService(
             issueStateGuard &&
             (!issueStateGuard.statuses.includes(issue.status) ||
               issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
-              (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion))
+              (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion) ||
+              (issueStateGuard.revision !== undefined && issue.revision !== issueStateGuard.revision))
           ) {
             await tx.insert(agentWakeupRequests).values({
               ...durableReceiptFields,

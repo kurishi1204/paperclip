@@ -9,6 +9,30 @@ vi.mock("node:child_process",()=>{const execFile=()=>{};Object.assign(execFile,{
 vi.mock("@paperclipai/adapter-utils/execution-target", () => ({ runAdapterExecutionTargetProcess: run }));
 import { executeCodexQa, QA_TOOLS, QA_TRUSTED_COMMAND, QA_TRUSTED_CODE_MODE_HOST } from "./qa-execute.js";
 const homes: string[] = [];
+it("uses the sealed executor for a commander with no MCP, no run token and only its server snapshot",async()=>{
+  const ctx=await context();ctx.config={...ctx.config,qaReviewToolsOnly:false,commanderCycleToolsOnly:true};
+  ctx.authToken=undefined;ctx.runtimeMcp={getServers:()=>[]};ctx.context={paperclipCommanderPrompt:"SERVER SNAPSHOT ONLY"};
+  let configured="";
+  run.mockResolvedValueOnce({exitCode:0,stdout:"codex-cli 0.154.0\n"}).mockImplementationOnce(async(...args)=>{
+    configured=await fs.readFile(path.join(args[4].env.CODEX_HOME,"config.toml"),"utf8");
+    return {exitCode:0,signal:null,timedOut:false,stdout:'{"type":"item.completed","item":{"type":"agent_message","text":"commander fixture"}}\n{"type":"turn.completed"}\n',stderr:""};
+  });
+  expect((await executeCodexQa(ctx)).exitCode).toBe(0);
+  const [,target,command,args,options]=run.mock.calls[1];
+  expect(target).toBeNull();expect(command).toBe(QA_TRUSTED_COMMAND);expect(options.inheritHostEnv).toBe(false);
+  expect(options.stdin).toBe("SERVER SNAPSHOT ONLY");expect(options.env.PAPERCLIP_QA_TOKEN).toBeUndefined();
+  expect(configured).toBe('cli_auth_credentials_store="file"\n');expect(args).toContain("features.shell_tool=false");
+  expect(args).toContain("features.code_mode_host=true");
+});
+it.each(["mcp","token","qa_flag","missing_snapshot"])("rejects commander authority contamination: %s",async kind=>{
+  const ctx=await context();ctx.config={...ctx.config,qaReviewToolsOnly:false,commanderCycleToolsOnly:true};
+  ctx.authToken=undefined;ctx.runtimeMcp={getServers:()=>[]};ctx.context={paperclipCommanderPrompt:"SERVER SNAPSHOT ONLY"};
+  if(kind==="mcp")ctx.runtimeMcp={getServers:()=>[{name:"paperclip_qa",connectionId:"paperclip-qa-review",url:"http://127.0.0.1:3317/api/mcp/qa-review",token:"PUBLIC_FIXTURE_TOKEN"}]};
+  if(kind==="token")ctx.authToken="PUBLIC_FIXTURE_TOKEN";
+  if(kind==="qa_flag")ctx.config.qaReviewToolsOnly=true;
+  if(kind==="missing_snapshot")ctx.context={};
+  expect((await executeCodexQa(ctx)).errorCode).toBe("commander_cycle_configuration_invalid");expect(run).not.toHaveBeenCalled();
+});
 const oldCompanionHash=process.env.PAPERCLIP_CODEX_QA_TRUSTED_CODE_MODE_HOST_SHA256;
 const oldCommand=process.env.PAPERCLIP_CODEX_QA_TRUSTED_COMMAND,oldHash=process.env.PAPERCLIP_CODEX_QA_TRUSTED_COMMAND_SHA256;
 afterEach(async () => { run.mockReset();if(oldCompanionHash===undefined)delete process.env.PAPERCLIP_CODEX_QA_TRUSTED_CODE_MODE_HOST_SHA256;else process.env.PAPERCLIP_CODEX_QA_TRUSTED_CODE_MODE_HOST_SHA256=oldCompanionHash;vi.restoreAllMocks();acl.mockReset(); if(oldCommand===undefined)delete process.env.PAPERCLIP_CODEX_QA_TRUSTED_COMMAND;else process.env.PAPERCLIP_CODEX_QA_TRUSTED_COMMAND=oldCommand;if(oldHash===undefined)delete process.env.PAPERCLIP_CODEX_QA_TRUSTED_COMMAND_SHA256;else process.env.PAPERCLIP_CODEX_QA_TRUSTED_COMMAND_SHA256=oldHash; await Promise.all(homes.splice(0).map(p => fs.rm(p, { recursive: true, force: true }))); });
