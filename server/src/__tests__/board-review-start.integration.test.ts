@@ -84,6 +84,22 @@ describe("conditional board review start", () => {
   expect(issue!.status).toBe("in_progress"); expect(issue!.executionPolicy).toBeNull(); expect(issue!.executionState).toBeNull(); expect(issue!.assigneeAgentId).toBe(f.agentId);
   expect(await server.db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.body, body.comment)))).toHaveLength(0);
  });
+ it("resumes the same blocked pending review with a version-bound transaction", async () => {
+  const { f, body, patch } = await fixture(); expect((await patch()).status).toBe(200);
+  await server.db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.issueId));
+  const [blocked] = await server.db.select().from(issues).where(eq(issues.id, f.issueId));
+  const response=await fetch(`${server.apiUrl}/api/issues/${f.issueId}`, {method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:"in_review",comment:"Runtime closure fixed; resume independent QA.",boardReviewExpected:{...body.boardReviewExpected,resume:true,revision:blocked!.revision,statusVersion:blocked!.statusVersion}})});
+  expect(response.status).toBe(200);const updated=await response.json();expect(updated.status).toBe("in_review");expect(updated.executionState).toEqual(blocked!.executionState);expect(updated.assigneeAgentId).toBe(blocked!.assigneeAgentId);
+  expect(await server.db.select().from(issueComments).where(and(eq(issueComments.issueId,f.issueId),eq(issueComments.body,"Runtime closure fixed; resume independent QA.")))).toHaveLength(1);
+ });
+ it("refuses blocked review resume with another reviewer or changed version", async () => {
+  const { f, body, patch } = await fixture();expect((await patch()).status).toBe(200);await server.db.update(issues).set({status:"blocked"}).where(eq(issues.id,f.issueId));
+  const [blocked]=await server.db.select().from(issues).where(eq(issues.id,f.issueId));
+  for(const expectation of [{...body.boardReviewExpected,reviewerAgentId:randomUUID(),resume:true,revision:blocked!.revision,statusVersion:blocked!.statusVersion},{...body.boardReviewExpected,resume:true,revision:blocked!.revision-1,statusVersion:blocked!.statusVersion}]){
+   const response=await fetch(`${server.apiUrl}/api/issues/${f.issueId}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({status:"in_review",comment:"Stale resume must fail",boardReviewExpected:expectation})});expect(response.status).toBe(409);
+  }
+  const [after]=await server.db.select().from(issues).where(eq(issues.id,f.issueId));expect(after!.status).toBe("blocked");expect(after!.executionState).toEqual(blocked!.executionState);
+ });
  it("does not allow arbitrary edits through the review precondition", async () => {
   const { patch } = await fixture(); expect((await patch({ description: "Unreviewed replacement" })).status).toBe(403);
  });

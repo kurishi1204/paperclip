@@ -9,3 +9,7 @@ The server checks the version and absence of active issue runs before preparing 
 ## Deployment follow-up
 
 The Codex QA installer was observed creating root directories as 0700 under a root umask of 077 despite requesting 0755. The existing dedicated directories were repaired to root-owned 0755 and UID501 traversal and `codex --version` were verified. A future installer change must apply explicit descriptor-based chmod to newly created directories and test creation under umask 077 plus execution by the actual service UID. Do not remove quarantine or relax ownership/write restrictions.
+
+## Resume a blocked pending QA
+
+Set `boardReviewExpected.resume: true` with the current revision, statusVersion, stageId and reviewerAgentId. Send only `status: in_review`, the resume comment and optional commentClientRequestId. Do not send a new execution policy. The server accepts only blocked issues retaining that exact pending review stage, assigned to that same agent, with no active issue Run. It restores the same stage and commits its comment atomically. The normal assignment dispatch then owns execution; callers must join its Run rather than create a second wake.
