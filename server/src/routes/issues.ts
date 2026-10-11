@@ -362,6 +362,7 @@ const updateIssueRouteSchema = updateIssueSchema.extend({
   boardReviewExpected: z.object({
     stageId: z.string().uuid(),
     reviewerAgentId: z.string().uuid(),
+    resume: z.boolean().optional(),
     revision: z.number().int().nonnegative(),
     statusVersion: z.number().int().nonnegative(),
   }).strict().optional(),
@@ -12889,18 +12890,19 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!existing) return;
-      const boardReviewExpected = req.body.boardReviewExpected as { stageId: string; reviewerAgentId: string; revision: number; statusVersion: number } | undefined;
+      const boardReviewExpected = req.body.boardReviewExpected as { stageId: string; reviewerAgentId: string; resume?: boolean; revision: number; statusVersion: number } | undefined;
+      const boardReviewResume = boardReviewExpected?.resume === true;
       if (boardReviewExpected && (req.actor.type !== "board" || req.actor.source === "mcp_oauth" ||
-          req.body.status !== "in_review" || !req.body.executionPolicy ||
-          req.body.executionPolicy.mode !== "normal" || req.body.executionPolicy.monitor != null ||
-          req.body.executionPolicy.stages?.[0]?.type !== "review" ||
+          req.body.status !== "in_review" || (boardReviewResume ? req.body.executionPolicy !== undefined :
+          !req.body.executionPolicy || req.body.executionPolicy.mode !== "normal" || req.body.executionPolicy.monitor != null ||
+          req.body.executionPolicy.stages?.[0]?.type !== "review") ||
           typeof req.body.comment !== "string" || !req.body.comment.trim() ||
           Object.keys(req.body).some(key => !["status", "executionPolicy", "comment", "commentClientRequestId", "boardReviewExpected"].includes(key)))) {
         throw forbidden("Board review start requires a conditional review-only patch");
       }
       if (boardReviewExpected) {
-        const effectivePolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
-        const firstStage = effectivePolicy?.stages[0];
+        const effectivePolicy = normalizeIssueExecutionPolicy(boardReviewResume ? existing.executionPolicy : req.body.executionPolicy);
+        const firstStage = boardReviewResume ? effectivePolicy?.stages.find(stage => stage.id === boardReviewExpected.stageId) : effectivePolicy?.stages[0];
         if (!effectivePolicy || effectivePolicy.mode !== "normal" || effectivePolicy.monitor != null ||
             firstStage?.id !== boardReviewExpected.stageId || firstStage.type !== "review" ||
             firstStage.approvalsNeeded !== 1 || firstStage.participants.length !== 1 ||
@@ -12912,8 +12914,14 @@ export function issueRoutes(
       const assertBoardReviewStart = async (query: IssueQueueDb, locked: NonNullable<typeof existing> | null) => {
         if (!boardReviewExpected) return;
         if (!locked || locked.revision !== boardReviewExpected.revision ||
-            locked.statusVersion !== boardReviewExpected.statusVersion || locked.status !== "in_progress" ||
-            locked.executionPolicy != null || locked.executionState != null) {
+            locked.statusVersion !== boardReviewExpected.statusVersion || (boardReviewResume ?
+              locked.status !== "blocked" || parseIssueExecutionState(locked.executionState)?.status !== "pending" ||
+              parseIssueExecutionState(locked.executionState)?.currentStageType !== "review" ||
+              parseIssueExecutionState(locked.executionState)?.currentStageId !== boardReviewExpected.stageId ||
+              parseIssueExecutionState(locked.executionState)?.currentParticipant?.type !== "agent" ||
+              parseIssueExecutionState(locked.executionState)?.currentParticipant?.agentId !== boardReviewExpected.reviewerAgentId ||
+              locked.assigneeAgentId !== boardReviewExpected.reviewerAgentId || locked.assigneeUserId !== null :
+              locked.status !== "in_progress" || locked.executionPolicy != null || locked.executionState != null)) {
           throw conflict("Issue revision or execution state changed; read the issue before starting review");
         }
         const [active] = await query.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
