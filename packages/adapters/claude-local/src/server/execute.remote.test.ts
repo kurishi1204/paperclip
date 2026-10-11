@@ -201,7 +201,8 @@ describe("claude remote execution", () => {
           if (await provider.text() !== "provider-ok") throw new Error("Provider request missed proxy");
         `;
         await execFileAsync(process.execPath, ["--use-env-proxy", "--input-type=module", "-e", probe], {
-          env: { ...options.env, HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, ALL_PROXY: proxyUrl },
+          env: { ...options.env, HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, ALL_PROXY: proxyUrl,
+            http_proxy: proxyUrl, https_proxy: proxyUrl, all_proxy: proxyUrl },
           timeout: 10_000,
         });
         expect(qaAuthorization).toBe("Bearer run-bound-token");
