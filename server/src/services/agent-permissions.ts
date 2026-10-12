@@ -24,8 +24,12 @@ export function agentTaskAssignmentOptedOut(permissions: unknown): boolean {
   return record?.canAssignTasks === false && record.canCreateAgents !== true;
 }
 
-export function standardAgentDefaultGrantKeys(permissions: unknown): PermissionKey[] {
-  if (!agentTaskAssignmentOptedOut(permissions)) return [...NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS];
+export function standardAgentDefaultGrantKeys(permissions: unknown, role: string): PermissionKey[] {
+  // CEO assignment is an explicit role exception in authorization and the
+  // agent detail API, including when a saved permission has false values.
+  if (role === "ceo" || !agentTaskAssignmentOptedOut(permissions)) {
+    return [...NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS];
+  }
   return NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS.filter(
     (key) => key !== "tasks:assign" && key !== "tasks:assign_scope",
   );

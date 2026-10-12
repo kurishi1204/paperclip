@@ -953,7 +953,7 @@ export function agentService(db: Db) {
         if (created.status !== "pending_approval" && !permissionsImplyLowTrust(normalizedPermissions) &&
             !readBuiltInAgentMarker(created.metadata)) {
           await tx.insert(principalPermissionGrants).values(
-            standardAgentDefaultGrantKeys(normalizedPermissions).map((permissionKey) => ({
+            standardAgentDefaultGrantKeys(normalizedPermissions, created.role).map((permissionKey) => ({
               companyId,
               principalType: "agent" as const,
               principalId: created.id,
@@ -1176,7 +1176,7 @@ export function agentService(db: Db) {
         await syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
         if (!permissionsImplyLowTrust(updated.permissions) && !readBuiltInAgentMarker(updated.metadata)) {
           await tx.insert(principalPermissionGrants).values(
-            standardAgentDefaultGrantKeys(updated.permissions).map((permissionKey) => ({
+            standardAgentDefaultGrantKeys(updated.permissions, updated.role).map((permissionKey) => ({
               companyId: updated.companyId,
               principalType: "agent" as const,
               principalId: updated.id,
