@@ -55,6 +55,7 @@ const apiPrefixes: Record<string, string> = {
   "instance-database-backups.ts": "/api",
   "instance-settings.ts": "/api",
   "issues.ts": "/api",
+  "issue-requirement-envelope.ts": "/api",
   "issue-tree-control.ts": "/api",
   "llms.ts": "/api",
   "managed-agent-profiles.ts": "/api",
@@ -245,6 +246,23 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents commander admission and Run-bound requirement envelope authority", () => {
+    const { spec } = loadSpecRoutes();
+    const admission = spec.paths["/api/issues/{id}/commander-admission"].post;
+    expect(admission.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+    expect(admission["x-paperclip-authorization"]).toEqual({ actor: "board" });
+    expect(admission.requestBody.content["application/json"].schema).toMatchObject({
+      additionalProperties: false,
+      required: ["commanderAgentId", "admissionId", "workerAgentId", "admissionSha256", "revision", "statusVersion"],
+    });
+    expect(admission.responses["409"]).toBeDefined();
+
+    const envelope = spec.paths["/api/issues/{id}/requirement-envelope"].get;
+    expect(envelope.security).toEqual([{ AgentRunAuth: [] }]);
+    expect(envelope["x-paperclip-authorization"]).toEqual({ actor: "agent", heartbeatBound: true, taskBound: true });
+    expect(envelope.responses["409"]).toBeDefined();
+  });
+
   it("documents strict run-attributed feedback without a read endpoint", () => {
     const { spec } = loadSpecRoutes();
     const path = spec.paths["/api/companies/{companyId}/agent-commentary"];
