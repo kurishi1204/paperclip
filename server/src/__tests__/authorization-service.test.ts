@@ -573,6 +573,34 @@ describeEmbeddedPostgres("authorization service", () => {
       explanation: "Agent task assignment is explicitly disabled.",
     });
 
+    const parentIssue = await createIssue(db, company.id);
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: actorAgent.id,
+      permissionKey: "tasks:assign_scope",
+      scope: { assigneeAgentId: targetAgent.id },
+      grantedByUserId: null,
+    });
+    await expect(authorization.decide({
+      actor: {
+        ...actor,
+        source: "agent_jwt",
+        keyId: randomUUID(),
+        keyScope: {
+          kind: "task_bridge",
+          parentIssueId: parentIssue.id,
+          allowedAssigneeAgentIds: [targetAgent.id],
+        },
+      },
+      action: "tasks:assign",
+      resource: { ...resource, parentIssueId: parentIssue.id },
+      scope: { assigneeAgentId: targetAgent.id },
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+
     await db.update(agents).set({ permissions: { canCreateAgents: false, canAssignTasks: true } })
       .where(eq(agents.id, actorAgent.id));
     await expect(authorization.decide({ actor, action: "tasks:assign", resource })).resolves.toMatchObject({
