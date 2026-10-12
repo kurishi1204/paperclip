@@ -1,0 +1,31 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
+  "linter": {
+    "rules": { "preset": "recommended" }
+  },
+  "overrides": [
+    {
+      // These parsers deliberately recognize control characters in CLI output.
+      "includes": [
+        "src/ui/parse-stdout.ts",
+        "src/ui/parse-stdout.test.ts",
+        "src/gateway/ui/parse-stdout.ts"
+      ],
+      "linter": {
+        "rules": { "suspicious": { "noControlCharactersInRegex": "off" } }
+      }
+    },
+    {
+      // The existing process setup conditionally assigns inferred variables.
+      "includes": ["src/server/safe-runtime.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noImplicitAnyLet": "off",
+            "noAssignInExpressions": "off"
+          }
+        }
+      }
+    }
+  ]
+}

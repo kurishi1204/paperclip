@@ -90,7 +90,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "lint": "eslint src/",
+    "lint": "biome lint --max-diagnostics=1000 src/",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:command-resolution": "vitest run src/server/command-resolution.test.ts",
@@ -103,6 +103,7 @@
     "picocolors": "^1.1.1"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.15",
     "@types/node": "^24.0.0",
     "typescript": "^7.0.2",
     "vitest": "^5.0.3"
