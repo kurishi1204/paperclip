@@ -813,6 +813,24 @@ export function agentService(db: Db) {
         await recordAgentStatusEvent(txDb, updated.companyId, id, current.status, updated.status);
       }
 
+      // An opted-out standard agent starts without assignment grants. If the
+      // board later promotes it to CEO, restore just the two grants that back
+      // the CEO assignment exception for restricted targets. Preserve every
+      // other explicit grant or revocation.
+      if (existing.role !== "ceo" && updated.role === "ceo" &&
+          !permissionsImplyLowTrust(updated.permissions) && !readBuiltInAgentMarker(updated.metadata)) {
+        const assignmentKeys = ["tasks:assign", "tasks:assign_scope"] as const;
+        await txDb.insert(principalPermissionGrants).values(
+          assignmentKeys.map((permissionKey) => ({
+            companyId: updated.companyId,
+            principalType: "agent" as const,
+            principalId: updated.id,
+            permissionKey,
+            scope: newStandardAgentGrantScope(permissionKey, updated.id),
+          })),
+        ).onConflictDoNothing();
+      }
+
       const priorAdapterConfig = isPlainRecord(existing.adapterConfig) ? existing.adapterConfig : {};
       const afterConfig = isPlainRecord(updated.adapterConfig) ? updated.adapterConfig : {};
       const changedExecution = updated.adapterType !== existing.adapterType

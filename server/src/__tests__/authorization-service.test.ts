@@ -20,6 +20,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { authorizationService } from "../services/authorization.js";
+import { agentService } from "../services/agents.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1326,6 +1327,48 @@ describeEmbeddedPostgres("authorization service", () => {
       reason: "allow_explicit_grant",
       grant: { permissionKey: "tasks:assign_scope" },
     });
+  });
+
+  it("keeps the CEO assignment exception after promoting an opted-out agent", async () => {
+    const company = await createCompany(db, "PromotedCeoAssignment");
+    const actorAgent = await createAgent(db, company.id, {
+      permissions: { canCreateAgents: false, canAssignTasks: false },
+    });
+    const targetAgent = await createAgent(db, company.id, {
+      permissions: {
+        authorizationPolicy: {
+          agentVisibility: { mode: "private", hiddenFromDefaultDirectory: true },
+          assignmentPolicy: { mode: "company_default", protectedAgentRequiresApproval: false },
+          protectedAgent: { requiresApproval: false },
+          managedBy: "permissions-extension",
+        },
+      },
+    });
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: actorAgent.id,
+      status: "active",
+      membershipRole: "member",
+    });
+    const input = {
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+      action: "tasks:assign",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: targetAgent.id },
+      scope: { assigneeAgentId: targetAgent.id },
+    } as const;
+    expect(await authorizationService(db).decide(input)).toMatchObject({ allowed: false });
+
+    await agentService(db).update(actorAgent.id, { role: "ceo" });
+    const assignmentGrants = await db.select({ permissionKey: principalPermissionGrants.permissionKey })
+      .from(principalPermissionGrants)
+      .where(eq(principalPermissionGrants.principalId, actorAgent.id));
+    expect(assignmentGrants.map((grant) => grant.permissionKey).sort())
+      .toEqual(["tasks:assign", "tasks:assign_scope"]);
+
+    const decision = await authorizationService(db).decide(input);
+
+    expect(decision).toMatchObject({ allowed: true });
   });
 
   it("allows simple-mode task assignment for active same-company board operators without explicit grants", async () => {
