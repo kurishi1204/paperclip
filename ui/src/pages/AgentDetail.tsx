@@ -2070,6 +2070,8 @@ export function ConfigurationTab({
           ? "Enabled via explicit organization permission grant."
           : taskAssignSource === "simple_default"
             ? "Enabled by simple organization-wide task assignment defaults."
+            : taskAssignSource === "agent_opt_out"
+              ? "Disabled by this agent's saved task assignment setting."
             : "Disabled unless explicitly granted.";
 
   return (

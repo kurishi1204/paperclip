@@ -556,6 +556,30 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision.explanation).toContain("shared default-open");
   });
 
+  it("denies an explicit non-creator assignment opt-out even with a stale grant", async () => {
+    const company = await createCompany(db, "AssignmentOptOut");
+    const actorAgent = await createAgent(db, company.id, {
+      permissions: { canCreateAgents: false, canAssignTasks: false },
+    });
+    const targetAgent = await createAgent(db, company.id);
+    await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
+    const authorization = authorizationService(db);
+    const actor = { type: "agent" as const, agentId: actorAgent.id, companyId: company.id, source: "agent_key" as const };
+    const resource = { type: "issue" as const, companyId: company.id, assigneeAgentId: targetAgent.id };
+
+    await expect(authorization.decide({ actor, action: "tasks:assign", resource })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+      explanation: "Agent task assignment is explicitly disabled.",
+    });
+
+    await db.update(agents).set({ permissions: { canCreateAgents: false, canAssignTasks: true } })
+      .where(eq(agents.id, actorAgent.id));
+    await expect(authorization.decide({ actor, action: "tasks:assign", resource })).resolves.toMatchObject({
+      allowed: true,
+    });
+  });
+
   it("allows standard-trust agents to comment on and update visible peer-owned issues", async () => {
     const company = await createCompany(db, "DefaultOpenPeerWrites");
     const actorAgent = await createAgent(db, company.id);

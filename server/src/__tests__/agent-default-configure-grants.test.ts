@@ -62,6 +62,7 @@ describeDatabase("new agent configuration defaults", () => {
 
     const standard = await create("Standard");
     const peer = await create("Peer");
+    const optedOut = await create("No assignment", { canCreateAgents: false, canAssignTasks: false });
     const lowTrust = await create("Low trust", { trustPreset: LOW_TRUST_REVIEW_PRESET });
     const bundled = await create("Bundled", {}, {
       paperclipBuiltInAgent: { key: "reflection-coach", featureKeys: [] },
@@ -77,6 +78,10 @@ describeDatabase("new agent configuration defaults", () => {
       expect(grants.find((grant) => grant.principalId === agent.id && grant.permissionKey === "inbox:manage")?.scope)
         .toEqual({ responsibleUserOnly: true });
     }
+    expect(grants.filter((grant) => grant.principalId === optedOut.id)
+      .map((grant) => grant.permissionKey).sort()).toEqual(
+        expectedNewAgentGrantKeys.filter((key) => key !== "tasks:assign" && key !== "tasks:assign_scope"),
+      );
     for (const agent of [lowTrust, bundled]) {
       expect(grants.filter((grant) => grant.principalId === agent.id)).toEqual([]);
     }

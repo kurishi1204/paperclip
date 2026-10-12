@@ -22,6 +22,8 @@ These permission keys have no blanket grant for new standard agents: `agents:cre
 
 The new direct grants do not grant company administration, user permission management, blanket tool administration, or cross-company access. The responsible user's permissions, route checks, and the normal approval gates still apply.
 
+An agent with saved `canCreateAgents: false` and explicit `canAssignTasks: false` opts out of task assignment. The opt-out overrides the standard default-open rule and any existing task-assignment grant, including a scoped task-bridge key. New agents with that setting do not receive the default `tasks:assign` or `tasks:assign_scope` grants. Omitted `canAssignTasks` keeps the default-open behavior for existing agents. CEO and agent-creator assignment authority remains enabled as shown in the agent settings UI.
+
 Agent-authenticated callers cannot set process adapter configuration or switch an existing agent onto the process adapter. For local adapters, they cannot change host command, argument, working-directory, arbitrary environment, or filesystem sandbox command settings. Provider credential secret references on known environment keys remain allowed so agents can hire peers with their own credentials. When a caller uses an AI connection pool, a new peer can use a plain provider authentication override on the small allowlist of supported keys. Arbitrary environment keys remain blocked. The same limits apply to creation, hiring, adapter switches, and configuration rollback. They also cannot restore host-executed workspace commands through a configuration revision. This keeps host-executed commands under board control while standard agents configure other supported agent settings.
 
 ## Exceptions and rollout
