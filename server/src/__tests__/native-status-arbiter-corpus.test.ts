@@ -2298,7 +2298,10 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     await issueService(db).update(seeded.issueId, { status });
     const before = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
     await dismissObsoleteNativePolicyReviews(db, [seeded.runId]);
-    expect(await db.select().from(issues).where(eq(issues.id, seeded.issueId))).toEqual(before);
+    // Retiring the interaction changes Issue material and increments its
+    // revision, even though its status and statusVersion stay unchanged.
+    expect(await db.select().from(issues).where(eq(issues.id, seeded.issueId)))
+      .toEqual([{ ...before[0], revision: before[0]!.revision + (status === "blocked" ? 1 : 0) }]);
     const [interaction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, seeded.interaction.id));
     expect(interaction!.status).toBe(status === "blocked" ? "cancelled" : "expired");
   });
@@ -2314,7 +2317,8 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
       }
       const before = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
       await dismissObsoleteNativePolicyReviews(db, [seeded.runId]);
-      expect(await db.select().from(issues).where(eq(issues.id, seeded.issueId))).toEqual(before);
+      expect(await db.select().from(issues).where(eq(issues.id, seeded.issueId)))
+        .toEqual([{ ...before[0], revision: before[0]!.revision + 1 }]);
     }
   });
 
