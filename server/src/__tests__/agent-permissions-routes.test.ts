@@ -1972,6 +1972,37 @@ describe("agent permission routes", () => {
     expect(res.body.access.taskAssignSource).toBe("simple_default");
   }, 15_000);
 
+  it("reports an explicit task-assignment opt-out even with a stale grant", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      permissions: { canCreateAgents: false, canAssignTasks: false },
+    });
+    mockAccessService.listPrincipalGrants.mockResolvedValue([{
+      id: "stale-assign-grant",
+      companyId,
+      principalType: "agent",
+      principalId: agentId,
+      permissionKey: "tasks:assign",
+      scope: null,
+    }]);
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}`));
+
+    expect(res.status).toBe(200);
+    expect(res.body.access).toMatchObject({
+      canAssignTasks: false,
+      taskAssignSource: "agent_opt_out",
+    });
+  }, 15_000);
+
   it("keeps task assignment enabled when agent creation privilege is enabled", async () => {
     mockAgentService.updatePermissions.mockResolvedValue({
       ...baseAgent,

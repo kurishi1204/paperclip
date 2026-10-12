@@ -39,7 +39,7 @@ import {
   syncAgentAdapterEnvBindings,
 } from "./agent-secret-bindings.js";
 import { logActivity } from "./activity-log.js";
-import { NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS, newStandardAgentGrantScope, normalizeAgentPermissions, permissionsImplyLowTrust } from "./agent-permissions.js";
+import { newStandardAgentGrantScope, normalizeAgentPermissions, permissionsImplyLowTrust, standardAgentDefaultGrantKeys } from "./agent-permissions.js";
 import { recordAgentStatusEvent, recordResourceCreationEvent } from "./resource-lifecycle-events.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import {
@@ -813,6 +813,24 @@ export function agentService(db: Db) {
         await recordAgentStatusEvent(txDb, updated.companyId, id, current.status, updated.status);
       }
 
+      // An opted-out standard agent starts without assignment grants. If the
+      // board later promotes it to CEO, restore just the two grants that back
+      // the CEO assignment exception for restricted targets. Preserve every
+      // other explicit grant or revocation.
+      if (existing.role !== "ceo" && updated.role === "ceo" &&
+          !permissionsImplyLowTrust(updated.permissions) && !readBuiltInAgentMarker(updated.metadata)) {
+        const assignmentKeys = ["tasks:assign", "tasks:assign_scope"] as const;
+        await txDb.insert(principalPermissionGrants).values(
+          assignmentKeys.map((permissionKey) => ({
+            companyId: updated.companyId,
+            principalType: "agent" as const,
+            principalId: updated.id,
+            permissionKey,
+            scope: newStandardAgentGrantScope(permissionKey, updated.id),
+          })),
+        ).onConflictDoNothing();
+      }
+
       const priorAdapterConfig = isPlainRecord(existing.adapterConfig) ? existing.adapterConfig : {};
       const afterConfig = isPlainRecord(updated.adapterConfig) ? updated.adapterConfig : {};
       const changedExecution = updated.adapterType !== existing.adapterType
@@ -953,7 +971,7 @@ export function agentService(db: Db) {
         if (created.status !== "pending_approval" && !permissionsImplyLowTrust(normalizedPermissions) &&
             !readBuiltInAgentMarker(created.metadata)) {
           await tx.insert(principalPermissionGrants).values(
-            NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS.map((permissionKey) => ({
+            standardAgentDefaultGrantKeys(normalizedPermissions, created.role).map((permissionKey) => ({
               companyId,
               principalType: "agent" as const,
               principalId: created.id,
@@ -1176,7 +1194,7 @@ export function agentService(db: Db) {
         await syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
         if (!permissionsImplyLowTrust(updated.permissions) && !readBuiltInAgentMarker(updated.metadata)) {
           await tx.insert(principalPermissionGrants).values(
-            NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS.map((permissionKey) => ({
+            standardAgentDefaultGrantKeys(updated.permissions, updated.role).map((permissionKey) => ({
               companyId: updated.companyId,
               principalType: "agent" as const,
               principalId: updated.id,

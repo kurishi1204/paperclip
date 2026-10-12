@@ -18,6 +18,23 @@ export const NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS = [
   "tasks:manage_active_checkouts",
 ] as const satisfies readonly PermissionKey[];
 
+/** A saved false opts a non-creator out of default-open task assignment. */
+export function agentTaskAssignmentOptedOut(permissions: unknown): boolean {
+  const record = asRecord(permissions);
+  return record?.canAssignTasks === false && record.canCreateAgents !== true;
+}
+
+export function standardAgentDefaultGrantKeys(permissions: unknown, role: string): PermissionKey[] {
+  // CEO assignment is an explicit role exception in authorization and the
+  // agent detail API, including when a saved permission has false values.
+  if (role === "ceo" || !agentTaskAssignmentOptedOut(permissions)) {
+    return [...NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS];
+  }
+  return NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS.filter(
+    (key) => key !== "tasks:assign" && key !== "tasks:assign_scope",
+  );
+}
+
 export function newStandardAgentGrantScope(
   permissionKey: PermissionKey,
   agentId: string,

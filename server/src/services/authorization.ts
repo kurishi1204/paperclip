@@ -37,7 +37,7 @@ import {
   type TrustPresetResolution,
 } from "./trust-preset-resolver.js";
 import { logger } from "../middleware/logger.js";
-import { normalizeAgentPermissions } from "./agent-permissions.js";
+import { agentTaskAssignmentOptedOut, normalizeAgentPermissions } from "./agent-permissions.js";
 import { grantsForHumanRole, normalizeHumanRole } from "./company-member-roles.js";
 
 export type AuthorizationActor =
@@ -1915,6 +1915,21 @@ export function authorizationService(db: Db | DbTransaction) {
         action: input.action,
         reason: "deny_company_boundary",
         explanation: "Actor agent was not found in the target company.",
+      });
+    }
+
+    // A saved opt-out must win over both the standard default-open rule and
+    // stale direct grants, including scoped task-bridge keys. CEO/creator
+    // assignment remains the explicit legacy exception shown by the UI.
+    if (
+      input.action === "tasks:assign" &&
+      actorAgent.role !== "ceo" &&
+      agentTaskAssignmentOptedOut(actorAgent.permissions)
+    ) {
+      return deny({
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation: "Agent task assignment is explicitly disabled.",
       });
     }
 

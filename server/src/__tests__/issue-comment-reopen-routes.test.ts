@@ -509,12 +509,13 @@ describe("issue comment reopen routes", () => {
   });
 
   it("treats reopen=true as a no-op when the issue is already open", async () => {
-    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    let committedIssue = makeIssue("todo");
+    mockIssueService.getById.mockImplementation(async () => committedIssue);
     mockIssueService.update.mockImplementation(
-      async (_id: string, patch: Record<string, unknown>) => ({
-        ...makeIssue("todo"),
-        ...patch,
-      }),
+      async (_id: string, patch: Record<string, unknown>) => {
+        committedIssue = makeIssueUpdateReceipt(committedIssue, patch);
+        return committedIssue;
+      },
     );
 
     const res = await request(await installActor(createApp()))

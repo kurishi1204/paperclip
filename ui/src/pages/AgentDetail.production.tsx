@@ -2179,6 +2179,8 @@ function ConfigurationTab({
           ? "Enabled via explicit company permission grant."
           : taskAssignSource === "simple_default"
             ? "Enabled by simple company-wide task assignment defaults."
+            : taskAssignSource === "agent_opt_out"
+              ? "Disabled by this agent's saved task assignment setting."
             : "Disabled unless explicitly granted.";
 
   return (

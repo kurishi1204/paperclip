@@ -930,15 +930,14 @@ describe("sandbox callback bridge", () => {
       error: "Bridge worker stopped before request could be handled.",
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 300));
-
-    await expect(readdir(directories.responsesDir)).resolves.toEqual([]);
-    await expect(
-      readdir(directories.responsesDir).then((entries) =>
-        entries.filter((entry) => entry.endsWith(".tmp") || entry.includes(".paperclip-write.lock")),
-      ),
-    ).resolves.toEqual([]);
-  });
+    // The first stop deliberately returns after a 10 ms drain window. Wait for
+    // the in-flight handler and its remote write cleanup before checking the
+    // directory; a fixed sleep can race that cleanup under a busy test host.
+    await worker.stop();
+    await vi.waitFor(async () => {
+      expect(await readdir(directories.responsesDir)).toEqual([]);
+    }, { timeout: 2_000, interval: 25 });
+  }, 10_000);
 
   it("rejects non-JSON request bodies and full queues at the bridge server", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-server-guards-"));

@@ -127,6 +127,7 @@ import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
 import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
+import { agentTaskAssignmentOptedOut } from "../services/agent-permissions.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import {
   persistReprojectedWorkspaceDiffs,
@@ -1627,6 +1628,15 @@ export function agentRoutes(
       return {
         canAssignTasks: true,
         taskAssignSource: "agent_creator" as const,
+        membership,
+        grants,
+      };
+    }
+
+    if (agentTaskAssignmentOptedOut(agent.permissions)) {
+      return {
+        canAssignTasks: false,
+        taskAssignSource: "agent_opt_out" as const,
         membership,
         grants,
       };

@@ -1418,20 +1418,34 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         return;
       }
 
-      await waitFor(() => gateway.getAgentPayloads().length === 2, 90_000);
+      // Completing a follow-up without a recorded disposition may also start
+      // a separate disposition-repair run. Identify this continuation by its
+      // promoted wake rather than assuming the company has exactly two runs.
       await waitFor(async () => {
-        const runs = await db
-          .select()
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.companyId, companyId));
-        return (
-          runs.length === 2 && runs.every((run) => run.status === "succeeded")
-        );
+        const [promotedWake] = await db.select({ runId: agentWakeupRequests.runId })
+          .from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.reason, "issue_execution_promoted"),
+          ));
+        if (!promotedWake?.runId) return false;
+        const runs = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+          .from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+        return runs.some((run) => run.id === firstRun!.id && run.status === "succeeded") &&
+          runs.some((run) => run.id === promotedWake.runId && run.status === "succeeded") &&
+          gateway.getAgentPayloads().some((payload) => payload.idempotencyKey === promotedWake.runId);
       }, 90_000);
+
+      const [promotedWake] = await db.select()
+        .from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.reason, "issue_execution_promoted"),
+        ));
+      expect(promotedWake?.runId).toBeTruthy();
+      expect(promotedWake?.payload).toMatchObject({ commentId: comment.id });
 
       const continuation = (await db.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, targetAgentId),
-      ))).find((run) => run.id !== firstRun!.id);
+      ))).find((run) => run.id === promotedWake!.runId);
       expect(continuation).toMatchObject({
         agentId: targetAgentId,
         contextSnapshot: expect.objectContaining({ issueId }),
@@ -1453,7 +1467,8 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       if (shouldReopen) expect(issueAfterPromotion?.completedAt).toBeNull();
       else expect(issueAfterPromotion?.completedAt).not.toBeNull();
 
-      const secondPayload = gateway.getAgentPayloads()[1] ?? {};
+      const secondPayload = gateway.getAgentPayloads()
+        .find((payload) => payload.idempotencyKey === promotedWake!.runId) ?? {};
       expect(secondPayload.paperclip).toBeUndefined();
       const secondWake = await readGatewayWakePayload(secondPayload);
       expect(secondWake).toMatchObject({

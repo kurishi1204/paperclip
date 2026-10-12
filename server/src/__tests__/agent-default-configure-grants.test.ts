@@ -49,10 +49,10 @@ describeDatabase("new agent configuration defaults", () => {
       name: "Agent permission defaults",
       issuePrefix: `PD${companyId.slice(0, 6).toUpperCase()}`,
     });
-    const create = (name: string, permissions: Record<string, unknown> = {}, metadata?: Record<string, unknown>) =>
+    const create = (name: string, permissions: Record<string, unknown> = {}, metadata?: Record<string, unknown>, role = "engineer") =>
       agentService(db).create(companyId, {
         name,
-        role: "engineer",
+        role,
         adapterType: "process",
         adapterConfig: {},
         runtimeConfig: {},
@@ -62,6 +62,8 @@ describeDatabase("new agent configuration defaults", () => {
 
     const standard = await create("Standard");
     const peer = await create("Peer");
+    const optedOut = await create("No assignment", { canCreateAgents: false, canAssignTasks: false });
+    const ceo = await create("CEO assignment exception", { canCreateAgents: false, canAssignTasks: false }, undefined, "ceo");
     const lowTrust = await create("Low trust", { trustPreset: LOW_TRUST_REVIEW_PRESET });
     const bundled = await create("Bundled", {}, {
       paperclipBuiltInAgent: { key: "reflection-coach", featureKeys: [] },
@@ -69,7 +71,7 @@ describeDatabase("new agent configuration defaults", () => {
 
     const grants = await db.select().from(principalPermissionGrants)
       .where(eq(principalPermissionGrants.companyId, companyId));
-    for (const agent of [standard, peer]) {
+    for (const agent of [standard, peer, ceo]) {
       expect(grants.filter((grant) => grant.principalId === agent.id)
         .map((grant) => grant.permissionKey).sort()).toEqual(expectedNewAgentGrantKeys);
       expect(grants.find((grant) => grant.principalId === agent.id && grant.permissionKey === "tasks:assign_scope")?.scope)
@@ -77,6 +79,10 @@ describeDatabase("new agent configuration defaults", () => {
       expect(grants.find((grant) => grant.principalId === agent.id && grant.permissionKey === "inbox:manage")?.scope)
         .toEqual({ responsibleUserOnly: true });
     }
+    expect(grants.filter((grant) => grant.principalId === optedOut.id)
+      .map((grant) => grant.permissionKey).sort()).toEqual(
+        expectedNewAgentGrantKeys.filter((key) => key !== "tasks:assign" && key !== "tasks:assign_scope"),
+      );
     for (const agent of [lowTrust, bundled]) {
       expect(grants.filter((grant) => grant.principalId === agent.id)).toEqual([]);
     }
@@ -198,13 +204,27 @@ describeDatabase("new agent configuration defaults", () => {
       adapterConfig: {},
       runtimeConfig: {},
     });
+    const pendingCeo = await agentService(db).create(companyId, {
+      name: "Pending CEO assignment exception",
+      status: "pending_approval",
+      role: "ceo",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: { canCreateAgents: false, canAssignTasks: false },
+    });
     expect(await db.select().from(principalPermissionGrants)
       .where(eq(principalPermissionGrants.companyId, companyId))).toEqual([]);
 
     const result = await agentService(db).activatePendingApproval(pending.id);
     expect(result?.activated).toBe(true);
+    const ceoResult = await agentService(db).activatePendingApproval(pendingCeo.id);
+    expect(ceoResult?.activated).toBe(true);
     expect((await db.select().from(principalPermissionGrants)
-      .where(eq(principalPermissionGrants.companyId, companyId)))
+      .where(eq(principalPermissionGrants.principalId, pending.id)))
+      .map((grant) => grant.permissionKey).sort()).toEqual(expectedNewAgentGrantKeys);
+    expect((await db.select().from(principalPermissionGrants)
+      .where(eq(principalPermissionGrants.principalId, pendingCeo.id)))
       .map((grant) => grant.permissionKey).sort()).toEqual(expectedNewAgentGrantKeys);
 
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));

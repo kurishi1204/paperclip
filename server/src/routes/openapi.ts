@@ -5,6 +5,7 @@ import {
 } from "./experimental-api-paths.js";
 import { Router } from "express";
 import { z } from "zod";
+import { prepareCommanderAdmissionSchema } from "../services/commander-cycle.js";
 import {
   createAiConnectionSchema,
   aiConnectionPoolConfigSchema,
@@ -1348,6 +1349,7 @@ const browserUseOperations = [
 
 const BOARD_ONLY_OPERATIONS = new Set([
   ...browserUseOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
+  "POST /api/issues/{id}/commander-admission",
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections/local",
@@ -1689,7 +1691,7 @@ function resolveOperationAuthLevel(
   if (path === "/api/mcp/setup" || path === "/api/mcp/device/consent" || path.startsWith("/api/mcp/requests/") || path.startsWith("/api/mcp/connections")) return "board";
   if (PUBLIC_OPERATIONS.has(key)) return "public";
   if (key === "POST /api/companies/{companyId}/agent-commentary") return "agent_heartbeat";
-  if (key === "POST /api/mcp/project-tools" || key === "POST /api/mcp/qa-review" || key === "POST /api/companies/{companyId}/slack/tasks/{issueId}/tools") return "agent_run";
+  if (key === "POST /api/mcp/project-tools" || key === "POST /api/mcp/qa-review" || key === "POST /api/companies/{companyId}/slack/tasks/{issueId}/tools" || key === "GET /api/issues/{id}/requirement-envelope") return "agent_run";
   if (RUNTIME_TOOLS_OPERATIONS.has(key)) return "runtime_tools";
   if (INSTANCE_ADMIN_OPERATIONS.has(key)) return "instance_admin";
   if (
@@ -3994,6 +3996,42 @@ registry.registerPath({
   summary: "Get an issue",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/requirement-envelope",
+  tags: ["issues"],
+  summary: "Read a canary requirement envelope for the active issue Run",
+  description: "Requires the assigned agent's JWT bound to this Issue's active Run. Unsupported linked requirements hold the projection.",
+  request: { params: z.object({ id: z.string().uuid() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/commander-admission",
+  tags: ["issues"],
+  summary: "Prepare a board-authorized commander admission",
+  description: "Revalidates the pinned admission, worker, issue revision, and status version before preparing a dispatch.",
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    body: jsonBody(prepareCommanderAdmissionSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 registry.registerPath({
