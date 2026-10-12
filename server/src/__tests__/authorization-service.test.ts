@@ -582,28 +582,34 @@ describeEmbeddedPostgres("authorization service", () => {
       scope: { assigneeAgentId: targetAgent.id },
       grantedByUserId: null,
     });
-    await expect(authorization.decide({
-      actor: {
-        ...actor,
-        source: "agent_jwt",
-        keyId: randomUUID(),
-        keyScope: {
-          kind: "task_bridge",
-          parentIssueId: parentIssue.id,
-          allowedAssigneeAgentIds: [targetAgent.id],
-        },
+    const bridgeActor = {
+      ...actor,
+      source: "agent_jwt" as const,
+      keyId: randomUUID(),
+      keyScope: {
+        kind: "task_bridge" as const,
+        parentIssueId: parentIssue.id,
+        allowedAssigneeAgentIds: [targetAgent.id],
       },
+    };
+    const bridgeRequest = {
+      actor: bridgeActor,
       action: "tasks:assign",
       resource: { ...resource, parentIssueId: parentIssue.id },
       scope: { assigneeAgentId: targetAgent.id },
-    })).resolves.toMatchObject({
+    } as const;
+    await expect(authorization.decide(bridgeRequest)).resolves.toMatchObject({
       allowed: false,
       reason: "deny_missing_grant",
+      explanation: "Agent task assignment is explicitly disabled.",
     });
 
     await db.update(agents).set({ permissions: { canCreateAgents: false, canAssignTasks: true } })
       .where(eq(agents.id, actorAgent.id));
     await expect(authorization.decide({ actor, action: "tasks:assign", resource })).resolves.toMatchObject({
+      allowed: true,
+    });
+    await expect(authorization.decide(bridgeRequest)).resolves.toMatchObject({
       allowed: true,
     });
   });
