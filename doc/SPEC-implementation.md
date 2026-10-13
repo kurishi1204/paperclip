@@ -769,6 +769,18 @@ approval is created. The legacy fields `protectedAgent.requiresApproval` and
 aliases for the same hard block, but API denial copy must describe the block and
 administrator remediation rather than promising a nonexistent approval step.
 
+For a paused, non-CEO agent in protected assignment mode, a board actor with
+company agent-management access may read `GET /api/agents/:id/continuity-controls`
+and use `PATCH /api/agents/:id/continuity-controls` to change only
+`authorizationPolicy.protectedAgent.blockAssignment` and
+`heartbeat.wakeOnDemand`. PATCH requires the exact `expectedUpdatedAt` from
+GET, boolean values for both controls, a disabled heartbeat, no task-assignment
+permission, and no active legacy approval flag. It locks the agent row, rejects
+stale or ineligible writes with 409, and records an activity event. GET and PATCH
+return selected non-secret fields, never the full permissions or runtime
+configuration. This scoped change does not resume or wake the agent, and removing
+the block alone does not grant assignment authority.
+
 ### 9.8.1 Issue-thread interaction resolver contract
 
 Issue-thread interactions are coordination records, not grants of authority. Every
