@@ -779,7 +779,9 @@ permission, and no active legacy approval flag. It locks the agent row, rejects
 stale or ineligible writes with 409, and records an activity event with both
 control values before and after the change, plus an `agent.updated` plugin event.
 It records a configuration revision when `runtimeConfig` changes; configuration
-rollback preserves the current assignment block and on-demand wake flag. To
+rollback preserves the current on-demand wake flag for a paused agent in protected
+assignment mode, and preserves its assignment block because revisions do not
+restore permissions. To
 change either control, use the scoped PATCH with a fresh `expectedUpdatedAt`.
 While this scoped control is
 eligible, general agent edits refuse changes to either flag, including a stale

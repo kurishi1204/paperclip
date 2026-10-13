@@ -1992,6 +1992,7 @@ function AgentConfigurePage({
     onSuccess: (updated) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.configRevisions(agent.id) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.continuityControls(agent.id) });
       if (!syncAgentRouteAfterRename(queryClient, navigate, agent, updated, urlTab ?? "configuration")) {
         queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.urlKey) });
       }
@@ -2136,6 +2137,7 @@ function ConfigurationTab({
     onSuccess: (updated) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.configRevisions(agent.id) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.continuityControls(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(agent.companyId) });
       if (!syncAgentRouteAfterRename(queryClient, navigate, agent, updated, urlTab ?? content)) {
         queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.urlKey) });
@@ -2209,8 +2211,7 @@ function ConfigurationTab({
 
       {content === "configuration" && agent.status === "paused"
         && agent.permissions.authorizationPolicy?.assignmentPolicy?.mode === "protected" ? (
-        <AgentContinuityControlsPanel agentId={agent.id} companyId={companyId ?? agent.companyId}
-          detailRef={agent.urlKey} />
+        <AgentContinuityControlsPanel agentId={agent.id} companyId={companyId ?? agent.companyId} />
       ) : null}
 
       {content === "configuration" ? <TrustPresetSection

@@ -32,12 +32,12 @@ function draftFrom(current: AgentContinuityControls): Draft | null {
 }
 
 /** Keeps the sensitive general agent configuration out of this two-flag UI. */
-export function AgentContinuityControlsPanel({ agentId, companyId, detailRef }: {
-  agentId: string; companyId: string; detailRef?: string;
+export function AgentContinuityControlsPanel({ agentId, companyId }: {
+  agentId: string; companyId: string;
 }) {
   const queryClient = useQueryClient();
   const { pushToast } = useToastActions();
-  const key = ["agents", agentId, "continuity-controls"] as const;
+  const key = queryKeys.agents.continuityControls(agentId);
   const controls = useQuery({
     queryKey: key,
     queryFn: () => agentsApi.getContinuityControls(agentId, companyId),
@@ -71,10 +71,7 @@ export function AgentContinuityControlsPanel({ agentId, companyId, detailRef }: 
     onSuccess: (updated: AgentContinuityControls) => {
       setDraft(draftFrom(updated));
       queryClient.setQueryData(key, updated);
-      queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agentId) });
-      if (detailRef && detailRef !== agentId) {
-        queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(detailRef) });
-      }
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.detailAll });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.configRevisions(agentId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(companyId) });
       pushToast({ title: "Continuity controls saved", tone: "success" });

@@ -50,11 +50,13 @@ describe("AgentContinuityControlsPanel", () => {
   it("saves both scoped flags with the exact read revision and no general agent update", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const routeDetailKey = ["agents", "detail", "paused-worker", "company-1"];
+    const aliasDetailKey = ["agents", "detail", "legacy-paused-worker", "company-1"];
     queryClient.setQueryData(routeDetailKey, { name: "Paused worker" });
+    queryClient.setQueryData(aliasDetailKey, { name: "Paused worker" });
     root = createRoot(container);
     await act(async () => root.render(
       <QueryClientProvider client={queryClient}>
-        <AgentContinuityControlsPanel agentId="agent-1" companyId="company-1" detailRef="paused-worker" />
+        <AgentContinuityControlsPanel agentId="agent-1" companyId="company-1" />
       </QueryClientProvider>,
     ));
     await flush();
@@ -71,6 +73,7 @@ describe("AgentContinuityControlsPanel", () => {
       expectedUpdatedAt: initial.updatedAt, blockAssignment: true, wakeOnDemand: true,
     }, "company-1");
     expect(queryClient.getQueryState(routeDetailKey)?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryState(aliasDetailKey)?.isInvalidated).toBe(true);
     expect(container.textContent).toContain("Saving does not resume or wake the agent");
   });
 
