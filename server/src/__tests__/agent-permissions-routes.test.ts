@@ -55,6 +55,8 @@ const mockAgentService = vi.hoisted(() => ({
   resolveByReference: vi.fn(),
 }));
 
+const mockContinuityControls = vi.hoisted(() => ({ get: vi.fn(), patch: vi.fn() }));
+
 const mockBuiltInAgentService = vi.hoisted(() => ({
   ensureCompanyDefaultAgentGrants: vi.fn(),
 }));
@@ -143,6 +145,9 @@ function registerModuleMocks() {
 
   vi.doMock("../services/agents.js", () => ({
     agentService: () => mockAgentService,
+  }));
+  vi.doMock("../services/agent-continuity-controls.js", () => ({
+    agentContinuityControls: () => mockContinuityControls,
   }));
 
   vi.doMock("../services/access.js", () => ({
@@ -306,6 +311,8 @@ describe("agent permission routes", () => {
     mockAgentService.updatePermissions.mockReset();
     mockAgentService.getChainOfCommand.mockReset();
     mockAgentService.resolveByReference.mockReset();
+    mockContinuityControls.get.mockReset();
+    mockContinuityControls.patch.mockReset();
     mockBuiltInAgentService.ensureCompanyDefaultAgentGrants.mockReset();
     mockAccessService.canUser.mockReset();
     mockAccessService.decide.mockReset();
@@ -2319,5 +2326,37 @@ describe("agent permission routes", () => {
     expect(res.status).toBe(404);
     expect(res.body.error).toBe("Heartbeat run not found");
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
+  it("scopes continuity controls to an authorized board and never returns agent config", async () => {
+    const updatedAt = "2026-03-19T00:00:00.000000Z";
+    const safe = { id: agentId, companyId, status: "paused", role: "engineer", adapterType: "codex_local",
+      updatedAt, assignmentMode: "protected", blockAssignment: true, wakeOnDemand: false,
+      heartbeatEnabled: false, canAssignTasks: false, canCreateAgents: false };
+    mockContinuityControls.get.mockResolvedValue(safe);
+    mockContinuityControls.patch.mockResolvedValue({ ...safe, blockAssignment: false, wakeOnDemand: true });
+
+    const agentApp = await createApp({ type: "agent", agentId, companyId, source: "agent_key" });
+    const agentResult = await requestApp(agentApp, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}/continuity-controls`));
+    expect(agentResult.status).toBe(403);
+
+    const otherCompanyApp = await createApp({ type: "board", userId: "other-user", source: "session",
+      isInstanceAdmin: false, companyIds: [] });
+    const otherResult = await requestApp(otherCompanyApp, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}/continuity-controls`));
+    expect(otherResult.status).toBeGreaterThanOrEqual(403);
+    expect(otherResult.status).toBeLessThan(500);
+
+    const boardApp = await createApp({ type: "board", userId: "board-user", source: "session",
+      isInstanceAdmin: false, companyIds: [companyId] });
+    const read = await requestApp(boardApp, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}/continuity-controls`));
+    expect(read.status).toBe(200);
+    expect(read.body).toEqual(safe);
+    const changed = await requestApp(boardApp, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/continuity-controls`)
+      .send({ expectedUpdatedAt: updatedAt, blockAssignment: false, wakeOnDemand: true }));
+    expect(changed.status).toBe(200);
+    expect(changed.body).toEqual({ ...safe, blockAssignment: false, wakeOnDemand: true });
+    expect(JSON.stringify([read.body, changed.body])).not.toMatch(/runtimeConfig|adapterConfig|aiConnection|credentialRef/);
+    expect(mockAgentService.getById).not.toHaveBeenCalled();
   });
 });

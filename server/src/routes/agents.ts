@@ -25,6 +25,7 @@ import { applyMcpReasoningEffort } from "../services/public-mcp/agent-config.js"
 import { executionProjectionForRun, executionProjectionsForRuns } from "../services/execution-projection.js";
 import { selectDashboardRunIds } from "../services/dashboard-run-selection.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
+import { z } from "zod";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
@@ -128,6 +129,7 @@ import { skillVersionSelectionMap } from "../services/runtime-skill-selections.j
 import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { agentTaskAssignmentOptedOut } from "../services/agent-permissions.js";
+import { agentContinuityControls } from "../services/agent-continuity-controls.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import {
   persistReprojectedWorkspaceDiffs,
@@ -5167,6 +5169,39 @@ export function agentRoutes(
     });
 
     res.json(await buildAgentDetail(agent));
+  });
+
+  const scopedContinuityControlsSchema = z.object({
+    expectedUpdatedAt: z.string().regex(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/),
+    blockAssignment: z.boolean(),
+    wakeOnDemand: z.boolean(),
+  }).strict();
+  const continuityControls = agentContinuityControls(db);
+
+  // Deliberately avoids the general agent detail and update paths: those read
+  // and replace entire runtimeConfig/permissions objects, including bindings.
+  router.get("/agents/:id/continuity-controls", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    if (!isUuidLike(id)) throw notFound("Agent not found");
+    const controls = await continuityControls.get(id);
+    if (!controls) throw notFound("Agent not found");
+    await assertBoardCanManageAgentsForCompany(req, controls.companyId);
+    res.json(controls);
+  });
+
+  router.patch("/agents/:id/continuity-controls", validate(scopedContinuityControlsSchema), async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    if (!isUuidLike(id)) throw notFound("Agent not found");
+    const controls = await continuityControls.get(id);
+    if (!controls) throw notFound("Agent not found");
+    await assertBoardCanManageAgentsForCompany(req, controls.companyId);
+    const actorId = req.actor.userId;
+    if (!actorId) throw forbidden("Board user identity required");
+    const changed = await continuityControls.patch(id, req.body, actorId, controls.companyId);
+    if (!changed) throw notFound("Agent not found");
+    res.json(changed);
   });
 
   router.patch("/agents/:id/instructions-path", validate(updateAgentInstructionsPathSchema), async (req, res) => {
