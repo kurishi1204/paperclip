@@ -1,6 +1,7 @@
 import { eq, sql } from "drizzle-orm";
-import { activityLog, agents, type Db } from "@paperclipai/db";
+import { agents, type Db } from "@paperclipai/db";
 import { conflict } from "../errors.js";
+import { persistActivity, publishActivity } from "./activity-log.js";
 
 // Only these non-secret fields may cross the continuity-controls API. In
 // particular, selecting the complete runtimeConfig would expose aiConnection.
@@ -17,7 +18,18 @@ const safeSelection = {
   heartbeatEnabled: sql<boolean | null>`case when jsonb_typeof(${agents.runtimeConfig} #> '{heartbeat,enabled}') = 'boolean' then (${agents.runtimeConfig} #>> '{heartbeat,enabled}')::boolean else null end`,
   canAssignTasks: sql<boolean | null>`case when jsonb_typeof(${agents.permissions} -> 'canAssignTasks') = 'boolean' then (${agents.permissions} ->> 'canAssignTasks')::boolean else null end`,
   canCreateAgents: sql<boolean | null>`case when jsonb_typeof(${agents.permissions} -> 'canCreateAgents') = 'boolean' then (${agents.permissions} ->> 'canCreateAgents')::boolean else null end`,
-  legacyRequiresApproval: sql<boolean>`coalesce((${agents.permissions} #>> '{authorizationPolicy,protectedAgent,requiresApproval}')::boolean, false) or coalesce((${agents.permissions} #>> '{authorizationPolicy,assignmentPolicy,protectedAgentRequiresApproval}')::boolean, false)`,
+  // Legacy approval flags have no approval workflow. An invalid but present
+  // value must block this narrow bypass instead of throwing a 500 or allowing it.
+  legacyRequiresApproval: sql<boolean>`
+    (case when ${agents.permissions} #> '{authorizationPolicy,protectedAgent,requiresApproval}' is null then false
+      when jsonb_typeof(${agents.permissions} #> '{authorizationPolicy,protectedAgent,requiresApproval}') = 'boolean'
+        then (${agents.permissions} #>> '{authorizationPolicy,protectedAgent,requiresApproval}')::boolean
+      else true end)
+    or
+    (case when ${agents.permissions} #> '{authorizationPolicy,assignmentPolicy,protectedAgentRequiresApproval}' is null then false
+      when jsonb_typeof(${agents.permissions} #> '{authorizationPolicy,assignmentPolicy,protectedAgentRequiresApproval}') = 'boolean'
+        then (${agents.permissions} #>> '{authorizationPolicy,assignmentPolicy,protectedAgentRequiresApproval}')::boolean
+      else true end)`,
 };
 
 function publicView(row: {
@@ -54,7 +66,7 @@ export function agentContinuityControls(db: Db) {
       blockAssignment: boolean;
       wakeOnDemand: boolean;
     }, actorId: string, authorizedCompanyId: string) {
-      return db.transaction(async (tx) => {
+      const outcome = await db.transaction(async (tx) => {
         const [row] = await tx.select(safeSelection).from(agents).where(eq(agents.id, id)).for("update");
         if (!row) return null;
         if (row.companyId !== authorizedCompanyId) {
@@ -76,9 +88,9 @@ export function agentContinuityControls(db: Db) {
         if (!changed || changed.blockAssignment !== input.blockAssignment || changed.wakeOnDemand !== input.wakeOnDemand) {
           throw conflict("Scoped controls did not change as requested");
         }
-        await tx.insert(activityLog).values({
+        const { publication } = await persistActivity(tx as unknown as Db, {
           companyId: row.companyId, actorType: "user", actorId,
-          action: "agent.continuity_controls_updated", entityType: "agent", entityId: id, agentId: id,
+          action: "agent.continuity_controls_updated", entityType: "agent", entityId: id,
           details: {
             previousBlockAssignment: row.blockAssignment,
             blockAssignment: changed.blockAssignment,
@@ -86,8 +98,11 @@ export function agentContinuityControls(db: Db) {
             wakeOnDemand: changed.wakeOnDemand,
           },
         });
-        return publicView(changed);
+        return { view: publicView(changed), publication };
       });
+      if (!outcome) return null;
+      publishActivity(outcome.publication);
+      return outcome.view;
     },
   };
 }

@@ -2339,15 +2339,37 @@ describe("agent permission routes", () => {
     const agentApp = await createApp({ type: "agent", agentId, companyId, source: "agent_key" });
     const agentResult = await requestApp(agentApp, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}/continuity-controls`));
     expect(agentResult.status).toBe(403);
+    const agentPatch = await requestApp(agentApp, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/continuity-controls`)
+      .send({ expectedUpdatedAt: updatedAt, blockAssignment: false, wakeOnDemand: true }));
+    expect(agentPatch.status).toBe(403);
 
     const otherCompanyApp = await createApp({ type: "board", userId: "other-user", source: "session",
       isInstanceAdmin: false, companyIds: [] });
     const otherResult = await requestApp(otherCompanyApp, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}/continuity-controls`));
     expect(otherResult.status).toBeGreaterThanOrEqual(403);
     expect(otherResult.status).toBeLessThan(500);
+    const otherPatch = await requestApp(otherCompanyApp, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/continuity-controls`)
+      .send({ expectedUpdatedAt: updatedAt, blockAssignment: false, wakeOnDemand: true }));
+    expect(otherPatch.status).toBeGreaterThanOrEqual(403);
+    expect(otherPatch.status).toBeLessThan(500);
 
     const boardApp = await createApp({ type: "board", userId: "board-user", source: "session",
       isInstanceAdmin: false, companyIds: [companyId] });
+    mockAccessService.canUser.mockResolvedValue(false);
+    const noGrant = await requestApp(boardApp, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/continuity-controls`)
+      .send({ expectedUpdatedAt: updatedAt, blockAssignment: false, wakeOnDemand: true }));
+    expect(noGrant.status).toBe(403);
+    expect(mockContinuityControls.patch).not.toHaveBeenCalled();
+    mockAccessService.canUser.mockResolvedValue(true);
+    const extraField = await requestApp(boardApp, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/continuity-controls`)
+      .send({ expectedUpdatedAt: updatedAt, blockAssignment: false, wakeOnDemand: true, heartbeat: { enabled: true } }));
+    expect(extraField.status).toBeGreaterThanOrEqual(400);
+    expect(extraField.status).toBeLessThan(500);
+    expect(mockContinuityControls.patch).not.toHaveBeenCalled();
     const read = await requestApp(boardApp, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}/continuity-controls`));
     expect(read.status).toBe(200);
     expect(read.body).toEqual(safe);

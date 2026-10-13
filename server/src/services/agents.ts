@@ -149,6 +149,34 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function nestedValue(value: unknown, path: readonly string[]): unknown {
+  let current = value;
+  for (const key of path) {
+    if (!isPlainRecord(current)) return undefined;
+    current = current[key];
+  }
+  return current;
+}
+
+function assertScopedContinuityFlagsPreserved(
+  current: Pick<typeof agents.$inferSelect, "status" | "permissions" | "runtimeConfig">,
+  nextPermissions?: unknown,
+  nextRuntimeConfig?: unknown,
+) {
+  if (current.status !== "paused" ||
+      nestedValue(current.permissions, ["authorizationPolicy", "assignmentPolicy", "mode"]) !== "protected") return;
+  const blockPath = ["authorizationPolicy", "protectedAgent", "blockAssignment"];
+  const wakePath = ["heartbeat", "wakeOnDemand"];
+  if (nextPermissions !== undefined &&
+      nestedValue(nextPermissions, blockPath) !== nestedValue(current.permissions, blockPath)) {
+    throw conflict("Use scoped continuity controls to change a paused protected agent's assignment block");
+  }
+  if (nextRuntimeConfig !== undefined &&
+      nestedValue(nextRuntimeConfig, wakePath) !== nestedValue(current.runtimeConfig, wakePath)) {
+    throw conflict("Use scoped continuity controls to change a paused protected agent's on-demand wake flag");
+  }
+}
+
 function jsonEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -792,10 +820,11 @@ export function agentService(db: Db) {
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
-      const current = data.status !== undefined
+      const current = data.status !== undefined || normalizedPatch.permissions !== undefined || normalizedPatch.runtimeConfig !== undefined
         ? await txDb.select().from(agents).where(eq(agents.id, id)).for("update").then(rows => rows[0] ?? null)
         : existing;
       if (!current) return null;
+      assertScopedContinuityFlagsPreserved(current, normalizedPatch.permissions, normalizedPatch.runtimeConfig);
       if (current.status === "terminated" && data.status && data.status !== "terminated") {
         throw conflict("Terminated agents cannot be resumed");
       }
@@ -804,7 +833,7 @@ export function agentService(db: Db) {
       }
       const updated = await txDb
         .update(agents)
-        .set({ ...normalizedPatch, updatedAt: new Date() })
+        .set({ ...normalizedPatch, updatedAt: sql`greatest(clock_timestamp(), ${agents.updatedAt} + interval '1 microsecond')` })
         .where(eq(agents.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -1220,27 +1249,25 @@ export function agentService(db: Db) {
     },
 
     updatePermissions: async (id: string, permissions: Record<string, unknown> & { canCreateAgents: boolean }) => {
-      const existing = await getById(id);
-      if (!existing) return null;
-      if (existing.status === "pending_approval") {
-        throw conflict("Pending approval agent permissions cannot be changed before board approval", {
-          code: "pending_approval_agent_config_frozen",
-          agentId: id,
-          fields: ["permissions"],
-        });
-      }
-
-      const updated = await db
-        .update(agents)
-        .set({
-          permissions: normalizeAgentPermissions({ ...existing.permissions, ...permissions }),
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-
-      return updated ? getById(updated.id) : null;
+      const updatedId = await db.transaction(async (tx) => {
+        const [current] = await tx.select().from(agents).where(eq(agents.id, id)).for("update");
+        if (!current) return null;
+        if (current.status === "pending_approval") {
+          throw conflict("Pending approval agent permissions cannot be changed before board approval", {
+            code: "pending_approval_agent_config_frozen",
+            agentId: id,
+            fields: ["permissions"],
+          });
+        }
+        const nextPermissions = normalizeAgentPermissions({ ...current.permissions, ...permissions });
+        assertScopedContinuityFlagsPreserved(current, nextPermissions);
+        const [updated] = await tx.update(agents).set({
+          permissions: nextPermissions,
+          updatedAt: sql`greatest(clock_timestamp(), ${agents.updatedAt} + interval '1 microsecond')`,
+        }).where(eq(agents.id, id)).returning({ id: agents.id });
+        return updated?.id ?? null;
+      });
+      return updatedId ? getById(updatedId) : null;
     },
 
     listConfigRevisions: async (id: string) =>

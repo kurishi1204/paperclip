@@ -4,6 +4,8 @@ import { eq } from "drizzle-orm";
 import { activityLog, agents, companies, createDb } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentContinuityControls } from "../services/agent-continuity-controls.js";
+import { evaluateAgentInvokabilityFromDb } from "../services/agent-invokability.js";
+import { agentService } from "../services/agents.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeDb = support.supported ? describe : describe.skip;
@@ -66,6 +68,18 @@ describeDb("agent continuity controls", () => {
       ...f.runtimeConfig.heartbeat, wakeOnDemand: true,
     } });
     expect(stored!.adapterConfig).toEqual({ token: "SYNTHETIC_ADAPTER_SECRET" });
+    expect(await evaluateAgentInvokabilityFromDb(db, stored!)).toMatchObject({ invokable: false, reason: "paused" });
+    const [audit] = await db.select().from(activityLog).where(eq(activityLog.entityId, f.agentId));
+    expect(audit).toMatchObject({ actorType: "user", actorId: "board-user",
+      agentId: null, action: "agent.continuity_controls_updated" });
+    await expect(agentService(db).update(f.agentId, { runtimeConfig: f.runtimeConfig }))
+      .rejects.toMatchObject({ status: 409 });
+    await expect(agentService(db).updatePermissions(f.agentId, {
+      ...f.permissions, canCreateAgents: false,
+    })).rejects.toMatchObject({ status: 409 });
+    const [afterRejectedUpdates] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(afterRejectedUpdates!.runtimeConfig).toEqual(stored!.runtimeConfig);
+    expect(afterRejectedUpdates!.permissions).toEqual(stored!.permissions);
     await expect(svc.patch(f.agentId, {
       expectedUpdatedAt: before!.updatedAt, blockAssignment: true, wakeOnDemand: false,
     }, "board-user", f.companyId)).rejects.toMatchObject({ status: 409 });
@@ -93,5 +107,26 @@ describeDb("agent continuity controls", () => {
     const [stored] = await db.select().from(agents).where(eq(agents.id, f.agentId));
     expect(stored!.permissions).toEqual(f.permissions);
     expect(stored!.runtimeConfig).toEqual(f.runtimeConfig);
+  });
+
+  it("fails closed on malformed legacy approval flags without a SQL cast error", async () => {
+    for (const path of ["protectedAgent", "assignmentPolicy"] as const) {
+      const f = await seed();
+      const permissions = structuredClone(f.permissions);
+      const policy = permissions.authorizationPolicy as unknown as {
+        protectedAgent: Record<string, unknown>; assignmentPolicy: Record<string, unknown>;
+      };
+      if (path === "protectedAgent") policy.protectedAgent.requiresApproval = "always";
+      else policy.assignmentPolicy.protectedAgentRequiresApproval = { unexpected: true };
+      await db.update(agents).set({ permissions }).where(eq(agents.id, f.agentId));
+      const svc = agentContinuityControls(db);
+      const before = await svc.get(f.agentId);
+      expect(before).not.toBeNull();
+      await expect(svc.patch(f.agentId, {
+        expectedUpdatedAt: before!.updatedAt, blockAssignment: false, wakeOnDemand: true,
+      }, "board-user", f.companyId)).rejects.toMatchObject({ status: 409 });
+      const [stored] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      expect(stored!.permissions).toEqual(permissions);
+    }
   });
 });
