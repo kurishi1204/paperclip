@@ -127,6 +127,7 @@ interface UpdateAgentOptions {
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
   claudeLogin?: ClaudeLoginContext;
+  preserveScopedWakeOnRollback?: boolean;
 }
 
 interface CreateAgentOptions {
@@ -156,6 +157,21 @@ function nestedValue(value: unknown, path: readonly string[]): unknown {
     current = current[key];
   }
   return current;
+}
+
+function preserveCurrentWakeOnRollback(
+  current: Pick<typeof agents.$inferSelect, "status" | "permissions" | "runtimeConfig">,
+  nextRuntimeConfig: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (current.status !== "paused" ||
+      nestedValue(current.permissions, ["authorizationPolicy", "assignmentPolicy", "mode"]) !== "protected" ||
+      !isPlainRecord(nextRuntimeConfig)) return nextRuntimeConfig;
+  const nextHeartbeat = isPlainRecord(nextRuntimeConfig.heartbeat) ? nextRuntimeConfig.heartbeat : {};
+  const heartbeat = { ...nextHeartbeat };
+  const wake = nestedValue(current.runtimeConfig, ["heartbeat", "wakeOnDemand"]);
+  if (wake === undefined) delete heartbeat.wakeOnDemand;
+  else heartbeat.wakeOnDemand = wake;
+  return { ...nextRuntimeConfig, heartbeat };
 }
 
 function assertScopedContinuityFlagsPreserved(
@@ -834,7 +850,6 @@ export function agentService(db: Db) {
       : null;
 
     const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
-    const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
@@ -842,7 +857,15 @@ export function agentService(db: Db) {
         ? await txDb.select().from(agents).where(eq(agents.id, id)).for("update").then(rows => rows[0] ?? null)
         : existing;
       if (!current) return null;
-      assertScopedContinuityFlagsPreserved(current, normalizedPatch.permissions, normalizedPatch.runtimeConfig);
+      const beforeConfig = shouldRecordRevision
+        ? buildConfigSnapshot(options?.preserveScopedWakeOnRollback ? current : existing)
+        : null;
+      // Revision restore keeps the live scoped control from the locked row.
+      // An earlier read could overwrite a concurrent board PATCH.
+      const effectivePatch = options?.preserveScopedWakeOnRollback
+        ? { ...normalizedPatch, runtimeConfig: preserveCurrentWakeOnRollback(current, normalizedPatch.runtimeConfig) }
+        : normalizedPatch;
+      assertScopedContinuityFlagsPreserved(current, effectivePatch.permissions, effectivePatch.runtimeConfig);
       if (current.status === "terminated" && data.status && data.status !== "terminated") {
         throw conflict("Terminated agents cannot be resumed");
       }
@@ -851,7 +874,7 @@ export function agentService(db: Db) {
       }
       const updated = await txDb
         .update(agents)
-        .set({ ...normalizedPatch, updatedAt: sql`greatest(clock_timestamp(), ${agents.updatedAt} + interval '1 microsecond')` })
+        .set({ ...effectivePatch, updatedAt: sql`greatest(clock_timestamp(), ${agents.updatedAt} + interval '1 microsecond')` })
         .where(eq(agents.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -1319,6 +1342,7 @@ export function agentService(db: Db) {
 
       const patch = configPatchFromSnapshot(revision.afterConfig);
       return updateAgent(id, patch, {
+        preserveScopedWakeOnRollback: true,
         recordRevision: {
           createdByAgentId: actor.agentId ?? null,
           createdByUserId: actor.userId ?? null,

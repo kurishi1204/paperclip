@@ -105,6 +105,32 @@ describeDb("agent continuity controls", () => {
     }, "board-user", f.companyId)).rejects.toMatchObject({ status: 409 });
   });
 
+  it("restores unrelated settings without rolling back live scoped controls", async () => {
+    const f = await seed();
+    const safeRuntime = { heartbeat: f.runtimeConfig.heartbeat, unrelated: "keep" };
+    await db.update(agents).set({ adapterConfig: {}, runtimeConfig: safeRuntime })
+      .where(eq(agents.id, f.agentId));
+    const historic = { ...safeRuntime, unrelated: "historic" };
+    const service = agentService(db);
+    await service.update(f.agentId, { runtimeConfig: historic },
+      { recordRevision: { source: "test" } });
+    const [revision] = await service.listConfigRevisions(f.agentId);
+    await service.update(f.agentId, { runtimeConfig: { ...historic, unrelated: "current" } });
+    const controls = agentContinuityControls(db);
+    const before = await controls.get(f.agentId);
+    await controls.patch(f.agentId, {
+      expectedUpdatedAt: before!.updatedAt, blockAssignment: false, wakeOnDemand: true,
+    }, "board-user", f.companyId);
+    await expect(service.rollbackConfigRevision(f.agentId, revision.id, {})).resolves.not.toBeNull();
+    const [stored] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(stored!.runtimeConfig).toMatchObject({
+      heartbeat: { enabled: false, wakeOnDemand: true }, unrelated: "historic",
+    });
+    expect(stored!.permissions).toMatchObject({
+      authorizationPolicy: { protectedAgent: { blockAssignment: false } },
+    });
+  });
+
   it("rejects active agents without changing their config", async () => {
     const f = await seed("active");
     const svc = agentContinuityControls(db);

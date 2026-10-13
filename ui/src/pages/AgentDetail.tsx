@@ -2101,7 +2101,8 @@ export function ConfigurationTab({
 
       {content === "permissions" && agent.status === "paused"
         && agent.permissions.authorizationPolicy?.assignmentPolicy?.mode === "protected" ? (
-        <AgentContinuityControlsPanel agentId={agent.id} companyId={companyId ?? agent.companyId} />
+        <AgentContinuityControlsPanel agentId={agent.id} companyId={companyId ?? agent.companyId}
+          detailRef={agent.urlKey} />
       ) : null}
 
       {content === "permissions" ? <TrustPresetSection
