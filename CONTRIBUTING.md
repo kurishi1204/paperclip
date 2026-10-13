@@ -23,7 +23,7 @@ Affirm that you did this search by checking the dedup-search box in the PR templ
 - Pick **one** clear thing to fix/improve
 - Touch the **smallest possible number of files**
 - Make sure the change is very targeted and easy to review
-- All tests pass and CI is green
+- Verification satisfies [Tests Must Pass](#tests-must-pass) and [Paperclip Gates Must Pass](#paperclip-gates-must-pass)
 - Greptile score is 5/5 with all comments addressed
 - Use the [PR template](.github/PULL_REQUEST_TEMPLATE.md)
 
@@ -38,7 +38,7 @@ These almost always get merged quickly when they're clean.
 - In your PR include:
   - Clear description of what & why
   - Proof it works (manual testing notes)
-  - All tests passing and CI green
+  - Verification satisfying [Tests Must Pass](#tests-must-pass) and [Paperclip Gates Must Pass](#paperclip-gates-must-pass)
   - Greptile score 5/5 with all comments addressed
   - [PR template](.github/PULL_REQUEST_TEMPLATE.md) fully filled out
 
@@ -100,7 +100,9 @@ Every PR must include a **Model Used** section specifying which AI model produce
 
 ### Tests Must Pass
 
-All tests must pass before a PR can be merged. Run them locally first and verify CI is green after pushing.
+Run the required tests locally before requesting merge. Tests must pass, except for
+the narrow, documented owner-controlled Actions-free case below. Do not describe
+a failed or unfinished test run as passing.
 
 ### Telemetry Changes
 
@@ -110,7 +112,34 @@ If your change adds, removes, or modifies emitted telemetry events, update the [
 
 ### Paperclip Gates Must Pass
 
-All Paperclip CI gates (lint, typecheck, tests, build, and any other required checks) must be satisfied before a PR can be merged. Don't ask for a merge while gates are red — fix them first.
+All Paperclip CI gates (lint, typecheck, tests, build, and any other required checks)
+must be satisfied before a PR can be merged. Don't ask for a merge while gates are
+red — fix them first.
+
+For an owner-controlled fork where the repository owner has disabled GitHub Actions,
+the owner may use fixed, local verification evidence instead of an Actions check.
+This is an exception to the *check transport*, not to verification. The PR must:
+
+1. Link a receipt for the exact PR head. Record the runner, tool versions, commands,
+   exit codes, test counts, and log hashes. Attach a machine-readable inventory
+   of every failed and skipped test, with the reason and whether the skip is
+   required or an intentional platform skip. Run the PR-specific tests,
+   typecheck, build, and applicable static gates to completion. Execute the
+   tested PR code under an identity that cannot read GitHub or Paperclip
+   publishing credentials; clearing environment variables alone is insufficient.
+2. For each full-suite failure or required-test skip, provide a matching result
+   on the unchanged base under comparable conditions, or independent review of
+   concrete causal evidence that it is not a regression from this PR. Grouping
+   failures by a shared cause is allowed only if every test is mapped to that
+   cause in the inventory. If the cause is unknown, the exception is not established.
+3. Have an independent reviewer validate the receipt, credential isolation, and
+   each exception. The
+   repository owner must explicitly accept the listed exceptions and the exact
+   head before merge. A new head requires new evidence and a new decision.
+
+Mark Actions as **disabled**, and a failing full suite as **failed with accepted
+exceptions**. Never label either one green. This exception does not bypass a failed
+PR-specific test, an unresolved regression, or the Greptile review requirement.
 
 ### Greptile Review
 
