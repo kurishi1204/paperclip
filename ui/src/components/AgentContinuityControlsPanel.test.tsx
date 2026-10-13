@@ -22,7 +22,7 @@ const initial: AgentContinuityControls = {
   id: "agent-1", companyId: "company-1", status: "paused", role: "engineer",
   adapterType: "codex_local", updatedAt: "2026-10-13T00:00:00.000001Z",
   assignmentMode: "protected", blockAssignment: true, wakeOnDemand: false,
-  heartbeatEnabled: false, canAssignTasks: false, canCreateAgents: false,
+  heartbeatEnabled: false, canAssignTasks: false, canCreateAgents: false, eligible: true,
 };
 
 async function flush() {
@@ -69,5 +69,50 @@ describe("AgentContinuityControlsPanel", () => {
       expectedUpdatedAt: initial.updatedAt, blockAssignment: true, wakeOnDemand: true,
     }, "company-1");
     expect(container.textContent).toContain("Saving does not resume or wake the agent");
+  });
+
+  it("does not offer Save when the server marks the agent ineligible", async () => {
+    getControls.mockResolvedValue({ ...initial, eligible: false });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(async () => root.render(
+      <QueryClientProvider client={queryClient}>
+        <AgentContinuityControlsPanel agentId="agent-1" companyId="company-1" />
+      </QueryClientProvider>,
+    ));
+    await flush();
+    expect(container.textContent).toContain("not eligible for scoped continuity changes");
+    expect(container.querySelector('[aria-label="Wake on demand"]')).toBeNull();
+    expect(patchControls).not.toHaveBeenCalled();
+  });
+
+  it("preserves a dirty draft and its original revision on a background refresh", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(async () => root.render(
+      <QueryClientProvider client={queryClient}>
+        <AgentContinuityControlsPanel agentId="agent-1" companyId="company-1" />
+      </QueryClientProvider>,
+    ));
+    await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Wake on demand"]')?.click());
+    await act(async () => queryClient.setQueryData(
+      ["agents", "agent-1", "continuity-controls"],
+      { ...initial, updatedAt: "2026-10-13T00:00:00.000002Z" },
+    ));
+    await flush();
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="Wake on demand"]')?.getAttribute("aria-checked"))
+      .toBe("true");
+    expect(container.textContent).toContain("Your choices are preserved");
+    const save = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("Save continuity controls"));
+    expect(save?.disabled).toBe(true);
+    expect(patchControls).not.toHaveBeenCalled();
+    const reload = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("Reload continuity controls"));
+    await act(async () => reload?.click());
+    expect(container.querySelector<HTMLButtonElement>('[aria-label="Wake on demand"]')?.getAttribute("aria-checked"))
+      .toBe("false");
+    expect(container.textContent).not.toContain("Your choices are preserved");
   });
 });

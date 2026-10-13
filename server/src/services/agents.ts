@@ -159,26 +159,38 @@ function nestedValue(value: unknown, path: readonly string[]): unknown {
 }
 
 function assertScopedContinuityFlagsPreserved(
-  current: Pick<typeof agents.$inferSelect, "status" | "permissions" | "runtimeConfig">,
+  current: Pick<typeof agents.$inferSelect, "status" | "role" | "permissions" | "runtimeConfig">,
   nextPermissions?: unknown,
   nextRuntimeConfig?: unknown,
 ) {
-  // This is an accidental-loosening fence on the general update path. It is
-  // not an authorization boundary: the existing agent-edit permission still
-  // controls this path, and explicit safety tightening remains available when
-  // the narrow continuity endpoint is ineligible for this agent.
+  // A scoped update has an updatedAt precondition. General edit forms do not,
+  // so a stale full-object save must not undo either scoped flag, even when it
+  // would tighten the policy. Ineligible agents retain the safety-tightening
+  // route through general edit.
   if (current.status !== "paused" ||
       nestedValue(current.permissions, ["authorizationPolicy", "assignmentPolicy", "mode"]) !== "protected") return;
   const blockPath = ["authorizationPolicy", "protectedAgent", "blockAssignment"];
   const wakePath = ["heartbeat", "wakeOnDemand"];
   const nextBlock = nestedValue(nextPermissions, blockPath);
   const nextWake = nestedValue(nextRuntimeConfig, wakePath);
+  const legacyProtectedApproval = nestedValue(current.permissions,
+    ["authorizationPolicy", "protectedAgent", "requiresApproval"]);
+  const legacyAssignmentApproval = nestedValue(current.permissions,
+    ["authorizationPolicy", "assignmentPolicy", "protectedAgentRequiresApproval"]);
+  const scopedEligible = current.role !== "ceo"
+    && typeof nestedValue(current.permissions, blockPath) === "boolean"
+    && typeof nestedValue(current.runtimeConfig, wakePath) === "boolean"
+    && nestedValue(current.runtimeConfig, ["heartbeat", "enabled"]) === false
+    && nestedValue(current.permissions, ["canAssignTasks"]) === false
+    && nestedValue(current.permissions, ["canCreateAgents"]) !== true
+    && (legacyProtectedApproval === undefined || legacyProtectedApproval === false)
+    && (legacyAssignmentApproval === undefined || legacyAssignmentApproval === false);
   if (nextPermissions !== undefined && nextBlock !== nestedValue(current.permissions, blockPath)
-      && nextBlock !== true) {
+      && (scopedEligible || nextBlock !== true)) {
     throw conflict("Use scoped continuity controls to change a paused protected agent's assignment block");
   }
   if (nextRuntimeConfig !== undefined && nextWake !== nestedValue(current.runtimeConfig, wakePath)
-      && nextWake !== false) {
+      && (scopedEligible || nextWake !== false)) {
     throw conflict("Use scoped continuity controls to change a paused protected agent's on-demand wake flag");
   }
 }

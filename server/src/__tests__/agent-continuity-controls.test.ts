@@ -54,7 +54,7 @@ describeDb("agent continuity controls", () => {
     const svc = agentContinuityControls(db);
     const before = await svc.get(f.agentId);
     expect(JSON.stringify(before)).not.toContain("SYNTHETIC_SECRET");
-    expect(before).toMatchObject({ companyId: f.companyId, status: "paused", blockAssignment: true, wakeOnDemand: false });
+    expect(before).toMatchObject({ companyId: f.companyId, status: "paused", blockAssignment: true, wakeOnDemand: false, eligible: true });
     const after = await svc.patch(f.agentId, {
       expectedUpdatedAt: before!.updatedAt, blockAssignment: false, wakeOnDemand: true,
     }, "board-user", f.companyId);
@@ -80,20 +80,26 @@ describeDb("agent continuity controls", () => {
       actorId: "board-user", action: "agent.continuity_controls_updated", entityType: "agent", entityId: f.agentId });
     expect(mappedEvent.publication.pluginEvent?.eventType).toBe("agent.updated");
     await expect(agentService(db).update(f.agentId, { runtimeConfig: f.runtimeConfig }))
-      .resolves.not.toBeNull();
-    await expect(agentService(db).update(f.agentId, { runtimeConfig: stored!.runtimeConfig }))
       .rejects.toMatchObject({ status: 409 });
     await expect(agentService(db).updatePermissions(f.agentId, {
       ...f.permissions, canCreateAgents: false,
-    })).resolves.not.toBeNull();
-    await expect(agentService(db).updatePermissions(f.agentId, {
-      ...(stored!.permissions as Record<string, unknown>), canCreateAgents: false,
     })).rejects.toMatchObject({ status: 409 });
-    const [afterRejectedUpdates] = await db.select().from(agents).where(eq(agents.id, f.agentId));
-    expect(afterRejectedUpdates!.runtimeConfig).toEqual(f.runtimeConfig);
-    expect(afterRejectedUpdates!.permissions).toMatchObject({ authorizationPolicy: {
-      protectedAgent: { blockAssignment: true },
-    } });
+    await expect(agentService(db).update(f.agentId, { runtimeConfig: {
+      ...(stored!.runtimeConfig as Record<string, unknown>), unrelated: "edited",
+    } })).resolves.not.toBeNull();
+    await expect(agentService(db).updatePermissions(f.agentId, {
+      ...(stored!.permissions as Record<string, unknown>), unrelated: "edited",
+    })).resolves.not.toBeNull();
+    await expect(agentService(db).update(f.agentId, {
+      adapterConfig: { token: "SYNTHETIC_ADAPTER_SECRET", harmless: true },
+    })).resolves.not.toBeNull();
+    const [afterGeneralEdits] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(afterGeneralEdits!.runtimeConfig).toMatchObject({ heartbeat: {
+      wakeOnDemand: true,
+    }, unrelated: "edited" });
+    expect(afterGeneralEdits!.permissions).toMatchObject({ authorizationPolicy: {
+      protectedAgent: { blockAssignment: false },
+    }, unrelated: "edited" });
     await expect(svc.patch(f.agentId, {
       expectedUpdatedAt: before!.updatedAt, blockAssignment: true, wakeOnDemand: false,
     }, "board-user", f.companyId)).rejects.toMatchObject({ status: 409 });
@@ -109,6 +115,21 @@ describeDb("agent continuity controls", () => {
     const [stored] = await db.select().from(agents).where(eq(agents.id, f.agentId));
     expect(stored!.permissions).toEqual(f.permissions);
     expect(stored!.runtimeConfig).toEqual(f.runtimeConfig);
+  });
+
+  it("reports legacy approval agents as ineligible before the operator edits", async () => {
+    const f = await seed();
+    const permissions = structuredClone(f.permissions);
+    (permissions.authorizationPolicy.protectedAgent as typeof permissions.authorizationPolicy.protectedAgent & {
+      requiresApproval: boolean;
+    }).requiresApproval = true;
+    await db.update(agents).set({ permissions }).where(eq(agents.id, f.agentId));
+    const svc = agentContinuityControls(db);
+    const before = await svc.get(f.agentId);
+    expect(before).toMatchObject({ eligible: false });
+    await expect(svc.patch(f.agentId, {
+      expectedUpdatedAt: before!.updatedAt, blockAssignment: false, wakeOnDemand: true,
+    }, "board-user", f.companyId)).rejects.toMatchObject({ status: 409 });
   });
 
   it("allows an ineligible paused agent to tighten both flags through the general update", async () => {

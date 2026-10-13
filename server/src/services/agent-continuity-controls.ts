@@ -37,7 +37,7 @@ function publicView(row: {
   id: string; companyId: string; status: string; role: string; adapterType: string;
   updatedAt: string; assignmentMode: string | null; blockAssignment: boolean | null;
   wakeOnDemand: boolean | null; heartbeatEnabled: boolean | null; canAssignTasks: boolean | null;
-  canCreateAgents: boolean | null;
+  canCreateAgents: boolean | null; legacyRequiresApproval: boolean;
 }) {
   return {
     id: row.id,
@@ -52,6 +52,10 @@ function publicView(row: {
     heartbeatEnabled: row.heartbeatEnabled,
     canAssignTasks: row.canAssignTasks,
     canCreateAgents: row.canCreateAgents,
+    eligible: row.status === "paused" && row.role !== "ceo" && row.assignmentMode === "protected"
+      && row.blockAssignment !== null && row.wakeOnDemand !== null
+      && row.heartbeatEnabled === false && row.canAssignTasks === false
+      && row.canCreateAgents !== true && !row.legacyRequiresApproval,
   };
 }
 
@@ -76,9 +80,7 @@ export function agentContinuityControls(db: Db) {
         if (row.updatedAt !== input.expectedUpdatedAt) {
           throw conflict("Agent controls changed; read them again");
         }
-        if (row.status !== "paused" || row.role === "ceo" || row.assignmentMode !== "protected"
-          || row.blockAssignment === null || row.wakeOnDemand === null || row.heartbeatEnabled !== false
-          || row.canAssignTasks !== false || row.canCreateAgents === true || row.legacyRequiresApproval) {
+        if (!publicView(row).eligible) {
           throw conflict("Agent is not eligible for a scoped continuity-control update");
         }
         // The row is already locked. Capture the normal sanitized revision

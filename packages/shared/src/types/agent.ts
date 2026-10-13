@@ -138,6 +138,7 @@ export interface AgentContinuityControls {
   heartbeatEnabled: boolean | null;
   canAssignTasks: boolean | null;
   canCreateAgents: boolean | null;
+  eligible: boolean;
 }
 
 export interface AgentConfigRevision {

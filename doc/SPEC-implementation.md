@@ -776,10 +776,15 @@ and use `PATCH /api/agents/:id/continuity-controls` to change only
 `heartbeat.wakeOnDemand`. PATCH requires the exact `expectedUpdatedAt` from
 GET, boolean values for both controls, a disabled heartbeat, no task-assignment
 permission, and no active legacy approval flag. It locks the agent row, rejects
-stale or ineligible writes with 409, and records an activity event, configuration
-revision, and `agent.updated` plugin event. GET and PATCH return selected
+stale or ineligible writes with 409, and records an activity event with both
+control values before and after the change, plus an `agent.updated` plugin event.
+It records a configuration revision when `runtimeConfig` changes; configuration
+rollback does not restore the assignment block. To change that block again, use
+the scoped PATCH with a fresh `expectedUpdatedAt`. While this scoped control is
+eligible, general agent edits refuse changes to either flag, including a stale
+full-object save that would tighten a previously restored value. GET and PATCH return selected
 non-secret fields, never the full permissions or runtime configuration. The
-board Agent configuration page exposes these two controls for paused protected
+board Agent detail permissions view exposes these two controls for eligible paused protected
 agents. This scoped change does not resume or wake the agent, and removing the
 block alone does not grant assignment authority.
 
