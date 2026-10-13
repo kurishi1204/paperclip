@@ -163,16 +163,22 @@ function assertScopedContinuityFlagsPreserved(
   nextPermissions?: unknown,
   nextRuntimeConfig?: unknown,
 ) {
+  // This is an accidental-loosening fence on the general update path. It is
+  // not an authorization boundary: the existing agent-edit permission still
+  // controls this path, and explicit safety tightening remains available when
+  // the narrow continuity endpoint is ineligible for this agent.
   if (current.status !== "paused" ||
       nestedValue(current.permissions, ["authorizationPolicy", "assignmentPolicy", "mode"]) !== "protected") return;
   const blockPath = ["authorizationPolicy", "protectedAgent", "blockAssignment"];
   const wakePath = ["heartbeat", "wakeOnDemand"];
-  if (nextPermissions !== undefined &&
-      nestedValue(nextPermissions, blockPath) !== nestedValue(current.permissions, blockPath)) {
+  const nextBlock = nestedValue(nextPermissions, blockPath);
+  const nextWake = nestedValue(nextRuntimeConfig, wakePath);
+  if (nextPermissions !== undefined && nextBlock !== nestedValue(current.permissions, blockPath)
+      && nextBlock !== true) {
     throw conflict("Use scoped continuity controls to change a paused protected agent's assignment block");
   }
-  if (nextRuntimeConfig !== undefined &&
-      nestedValue(nextRuntimeConfig, wakePath) !== nestedValue(current.runtimeConfig, wakePath)) {
+  if (nextRuntimeConfig !== undefined && nextWake !== nestedValue(current.runtimeConfig, wakePath)
+      && nextWake !== false) {
     throw conflict("Use scoped continuity controls to change a paused protected agent's on-demand wake flag");
   }
 }

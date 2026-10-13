@@ -73,13 +73,20 @@ describeDb("agent continuity controls", () => {
     expect(audit).toMatchObject({ actorType: "user", actorId: "board-user",
       agentId: null, action: "agent.continuity_controls_updated" });
     await expect(agentService(db).update(f.agentId, { runtimeConfig: f.runtimeConfig }))
+      .resolves.not.toBeNull();
+    await expect(agentService(db).update(f.agentId, { runtimeConfig: stored!.runtimeConfig }))
       .rejects.toMatchObject({ status: 409 });
     await expect(agentService(db).updatePermissions(f.agentId, {
       ...f.permissions, canCreateAgents: false,
+    })).resolves.not.toBeNull();
+    await expect(agentService(db).updatePermissions(f.agentId, {
+      ...(stored!.permissions as Record<string, unknown>), canCreateAgents: false,
     })).rejects.toMatchObject({ status: 409 });
     const [afterRejectedUpdates] = await db.select().from(agents).where(eq(agents.id, f.agentId));
-    expect(afterRejectedUpdates!.runtimeConfig).toEqual(stored!.runtimeConfig);
-    expect(afterRejectedUpdates!.permissions).toEqual(stored!.permissions);
+    expect(afterRejectedUpdates!.runtimeConfig).toEqual(f.runtimeConfig);
+    expect(afterRejectedUpdates!.permissions).toMatchObject({ authorizationPolicy: {
+      protectedAgent: { blockAssignment: true },
+    } });
     await expect(svc.patch(f.agentId, {
       expectedUpdatedAt: before!.updatedAt, blockAssignment: true, wakeOnDemand: false,
     }, "board-user", f.companyId)).rejects.toMatchObject({ status: 409 });
@@ -95,6 +102,79 @@ describeDb("agent continuity controls", () => {
     const [stored] = await db.select().from(agents).where(eq(agents.id, f.agentId));
     expect(stored!.permissions).toEqual(f.permissions);
     expect(stored!.runtimeConfig).toEqual(f.runtimeConfig);
+  });
+
+  it("allows an ineligible paused agent to tighten both flags through the general update", async () => {
+    const f = await seed();
+    const permissions = structuredClone(f.permissions);
+    permissions.authorizationPolicy.protectedAgent.blockAssignment = false;
+    const runtimeConfig = structuredClone(f.runtimeConfig);
+    runtimeConfig.heartbeat.enabled = true;
+    runtimeConfig.heartbeat.wakeOnDemand = true;
+    await db.update(agents).set({ permissions, runtimeConfig }).where(eq(agents.id, f.agentId));
+    const before = await agentContinuityControls(db).get(f.agentId);
+    await expect(agentContinuityControls(db).patch(f.agentId, {
+      expectedUpdatedAt: before!.updatedAt, blockAssignment: true, wakeOnDemand: false,
+    }, "board-user", f.companyId)).rejects.toMatchObject({ status: 409 });
+    const tightenedPermissions = structuredClone(permissions);
+    tightenedPermissions.authorizationPolicy.protectedAgent.blockAssignment = true;
+    const tightenedRuntime = structuredClone(runtimeConfig);
+    tightenedRuntime.heartbeat.wakeOnDemand = false;
+    await expect(agentService(db).update(f.agentId, {
+      permissions: tightenedPermissions, runtimeConfig: tightenedRuntime,
+    })).resolves.not.toBeNull();
+    const [stored] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(stored!.permissions).toMatchObject({ authorizationPolicy: {
+      protectedAgent: { blockAssignment: true },
+    } });
+    expect(stored!.runtimeConfig).toMatchObject({ heartbeat: {
+      enabled: true, wakeOnDemand: false,
+    } });
+  });
+
+  it("rechecks a stale general update after a concurrent scoped patch commits", async () => {
+    const f = await seed();
+    const stalePermissions = structuredClone(f.permissions);
+    stalePermissions.authorizationPolicy.protectedAgent.blockAssignment = false;
+    const staleRuntime = structuredClone(f.runtimeConfig);
+    staleRuntime.heartbeat.wakeOnDemand = true;
+    await db.update(agents).set({ permissions: stalePermissions, runtimeConfig: staleRuntime })
+      .where(eq(agents.id, f.agentId));
+
+    let enterTransaction!: () => void;
+    let releaseTransaction!: () => void;
+    const entered = new Promise<void>((resolve) => { enterTransaction = resolve; });
+    const release = new Promise<void>((resolve) => { releaseTransaction = resolve; });
+    const wrappedDb = new Proxy(db, {
+      get(target, key, receiver) {
+        if (key === "transaction") {
+          return async (callback: Parameters<typeof db.transaction>[0]) => target.transaction(async (tx) => {
+            enterTransaction();
+            await release;
+            return callback(tx);
+          });
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const pending = agentService(wrappedDb).update(f.agentId, {
+      permissions: stalePermissions, runtimeConfig: staleRuntime,
+    });
+    try {
+      await entered; // The general path has already read its stale snapshot.
+      const before = await agentContinuityControls(db).get(f.agentId);
+      await agentContinuityControls(db).patch(f.agentId, {
+        expectedUpdatedAt: before!.updatedAt, blockAssignment: true, wakeOnDemand: false,
+      }, "board-user", f.companyId);
+    } finally {
+      releaseTransaction();
+    }
+    await expect(pending).rejects.toMatchObject({ status: 409 });
+    const [stored] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(stored!.permissions).toMatchObject({ authorizationPolicy: {
+      protectedAgent: { blockAssignment: true },
+    } });
+    expect(stored!.runtimeConfig).toMatchObject({ heartbeat: { wakeOnDemand: false } });
   });
 
   it("rejects a company change between authorization and the locked write", async () => {
