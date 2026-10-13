@@ -33,6 +33,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { copyTextToClipboard } from "../lib/clipboard";
 import { AgentSkillsTab } from "./agent-skills/AgentSkillsTab";
 import { AgentConfigForm } from "../components/AgentConfigForm";
+import { AgentContinuityControlsPanel } from "../components/AgentContinuityControlsPanel";
 import { getAdapterDisplay } from "../adapters/adapter-display-registry";
 import { adapterLabels, roleLabels, help } from "../components/agent-config-primitives";
 import { ToggleSwitch } from "@/components/ui/toggle-switch";
@@ -2097,6 +2098,11 @@ export function ConfigurationTab({
         canConfigureProviderTrace={canConfigureProviderTrace}
       /> : null}
 
+
+      {content === "permissions" && agent.status === "paused"
+        && agent.permissions.authorizationPolicy?.assignmentPolicy?.mode === "protected" ? (
+        <AgentContinuityControlsPanel agentId={agent.id} companyId={companyId ?? agent.companyId} />
+      ) : null}
 
       {content === "permissions" ? <TrustPresetSection
         permissions={agent.permissions}

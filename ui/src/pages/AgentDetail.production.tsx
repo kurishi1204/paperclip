@@ -32,6 +32,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { copyTextToClipboard } from "../lib/clipboard";
 import { AgentSkillsTab } from "./agent-skills/AgentSkillsTab";
 import { AgentConfigForm } from "../components/AgentConfigForm";
+import { AgentContinuityControlsPanel } from "../components/AgentContinuityControlsPanel";
 import { PageTabBar } from "../components/PageTabBar";
 import { adapterLabels, roleLabels, help } from "../components/agent-config-primitives";
 import { ToggleSwitch } from "@/components/ui/toggle-switch";
@@ -2204,6 +2205,11 @@ function ConfigurationTab({
         <p className="text-xs text-muted-foreground">
           Saved adapter config affects the next run. Active runs keep the config they started with, and config changes may start a fresh adapter session.
         </p>
+      ) : null}
+
+      {content === "configuration" && agent.status === "paused"
+        && agent.permissions.authorizationPolicy?.assignmentPolicy?.mode === "protected" ? (
+        <AgentContinuityControlsPanel agentId={agent.id} companyId={companyId ?? agent.companyId} />
       ) : null}
 
       {content === "configuration" ? <TrustPresetSection

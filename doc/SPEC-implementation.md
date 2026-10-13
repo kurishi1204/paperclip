@@ -776,10 +776,12 @@ and use `PATCH /api/agents/:id/continuity-controls` to change only
 `heartbeat.wakeOnDemand`. PATCH requires the exact `expectedUpdatedAt` from
 GET, boolean values for both controls, a disabled heartbeat, no task-assignment
 permission, and no active legacy approval flag. It locks the agent row, rejects
-stale or ineligible writes with 409, and records an activity event. GET and PATCH
-return selected non-secret fields, never the full permissions or runtime
-configuration. This scoped change does not resume or wake the agent, and removing
-the block alone does not grant assignment authority.
+stale or ineligible writes with 409, and records an activity event, configuration
+revision, and `agent.updated` plugin event. GET and PATCH return selected
+non-secret fields, never the full permissions or runtime configuration. The
+board Agent configuration page exposes these two controls for paused protected
+agents. This scoped change does not resume or wake the agent, and removing the
+block alone does not grant assignment authority.
 
 ### 9.8.1 Issue-thread interaction resolver contract
 

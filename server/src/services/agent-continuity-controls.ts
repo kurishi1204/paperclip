@@ -1,7 +1,8 @@
 import { eq, sql } from "drizzle-orm";
-import { agents, type Db } from "@paperclipai/db";
+import { agentConfigRevisions, agents, type Db } from "@paperclipai/db";
 import { conflict } from "../errors.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
+import { buildConfigSnapshot, diffConfigSnapshot } from "./agents.js";
 
 // Only these non-secret fields may cross the continuity-controls API. In
 // particular, selecting the complete runtimeConfig would expose aiConnection.
@@ -80,6 +81,11 @@ export function agentContinuityControls(db: Db) {
           || row.canAssignTasks !== false || row.canCreateAgents === true || row.legacyRequiresApproval) {
           throw conflict("Agent is not eligible for a scoped continuity-control update");
         }
+        // The row is already locked. Capture the normal sanitized revision
+        // snapshot before modifying either JSON path.
+        const [beforeAgent] = await tx.select().from(agents).where(eq(agents.id, id));
+        if (!beforeAgent) throw conflict("Agent changed; read the controls again");
+        const beforeConfig = buildConfigSnapshot(beforeAgent);
         const [changed] = await tx.update(agents).set({
           permissions: sql`jsonb_set(${agents.permissions}, '{authorizationPolicy,protectedAgent,blockAssignment}', to_jsonb(${input.blockAssignment}::boolean), false)`,
           runtimeConfig: sql`jsonb_set(${agents.runtimeConfig}, '{heartbeat,wakeOnDemand}', to_jsonb(${input.wakeOnDemand}::boolean), false)`,
@@ -87,6 +93,21 @@ export function agentContinuityControls(db: Db) {
         }).where(eq(agents.id, id)).returning(safeSelection);
         if (!changed || changed.blockAssignment !== input.blockAssignment || changed.wakeOnDemand !== input.wakeOnDemand) {
           throw conflict("Scoped controls did not change as requested");
+        }
+        const [afterAgent] = await tx.select().from(agents).where(eq(agents.id, id));
+        if (!afterAgent) throw conflict("Agent changed; read the controls again");
+        const afterConfig = buildConfigSnapshot(afterAgent);
+        const changedKeys = diffConfigSnapshot(beforeConfig, afterConfig);
+        if (changedKeys.length > 0) {
+          await tx.insert(agentConfigRevisions).values({
+            companyId: row.companyId,
+            agentId: id,
+            createdByUserId: actorId,
+            source: "patch",
+            changedKeys,
+            beforeConfig: beforeConfig as unknown as Record<string, unknown>,
+            afterConfig: afterConfig as unknown as Record<string, unknown>,
+          });
         }
         const { publication } = await persistActivity(tx as unknown as Db, {
           companyId: row.companyId, actorType: "user", actorId,

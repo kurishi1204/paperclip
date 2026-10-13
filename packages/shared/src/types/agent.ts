@@ -124,6 +124,22 @@ export interface AgentKeyCreated {
   createdAt: Date;
 }
 
+/** Public, non-secret projection returned by the scoped board API. */
+export interface AgentContinuityControls {
+  id: string;
+  companyId: string;
+  status: AgentStatus;
+  role: AgentRole;
+  adapterType: string;
+  updatedAt: string;
+  assignmentMode: string | null;
+  blockAssignment: boolean | null;
+  wakeOnDemand: boolean | null;
+  heartbeatEnabled: boolean | null;
+  canAssignTasks: boolean | null;
+  canCreateAgents: boolean | null;
+}
+
 export interface AgentConfigRevision {
   id: string;
   companyId: string;

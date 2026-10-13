@@ -2347,13 +2347,14 @@ describe("agent permission routes", () => {
     const otherCompanyApp = await createApp({ type: "board", userId: "other-user", source: "session",
       isInstanceAdmin: false, companyIds: [] });
     const otherResult = await requestApp(otherCompanyApp, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}/continuity-controls`));
-    expect(otherResult.status).toBeGreaterThanOrEqual(403);
-    expect(otherResult.status).toBeLessThan(500);
+    expect(otherResult.status).toBe(404);
+    expect(otherResult.body.error).toBe("Agent not found");
     const otherPatch = await requestApp(otherCompanyApp, (baseUrl) => request(baseUrl)
       .patch(`/api/agents/${agentId}/continuity-controls`)
       .send({ expectedUpdatedAt: updatedAt, blockAssignment: false, wakeOnDemand: true }));
-    expect(otherPatch.status).toBeGreaterThanOrEqual(403);
-    expect(otherPatch.status).toBeLessThan(500);
+    expect(otherPatch.status).toBe(404);
+    expect(otherPatch.body.error).toBe("Agent not found");
+    expect(mockContinuityControls.patch).not.toHaveBeenCalled();
 
     const boardApp = await createApp({ type: "board", userId: "board-user", source: "session",
       isInstanceAdmin: false, companyIds: [companyId] });

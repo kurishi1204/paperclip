@@ -130,6 +130,7 @@ import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { agentTaskAssignmentOptedOut } from "../services/agent-permissions.js";
 import { agentContinuityControls } from "../services/agent-continuity-controls.js";
+import { agentContinuityControlsPatchSchema } from "@paperclipai/shared";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import {
   persistReprojectedWorkspaceDiffs,
@@ -5171,11 +5172,6 @@ export function agentRoutes(
     res.json(await buildAgentDetail(agent));
   });
 
-  const scopedContinuityControlsSchema = z.object({
-    expectedUpdatedAt: z.string().regex(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/),
-    blockAssignment: z.boolean(),
-    wakeOnDemand: z.boolean(),
-  }).strict();
   const continuityControls = agentContinuityControls(db);
 
   // Deliberately avoids the general agent detail and update paths: those read
@@ -5185,17 +5181,17 @@ export function agentRoutes(
     const id = req.params.id as string;
     if (!isUuidLike(id)) throw notFound("Agent not found");
     const controls = await continuityControls.get(id);
-    if (!controls) throw notFound("Agent not found");
+    if (!controls || !hasCompanyAccess(req, controls.companyId)) throw notFound("Agent not found");
     await assertBoardCanManageAgentsForCompany(req, controls.companyId);
     res.json(controls);
   });
 
-  router.patch("/agents/:id/continuity-controls", validate(scopedContinuityControlsSchema), async (req, res) => {
+  router.patch("/agents/:id/continuity-controls", validate(agentContinuityControlsPatchSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
     if (!isUuidLike(id)) throw notFound("Agent not found");
     const controls = await continuityControls.get(id);
-    if (!controls) throw notFound("Agent not found");
+    if (!controls || !hasCompanyAccess(req, controls.companyId)) throw notFound("Agent not found");
     await assertBoardCanManageAgentsForCompany(req, controls.companyId);
     const actorId = req.actor.userId;
     if (!actorId) throw forbidden("Board user identity required");

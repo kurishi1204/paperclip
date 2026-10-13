@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { activityLog, agents, companies, createDb } from "@paperclipai/db";
+import { activityLog, agentConfigRevisions, agents, companies, createDb } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentContinuityControls } from "../services/agent-continuity-controls.js";
 import { evaluateAgentInvokabilityFromDb } from "../services/agent-invokability.js";
 import { agentService } from "../services/agents.js";
+import { persistActivity } from "../services/activity-log.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeDb = support.supported ? describe : describe.skip;
@@ -72,6 +73,12 @@ describeDb("agent continuity controls", () => {
     const [audit] = await db.select().from(activityLog).where(eq(activityLog.entityId, f.agentId));
     expect(audit).toMatchObject({ actorType: "user", actorId: "board-user",
       agentId: null, action: "agent.continuity_controls_updated" });
+    const [revision] = await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, f.agentId));
+    expect(revision).toMatchObject({ createdByUserId: "board-user", source: "patch", changedKeys: ["runtimeConfig"] });
+    expect((revision!.afterConfig.runtimeConfig as { heartbeat: { wakeOnDemand: boolean } }).heartbeat.wakeOnDemand).toBe(true);
+    const mappedEvent = await persistActivity(db, { companyId: f.companyId, actorType: "user",
+      actorId: "board-user", action: "agent.continuity_controls_updated", entityType: "agent", entityId: f.agentId });
+    expect(mappedEvent.publication.pluginEvent?.eventType).toBe("agent.updated");
     await expect(agentService(db).update(f.agentId, { runtimeConfig: f.runtimeConfig }))
       .resolves.not.toBeNull();
     await expect(agentService(db).update(f.agentId, { runtimeConfig: stored!.runtimeConfig }))

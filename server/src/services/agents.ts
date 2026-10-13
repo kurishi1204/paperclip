@@ -187,7 +187,7 @@ function jsonEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function buildConfigSnapshot(
+export function buildConfigSnapshot(
   row: Pick<typeof agents.$inferSelect, ConfigRevisionField>,
 ): AgentConfigSnapshot {
   const adapterConfig =
@@ -294,7 +294,7 @@ function normalizeRuntimeConfigForNewAgent(runtimeConfig: unknown): Record<strin
   return normalizedRuntimeConfig;
 }
 
-function diffConfigSnapshot(
+export function diffConfigSnapshot(
   before: AgentConfigSnapshot,
   after: AgentConfigSnapshot,
 ): string[] {
