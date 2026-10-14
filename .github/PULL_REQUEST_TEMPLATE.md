@@ -62,8 +62,10 @@
   steps, or both. If GitHub Actions is disabled by the repository owner, link
   the exact-head local receipt, base/head test-ID comparison, and machine-readable
   failure/skip inventory. List the required gates and results from the recorded
-  base workflow and repository rules. For a baseline exception, link a separate
-  receipt for the recorded base SHA under the same runner conditions.
+  base workflow and repository rules. Compare collected test IDs with the
+  recorded base SHA; for a baseline exception, link a full base-run receipt
+  under the same runner conditions. If the base tip moves before merge, refresh
+  the evidence or test the exact merge commit.
   State how the test identity was isolated from publishing credentials. A
   baseline full-suite failure needs the same evidence whether Actions is enabled
   or disabled. Include the independent review and owner decision required by
