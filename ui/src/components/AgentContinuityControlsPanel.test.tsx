@@ -51,8 +51,10 @@ describe("AgentContinuityControlsPanel", () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const routeDetailKey = ["agents", "detail", "paused-worker", "company-1"];
     const aliasDetailKey = ["agents", "detail", "legacy-paused-worker", "company-1"];
-    queryClient.setQueryData(routeDetailKey, { name: "Paused worker" });
-    queryClient.setQueryData(aliasDetailKey, { name: "Paused worker" });
+    queryClient.setQueryData(routeDetailKey, { id: "agent-1", name: "Paused worker" });
+    queryClient.setQueryData(aliasDetailKey, { id: "agent-1", name: "Paused worker" });
+    const unrelatedKey = ["agents", "detail", "unrelated-worker", "company-2"];
+    queryClient.setQueryData(unrelatedKey, { id: "agent-2", name: "Unrelated worker" });
     root = createRoot(container);
     await act(async () => root.render(
       <QueryClientProvider client={queryClient}>
@@ -74,6 +76,7 @@ describe("AgentContinuityControlsPanel", () => {
     }, "company-1");
     expect(queryClient.getQueryState(routeDetailKey)?.isInvalidated).toBe(true);
     expect(queryClient.getQueryState(aliasDetailKey)?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryState(unrelatedKey)?.isInvalidated).toBe(false);
     expect(container.textContent).toContain("Saving does not resume or wake the agent");
   });
 

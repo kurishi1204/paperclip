@@ -22,12 +22,15 @@ describe("LiveUpdatesProvider agent invalidation", () => {
     client.setQueryData(key, { eligible: true });
     const alias = queryKeys.agents.detail("paused-worker");
     client.setQueryData(alias, { id: "agent-1", wakeOnDemand: false });
+    const unrelated = queryKeys.agents.detail("other-company-worker");
+    client.setQueryData(unrelated, { id: "agent-2", companyId: "company-2" });
     const invalidate = vi.spyOn(client, "invalidateQueries");
     __liveUpdatesTestUtils.invalidateActivityQueries(client, "company-1", {
       entityType: "agent", entityId: "agent-1", action: "agent.updated",
     }, { userId: "user-1", agentId: null });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: key });
     expect(client.getQueryState(alias)?.isInvalidated).toBe(true);
+    expect(client.getQueryState(unrelated)?.isInvalidated).toBe(false);
     client.clear();
   });
 });

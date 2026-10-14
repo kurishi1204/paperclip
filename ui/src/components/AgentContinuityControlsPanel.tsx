@@ -75,7 +75,11 @@ export function AgentContinuityControlsPanel({ agentId, companyId, configuration
     onSuccess: (updated: AgentContinuityControls) => {
       setDraft(draftFrom(updated));
       queryClient.setQueryData(key, updated);
-      queryClient.invalidateQueries({ queryKey: queryKeys.agents.detailAll });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.agents.detailAll,
+        predicate: query => (query.state.data as { id?: string } | undefined)?.id === agentId
+          || query.queryKey[2] === agentId,
+      });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.configRevisions(agentId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(companyId) });
       pushToast({ title: "Continuity controls saved", tone: "success" });
