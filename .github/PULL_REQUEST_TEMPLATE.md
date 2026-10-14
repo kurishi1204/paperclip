@@ -60,9 +60,11 @@
 <!--
   How can a reviewer confirm this works? Include test commands, manual
   steps, or both. If GitHub Actions is disabled by the repository owner, link
-  the exact-head receipt and machine-readable failure/skip inventory. State
-  how the test identity was isolated from publishing credentials. Include the
-  independent review and owner decision required by CONTRIBUTING.md.
+  the exact-head local receipt and machine-readable failure/skip inventory.
+  State how the test identity was isolated from publishing credentials. A
+  baseline full-suite failure needs the same evidence whether Actions is enabled
+  or disabled. Include the independent review and owner decision required by
+  CONTRIBUTING.md. Never mark a failed test or disabled check green.
 -->
 
 -
@@ -102,10 +104,10 @@
 - [ ] I have either (a) linked existing issues with `Fixes: #` / `Closes #` / `Refs #` OR (b) described the issue in-PR following the relevant issue template
 - [ ] I have not referenced internal/instance-local Paperclip issues or links (only public GitHub `#NNN` / `github.com/paperclipai/paperclip` URLs)
 - [ ] My branch name describes the change (e.g. `docs/...`, `fix/...`) and contains no internal Paperclip ticket id or instance-derived details
-- [ ] I have run required tests locally; any full-suite failure meets the documented exact-head exception in CONTRIBUTING.md
+- [ ] I have run required tests locally; PR-specific tests, lint, typecheck, build, and required static gates pass
 - [ ] I have added or updated tests where applicable
 - [ ] I have updated relevant documentation to reflect my changes
 - [ ] I have considered and documented any risks above
-- [ ] All applicable Paperclip gates pass, or the owner-controlled Actions-free exception is fully evidenced and accepted; I have not called a disabled or failing gate green
+- [ ] The full suite passes or each baseline failure has the exact-head evidence, independent review, and owner acceptance required by CONTRIBUTING.md; I have not called a disabled or failing gate green
 - [ ] Greptile is 5/5 with no open P2s, recommendations, or follow-ups
 - [ ] I will address all Greptile and reviewer comments before requesting merge
