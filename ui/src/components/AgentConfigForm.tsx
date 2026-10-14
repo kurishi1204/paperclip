@@ -258,6 +258,23 @@ export function subtractPersistedOverlay(
   };
 }
 
+/** Stored state is complete: absent/null fields represent an unset value. */
+export function reconcileStoredAgentOverlay(current: AgentConfigOverlay, agent: Agent): AgentConfigOverlay {
+  const keep = (pending: Record<string, unknown>, stored: Record<string, unknown>) =>
+    Object.fromEntries(Object.entries(pending).filter(([key, value]) =>
+      !overlayValuesEqual(value ?? undefined, stored[key] ?? undefined)));
+  const config = agent.runtimeConfig ?? {};
+  return {
+    identity: keep(current.identity, agent as unknown as Record<string, unknown>),
+    ...(current.adapterType !== undefined && current.adapterType !== agent.adapterType
+      ? { adapterType: current.adapterType } : {}),
+    adapterConfig: keep(current.adapterConfig, agent.adapterConfig ?? {}),
+    heartbeat: keep(current.heartbeat, (config.heartbeat ?? {}) as Record<string, unknown>),
+    debug: keep(current.debug, (config.debug ?? {}) as Record<string, unknown>),
+    runtime: keep(current.runtime, { runtimeConfig: config }),
+  };
+}
+
 /* ---- Shared input class ---- */
 const inputClass =
   "w-full rounded-md border border-border px-2.5 py-1.5 bg-transparent outline-none text-sm font-mono placeholder:text-muted-foreground/40";
@@ -489,42 +506,17 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const [environmentDraftDirty, setEnvironmentDraftDirty] = useState(false);
   const [environmentEditorKey, setEnvironmentEditorKey] = useState(0);
   const agentRef = useRef<Agent | null>(null);
-  // The overlay snapshot a background account-binding save persisted. The form
-  // stays editable while that save is in flight, so the agent refresh that
-  // follows it must not wipe edits made during the save. The refresh subtracts
-  // only what the save persisted; a user-initiated Save leaves the snapshot
-  // null and reconciles only values actually stored by the refreshed agent. An UNRELATED refresh can land while the save
-  // is still in flight — that refresh does not carry the persisted binding
-  // yet, so it must neither consume the snapshot nor subtract it: subtracting
-  // would drop the binding entry from the overlay while `props.agent` also
-  // lacks it, and an ordinary Save racing the binding refresh would then
-  // replace the config without the binding and undo the just-persisted bind.
-  // The overlay stays untouched until the save settles; the refresh after
-  // settlement consumes the snapshot and subtracts it.
-  const backgroundSaveOverlayRef = useRef<AgentConfigOverlay | null>(null);
-  const backgroundSaveInFlightRef = useRef(false);
-
+  // Binding saves and ordinary saves share stored-state reconciliation.
+  // A refresh removes only edits already present on the stored agent.
   // Reconcile stored values; unrelated refreshes must preserve pending edits.
   useEffect(() => {
     if (!isCreate) {
       if (agentRef.current !== null && agentRef.current.id !== props.agent.id) {
-        backgroundSaveOverlayRef.current = null;
         setOverlay({ ...emptyOverlay });
         setEnvironmentDraftDirty(false);
         setEnvironmentEditorKey((key) => key + 1);
-      } else if (agentRef.current !== null && props.agent !== agentRef.current
-          && !backgroundSaveInFlightRef.current) {
-        const config = props.agent.runtimeConfig ?? {};
-        const persisted = backgroundSaveOverlayRef.current ?? {
-          identity: { ...props.agent },
-          adapterType: props.agent.adapterType,
-          adapterConfig: props.agent.adapterConfig ?? {},
-          heartbeat: (config.heartbeat ?? {}) as Record<string, unknown>,
-          debug: (config.debug ?? {}) as Record<string, unknown>,
-          runtime: config,
-        };
-        backgroundSaveOverlayRef.current = null;
-        setOverlay((previous) => subtractPersistedOverlay(previous, persisted));
+      } else if (agentRef.current !== null && props.agent !== agentRef.current) {
+        setOverlay((previous) => reconcileStoredAgentOverlay(previous, props.agent));
       }
       agentRef.current = props.agent;
     }
@@ -735,23 +727,8 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       adapterConfig: { ...overlay.adapterConfig, env: nextEnv },
     };
     setOverlay(nextOverlay);
-    // This save runs in the background while the form stays editable. Record
-    // exactly what it persists so the agent refresh it triggers keeps edits
-    // made during the save (see the refresh effect) instead of wiping them
-    // with the persisted entries. The in-flight flag protects the snapshot
-    // from an unrelated refresh landing mid-save. A failed save never
-    // refreshes the agent with the binding, so clear the snapshot there — a
-    // later unrelated refresh then wipes normally.
-    backgroundSaveOverlayRef.current = nextOverlay;
-    backgroundSaveInFlightRef.current = true;
-    try {
-      await props.onSave(buildAgentUpdatePatch(props.agent, nextOverlay));
-    } catch (err) {
-      backgroundSaveOverlayRef.current = null;
-      throw err;
-    } finally {
-      backgroundSaveInFlightRef.current = false;
-    }
+    // A refresh reconciles stored values while preserving concurrent edits.
+    await props.onSave(buildAgentUpdatePatch(props.agent, nextOverlay));
     invalidateUserSecretDefinitions();
   };
 

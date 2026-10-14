@@ -9,7 +9,7 @@ import type { Agent, Environment, UserSecretDefinition } from "@paperclipai/shar
 import { getEnvironmentCapabilities } from "@paperclipai/shared";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ToastProvider } from "../context/ToastContext";
-import { AgentConfigForm, AdapterLoginPanel, subtractPersistedOverlay, type AdapterLoginDescriptor } from "./AgentConfigForm";
+import { AgentConfigForm, AdapterLoginPanel, subtractPersistedOverlay, reconcileStoredAgentOverlay, type AdapterLoginDescriptor } from "./AgentConfigForm";
 import { defaultCreateValues } from "./agent-config-defaults";
 import { buildNewAgentHirePayload } from "../lib/new-agent-hire-payload";
 import { ApiError } from "../api/client";
@@ -4037,5 +4037,21 @@ describe("subtractPersistedOverlay", () => {
     expect(subtractPersistedOverlay(changed, persisted).adapterConfig).toEqual({
       args: ["--flag", "other"],
     });
+  });
+});
+
+describe("reconcileStoredAgentOverlay", () => {
+  const empty = { identity: {}, adapterConfig: {}, heartbeat: {}, debug: {}, runtime: {} };
+  it("clears persisted unset fields while retaining a concurrent edit", () => {
+    const current = { ...empty, adapterConfig: { model: undefined, cwd: null, command: "pending" }, debug: { providerTrace: undefined } };
+    const next = reconcileStoredAgentOverlay(current, makeAgent({ adapterConfig: {}, runtimeConfig: {} }));
+    expect(next.adapterConfig).toEqual({ command: "pending" });
+    expect(next.debug).toEqual({});
+  });
+  it("clears the complete persisted runtime patch and retains a newer connection change", () => {
+    const stored = { aiConnection: { connectionId: "connection-1" }, heartbeat: { enabled: false } };
+    expect(reconcileStoredAgentOverlay({ ...empty, runtime: { runtimeConfig: stored } }, makeAgent({ runtimeConfig: stored })).runtime).toEqual({});
+    const changed = { ...stored, aiConnection: { connectionId: "connection-2" } };
+    expect(reconcileStoredAgentOverlay({ ...empty, runtime: { runtimeConfig: changed } }, makeAgent({ runtimeConfig: stored })).runtime).toEqual({ runtimeConfig: changed });
   });
 });
