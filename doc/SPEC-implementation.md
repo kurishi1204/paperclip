@@ -789,8 +789,9 @@ would tighten a previously restored value. A partial general permissions policy
 that omits the assignment block retains its live value instead of clearing it.
 Once the agent is ineligible, the general edit path may change these flags again;
 the guard prevents stale overwrites while eligible rather than imposing a
-permanent restriction after eligibility ends. While eligible, even a configure-only
-board member needs the agent-management grant to change these flags. GET returns
+permanent authorization boundary. A general configuration edit can end eligibility,
+after which a configure-only member may edit wakeOnDemand and restore eligibility.
+The scoped PATCH itself requires the agent-management grant. GET returns
 an actor-specific `canManage` boolean; the panel shows read-only controls when it
 is false or absent and never offers an actionable Save. The scoped PATCH requires the same board company
 agent-management grant as the existing general permissions endpoint. GET and PATCH return selected

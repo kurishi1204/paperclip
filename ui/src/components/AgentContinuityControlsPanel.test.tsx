@@ -107,6 +107,31 @@ describe("AgentContinuityControlsPanel", () => {
     expect(patchControls).not.toHaveBeenCalled();
   });
 
+  it("refreshes the revision after toggles are returned to their original values", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(async () => root.render(<QueryClientProvider client={client}>
+      <AgentContinuityControlsPanel agentId="agent-1" companyId="company-1" />
+    </QueryClientProvider>));
+    await flush();
+    const wake = () => container.querySelector<HTMLButtonElement>('[aria-label="Wake on demand"]');
+    await act(async () => wake()?.click());
+    await act(async () => wake()?.click());
+    const refreshed = { ...initial, updatedAt: "2026-10-13T00:00:00.000003Z" };
+    await act(async () => client.setQueryData(["agents", "agent-1", "continuity-controls"], refreshed));
+    await flush();
+    expect(container.textContent).not.toContain("Your choices are preserved");
+    await act(async () => wake()?.click());
+    const save = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent?.includes("Save continuity controls"));
+    expect(save?.disabled).toBe(false);
+    await act(async () => save?.click());
+    await flush();
+    expect(patchControls).toHaveBeenCalledWith("agent-1", {
+      expectedUpdatedAt: refreshed.updatedAt, blockAssignment: true, wakeOnDemand: true,
+    }, "company-1");
+  });
+
   it("preserves a dirty draft and its original revision on a background refresh", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     root = createRoot(container);

@@ -15,7 +15,6 @@ type Draft = {
   initialWakeOnDemand: boolean;
   blockAssignment: boolean;
   wakeOnDemand: boolean;
-  dirty: boolean;
 };
 
 function draftFrom(current: AgentContinuityControls): Draft | null {
@@ -27,7 +26,6 @@ function draftFrom(current: AgentContinuityControls): Draft | null {
     initialWakeOnDemand: current.wakeOnDemand,
     blockAssignment: current.blockAssignment,
     wakeOnDemand: current.wakeOnDemand,
-    dirty: false,
   };
 }
 
@@ -53,7 +51,9 @@ export function AgentContinuityControlsPanel({ agentId, companyId, configuration
       if (!current || current.id !== agentId) return null;
       // A background query refresh must not erase choices or replace the CAS
       // revision that the operator originally edited.
-      if (previous?.agentId === current.id && previous.dirty) return previous;
+      if (previous?.agentId === current.id
+        && (previous.blockAssignment !== previous.initialBlockAssignment
+          || previous.wakeOnDemand !== previous.initialWakeOnDemand)) return previous;
       return draftFrom(current);
     });
   }, [agentId, controls.data]);
@@ -135,12 +135,12 @@ export function AgentContinuityControlsPanel({ agentId, companyId, configuration
         <div className="flex items-center justify-between gap-4 text-sm">
           <span>Block task assignment</span>
           <ToggleSwitch aria-label="Block task assignment" checked={draft.blockAssignment} disabled={!canManage || save.isPending}
-            onCheckedChange={(blockAssignment) => setDraft((previous) => previous && { ...previous, blockAssignment, dirty: true })} />
+            onCheckedChange={(blockAssignment) => setDraft((previous) => previous && { ...previous, blockAssignment })} />
         </div>
         <div className="flex items-center justify-between gap-4 text-sm">
           <span>Wake on demand</span>
           <ToggleSwitch aria-label="Wake on demand" checked={draft.wakeOnDemand} disabled={!canManage || save.isPending}
-            onCheckedChange={(wakeOnDemand) => setDraft((previous) => previous && { ...previous, wakeOnDemand, dirty: true })} />
+            onCheckedChange={(wakeOnDemand) => setDraft((previous) => previous && { ...previous, wakeOnDemand })} />
         </div>
         <p className="text-xs text-muted-foreground">
           Clearing the block still requires a separate assignment grant and an explicit operator action.
