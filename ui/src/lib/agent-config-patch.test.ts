@@ -59,6 +59,23 @@ function makeOverlay(patch?: Partial<AgentConfigOverlay>): AgentConfigOverlay {
 }
 
 describe("buildAgentUpdatePatch", () => {
+  it("preserves current runtime fields when only the connection changes", () => {
+    const agent = makeAgent();
+    const patch = buildAgentUpdatePatch(agent, makeOverlay({
+      runtime: { runtimeConfig: { aiConnection: { connectionId: "connection-2" } } },
+    }));
+    expect(patch.runtimeConfig).toEqual({
+      ...agent.runtimeConfig, aiConnection: { connectionId: "connection-2" },
+    });
+  });
+  it("clears a connection without clearing heartbeat settings", () => {
+    const agent = makeAgent();
+    agent.runtimeConfig = { ...agent.runtimeConfig, aiConnection: { connectionId: "old" } };
+    const patch = buildAgentUpdatePatch(agent, makeOverlay({
+      runtime: { runtimeConfig: { aiConnection: undefined } },
+    }));
+    expect(patch.runtimeConfig).toEqual({ heartbeat: agent.runtimeConfig.heartbeat });
+  });
   it("keeps heartbeat and debug edits when a connection changes in the same save", () => {
     const agent = makeAgent();
     const patch = buildAgentUpdatePatch(agent, makeOverlay({

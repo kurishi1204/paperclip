@@ -2161,8 +2161,10 @@ function ConfigurationTab({
       setAwaitingRefreshAfterSave(true);
     },
     onSuccess: (updated) => {
-      queryClient.setQueryData(queryKeys.agents.detail(agent.id), updated);
-      queryClient.setQueryData(queryKeys.agents.detail(agent.urlKey), updated);
+      queryClient.setQueriesData<Agent>({
+        queryKey: ["agents", "detail"],
+        predicate: query => (query.state.data as Agent | undefined)?.id === updated.id,
+      }, updated);
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.configRevisions(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.continuityControls(agent.id) });
