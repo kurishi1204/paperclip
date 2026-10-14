@@ -942,7 +942,9 @@ export function agentService(db: Db) {
       }
 
       if (shouldRecordRevision && beforeConfig) {
-        const afterConfig = buildConfigSnapshot(normalizedUpdated);
+        // Compare persisted rows on both sides; API appearance fallbacks are
+        // presentation values, not changes made by this write.
+        const afterConfig = buildConfigSnapshot(updated);
         const changedKeys = diffConfigSnapshot(beforeConfig, afterConfig);
         if (changedKeys.length > 0) {
           await txDb.insert(agentConfigRevisions).values({

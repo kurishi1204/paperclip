@@ -5186,7 +5186,11 @@ export function agentRoutes(
     // stronger management grant. Read-only eligibility must not disable
     // permitted general configuration editing for a company board member.
     await assertCanReadConfigurations(req, controls.companyId);
-    res.json(controls);
+    const management = await access.decide({
+      actor: req.actor, action: "agents:create",
+      resource: { type: "company", companyId: controls.companyId },
+    });
+    res.json({ ...controls, canManage: management.allowed });
   });
 
   router.patch("/agents/:id/continuity-controls", validate(agentContinuityControlsPatchSchema), async (req, res) => {
@@ -5200,7 +5204,7 @@ export function agentRoutes(
     if (!actorId) throw forbidden("Board user identity required");
     const changed = await continuityControls.patch(id, req.body, actorId, controls.companyId);
     if (!changed) throw notFound("Agent not found");
-    res.json(changed);
+    res.json({ ...changed, canManage: true });
   });
 
   router.patch("/agents/:id/instructions-path", validate(updateAgentInstructionsPathSchema), async (req, res) => {

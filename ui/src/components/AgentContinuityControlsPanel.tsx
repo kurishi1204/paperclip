@@ -58,7 +58,7 @@ export function AgentContinuityControlsPanel({ agentId, companyId }: {
   const save = useMutation({
     mutationFn: async () => {
       const current = controls.data;
-      if (!current || !draft) throw new Error("Read the continuity controls again");
+      if (!current || current.canManage !== true || !draft) throw new Error("Read the continuity controls again");
       if (current.updatedAt !== draft.expectedUpdatedAt) {
         throw new Error("Agent controls changed; reload them before saving");
       }
@@ -88,6 +88,7 @@ export function AgentContinuityControlsPanel({ agentId, companyId }: {
 
   const current = controls.data;
   const eligible = current?.eligible === true;
+  const canManage = current?.canManage === true;
   const stale = Boolean(draft && current && draft.agentId === current.id
     && draft.expectedUpdatedAt !== current.updatedAt);
   const changed = Boolean(draft && (draft.blockAssignment !== draft.initialBlockAssignment
@@ -110,21 +111,22 @@ export function AgentContinuityControlsPanel({ agentId, companyId }: {
           Reload continuity controls
         </Button>
       </div> : null}
+      {eligible && !canManage ? <p className="text-sm text-muted-foreground">Read-only: agent management permission is required to change these controls.</p> : null}
       {eligible && draft ? <>
         <div className="flex items-center justify-between gap-4 text-sm">
           <span>Block task assignment</span>
-          <ToggleSwitch aria-label="Block task assignment" checked={draft.blockAssignment} disabled={save.isPending}
+          <ToggleSwitch aria-label="Block task assignment" checked={draft.blockAssignment} disabled={!canManage || save.isPending}
             onCheckedChange={(blockAssignment) => setDraft((previous) => previous && { ...previous, blockAssignment, dirty: true })} />
         </div>
         <div className="flex items-center justify-between gap-4 text-sm">
           <span>Wake on demand</span>
-          <ToggleSwitch aria-label="Wake on demand" checked={draft.wakeOnDemand} disabled={save.isPending}
+          <ToggleSwitch aria-label="Wake on demand" checked={draft.wakeOnDemand} disabled={!canManage || save.isPending}
             onCheckedChange={(wakeOnDemand) => setDraft((previous) => previous && { ...previous, wakeOnDemand, dirty: true })} />
         </div>
         <p className="text-xs text-muted-foreground">
           Clearing the block still requires a separate assignment grant and an explicit operator action.
         </p>
-        <Button type="button" disabled={!changed || stale || save.isPending} onClick={() => save.mutate()}>
+        <Button type="button" disabled={!canManage || !changed || stale || save.isPending} onClick={() => save.mutate()}>
           {save.isPending ? "Saving..." : "Save continuity controls"}
         </Button>
       </> : null}

@@ -139,6 +139,8 @@ export interface AgentContinuityControls {
   canAssignTasks: boolean | null;
   canCreateAgents: boolean | null;
   eligible: boolean;
+  /** Actor-specific mutation permission; absence is read-only. */
+  canManage?: boolean;
 }
 
 export interface AgentConfigRevision {

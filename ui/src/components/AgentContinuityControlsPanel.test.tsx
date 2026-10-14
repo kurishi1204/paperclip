@@ -22,7 +22,7 @@ const initial: AgentContinuityControls = {
   id: "agent-1", companyId: "company-1", status: "paused", role: "engineer",
   adapterType: "codex_local", updatedAt: "2026-10-13T00:00:00.000001Z",
   assignmentMode: "protected", blockAssignment: true, wakeOnDemand: false,
-  heartbeatEnabled: false, canAssignTasks: false, canCreateAgents: false, eligible: true,
+  heartbeatEnabled: false, canAssignTasks: false, canCreateAgents: false, eligible: true, canManage: true,
 };
 
 async function flush() {
@@ -75,6 +75,21 @@ describe("AgentContinuityControlsPanel", () => {
     expect(queryClient.getQueryState(routeDetailKey)?.isInvalidated).toBe(true);
     expect(queryClient.getQueryState(aliasDetailKey)?.isInvalidated).toBe(true);
     expect(container.textContent).toContain("Saving does not resume or wake the agent");
+  });
+
+  it("keeps eligible controls read-only without management permission", async () => {
+    getControls.mockResolvedValue({ ...initial, canManage: false });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(async () => root.render(<QueryClientProvider client={client}>
+      <AgentContinuityControlsPanel agentId="agent-1" companyId="company-1" />
+    </QueryClientProvider>));
+    await flush();
+    expect(container.textContent).toContain("Read-only");
+    expect(container.querySelector('[aria-label="Wake on demand"]')?.getAttribute("disabled")).not.toBeNull();
+    const save = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes("Save continuity controls"));
+    expect(save?.disabled).toBe(true);
+    expect(patchControls).not.toHaveBeenCalled();
   });
 
   it("does not offer Save when the server marks the agent ineligible", async () => {

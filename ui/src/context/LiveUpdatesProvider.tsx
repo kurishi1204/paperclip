@@ -1440,9 +1440,8 @@ function invalidateActivityQueries(
     });
     queryClient.invalidateQueries({ queryKey: queryKeys.org(companyId) });
     if (entityId) {
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.agents.detail(entityId),
-      });
+      // Detail records may be keyed by either UUID or route short name.
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.detailAll });
       queryClient.invalidateQueries({
         queryKey: queryKeys.agents.continuityControls(entityId),
       });

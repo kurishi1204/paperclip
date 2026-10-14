@@ -334,6 +334,7 @@ describeDb("agent continuity controls", () => {
     const revision = revisions.find((item) => item.source === "test");
     expect(revision?.changedKeys).toContain("name");
     expect(revision?.changedKeys).not.toContain("runtimeConfig");
+    expect(revision?.changedKeys).not.toContain("appearance");
     expect((revision!.beforeConfig.runtimeConfig as { heartbeat: { wakeOnDemand: boolean } })
       .heartbeat.wakeOnDemand).toBe(true);
     expect((revision!.afterConfig.runtimeConfig as { heartbeat: { wakeOnDemand: boolean } })

@@ -2362,7 +2362,7 @@ describe("agent permission routes", () => {
     const configViewerRead = await requestApp(boardApp, (baseUrl) => request(baseUrl)
       .get(`/api/agents/${agentId}/continuity-controls`));
     expect(configViewerRead.status).toBe(200);
-    expect(configViewerRead.body).toEqual(safe);
+    expect(configViewerRead.body).toEqual({ ...safe, canManage: false });
     const noGrant = await requestApp(boardApp, (baseUrl) => request(baseUrl)
       .patch(`/api/agents/${agentId}/continuity-controls`)
       .send({ expectedUpdatedAt: updatedAt, blockAssignment: false, wakeOnDemand: true }));
@@ -2382,12 +2382,12 @@ describe("agent permission routes", () => {
     expect(mockContinuityControls.patch).not.toHaveBeenCalled();
     const read = await requestApp(boardApp, (baseUrl) => request(baseUrl).get(`/api/agents/${agentId}/continuity-controls`));
     expect(read.status).toBe(200);
-    expect(read.body).toEqual(safe);
+    expect(read.body).toEqual({ ...safe, canManage: true });
     const changed = await requestApp(boardApp, (baseUrl) => request(baseUrl)
       .patch(`/api/agents/${agentId}/continuity-controls`)
       .send({ expectedUpdatedAt: updatedAt, blockAssignment: false, wakeOnDemand: true }));
     expect(changed.status).toBe(200);
-    expect(changed.body).toEqual({ ...safe, blockAssignment: false, wakeOnDemand: true });
+    expect(changed.body).toEqual({ ...safe, blockAssignment: false, wakeOnDemand: true, canManage: true });
     expect(mockAccessService.decide).toHaveBeenLastCalledWith(expect.objectContaining({
       actor: expect.objectContaining({ type: "board", userId: "board-user" }),
       action: "agents:create",
