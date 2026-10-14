@@ -493,7 +493,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   // stays editable while that save is in flight, so the agent refresh that
   // follows it must not wipe edits made during the save. The refresh subtracts
   // only what the save persisted; a user-initiated Save leaves the snapshot
-  // null and keeps the full wipe. An UNRELATED refresh can land while the save
+  // null and reconciles only values actually stored by the refreshed agent. An UNRELATED refresh can land while the save
   // is still in flight — that refresh does not carry the persisted binding
   // yet, so it must neither consume the snapshot nor subtract it: subtracting
   // would drop the binding entry from the overlay while `props.agent` also
@@ -504,19 +504,27 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const backgroundSaveOverlayRef = useRef<AgentConfigOverlay | null>(null);
   const backgroundSaveInFlightRef = useRef(false);
 
-  // Clear overlay when agent data refreshes (after save)
+  // Reconcile stored values; unrelated refreshes must preserve pending edits.
   useEffect(() => {
     if (!isCreate) {
-      if (
-        agentRef.current !== null &&
-        props.agent !== agentRef.current &&
-        !backgroundSaveInFlightRef.current
-      ) {
-        const persisted = backgroundSaveOverlayRef.current;
+      if (agentRef.current !== null && agentRef.current.id !== props.agent.id) {
         backgroundSaveOverlayRef.current = null;
-        setOverlay((prev) =>
-          persisted ? subtractPersistedOverlay(prev, persisted) : { ...emptyOverlay },
-        );
+        setOverlay({ ...emptyOverlay });
+        setEnvironmentDraftDirty(false);
+        setEnvironmentEditorKey((key) => key + 1);
+      } else if (agentRef.current !== null && props.agent !== agentRef.current
+          && !backgroundSaveInFlightRef.current) {
+        const config = props.agent.runtimeConfig ?? {};
+        const persisted = backgroundSaveOverlayRef.current ?? {
+          identity: { ...props.agent },
+          adapterType: props.agent.adapterType,
+          adapterConfig: props.agent.adapterConfig ?? {},
+          heartbeat: (config.heartbeat ?? {}) as Record<string, unknown>,
+          debug: (config.debug ?? {}) as Record<string, unknown>,
+          runtime: config,
+        };
+        backgroundSaveOverlayRef.current = null;
+        setOverlay((previous) => subtractPersistedOverlay(previous, persisted));
       }
       agentRef.current = props.agent;
     }

@@ -177,4 +177,24 @@ describe("AgentContinuityControlsPanel", () => {
     expect(container.querySelector('[aria-label="Wake on demand"]')).not.toBeNull();
   });
 
+  it("registers navigation dirty state, page Save and page Discard without losing the other draft", async () => {
+    const dirty = vi.fn(); let pageSave: (() => void) | null = null; let pageDiscard: (() => void) | null = null;
+    const registerSave = (action: (() => void) | null) => { pageSave = action; };
+    const registerDiscard = (action: (() => void) | null) => { pageDiscard = action; };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(async () => root.render(<QueryClientProvider client={client}>
+      <AgentContinuityControlsPanel agentId="agent-1" companyId="company-1"
+        onDirtyChange={dirty} onSaveActionChange={registerSave} onCancelActionChange={registerDiscard} />
+    </QueryClientProvider>));
+    await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Wake on demand"]')?.click());
+    await flush(); expect(dirty).toHaveBeenLastCalledWith(true); expect(pageSave).not.toBeNull(); expect(pageDiscard).not.toBeNull();
+    await act(async () => pageDiscard?.());
+    await flush(); expect(dirty).toHaveBeenLastCalledWith(false); expect(patchControls).not.toHaveBeenCalled();
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Wake on demand"]')?.click());
+    await flush(); await act(async () => pageSave?.());
+    await flush(); expect(patchControls).toHaveBeenCalledTimes(1); expect(dirty).toHaveBeenLastCalledWith(false);
+  });
+
 });

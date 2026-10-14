@@ -2103,10 +2103,30 @@ function ConfigurationTab({
   const { pushToast } = useToastActions();
   const [awaitingRefreshAfterSave, setAwaitingRefreshAfterSave] = useState(false);
   const [configurationDirty, setConfigurationDirty] = useState(false);
-  const reportConfigurationDirty = useCallback((dirty: boolean) => {
-    setConfigurationDirty(dirty);
-    onDirtyChange(dirty);
-  }, [onDirtyChange]);
+  const [continuityDirty, setContinuityDirty] = useState(false);
+  const [continuityCanSave, setContinuityCanSave] = useState(false);
+  const draftActions = useRef<{ configurationSave: (() => void) | null; continuitySave: (() => void) | null;
+    configurationCancel: (() => void) | null; continuityCancel: (() => void) | null }>(
+    { configurationSave: null, continuitySave: null, configurationCancel: null, continuityCancel: null });
+  const reportConfigurationDirty = useCallback((dirty: boolean) => setConfigurationDirty(dirty), []);
+  const registerConfigurationSave = useCallback((action: (() => void) | null) => { draftActions.current.configurationSave = action; }, []);
+  const registerConfigurationCancel = useCallback((action: (() => void) | null) => { draftActions.current.configurationCancel = action; }, []);
+  const registerContinuitySave = useCallback((action: (() => void) | null) => {
+    draftActions.current.continuitySave = action;
+    setContinuityCanSave(action !== null);
+  }, []);
+  const registerContinuityCancel = useCallback((action: (() => void) | null) => { draftActions.current.continuityCancel = action; }, []);
+  useEffect(() => { onDirtyChange(configurationDirty || continuityDirty); }, [configurationDirty, continuityDirty, onDirtyChange]);
+  useEffect(() => {
+    onSaveActionChange(configurationDirty ? () => draftActions.current.configurationSave?.()
+      : continuityDirty && continuityCanSave ? () => draftActions.current.continuitySave?.() : null);
+    onCancelActionChange(configurationDirty || continuityDirty ? () => {
+      draftActions.current.configurationCancel?.(); draftActions.current.continuityCancel?.();
+    } : null);
+  }, [configurationDirty, continuityDirty, continuityCanSave, onSaveActionChange, onCancelActionChange]);
+  useEffect(() => () => {
+    onDirtyChange(false); onSaveActionChange(null); onCancelActionChange(null);
+  }, [onDirtyChange, onSaveActionChange, onCancelActionChange]);
   const lastAgentRef = useRef(agent);
 
   const catalogProvider = agent.adapterType === "paperclip_runner" ? String(agent.adapterConfig.provider ?? "codex") : undefined;
@@ -2201,8 +2221,8 @@ function ConfigurationTab({
         isSaving={isConfigSaving}
         adapterModels={adapterModels}
         onDirtyChange={reportConfigurationDirty}
-        onSaveActionChange={onSaveActionChange}
-        onCancelActionChange={onCancelActionChange}
+        onSaveActionChange={registerConfigurationSave}
+        onCancelActionChange={registerConfigurationCancel}
         hideInlineSave
         hidePromptTemplate={hidePromptTemplate}
         hideInstructionsFile={hideInstructionsFile}
@@ -2217,7 +2237,8 @@ function ConfigurationTab({
 
       {content === "configuration" && agent.status === "paused"
         && agent.permissions.authorizationPolicy?.assignmentPolicy?.mode === "protected" ? (
-        <AgentContinuityControlsPanel agentId={agent.id} companyId={companyId ?? agent.companyId} configurationBusy={configurationDirty || isConfigSaving} />
+        <AgentContinuityControlsPanel agentId={agent.id} companyId={companyId ?? agent.companyId} configurationBusy={configurationDirty || isConfigSaving}
+          onDirtyChange={setContinuityDirty} onSaveActionChange={registerContinuitySave} onCancelActionChange={registerContinuityCancel} />
       ) : null}
 
       {content === "configuration" ? <TrustPresetSection

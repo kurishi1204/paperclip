@@ -743,6 +743,39 @@ describe("AgentConfigForm environment selector", () => {
     vi.clearAllMocks();
   });
 
+  it("preserves configuration drafts across scoped refreshes and clears only persisted edits or another agent", async () => {
+    const dirty = vi.fn();
+    let refresh: (agent: Agent) => void = () => {};
+    const container = document.createElement("div"); document.body.appendChild(container);
+    const root = createRoot(container); roots.push(root);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    function Harness() {
+      const [agent, setAgent] = useState(makeAgent()); refresh = setAgent;
+      return <AgentConfigForm mode="edit" agent={agent} onSave={vi.fn()}
+        onDirtyChange={dirty} hidePromptTemplate showAdapterTypeField={false} />;
+    }
+    await act(async () => root.render(<QueryClientProvider client={client}><ToastProvider><TooltipProvider>
+      <Harness />
+    </TooltipProvider></ToastProvider></QueryClientProvider>));
+    await flushReact();
+    const input = () => container.querySelector<HTMLInputElement>('input[placeholder="Agent name"]')!;
+    await act(async () => setInputValue(input(), "Pending rename"));
+    await flushReact();
+    await act(async () => refresh(makeAgent({ runtimeConfig: { wakeOnDemand: true }, updatedAt: new Date(1) })));
+    await flushReact();
+    expect(input().value).toBe("Pending rename");
+    expect(dirty).toHaveBeenLastCalledWith(true);
+    await act(async () => refresh(makeAgent({ name: "Pending rename", updatedAt: new Date(2) })));
+    await flushReact();
+    expect(input().value).toBe("Pending rename");
+    expect(dirty).toHaveBeenLastCalledWith(false);
+    await act(async () => setInputValue(input(), "Another pending edit"));
+    await act(async () => refresh(makeAgent({ id: "agent-2", name: "Other agent" })));
+    await flushReact();
+    expect(input().value).toBe("Other agent");
+    expect(dirty).toHaveBeenLastCalledWith(false);
+  });
+
   it("promotes environment drafts through the page Save action and discards them through the page Discard action", async () => {
     const dirty = vi.fn();
     let save: (() => void) | null = null;

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { AgentContinuityControls } from "@paperclipai/shared";
 import { agentsApi } from "../api/agents";
@@ -32,8 +32,11 @@ function draftFrom(current: AgentContinuityControls): Draft | null {
 }
 
 /** Keeps the sensitive general agent configuration out of this two-flag UI. */
-export function AgentContinuityControlsPanel({ agentId, companyId, configurationBusy = false }: {
+export function AgentContinuityControlsPanel({ agentId, companyId, configurationBusy = false, onDirtyChange, onSaveActionChange, onCancelActionChange }: {
   agentId: string; companyId: string; configurationBusy?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
+  onSaveActionChange?: (action: (() => void) | null) => void;
+  onCancelActionChange?: (action: (() => void) | null) => void;
 }) {
   const queryClient = useQueryClient();
   const { pushToast } = useToastActions();
@@ -94,6 +97,17 @@ export function AgentContinuityControlsPanel({ agentId, companyId, configuration
     && draft.expectedUpdatedAt !== current.updatedAt);
   const changed = Boolean(draft && (draft.blockAssignment !== draft.initialBlockAssignment
     || draft.wakeOnDemand !== draft.initialWakeOnDemand));
+
+  const discard = useCallback(() => setDraft(current ? draftFrom(current) : null), [current]);
+  const canSave = canManage && changed && !stale && !configurationBusy && !save.isPending;
+  useEffect(() => { onDirtyChange?.(changed); }, [changed, onDirtyChange]);
+  useEffect(() => { onSaveActionChange?.(canSave ? () => save.mutate() : null); }, [canSave, onSaveActionChange, save.mutate]);
+  useEffect(() => { onCancelActionChange?.(changed ? discard : null); }, [changed, discard, onCancelActionChange]);
+  useEffect(() => () => {
+    onDirtyChange?.(false);
+    onSaveActionChange?.(null);
+    onCancelActionChange?.(null);
+  }, [onDirtyChange, onSaveActionChange, onCancelActionChange]);
 
   return (
     <section className="rounded-lg border border-border p-4 space-y-4">
