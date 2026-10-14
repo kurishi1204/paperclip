@@ -213,14 +213,17 @@ When creating a pull request (via `gh pr create` or any other method), you **mus
 - **Verification** — how a reviewer can confirm it works
 - **Risks** — what could go wrong
 - **Model Used** — the AI model that produced or assisted with the change (provider, exact model ID, context window, capabilities). Write "None — human-authored" if no AI was used.
-- **Checklist** — all items checked
+- **Checklist** — all items checked with truthful evidence, including any narrow
+  Actions-free exception under `CONTRIBUTING.md` instead of a false green claim
 
 ## 11. Definition of Done
 
 A change is done when all are true:
 
 1. Behavior matches `doc/SPEC-implementation.md`
-2. Typecheck, tests, and build pass
+2. Typecheck, tests, and build pass, or a full-suite exception meets the exact-head
+   Actions-free evidence and owner-decision rules in `CONTRIBUTING.md`. PR-specific
+   tests, typecheck, build, and applicable static gates must still pass.
 3. Contracts are synced across db/shared/server/ui
 4. Docs updated when behavior or commands change
 5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)
