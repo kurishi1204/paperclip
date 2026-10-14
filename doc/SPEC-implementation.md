@@ -775,7 +775,7 @@ and use `PATCH /api/agents/:id/continuity-controls` to change only
 `authorizationPolicy.protectedAgent.blockAssignment` and
 `heartbeat.wakeOnDemand`. PATCH requires the exact `expectedUpdatedAt` from
 GET, boolean values for both controls, a disabled heartbeat, no task-assignment
-permission, and no active legacy approval flag. It locks the agent row, rejects
+permission, no agent-creation permission, and no active legacy approval flag. It locks the agent row, rejects
 stale or ineligible writes with 409, and records an activity event with both
 control values before and after the change, plus an `agent.updated` plugin event.
 It records a configuration revision when `runtimeConfig` changes; configuration

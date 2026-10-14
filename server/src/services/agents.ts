@@ -166,9 +166,9 @@ function preserveCurrentWakeOnRollback(
   if (current.status !== "paused" ||
       nestedValue(current.permissions, ["authorizationPolicy", "assignmentPolicy", "mode"]) !== "protected" ||
       !isPlainRecord(nextRuntimeConfig)) return nextRuntimeConfig;
-  const nextHeartbeat = isPlainRecord(nextRuntimeConfig.heartbeat) ? nextRuntimeConfig.heartbeat : {};
-  const heartbeat = { ...nextHeartbeat };
   const wake = nestedValue(current.runtimeConfig, ["heartbeat", "wakeOnDemand"]);
+  if (wake === undefined && !isPlainRecord(nextRuntimeConfig.heartbeat)) return nextRuntimeConfig;
+  const heartbeat = isPlainRecord(nextRuntimeConfig.heartbeat) ? { ...nextRuntimeConfig.heartbeat } : {};
   if (wake === undefined) delete heartbeat.wakeOnDemand;
   else heartbeat.wakeOnDemand = wake;
   return { ...nextRuntimeConfig, heartbeat };

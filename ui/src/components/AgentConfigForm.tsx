@@ -377,6 +377,15 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   // Pending binding proposals targeting this agent (PAP-14731). Board-only route;
   // non-permitted viewers simply get an empty list.
   const editAgentId = !isCreate ? props.agent.id : null;
+  const pausedProtected = !isCreate && props.agent.status === "paused"
+    && asObject(asObject(props.agent.permissions.authorizationPolicy).assignmentPolicy).mode === "protected";
+  const scopedContinuity = useQuery({
+    queryKey: editAgentId ? queryKeys.agents.continuityControls(editAgentId) : ["agents", "none", "continuity-controls"],
+    queryFn: () => agentsApi.getContinuityControls(editAgentId!, selectedCompanyId ?? undefined),
+    enabled: pausedProtected,
+    retry: false,
+  });
+  const generalWakeEditable = !pausedProtected || scopedContinuity.data?.eligible === false;
   const { data: pendingProposals = [] } = useQuery({
     queryKey: selectedCompanyId
       ? queryKeys.secrets.proposals(selectedCompanyId, "pending")
@@ -2035,16 +2044,21 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 </>
               )}
               </>)}
-              <ToggleField
+              {generalWakeEditable ? <ToggleField
                 label="Wake on demand"
                 hint={help.wakeOnDemand}
+                toggleTestId="general-wake-on-demand"
                 checked={eff(
                   "heartbeat",
                   "wakeOnDemand",
                   heartbeat.wakeOnDemand !== false,
                 )}
                 onChange={(v) => mark("heartbeat", "wakeOnDemand", v)}
-              />
+              /> : <Field label="Wake on demand" hint={help.wakeOnDemand}>
+                <p className="text-xs text-muted-foreground">
+                  Use Paused agent continuity in Permissions to change this control.
+                </p>
+              </Field>}
               <Field label="Cooldown (sec)" hint={help.cooldownSec}>
                 <DraftNumberInput
                   value={eff(

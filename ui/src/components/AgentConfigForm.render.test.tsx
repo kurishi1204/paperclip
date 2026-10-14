@@ -35,6 +35,7 @@ const mockAgentsApi = vi.hoisted(() => ({
   completeClaudeSetupTokenLogin: vi.fn(),
   cancelClaudeSetupTokenLogin: vi.fn(),
   getClaudeOAuthTokenStatus: vi.fn(),
+  getContinuityControls: vi.fn(),
 }));
 
 // The default resume read for a test that does not exercise resume: no active
@@ -3399,6 +3400,31 @@ describe("AgentConfigForm environment selector", () => {
 
     expect(result.container.textContent).toContain("Authenticated");
     expect(result.container.textContent).not.toContain("sk-ant-SECRET-TOKEN");
+  });
+
+  it("routes an eligible paused protected agent's wake change to scoped controls", async () => {
+    mockAgentsApi.getContinuityControls.mockResolvedValue({ id: "agent-1", eligible: true });
+    const result = await renderForm([], {
+      status: "paused",
+      permissions: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } } as Agent["permissions"],
+    });
+    roots.push(result.root);
+
+    await flushUntil(() => (result.container.textContent ?? "").includes("Use Paused agent continuity"));
+    expect(result.container.querySelector('[data-testid="general-wake-on-demand"]')).toBeNull();
+    expect(mockAgentsApi.getContinuityControls).toHaveBeenCalledWith("agent-1", "company-1");
+  });
+
+  it("keeps the general wake control available when scoped controls are ineligible", async () => {
+    mockAgentsApi.getContinuityControls.mockResolvedValue({ id: "agent-1", eligible: false });
+    const result = await renderForm([], {
+      status: "paused",
+      permissions: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } } as Agent["permissions"],
+    });
+    roots.push(result.root);
+
+    await flushUntil(() => result.container.querySelector('[data-testid="general-wake-on-demand"]') !== null);
+    expect(result.container.textContent).not.toContain("Use Paused agent continuity");
   });
 });
 

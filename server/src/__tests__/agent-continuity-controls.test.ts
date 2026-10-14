@@ -131,6 +131,21 @@ describeDb("agent continuity controls", () => {
     });
   });
 
+  it("keeps a legacy missing heartbeat absent when rolling back unrelated settings", async () => {
+    const f = await seed();
+    const service = agentService(db);
+    await db.update(agents).set({ adapterConfig: {}, runtimeConfig: { unrelated: "initial" } })
+      .where(eq(agents.id, f.agentId));
+    await service.update(f.agentId, { runtimeConfig: { unrelated: "historic" } },
+      { recordRevision: { source: "test" } });
+    const [revision] = await service.listConfigRevisions(f.agentId);
+    await service.update(f.agentId, { runtimeConfig: { unrelated: "current" } });
+
+    await expect(service.rollbackConfigRevision(f.agentId, revision.id, {})).resolves.not.toBeNull();
+    const [stored] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(stored!.runtimeConfig).toEqual({ unrelated: "historic" });
+  });
+
   it("records the live scoped wake in a rollback racing with a scoped patch", async () => {
     const f = await seed();
     const safeRuntime = { heartbeat: f.runtimeConfig.heartbeat, unrelated: "keep" };
