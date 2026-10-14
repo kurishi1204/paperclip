@@ -70,7 +70,7 @@ describe("buildAgentUpdatePatch", () => {
   });
   it("clears a connection without clearing heartbeat settings", () => {
     const agent = makeAgent();
-    agent.runtimeConfig = { ...agent.runtimeConfig, aiConnection: { connectionId: "old" } };
+    agent.runtimeConfig = { ...agent.runtimeConfig, aiConnection: { mode: "router", connectionId: "old" } };
     const patch = buildAgentUpdatePatch(agent, makeOverlay({
       runtime: { runtimeConfig: { aiConnection: undefined } },
     }));
