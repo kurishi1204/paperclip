@@ -781,13 +781,17 @@ control values before and after the change, plus an `agent.updated` plugin event
 It records a configuration revision when `runtimeConfig` changes; configuration
 rollback preserves the current on-demand wake flag for a paused agent in protected
 assignment mode, and preserves its assignment block because revisions do not
-restore permissions. To
-change either control, use the scoped PATCH with a fresh `expectedUpdatedAt`.
-While this scoped control is
-eligible, general agent edits refuse changes to either flag, including a stale
-full-object save that would tighten a previously restored value. GET and PATCH return selected
+restore permissions. While this scoped control is eligible, change either flag
+through the scoped PATCH with a fresh `expectedUpdatedAt`. General agent edits
+reject explicit changes to either flag, including a stale full-object save that
+would tighten a previously restored value. A partial general permissions policy
+that omits the assignment block retains its live value instead of clearing it.
+Once the agent is ineligible, the general edit path may change these flags again;
+the guard prevents stale overwrites while eligible rather than imposing a
+permanent actor restriction. The scoped endpoints require the same board company
+agent-management grant as the existing general permissions endpoint. GET and PATCH return selected
 non-secret fields, never the full permissions or runtime configuration. The
-board Agent detail permissions view exposes these two controls for eligible paused protected
+board Agent detail view exposes these two controls for eligible paused protected
 agents. This scoped change does not resume or wake the agent, and removing the
 block alone does not grant assignment authority.
 

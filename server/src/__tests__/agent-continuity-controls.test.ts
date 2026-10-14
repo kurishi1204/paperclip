@@ -277,6 +277,28 @@ describeDb("agent continuity controls", () => {
     } });
   });
 
+  it("retains the live scoped block for a partial permissions policy while rejecting an explicit change", async () => {
+    const f = await seed();
+    const service = agentService(db);
+    await expect(service.updatePermissions(f.agentId, {
+      canCreateAgents: false,
+      authorizationPolicy: { assignmentPolicy: { mode: "protected", extra: "updated" } },
+    })).resolves.not.toBeNull();
+    const [stored] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(stored!.permissions).toMatchObject({ authorizationPolicy: {
+      assignmentPolicy: { mode: "protected", extra: "updated" },
+      protectedAgent: { blockAssignment: true },
+    } });
+
+    await expect(service.updatePermissions(f.agentId, {
+      canCreateAgents: false,
+      authorizationPolicy: {
+        assignmentPolicy: { mode: "protected" },
+        protectedAgent: { blockAssignment: false },
+      },
+    })).rejects.toMatchObject({ status: 409 });
+  });
+
   it("attributes a general config revision only to changes made after the scoped patch", async () => {
     const f = await seed();
     let enterTransaction!: () => void;

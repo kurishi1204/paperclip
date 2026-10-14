@@ -385,7 +385,10 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     enabled: pausedProtected,
     retry: false,
   });
-  const generalWakeEditable = !pausedProtected || scopedContinuity.data?.eligible === false;
+  const scopedContinuityUnknown = pausedProtected &&
+    (scopedContinuity.isError || scopedContinuity.data?.eligible === undefined);
+  const generalWakeEditable = !pausedProtected ||
+    (!scopedContinuity.isError && scopedContinuity.data?.eligible === false);
   const { data: pendingProposals = [] } = useQuery({
     queryKey: selectedCompanyId
       ? queryKeys.secrets.proposals(selectedCompanyId, "pending")
@@ -2001,6 +2004,15 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 showNumber={eff("heartbeat", "enabled", heartbeat.enabled === true)}
               />
             </div>
+            {scopedContinuityUnknown ? <div role={scopedContinuity.isError ? "alert" : "status"}
+              className={cn("text-xs text-muted-foreground", cards ? "px-4 pb-3" : "px-4 pb-2")}>
+              {scopedContinuity.isError ? <>
+                Could not read paused agent continuity controls. Wake editing is unavailable until the read succeeds.
+                <Button type="button" variant="link" size="sm" onClick={() => void scopedContinuity.refetch()}>
+                  Retry continuity read
+                </Button>
+              </> : "Checking whether paused agent continuity controls apply…"}
+            </div> : null}
             <CollapsibleSection
               title="Advanced Run Policy"
               bordered={cards}
@@ -2044,10 +2056,11 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 </>
               )}
               </>)}
-              {generalWakeEditable ? <ToggleField
+              {generalWakeEditable || scopedContinuityUnknown ? <ToggleField
                 label="Wake on demand"
                 hint={help.wakeOnDemand}
                 toggleTestId="general-wake-on-demand"
+                disabled={scopedContinuityUnknown}
                 checked={eff(
                   "heartbeat",
                   "wakeOnDemand",
@@ -2056,7 +2069,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 onChange={(v) => mark("heartbeat", "wakeOnDemand", v)}
               /> : <Field label="Wake on demand" hint={help.wakeOnDemand}>
                 <p className="text-xs text-muted-foreground">
-                  Use Paused agent continuity in Permissions to change this control.
+                  Use Paused agent continuity controls to change this control.
                 </p>
               </Field>}
               <Field label="Cooldown (sec)" hint={help.cooldownSec}>

@@ -3409,8 +3409,10 @@ describe("AgentConfigForm environment selector", () => {
       permissions: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } } as Agent["permissions"],
     });
     roots.push(result.root);
+    await clickByText(result.container, "Advanced Run Policy");
 
-    await flushUntil(() => (result.container.textContent ?? "").includes("Use Paused agent continuity"));
+    await flushUntil(() => (result.container.textContent ?? "").includes("Use Paused agent continuity controls"));
+    expect(result.container.textContent).toContain("Use Paused agent continuity controls");
     expect(result.container.querySelector('[data-testid="general-wake-on-demand"]')).toBeNull();
     expect(mockAgentsApi.getContinuityControls).toHaveBeenCalledWith("agent-1", "company-1");
   });
@@ -3422,9 +3424,34 @@ describe("AgentConfigForm environment selector", () => {
       permissions: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } } as Agent["permissions"],
     });
     roots.push(result.root);
+    await clickByText(result.container, "Advanced Run Policy");
 
     await flushUntil(() => result.container.querySelector('[data-testid="general-wake-on-demand"]') !== null);
-    expect(result.container.textContent).not.toContain("Use Paused agent continuity");
+    expect(result.container.textContent).not.toContain("Use Paused agent continuity controls");
+  });
+
+  it("shows a failed eligibility read and enables wake editing only after a successful retry", async () => {
+    mockAgentsApi.getContinuityControls.mockReset();
+    mockAgentsApi.getContinuityControls
+      .mockRejectedValueOnce(new Error("temporary read failure"))
+      .mockResolvedValueOnce({ id: "agent-1", eligible: false });
+    const result = await renderForm([], {
+      status: "paused",
+      permissions: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } } as Agent["permissions"],
+    });
+    roots.push(result.root);
+
+    await flushUntil(() => (result.container.textContent ?? "").includes("Could not read paused agent continuity controls"));
+    expect(result.container.textContent).toContain("Could not read paused agent continuity controls");
+    expect(result.container.querySelector('[role="alert"]')?.textContent).toContain("Retry continuity read");
+    await clickByText(result.container, "Advanced Run Policy");
+    const toggle = result.container.querySelector<HTMLButtonElement>('[data-testid="general-wake-on-demand"]');
+    expect(toggle?.disabled).toBe(true);
+
+    await clickByText(result.container, "Retry continuity read");
+    await flushUntil(() => result.container.querySelector<HTMLButtonElement>('[data-testid="general-wake-on-demand"]')?.disabled === false);
+    expect(result.container.querySelector<HTMLButtonElement>('[data-testid="general-wake-on-demand"]')?.disabled).toBe(false);
+    expect(mockAgentsApi.getContinuityControls).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -174,25 +174,21 @@ function preserveCurrentWakeOnRollback(
   return { ...nextRuntimeConfig, heartbeat };
 }
 
-function assertScopedContinuityFlagsPreserved(
+function scopedContinuityEligible(
   current: Pick<typeof agents.$inferSelect, "status" | "role" | "permissions" | "runtimeConfig">,
-  nextPermissions?: unknown,
-  nextRuntimeConfig?: unknown,
-) {
+): boolean {
   // A scoped update has an updatedAt precondition. General edit forms do not,
   // so an eligible agent's stale full-object save must not undo either scoped
   // flag. Ineligible agents have no scoped route and keep their general edit.
   if (current.status !== "paused" ||
-      nestedValue(current.permissions, ["authorizationPolicy", "assignmentPolicy", "mode"]) !== "protected") return;
+      nestedValue(current.permissions, ["authorizationPolicy", "assignmentPolicy", "mode"]) !== "protected") return false;
   const blockPath = ["authorizationPolicy", "protectedAgent", "blockAssignment"];
   const wakePath = ["heartbeat", "wakeOnDemand"];
-  const nextBlock = nestedValue(nextPermissions, blockPath);
-  const nextWake = nestedValue(nextRuntimeConfig, wakePath);
   const legacyProtectedApproval = nestedValue(current.permissions,
     ["authorizationPolicy", "protectedAgent", "requiresApproval"]);
   const legacyAssignmentApproval = nestedValue(current.permissions,
     ["authorizationPolicy", "assignmentPolicy", "protectedAgentRequiresApproval"]);
-  const scopedEligible = current.role !== "ceo"
+  return current.role !== "ceo"
     && typeof nestedValue(current.permissions, blockPath) === "boolean"
     && typeof nestedValue(current.runtimeConfig, wakePath) === "boolean"
     && nestedValue(current.runtimeConfig, ["heartbeat", "enabled"]) === false
@@ -200,7 +196,18 @@ function assertScopedContinuityFlagsPreserved(
     && nestedValue(current.permissions, ["canCreateAgents"]) !== true
     && (legacyProtectedApproval === undefined || legacyProtectedApproval === false)
     && (legacyAssignmentApproval === undefined || legacyAssignmentApproval === false);
-  if (!scopedEligible) return;
+}
+
+function assertScopedContinuityFlagsPreserved(
+  current: Pick<typeof agents.$inferSelect, "status" | "role" | "permissions" | "runtimeConfig">,
+  nextPermissions?: unknown,
+  nextRuntimeConfig?: unknown,
+) {
+  if (!scopedContinuityEligible(current)) return;
+  const blockPath = ["authorizationPolicy", "protectedAgent", "blockAssignment"];
+  const wakePath = ["heartbeat", "wakeOnDemand"];
+  const nextBlock = nestedValue(nextPermissions, blockPath);
+  const nextWake = nestedValue(nextRuntimeConfig, wakePath);
   if (nextPermissions !== undefined && nextBlock !== nestedValue(current.permissions, blockPath)) {
     throw conflict("Use scoped continuity controls to change a paused protected agent's assignment block");
   }
@@ -1298,7 +1305,26 @@ export function agentService(db: Db) {
             fields: ["permissions"],
           });
         }
-        const nextPermissions = normalizeAgentPermissions({ ...current.permissions, ...permissions });
+        let nextPermissions = normalizeAgentPermissions({ ...current.permissions, ...permissions });
+        // A partial authorizationPolicy replaces that top-level JSON member.
+        // Retain the live scoped flag when the caller did not name it; an
+        // explicit different value still fails the guarded comparison below.
+        if (scopedContinuityEligible(current) &&
+            nestedValue(nextPermissions, ["authorizationPolicy", "protectedAgent", "blockAssignment"]) === undefined) {
+          const policy = isPlainRecord(nextPermissions.authorizationPolicy) ? nextPermissions.authorizationPolicy : {};
+          const protectedAgent = isPlainRecord(policy.protectedAgent) ? policy.protectedAgent : {};
+          nextPermissions = {
+            ...nextPermissions,
+            authorizationPolicy: {
+              ...policy,
+              protectedAgent: {
+                ...protectedAgent,
+                blockAssignment: nestedValue(current.permissions,
+                  ["authorizationPolicy", "protectedAgent", "blockAssignment"]),
+              },
+            },
+          } as typeof nextPermissions;
+        }
         assertScopedContinuityFlagsPreserved(current, nextPermissions);
         const [updated] = await tx.update(agents).set({
           permissions: nextPermissions,
