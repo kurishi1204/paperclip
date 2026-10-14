@@ -138,6 +138,8 @@ type AgentConfigFormProps = {
   hideInstructionsFile?: boolean;
   /** Allow instance administrators to configure short-lived raw provider capture. */
   canConfigureProviderTrace?: boolean;
+  /** Visible tab containing this build's scoped control panel. */
+  continuityControlsTab?: "Permissions" | "Configuration";
   /** Hide the prompt template field from the Identity section (used when it's shown in a separate Prompts tab). */
   hidePromptTemplate?: boolean;
   /** Render the main configuration sections or the dedicated edit-only Secrets surface. */
@@ -377,6 +379,18 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   // Pending binding proposals targeting this agent (PAP-14731). Board-only route;
   // non-permitted viewers simply get an empty list.
   const editAgentId = !isCreate ? props.agent.id : null;
+  const pausedProtected = !isCreate && props.agent.status === "paused"
+    && asObject(asObject(props.agent.permissions.authorizationPolicy).assignmentPolicy).mode === "protected";
+  const scopedContinuity = useQuery({
+    queryKey: editAgentId ? queryKeys.agents.continuityControls(editAgentId) : ["agents", "none", "continuity-controls"],
+    queryFn: () => agentsApi.getContinuityControls(editAgentId!, selectedCompanyId ?? undefined),
+    enabled: pausedProtected,
+    retry: false,
+  });
+  const scopedContinuityUnknown = pausedProtected &&
+    (scopedContinuity.isError || scopedContinuity.data?.eligible === undefined);
+  const generalWakeEditable = !pausedProtected ||
+    (!scopedContinuity.isError && scopedContinuity.data?.eligible === false);
   const { data: pendingProposals = [] } = useQuery({
     queryKey: selectedCompanyId
       ? queryKeys.secrets.proposals(selectedCompanyId, "pending")
@@ -475,34 +489,14 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const [environmentDraftDirty, setEnvironmentDraftDirty] = useState(false);
   const [environmentEditorKey, setEnvironmentEditorKey] = useState(0);
   const agentRef = useRef<Agent | null>(null);
-  // The overlay snapshot a background account-binding save persisted. The form
-  // stays editable while that save is in flight, so the agent refresh that
-  // follows it must not wipe edits made during the save. The refresh subtracts
-  // only what the save persisted; a user-initiated Save leaves the snapshot
-  // null and keeps the full wipe. An UNRELATED refresh can land while the save
-  // is still in flight — that refresh does not carry the persisted binding
-  // yet, so it must neither consume the snapshot nor subtract it: subtracting
-  // would drop the binding entry from the overlay while `props.agent` also
-  // lacks it, and an ordinary Save racing the binding refresh would then
-  // replace the config without the binding and undo the just-persisted bind.
-  // The overlay stays untouched until the save settles; the refresh after
-  // settlement consumes the snapshot and subtracts it.
-  const backgroundSaveOverlayRef = useRef<AgentConfigOverlay | null>(null);
-  const backgroundSaveInFlightRef = useRef(false);
-
-  // Clear overlay when agent data refreshes (after save)
+  // Only a successful submission confirms pending edits. Server reads may be
+  // redacted or unrelated to this editor, so refreshes never clear its draft.
   useEffect(() => {
     if (!isCreate) {
-      if (
-        agentRef.current !== null &&
-        props.agent !== agentRef.current &&
-        !backgroundSaveInFlightRef.current
-      ) {
-        const persisted = backgroundSaveOverlayRef.current;
-        backgroundSaveOverlayRef.current = null;
-        setOverlay((prev) =>
-          persisted ? subtractPersistedOverlay(prev, persisted) : { ...emptyOverlay },
-        );
+      if (agentRef.current !== null && agentRef.current.id !== props.agent.id) {
+        setOverlay({ ...emptyOverlay });
+        setEnvironmentDraftDirty(false);
+        setEnvironmentEditorKey((key) => key + 1);
       }
       agentRef.current = props.agent;
     }
@@ -574,7 +568,10 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
         }
       : overlay;
     if (!isOverlayDirty(nextOverlay)) return;
+    const savedAgentId = props.agent.id;
     await props.onSave(buildAgentUpdatePatch(props.agent, nextOverlay));
+    setOverlay(previous => agentRef.current?.id === savedAgentId
+      ? subtractPersistedOverlay(previous, nextOverlay) : previous);
   }, [isCreate, isDirty, overlay, props]);
 
   useEffect(() => {
@@ -597,6 +594,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   // ---- Resolve values ----
   const config = !isCreate ? ((props.agent.adapterConfig ?? {}) as Record<string, unknown>) : {};
   const runtimeConfig = !isCreate ? ((props.agent.runtimeConfig ?? {}) as Record<string, unknown>) : {};
+  const pendingRuntimeConfig = overlay.runtime.runtimeConfig as Record<string, unknown> | undefined;
+  const effectiveAiConnection = pendingRuntimeConfig && Object.hasOwn(pendingRuntimeConfig, "aiConnection")
+    ? pendingRuntimeConfig.aiConnection : runtimeConfig.aiConnection;
   const heartbeat = !isCreate ? ((runtimeConfig.heartbeat ?? {}) as Record<string, unknown>) : {};
   const debug = !isCreate ? ((runtimeConfig.debug ?? {}) as Record<string, unknown>) : {};
 
@@ -681,10 +681,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       adapterConfig: { ...overlay.adapterConfig, env: nextEnv },
     };
     setOverlay(nextOverlay);
+    const savedAgentId = props.agent.id;
     await props.onSave({
       ...buildAgentUpdatePatch(props.agent, nextOverlay),
       applyStoredClaudeLogin: true,
     });
+    setOverlay(previous => agentRef.current?.id === savedAgentId
+      ? subtractPersistedOverlay(previous, nextOverlay) : previous);
     invalidateUserSecretDefinitions();
   };
 
@@ -713,23 +716,10 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       adapterConfig: { ...overlay.adapterConfig, env: nextEnv },
     };
     setOverlay(nextOverlay);
-    // This save runs in the background while the form stays editable. Record
-    // exactly what it persists so the agent refresh it triggers keeps edits
-    // made during the save (see the refresh effect) instead of wiping them
-    // with the persisted entries. The in-flight flag protects the snapshot
-    // from an unrelated refresh landing mid-save. A failed save never
-    // refreshes the agent with the binding, so clear the snapshot there — a
-    // later unrelated refresh then wipes normally.
-    backgroundSaveOverlayRef.current = nextOverlay;
-    backgroundSaveInFlightRef.current = true;
-    try {
-      await props.onSave(buildAgentUpdatePatch(props.agent, nextOverlay));
-    } catch (err) {
-      backgroundSaveOverlayRef.current = null;
-      throw err;
-    } finally {
-      backgroundSaveInFlightRef.current = false;
-    }
+    const savedAgentId = props.agent.id;
+    await props.onSave(buildAgentUpdatePatch(props.agent, nextOverlay));
+    setOverlay(previous => agentRef.current?.id === savedAgentId
+      ? subtractPersistedOverlay(previous, nextOverlay) : previous);
     invalidateUserSecretDefinitions();
   };
 
@@ -763,10 +753,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       adapterConfig: { ...overlay.adapterConfig, env: nextEnv },
     };
     setOverlay(nextOverlay);
+    const savedAgentId = props.agent.id;
     await props.onSave({
       ...buildAgentUpdatePatch(props.agent, nextOverlay),
       applyStoredClaudeLogin: true,
     });
+    setOverlay(previous => agentRef.current?.id === savedAgentId
+      ? subtractPersistedOverlay(previous, nextOverlay) : previous);
     invalidateUserSecretDefinitions();
   };
 
@@ -896,9 +889,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       : eff("adapterConfig", "provider", config.provider === "acpx" && config.acpxAgent === "codex" ? "codex" : config.provider ?? "codex"))
     : undefined;
   const modelProvider = adapterType === "opencode_local" && aiConnectionBindingSchema.safeParse(
-    (overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection,
+    effectiveAiConnection,
   ).data?.provider === "openrouter" ? "openrouter" : runnerProvider;
-  const connectionModels = useConnectionModels(selectedCompanyId, isCreate ? undefined : aiConnectionBindingSchema.safeParse((overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection).data, aiRoutingHarness(adapterType, runnerProvider, eff("adapterConfig", "acpxAgent", config.acpxAgent)));
+  const connectionModels = useConnectionModels(selectedCompanyId, isCreate ? undefined : aiConnectionBindingSchema.safeParse(effectiveAiConnection).data, aiRoutingHarness(adapterType, runnerProvider, eff("adapterConfig", "acpxAgent", config.acpxAgent)));
   // Fetch adapter models for the effective provider, including unsaved changes.
   const modelQueryKey = selectedCompanyId
     ? queryKeys.agents.adapterModels(selectedCompanyId, adapterType, currentDefaultEnvironmentId || null, modelProvider)
@@ -1072,7 +1065,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       const adapterConfig = buildAdapterConfigForTest(adapterConfigPatch);
       const agentId = isCreate ? undefined : props.agent.id;
       const aiConnection = isCreate ? undefined : aiRuntimeConnectionBindingSchema.safeParse(
-        (overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? props.agent.runtimeConfig.aiConnection,
+        effectiveAiConnection,
       ).data;
       if (props.compactTestFeedback) {
         const providerAdapter = adapterType === "paperclip_runner"
@@ -1159,7 +1152,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     environmentCapabilities?.sandboxProviders?.[effectiveLoginProvider]?.supportsLoginPty === true;
   const loginNeedsPty = adapterCaps.login != null;
   const showAdapterLogin =
-    (isCreate || !((overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection)) &&
+    (isCreate || !(effectiveAiConnection)) &&
     adapterSupportsSandboxLogin &&
     effectiveLoginEnvironment?.driver === "sandbox" &&
     Boolean(effectiveLoginEnvironmentId) &&
@@ -1669,9 +1662,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
           )}
 
           {!isCreate && selectedCompanyId && <AiConnectionField companyId={selectedCompanyId} agentId={props.agent.id} agentName={props.agent.name} adapterType={aiRoutingHarness(adapterType, eff("adapterConfig", "provider", config.provider), eff("adapterConfig", "acpxAgent", config.acpxAgent))}
-            routerAdapterType={adapterType} value={aiRuntimeConnectionBindingSchema.safeParse((overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection).data}
+            routerAdapterType={adapterType} value={aiRuntimeConnectionBindingSchema.safeParse(effectiveAiConnection).data}
             model={String(eff("adapterConfig", "model", config.model) ?? "")} environmentId={currentDefaultEnvironmentId || undefined} legacy
-            onChange={binding => mark("runtime", "runtimeConfig", { ...runtimeConfig, aiConnection: binding })} />}
+            onChange={binding => mark("runtime", "runtimeConfig", { aiConnection: binding })} />}
 
           {showInlineAdapterTestEnvironmentFeedback && !props.compactTestFeedback && (testActionError || testEnvironment.error) && (
             <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
@@ -1992,6 +1985,15 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 showNumber={eff("heartbeat", "enabled", heartbeat.enabled === true)}
               />
             </div>
+            {scopedContinuityUnknown ? <div role={scopedContinuity.isError ? "alert" : "status"}
+              className={cn("text-xs text-muted-foreground", cards ? "px-4 pb-3" : "px-4 pb-2")}>
+              {scopedContinuity.isError ? <>
+                Could not read paused agent continuity controls. Wake editing is unavailable until the read succeeds.
+                <Button type="button" variant="link" size="sm" onClick={() => void scopedContinuity.refetch()}>
+                  Retry continuity read
+                </Button>
+              </> : "Checking whether paused agent continuity controls apply…"}
+            </div> : null}
             <CollapsibleSection
               title="Advanced Run Policy"
               bordered={cards}
@@ -2035,16 +2037,23 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 </>
               )}
               </>)}
-              <ToggleField
+              {generalWakeEditable || scopedContinuityUnknown ? <ToggleField
                 label="Wake on demand"
                 hint={help.wakeOnDemand}
+                toggleTestId="general-wake-on-demand"
+                disabled={scopedContinuityUnknown}
                 checked={eff(
                   "heartbeat",
                   "wakeOnDemand",
                   heartbeat.wakeOnDemand !== false,
                 )}
                 onChange={(v) => mark("heartbeat", "wakeOnDemand", v)}
-              />
+              /> : <Field label="Wake on demand" hint={help.wakeOnDemand}>
+                <p className="text-xs text-muted-foreground">
+                  Use Paused agent continuity controls on the {props.continuityControlsTab ?? "Configuration"} tab.
+                  {scopedContinuity.data?.canManage !== true ? " Only an agent manager can save these controls while this agent is eligible." : ""}
+                </p>
+              </Field>}
               <Field label="Cooldown (sec)" hint={help.cooldownSec}>
                 <DraftNumberInput
                   value={eff(

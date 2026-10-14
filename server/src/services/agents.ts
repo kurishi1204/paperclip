@@ -127,6 +127,7 @@ interface UpdateAgentOptions {
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
   claudeLogin?: ClaudeLoginContext;
+  preserveScopedWakeOnRollback?: boolean;
 }
 
 interface CreateAgentOptions {
@@ -149,11 +150,77 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function nestedValue(value: unknown, path: readonly string[]): unknown {
+  let current = value;
+  for (const key of path) {
+    if (!isPlainRecord(current)) return undefined;
+    current = current[key];
+  }
+  return current;
+}
+
+function preserveCurrentWakeOnRollback(
+  current: Pick<typeof agents.$inferSelect, "status" | "permissions" | "runtimeConfig">,
+  nextRuntimeConfig: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (current.status !== "paused" ||
+      nestedValue(current.permissions, ["authorizationPolicy", "assignmentPolicy", "mode"]) !== "protected" ||
+      !isPlainRecord(nextRuntimeConfig)) return nextRuntimeConfig;
+  const wake = nestedValue(current.runtimeConfig, ["heartbeat", "wakeOnDemand"]);
+  if (wake === undefined && !isPlainRecord(nextRuntimeConfig.heartbeat)) return nextRuntimeConfig;
+  const heartbeat = isPlainRecord(nextRuntimeConfig.heartbeat) ? { ...nextRuntimeConfig.heartbeat } : {};
+  if (wake === undefined) delete heartbeat.wakeOnDemand;
+  else heartbeat.wakeOnDemand = wake;
+  return { ...nextRuntimeConfig, heartbeat };
+}
+
+function scopedContinuityEligible(
+  current: Pick<typeof agents.$inferSelect, "status" | "role" | "permissions" | "runtimeConfig">,
+): boolean {
+  // A scoped update has an updatedAt precondition. General edit forms do not,
+  // so an eligible agent's stale full-object save must not undo either scoped
+  // flag. Ineligible agents have no scoped route and keep their general edit.
+  if (current.status !== "paused" ||
+      nestedValue(current.permissions, ["authorizationPolicy", "assignmentPolicy", "mode"]) !== "protected") return false;
+  const blockPath = ["authorizationPolicy", "protectedAgent", "blockAssignment"];
+  const wakePath = ["heartbeat", "wakeOnDemand"];
+  const legacyProtectedApproval = nestedValue(current.permissions,
+    ["authorizationPolicy", "protectedAgent", "requiresApproval"]);
+  const legacyAssignmentApproval = nestedValue(current.permissions,
+    ["authorizationPolicy", "assignmentPolicy", "protectedAgentRequiresApproval"]);
+  return current.role !== "ceo"
+    && typeof nestedValue(current.permissions, blockPath) === "boolean"
+    && typeof nestedValue(current.runtimeConfig, wakePath) === "boolean"
+    && nestedValue(current.runtimeConfig, ["heartbeat", "enabled"]) === false
+    && nestedValue(current.permissions, ["canAssignTasks"]) === false
+    && nestedValue(current.permissions, ["canCreateAgents"]) !== true
+    && (legacyProtectedApproval === undefined || legacyProtectedApproval === false)
+    && (legacyAssignmentApproval === undefined || legacyAssignmentApproval === false);
+}
+
+function assertScopedContinuityFlagsPreserved(
+  current: Pick<typeof agents.$inferSelect, "status" | "role" | "permissions" | "runtimeConfig">,
+  nextPermissions?: unknown,
+  nextRuntimeConfig?: unknown,
+) {
+  if (!scopedContinuityEligible(current)) return;
+  const blockPath = ["authorizationPolicy", "protectedAgent", "blockAssignment"];
+  const wakePath = ["heartbeat", "wakeOnDemand"];
+  const nextBlock = nestedValue(nextPermissions, blockPath);
+  const nextWake = nestedValue(nextRuntimeConfig, wakePath);
+  if (nextPermissions !== undefined && nextBlock !== nestedValue(current.permissions, blockPath)) {
+    throw conflict("Use scoped continuity controls to change a paused protected agent's assignment block");
+  }
+  if (nextRuntimeConfig !== undefined && nextWake !== nestedValue(current.runtimeConfig, wakePath)) {
+    throw conflict("Use scoped continuity controls to change a paused protected agent's on-demand wake flag");
+  }
+}
+
 function jsonEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function buildConfigSnapshot(
+export function buildConfigSnapshot(
   row: Pick<typeof agents.$inferSelect, ConfigRevisionField>,
 ): AgentConfigSnapshot {
   const adapterConfig =
@@ -260,7 +327,7 @@ function normalizeRuntimeConfigForNewAgent(runtimeConfig: unknown): Record<strin
   return normalizedRuntimeConfig;
 }
 
-function diffConfigSnapshot(
+export function diffConfigSnapshot(
   before: AgentConfigSnapshot,
   after: AgentConfigSnapshot,
 ): string[] {
@@ -788,14 +855,22 @@ export function agentService(db: Db) {
       : null;
 
     const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
-    const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
-      const current = data.status !== undefined
+      const current = shouldRecordRevision || data.status !== undefined || normalizedPatch.permissions !== undefined || normalizedPatch.runtimeConfig !== undefined
         ? await txDb.select().from(agents).where(eq(agents.id, id)).for("update").then(rows => rows[0] ?? null)
         : existing;
       if (!current) return null;
+      const beforeConfig = shouldRecordRevision
+        ? buildConfigSnapshot(current)
+        : null;
+      // Revision restore keeps the live scoped control from the locked row.
+      // An earlier read could overwrite a concurrent board PATCH.
+      const effectivePatch = options?.preserveScopedWakeOnRollback
+        ? { ...normalizedPatch, runtimeConfig: preserveCurrentWakeOnRollback(current, normalizedPatch.runtimeConfig) }
+        : normalizedPatch;
+      assertScopedContinuityFlagsPreserved(current, effectivePatch.permissions, effectivePatch.runtimeConfig);
       if (current.status === "terminated" && data.status && data.status !== "terminated") {
         throw conflict("Terminated agents cannot be resumed");
       }
@@ -804,7 +879,7 @@ export function agentService(db: Db) {
       }
       const updated = await txDb
         .update(agents)
-        .set({ ...normalizedPatch, updatedAt: new Date() })
+        .set({ ...effectivePatch, updatedAt: sql`greatest(clock_timestamp(), ${agents.updatedAt} + interval '1 microsecond')` })
         .where(eq(agents.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -867,7 +942,9 @@ export function agentService(db: Db) {
       }
 
       if (shouldRecordRevision && beforeConfig) {
-        const afterConfig = buildConfigSnapshot(normalizedUpdated);
+        // Compare persisted rows on both sides; API appearance fallbacks are
+        // presentation values, not changes made by this write.
+        const afterConfig = buildConfigSnapshot(updated);
         const changedKeys = diffConfigSnapshot(beforeConfig, afterConfig);
         if (changedKeys.length > 0) {
           await txDb.insert(agentConfigRevisions).values({
@@ -1220,27 +1297,44 @@ export function agentService(db: Db) {
     },
 
     updatePermissions: async (id: string, permissions: Record<string, unknown> & { canCreateAgents: boolean }) => {
-      const existing = await getById(id);
-      if (!existing) return null;
-      if (existing.status === "pending_approval") {
-        throw conflict("Pending approval agent permissions cannot be changed before board approval", {
-          code: "pending_approval_agent_config_frozen",
-          agentId: id,
-          fields: ["permissions"],
-        });
-      }
-
-      const updated = await db
-        .update(agents)
-        .set({
-          permissions: normalizeAgentPermissions({ ...existing.permissions, ...permissions }),
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-
-      return updated ? getById(updated.id) : null;
+      const updatedId = await db.transaction(async (tx) => {
+        const [current] = await tx.select().from(agents).where(eq(agents.id, id)).for("update");
+        if (!current) return null;
+        if (current.status === "pending_approval") {
+          throw conflict("Pending approval agent permissions cannot be changed before board approval", {
+            code: "pending_approval_agent_config_frozen",
+            agentId: id,
+            fields: ["permissions"],
+          });
+        }
+        let nextPermissions = normalizeAgentPermissions({ ...current.permissions, ...permissions });
+        // A partial authorizationPolicy replaces that top-level JSON member.
+        // Retain the live scoped flag when the caller did not name it; an
+        // explicit different value still fails the guarded comparison below.
+        if (scopedContinuityEligible(current) &&
+            nestedValue(nextPermissions, ["authorizationPolicy", "protectedAgent", "blockAssignment"]) === undefined) {
+          const policy = isPlainRecord(nextPermissions.authorizationPolicy) ? nextPermissions.authorizationPolicy : {};
+          const protectedAgent = isPlainRecord(policy.protectedAgent) ? policy.protectedAgent : {};
+          nextPermissions = {
+            ...nextPermissions,
+            authorizationPolicy: {
+              ...policy,
+              protectedAgent: {
+                ...protectedAgent,
+                blockAssignment: nestedValue(current.permissions,
+                  ["authorizationPolicy", "protectedAgent", "blockAssignment"]),
+              },
+            },
+          } as typeof nextPermissions;
+        }
+        assertScopedContinuityFlagsPreserved(current, nextPermissions);
+        const [updated] = await tx.update(agents).set({
+          permissions: nextPermissions,
+          updatedAt: sql`greatest(clock_timestamp(), ${agents.updatedAt} + interval '1 microsecond')`,
+        }).where(eq(agents.id, id)).returning({ id: agents.id });
+        return updated?.id ?? null;
+      });
+      return updatedId ? getById(updatedId) : null;
     },
 
     listConfigRevisions: async (id: string) =>
@@ -1274,6 +1368,7 @@ export function agentService(db: Db) {
 
       const patch = configPatchFromSnapshot(revision.afterConfig);
       return updateAgent(id, patch, {
+        preserveScopedWakeOnRollback: true,
         recordRevision: {
           createdByAgentId: actor.agentId ?? null,
           createdByUserId: actor.userId ?? null,

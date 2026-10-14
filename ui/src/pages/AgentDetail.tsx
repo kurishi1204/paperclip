@@ -33,6 +33,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { copyTextToClipboard } from "../lib/clipboard";
 import { AgentSkillsTab } from "./agent-skills/AgentSkillsTab";
 import { AgentConfigForm } from "../components/AgentConfigForm";
+import { AgentContinuityControlsPanel } from "../components/AgentContinuityControlsPanel";
 import { getAdapterDisplay } from "../adapters/adapter-display-registry";
 import { adapterLabels, roleLabels, help } from "../components/agent-config-primitives";
 import { ToggleSwitch } from "@/components/ui/toggle-switch";
@@ -1024,10 +1025,11 @@ export function AgentDetail() {
   const updatePermissions = useMutation({
     mutationFn: (permissions: AgentPermissionUpdate) =>
       agentsApi.updatePermissions(agentLookupRef, permissions, resolvedCompanyId ?? undefined),
-    onSuccess: () => {
+    onSuccess: (updated) => {
       setActionError(null);
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(routeAgentRef) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agentLookupRef) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.continuityControls(updated.id) });
       if (resolvedCompanyId) {
         queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(resolvedCompanyId) });
       }
@@ -1905,6 +1907,7 @@ export function AgentRevisionsTab({
     onSuccess: (updated) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.configRevisions(agent.id) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.continuityControls(agent.id) });
       if (!syncAgentRouteAfterRename(queryClient, navigate, agent, updated, "revisions")) {
         queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.urlKey) });
       }
@@ -2017,8 +2020,13 @@ export function ConfigurationTab({
       setAwaitingRefreshAfterSave(true);
     },
     onSuccess: (updated) => {
+      queryClient.setQueriesData<Agent>({
+        queryKey: ["agents", "detail"],
+        predicate: query => (query.state.data as Agent | undefined)?.id === updated.id,
+      }, previous => previous ? { ...previous, ...updated } : previous);
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.configRevisions(agent.id) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.continuityControls(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(agent.companyId) });
       if (!syncAgentRouteAfterRename(queryClient, navigate, agent, updated, urlTab ?? content)) {
         queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.urlKey) });
@@ -2077,6 +2085,7 @@ export function ConfigurationTab({
   return (
     <div className="agent-settings-form space-y-6">
       {content !== "permissions" ? <AgentConfigForm
+        continuityControlsTab="Permissions"
         mode="edit"
         agent={agent}
         onSave={(patch) => updateAgent.mutateAsync(patch)}
@@ -2097,6 +2106,12 @@ export function ConfigurationTab({
         canConfigureProviderTrace={canConfigureProviderTrace}
       /> : null}
 
+
+      {content === "permissions" && agent.status === "paused"
+        && agent.permissions.authorizationPolicy?.assignmentPolicy?.mode === "protected" ? (
+        <AgentContinuityControlsPanel agentId={agent.id} companyId={companyId ?? agent.companyId}
+          onDirtyChange={onDirtyChange} onSaveActionChange={onSaveActionChange} onCancelActionChange={onCancelActionChange} />
+      ) : null}
 
       {content === "permissions" ? <TrustPresetSection
         permissions={agent.permissions}

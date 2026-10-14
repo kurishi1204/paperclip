@@ -33,6 +33,8 @@ import type {
   HeartbeatRun,
   Approval,
   AgentConfigRevision,
+  AgentContinuityControls,
+  AgentContinuityControlsPatch,
   ClearAgentErrorResponse,
   AgentApiKeyScope,
 } from "@paperclipai/shared";
@@ -147,6 +149,10 @@ export const agentsApi = {
   },
   getConfiguration: (id: string, companyId?: string) =>
     api.get<Record<string, unknown>>(agentPath(id, companyId, "/configuration")),
+  getContinuityControls: (id: string, companyId?: string) =>
+    api.get<AgentContinuityControls>(agentPath(id, companyId, "/continuity-controls")),
+  patchContinuityControls: (id: string, patch: AgentContinuityControlsPatch, companyId?: string) =>
+    api.patch<AgentContinuityControls>(agentPath(id, companyId, "/continuity-controls"), patch),
   listConfigRevisions: (id: string, companyId?: string) =>
     api.get<AgentConfigRevision[]>(agentPath(id, companyId, "/config-revisions")),
   getConfigRevision: (id: string, revisionId: string, companyId?: string) =>

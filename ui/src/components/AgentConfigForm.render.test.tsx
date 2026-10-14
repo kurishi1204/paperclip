@@ -35,6 +35,7 @@ const mockAgentsApi = vi.hoisted(() => ({
   completeClaudeSetupTokenLogin: vi.fn(),
   cancelClaudeSetupTokenLogin: vi.fn(),
   getClaudeOAuthTokenStatus: vi.fn(),
+  getContinuityControls: vi.fn(),
 }));
 
 // The default resume read for a test that does not exercise resume: no active
@@ -740,6 +741,38 @@ describe("AgentConfigForm environment selector", () => {
     roots = [];
     document.body.innerHTML = "";
     vi.clearAllMocks();
+  });
+
+  it("preserves drafts on unrelated refreshes and confirms only the successful save despite normalized data", async () => {
+    const dirty = vi.fn(); let refresh: (agent: Agent) => void = () => {};
+    let save: (() => void) | null = null; let release: () => void = () => {};
+    const onSave = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    const container = document.createElement("div"); document.body.appendChild(container);
+    const root = createRoot(container); roots.push(root);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    function Harness() {
+      const [agent, setAgent] = useState(makeAgent()); refresh = setAgent;
+      return <AgentConfigForm mode="edit" agent={agent} onSave={onSave}
+        onDirtyChange={dirty} onSaveActionChange={action => { save = action; }} hideInlineSave
+        hidePromptTemplate showAdapterTypeField={false} />;
+    }
+    await act(async () => root.render(<QueryClientProvider client={client}><ToastProvider><TooltipProvider>
+      <Harness />
+    </TooltipProvider></ToastProvider></QueryClientProvider>));
+    await flushReact();
+    const input = () => container.querySelector<HTMLInputElement>('input[placeholder="Agent name"]')!;
+    await act(async () => setInputValue(input(), "Pending rename"));
+    await act(async () => refresh(makeAgent({ runtimeConfig: { heartbeat: { wakeOnDemand: true } }, updatedAt: new Date(1) })));
+    await flushReact(); expect(input().value).toBe("Pending rename"); expect(dirty).toHaveBeenLastCalledWith(true);
+    let pending: unknown;
+    await act(async () => { pending = save?.(); });
+    await act(async () => refresh(makeAgent({ name: "Server-normalized", updatedAt: new Date(2) })));
+    await flushReact(); expect(input().value).toBe("Pending rename"); expect(dirty).toHaveBeenLastCalledWith(true);
+    await act(async () => { release(); await pending; });
+    await flushReact(); expect(input().value).toBe("Server-normalized"); expect(dirty).toHaveBeenLastCalledWith(false);
+    await act(async () => setInputValue(input(), "Another pending edit"));
+    await act(async () => refresh(makeAgent({ id: "agent-2", name: "Other agent" })));
+    await flushReact(); expect(input().value).toBe("Other agent"); expect(dirty).toHaveBeenLastCalledWith(false);
   });
 
   it("promotes environment drafts through the page Save action and discards them through the page Discard action", async () => {
@@ -2225,8 +2258,8 @@ describe("AgentConfigForm environment selector", () => {
       version: "latest",
     });
 
-    // Both saves land, and the page refreshes the agent with the persisted
-    // binding — the same adapter config the bind save sent.
+    // Both saves land. The server merges the ordinary name patch with the
+    // binding patch, which never wrote a name; its refreshed name is the saved rename.
     await act(async () => {
       for (const release of releaseSaves) release();
     });
@@ -2236,13 +2269,13 @@ describe("AgentConfigForm environment selector", () => {
         makeAgent({
           defaultEnvironmentId: "sandbox-1",
           adapterConfig: persistedPatch.adapterConfig as Record<string, unknown>,
+          name: racingPatch.name as string,
         }),
       );
     });
     await flushReact();
 
-    // The rename survives the refresh instead of reverting to the refreshed
-    // agent's name.
+    // The successfully saved rename is visible in the actual server state.
     expect(
       container.querySelector<HTMLInputElement>('input[placeholder="Agent name"]')!.value,
     ).toBe("Renamed during bind");
@@ -3399,6 +3432,58 @@ describe("AgentConfigForm environment selector", () => {
 
     expect(result.container.textContent).toContain("Authenticated");
     expect(result.container.textContent).not.toContain("sk-ant-SECRET-TOKEN");
+  });
+
+  it("routes an eligible paused protected agent's wake change to scoped controls", async () => {
+    mockAgentsApi.getContinuityControls.mockResolvedValue({ id: "agent-1", eligible: true });
+    const result = await renderForm([], {
+      status: "paused",
+      permissions: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } } as Agent["permissions"],
+    });
+    roots.push(result.root);
+    await clickByText(result.container, "Advanced Run Policy");
+
+    await flushUntil(() => (result.container.textContent ?? "").includes("Use Paused agent continuity controls"));
+    expect(result.container.textContent).toContain("Use Paused agent continuity controls");
+    expect(result.container.querySelector('[data-testid="general-wake-on-demand"]')).toBeNull();
+    expect(mockAgentsApi.getContinuityControls).toHaveBeenCalledWith("agent-1", "company-1");
+  });
+
+  it("keeps the general wake control available when scoped controls are ineligible", async () => {
+    mockAgentsApi.getContinuityControls.mockResolvedValue({ id: "agent-1", eligible: false });
+    const result = await renderForm([], {
+      status: "paused",
+      permissions: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } } as Agent["permissions"],
+    });
+    roots.push(result.root);
+    await clickByText(result.container, "Advanced Run Policy");
+
+    await flushUntil(() => result.container.querySelector('[data-testid="general-wake-on-demand"]') !== null);
+    expect(result.container.textContent).not.toContain("Use Paused agent continuity controls");
+  });
+
+  it("shows a failed eligibility read and enables wake editing only after a successful retry", async () => {
+    mockAgentsApi.getContinuityControls.mockReset();
+    mockAgentsApi.getContinuityControls
+      .mockRejectedValueOnce(new Error("temporary read failure"))
+      .mockResolvedValueOnce({ id: "agent-1", eligible: false });
+    const result = await renderForm([], {
+      status: "paused",
+      permissions: { authorizationPolicy: { assignmentPolicy: { mode: "protected" } } } as Agent["permissions"],
+    });
+    roots.push(result.root);
+
+    await flushUntil(() => (result.container.textContent ?? "").includes("Could not read paused agent continuity controls"));
+    expect(result.container.textContent).toContain("Could not read paused agent continuity controls");
+    expect(result.container.querySelector('[role="alert"]')?.textContent).toContain("Retry continuity read");
+    await clickByText(result.container, "Advanced Run Policy");
+    const toggle = result.container.querySelector<HTMLButtonElement>('[data-testid="general-wake-on-demand"]');
+    expect(toggle?.disabled).toBe(true);
+
+    await clickByText(result.container, "Retry continuity read");
+    await flushUntil(() => result.container.querySelector<HTMLButtonElement>('[data-testid="general-wake-on-demand"]')?.disabled === false);
+    expect(result.container.querySelector<HTMLButtonElement>('[data-testid="general-wake-on-demand"]')?.disabled).toBe(false);
+    expect(mockAgentsApi.getContinuityControls).toHaveBeenCalledTimes(2);
   });
 });
 

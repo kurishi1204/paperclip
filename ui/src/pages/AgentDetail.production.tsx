@@ -32,6 +32,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { copyTextToClipboard } from "../lib/clipboard";
 import { AgentSkillsTab } from "./agent-skills/AgentSkillsTab";
 import { AgentConfigForm } from "../components/AgentConfigForm";
+import { AgentContinuityControlsPanel } from "../components/AgentContinuityControlsPanel";
 import { PageTabBar } from "../components/PageTabBar";
 import { adapterLabels, roleLabels, help } from "../components/agent-config-primitives";
 import { ToggleSwitch } from "@/components/ui/toggle-switch";
@@ -1053,10 +1054,11 @@ export function AgentDetail() {
   const updatePermissions = useMutation({
     mutationFn: (permissions: AgentPermissionUpdate) =>
       agentsApi.updatePermissions(agentLookupRef, permissions, resolvedCompanyId ?? undefined),
-    onSuccess: () => {
+    onSuccess: (updated) => {
       setActionError(null);
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(routeAgentRef) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agentLookupRef) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.continuityControls(updated.id) });
       if (resolvedCompanyId) {
         queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(resolvedCompanyId) });
       }
@@ -1991,6 +1993,7 @@ function AgentConfigurePage({
     onSuccess: (updated) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.configRevisions(agent.id) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.continuityControls(agent.id) });
       if (!syncAgentRouteAfterRename(queryClient, navigate, agent, updated, urlTab ?? "configuration")) {
         queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.urlKey) });
       }
@@ -2099,6 +2102,31 @@ function ConfigurationTab({
   const { tab: urlTab } = useParams<{ tab?: string }>();
   const { pushToast } = useToastActions();
   const [awaitingRefreshAfterSave, setAwaitingRefreshAfterSave] = useState(false);
+  const [configurationDirty, setConfigurationDirty] = useState(false);
+  const [continuityDirty, setContinuityDirty] = useState(false);
+  const [continuityCanSave, setContinuityCanSave] = useState(false);
+  const draftActions = useRef<{ configurationSave: (() => void) | null; continuitySave: (() => void) | null;
+    configurationCancel: (() => void) | null; continuityCancel: (() => void) | null }>(
+    { configurationSave: null, continuitySave: null, configurationCancel: null, continuityCancel: null });
+  const reportConfigurationDirty = useCallback((dirty: boolean) => setConfigurationDirty(dirty), []);
+  const registerConfigurationSave = useCallback((action: (() => void) | null) => { draftActions.current.configurationSave = action; }, []);
+  const registerConfigurationCancel = useCallback((action: (() => void) | null) => { draftActions.current.configurationCancel = action; }, []);
+  const registerContinuitySave = useCallback((action: (() => void) | null) => {
+    draftActions.current.continuitySave = action;
+    setContinuityCanSave(action !== null);
+  }, []);
+  const registerContinuityCancel = useCallback((action: (() => void) | null) => { draftActions.current.continuityCancel = action; }, []);
+  useEffect(() => { onDirtyChange(configurationDirty || continuityDirty); }, [configurationDirty, continuityDirty, onDirtyChange]);
+  useEffect(() => {
+    onSaveActionChange(configurationDirty ? () => draftActions.current.configurationSave?.()
+      : continuityDirty && continuityCanSave ? () => draftActions.current.continuitySave?.() : null);
+    onCancelActionChange(configurationDirty || continuityDirty ? () => {
+      draftActions.current.configurationCancel?.(); draftActions.current.continuityCancel?.();
+    } : null);
+  }, [configurationDirty, continuityDirty, continuityCanSave, onSaveActionChange, onCancelActionChange]);
+  useEffect(() => () => {
+    onDirtyChange(false); onSaveActionChange(null); onCancelActionChange(null);
+  }, [onDirtyChange, onSaveActionChange, onCancelActionChange]);
   const lastAgentRef = useRef(agent);
 
   const catalogProvider = agent.adapterType === "paperclip_runner" ? String(agent.adapterConfig.provider ?? "codex") : undefined;
@@ -2133,8 +2161,13 @@ function ConfigurationTab({
       setAwaitingRefreshAfterSave(true);
     },
     onSuccess: (updated) => {
+      queryClient.setQueriesData<Agent>({
+        queryKey: ["agents", "detail"],
+        predicate: query => (query.state.data as Agent | undefined)?.id === updated.id,
+      }, previous => previous ? { ...previous, ...updated } : previous);
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.configRevisions(agent.id) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.continuityControls(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(agent.companyId) });
       if (!syncAgentRouteAfterRename(queryClient, navigate, agent, updated, urlTab ?? content)) {
         queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.urlKey) });
@@ -2191,9 +2224,9 @@ function ConfigurationTab({
         onSave={(patch) => updateAgent.mutateAsync(patch)}
         isSaving={isConfigSaving}
         adapterModels={adapterModels}
-        onDirtyChange={onDirtyChange}
-        onSaveActionChange={onSaveActionChange}
-        onCancelActionChange={onCancelActionChange}
+        onDirtyChange={reportConfigurationDirty}
+        onSaveActionChange={registerConfigurationSave}
+        onCancelActionChange={registerConfigurationCancel}
         hideInlineSave
         hidePromptTemplate={hidePromptTemplate}
         hideInstructionsFile={hideInstructionsFile}
@@ -2204,6 +2237,12 @@ function ConfigurationTab({
         <p className="text-xs text-muted-foreground">
           Saved adapter config affects the next run. Active runs keep the config they started with, and config changes may start a fresh adapter session.
         </p>
+      ) : null}
+
+      {content === "configuration" && agent.status === "paused"
+        && agent.permissions.authorizationPolicy?.assignmentPolicy?.mode === "protected" ? (
+        <AgentContinuityControlsPanel agentId={agent.id} companyId={companyId ?? agent.companyId} configurationBusy={configurationDirty || isConfigSaving}
+          onDirtyChange={setContinuityDirty} onSaveActionChange={registerContinuitySave} onCancelActionChange={registerContinuityCancel} />
       ) : null}
 
       {content === "configuration" ? <TrustPresetSection

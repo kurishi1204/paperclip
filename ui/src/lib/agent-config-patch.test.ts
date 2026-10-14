@@ -59,6 +59,50 @@ function makeOverlay(patch?: Partial<AgentConfigOverlay>): AgentConfigOverlay {
 }
 
 describe("buildAgentUpdatePatch", () => {
+  it("preserves current runtime fields when only the connection changes", () => {
+    const agent = makeAgent();
+    const patch = buildAgentUpdatePatch(agent, makeOverlay({
+      runtime: { runtimeConfig: { aiConnection: { connectionId: "connection-2" } } },
+    }));
+    expect(patch.runtimeConfig).toEqual({
+      ...agent.runtimeConfig, aiConnection: { connectionId: "connection-2" },
+    });
+  });
+  it("clears a connection without clearing heartbeat settings", () => {
+    const agent = makeAgent();
+    agent.runtimeConfig = { ...agent.runtimeConfig, aiConnection: { mode: "router", connectionId: "old" } };
+    const patch = buildAgentUpdatePatch(agent, makeOverlay({
+      runtime: { runtimeConfig: { aiConnection: undefined } },
+    }));
+    expect(patch.runtimeConfig).toEqual({ heartbeat: agent.runtimeConfig.heartbeat });
+  });
+  it.each([
+    { heartbeat: { enabled: false }, debug: {} },
+    { heartbeat: {}, debug: { providerTrace: "raw" } },
+  ])("keeps a connection cleared when saving other runtime edits: %j", (edits) => {
+    const agent = makeAgent();
+    agent.runtimeConfig = { ...agent.runtimeConfig, aiConnection: { mode: "router", connectionId: "old" } };
+    const patch = buildAgentUpdatePatch(agent, makeOverlay({
+      runtime: { runtimeConfig: { aiConnection: undefined } }, ...edits,
+    }));
+    expect(patch.runtimeConfig).not.toHaveProperty("aiConnection");
+    expect(patch.runtimeConfig).toMatchObject({ heartbeat: {
+      ...(agent.runtimeConfig.heartbeat as Record<string, unknown>), ...edits.heartbeat,
+    } });
+  });
+  it("keeps heartbeat and debug edits when a connection changes in the same save", () => {
+    const agent = makeAgent();
+    const patch = buildAgentUpdatePatch(agent, makeOverlay({
+      runtime: { runtimeConfig: { ...agent.runtimeConfig, aiConnection: { connectionId: "connection-2" } } },
+      heartbeat: { enabled: false },
+      debug: { providerTrace: "raw" },
+    }));
+    expect(patch).toMatchObject({ runtimeConfig: {
+      aiConnection: { connectionId: "connection-2" },
+      heartbeat: { enabled: false, intervalSec: 300 },
+      debug: { providerTrace: "raw" },
+    } });
+  });
   it("merges the agent-scoped provider trace debug setting into runtime config", () => {
     const patch = buildAgentUpdatePatch(
       makeAgent(),
