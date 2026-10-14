@@ -180,9 +180,8 @@ function assertScopedContinuityFlagsPreserved(
   nextRuntimeConfig?: unknown,
 ) {
   // A scoped update has an updatedAt precondition. General edit forms do not,
-  // so a stale full-object save must not undo either scoped flag, even when it
-  // would tighten the policy. Ineligible agents retain the safety-tightening
-  // route through general edit.
+  // so an eligible agent's stale full-object save must not undo either scoped
+  // flag. Ineligible agents have no scoped route and keep their general edit.
   if (current.status !== "paused" ||
       nestedValue(current.permissions, ["authorizationPolicy", "assignmentPolicy", "mode"]) !== "protected") return;
   const blockPath = ["authorizationPolicy", "protectedAgent", "blockAssignment"];
@@ -201,12 +200,11 @@ function assertScopedContinuityFlagsPreserved(
     && nestedValue(current.permissions, ["canCreateAgents"]) !== true
     && (legacyProtectedApproval === undefined || legacyProtectedApproval === false)
     && (legacyAssignmentApproval === undefined || legacyAssignmentApproval === false);
-  if (nextPermissions !== undefined && nextBlock !== nestedValue(current.permissions, blockPath)
-      && (scopedEligible || nextBlock !== true)) {
+  if (!scopedEligible) return;
+  if (nextPermissions !== undefined && nextBlock !== nestedValue(current.permissions, blockPath)) {
     throw conflict("Use scoped continuity controls to change a paused protected agent's assignment block");
   }
-  if (nextRuntimeConfig !== undefined && nextWake !== nestedValue(current.runtimeConfig, wakePath)
-      && (scopedEligible || nextWake !== false)) {
+  if (nextRuntimeConfig !== undefined && nextWake !== nestedValue(current.runtimeConfig, wakePath)) {
     throw conflict("Use scoped continuity controls to change a paused protected agent's on-demand wake flag");
   }
 }
@@ -853,12 +851,12 @@ export function agentService(db: Db) {
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
-      const current = data.status !== undefined || normalizedPatch.permissions !== undefined || normalizedPatch.runtimeConfig !== undefined
+      const current = shouldRecordRevision || data.status !== undefined || normalizedPatch.permissions !== undefined || normalizedPatch.runtimeConfig !== undefined
         ? await txDb.select().from(agents).where(eq(agents.id, id)).for("update").then(rows => rows[0] ?? null)
         : existing;
       if (!current) return null;
       const beforeConfig = shouldRecordRevision
-        ? buildConfigSnapshot(options?.preserveScopedWakeOnRollback ? current : existing)
+        ? buildConfigSnapshot(current)
         : null;
       // Revision restore keeps the live scoped control from the locked row.
       // An earlier read could overwrite a concurrent board PATCH.

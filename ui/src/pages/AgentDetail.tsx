@@ -1025,10 +1025,11 @@ export function AgentDetail() {
   const updatePermissions = useMutation({
     mutationFn: (permissions: AgentPermissionUpdate) =>
       agentsApi.updatePermissions(agentLookupRef, permissions, resolvedCompanyId ?? undefined),
-    onSuccess: () => {
+    onSuccess: (updated) => {
       setActionError(null);
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(routeAgentRef) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agentLookupRef) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.continuityControls(updated.id) });
       if (resolvedCompanyId) {
         queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(resolvedCompanyId) });
       }

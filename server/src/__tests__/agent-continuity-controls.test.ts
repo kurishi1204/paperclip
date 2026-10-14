@@ -131,6 +131,58 @@ describeDb("agent continuity controls", () => {
     });
   });
 
+  it("records the live scoped wake in a rollback racing with a scoped patch", async () => {
+    const f = await seed();
+    const safeRuntime = { heartbeat: f.runtimeConfig.heartbeat, unrelated: "keep" };
+    await db.update(agents).set({ adapterConfig: {}, runtimeConfig: safeRuntime })
+      .where(eq(agents.id, f.agentId));
+    const service = agentService(db);
+    const historic = { ...safeRuntime, unrelated: "historic" };
+    await service.update(f.agentId, { runtimeConfig: historic },
+      { recordRevision: { source: "test" } });
+    const [sourceRevision] = await service.listConfigRevisions(f.agentId);
+    await service.update(f.agentId, { runtimeConfig: { ...historic, unrelated: "current" } });
+
+    let enterTransaction!: () => void;
+    let releaseTransaction!: () => void;
+    const entered = new Promise<void>((resolve) => { enterTransaction = resolve; });
+    const release = new Promise<void>((resolve) => { releaseTransaction = resolve; });
+    const wrappedDb = new Proxy(db, {
+      get(target, key, receiver) {
+        if (key === "transaction") {
+          return async (callback: Parameters<typeof db.transaction>[0]) => target.transaction(async (tx) => {
+            enterTransaction();
+            await release;
+            return callback(tx);
+          });
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const pending = agentService(wrappedDb).rollbackConfigRevision(
+      f.agentId, sourceRevision.id, { userId: "board-user" });
+    try {
+      await entered; // Rollback read the historic snapshot before the scoped write.
+      const before = await agentContinuityControls(db).get(f.agentId);
+      await agentContinuityControls(db).patch(f.agentId, {
+        expectedUpdatedAt: before!.updatedAt, blockAssignment: false, wakeOnDemand: true,
+      }, "board-user", f.companyId);
+    } finally {
+      releaseTransaction();
+    }
+    await expect(pending).resolves.not.toBeNull();
+    const revisions = await db.select().from(agentConfigRevisions)
+      .where(eq(agentConfigRevisions.agentId, f.agentId));
+    const rollback = revisions.find((item) => item.source === "rollback");
+    expect(rollback?.changedKeys).toContain("runtimeConfig");
+    for (const snapshot of [rollback!.beforeConfig, rollback!.afterConfig]) {
+      expect((snapshot.runtimeConfig as { heartbeat: { wakeOnDemand: boolean } })
+        .heartbeat.wakeOnDemand).toBe(true);
+    }
+    const [stored] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(stored!.runtimeConfig).toMatchObject({ heartbeat: { wakeOnDemand: true }, unrelated: "historic" });
+  });
+
   it("rejects active agents without changing their config", async () => {
     const f = await seed("active");
     const svc = agentContinuityControls(db);
@@ -184,6 +236,68 @@ describeDb("agent continuity controls", () => {
     expect(stored!.runtimeConfig).toMatchObject({ heartbeat: {
       enabled: true, wakeOnDemand: false,
     } });
+  });
+
+  it("keeps general edits available when a paused agent is ineligible for scoped controls", async () => {
+    const f = await seed();
+    const runtimeConfig = structuredClone(f.runtimeConfig);
+    runtimeConfig.heartbeat.enabled = true;
+    await db.update(agents).set({ runtimeConfig }).where(eq(agents.id, f.agentId));
+    expect(await agentContinuityControls(db).get(f.agentId)).toMatchObject({ eligible: false });
+
+    const permissions = structuredClone(f.permissions);
+    permissions.authorizationPolicy.protectedAgent.blockAssignment = false;
+    runtimeConfig.heartbeat.wakeOnDemand = true;
+    await expect(agentService(db).update(f.agentId, { permissions, runtimeConfig }))
+      .resolves.not.toBeNull();
+    const [stored] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(stored!.permissions).toMatchObject({ authorizationPolicy: {
+      protectedAgent: { blockAssignment: false },
+    } });
+    expect(stored!.runtimeConfig).toMatchObject({ heartbeat: {
+      enabled: true, wakeOnDemand: true,
+    } });
+  });
+
+  it("attributes a general config revision only to changes made after the scoped patch", async () => {
+    const f = await seed();
+    let enterTransaction!: () => void;
+    let releaseTransaction!: () => void;
+    const entered = new Promise<void>((resolve) => { enterTransaction = resolve; });
+    const release = new Promise<void>((resolve) => { releaseTransaction = resolve; });
+    const wrappedDb = new Proxy(db, {
+      get(target, key, receiver) {
+        if (key === "transaction") {
+          return async (callback: Parameters<typeof db.transaction>[0]) => target.transaction(async (tx) => {
+            enterTransaction();
+            await release;
+            return callback(tx);
+          });
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const pending = agentService(wrappedDb).update(f.agentId, { name: "Renamed" },
+      { recordRevision: { source: "test" } });
+    try {
+      await entered; // The general edit has already read the pre-patch row.
+      const before = await agentContinuityControls(db).get(f.agentId);
+      await agentContinuityControls(db).patch(f.agentId, {
+        expectedUpdatedAt: before!.updatedAt, blockAssignment: false, wakeOnDemand: true,
+      }, "board-user", f.companyId);
+    } finally {
+      releaseTransaction();
+    }
+    await expect(pending).resolves.not.toBeNull();
+    const revisions = await db.select().from(agentConfigRevisions)
+      .where(eq(agentConfigRevisions.agentId, f.agentId));
+    const revision = revisions.find((item) => item.source === "test");
+    expect(revision?.changedKeys).toContain("name");
+    expect(revision?.changedKeys).not.toContain("runtimeConfig");
+    expect((revision!.beforeConfig.runtimeConfig as { heartbeat: { wakeOnDemand: boolean } })
+      .heartbeat.wakeOnDemand).toBe(true);
+    expect((revision!.afterConfig.runtimeConfig as { heartbeat: { wakeOnDemand: boolean } })
+      .heartbeat.wakeOnDemand).toBe(true);
   });
 
   it("rechecks a stale general update after a concurrent scoped patch commits", async () => {
