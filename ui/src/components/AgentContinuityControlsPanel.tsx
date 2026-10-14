@@ -32,8 +32,8 @@ function draftFrom(current: AgentContinuityControls): Draft | null {
 }
 
 /** Keeps the sensitive general agent configuration out of this two-flag UI. */
-export function AgentContinuityControlsPanel({ agentId, companyId }: {
-  agentId: string; companyId: string;
+export function AgentContinuityControlsPanel({ agentId, companyId, configurationBusy = false }: {
+  agentId: string; companyId: string; configurationBusy?: boolean;
 }) {
   const queryClient = useQueryClient();
   const { pushToast } = useToastActions();
@@ -58,6 +58,7 @@ export function AgentContinuityControlsPanel({ agentId, companyId }: {
   const save = useMutation({
     mutationFn: async () => {
       const current = controls.data;
+      if (configurationBusy) throw new Error("Save or discard configuration edits first");
       if (!current || current.canManage !== true || !draft) throw new Error("Read the continuity controls again");
       if (current.updatedAt !== draft.expectedUpdatedAt) {
         throw new Error("Agent controls changed; reload them before saving");
@@ -103,7 +104,11 @@ export function AgentContinuityControlsPanel({ agentId, companyId }: {
         </p>
       </div>
       {controls.isLoading ? <p className="text-sm text-muted-foreground">Loading controls...</p> : null}
-      {controls.isError ? <p className="text-sm text-destructive">Could not read these controls.</p> : null}
+      {controls.isError ? <div className="space-y-2">
+        <p className="text-sm text-destructive">Could not read these controls.</p>
+        <Button type="button" disabled={controls.isFetching} onClick={() => void controls.refetch()}>Retry reading controls</Button>
+      </div> : null}
+      {configurationBusy ? <p className="text-sm text-muted-foreground">Save or discard configuration edits before saving continuity controls.</p> : null}
       {current && !eligible ? <p className="text-sm text-muted-foreground">This agent is not eligible for scoped continuity changes.</p> : null}
       {stale ? <div className="space-y-2 text-sm" role="status">
         <p>These controls changed while you were editing. Your choices are preserved; reload before saving.</p>
@@ -126,7 +131,7 @@ export function AgentContinuityControlsPanel({ agentId, companyId }: {
         <p className="text-xs text-muted-foreground">
           Clearing the block still requires a separate assignment grant and an explicit operator action.
         </p>
-        <Button type="button" disabled={!canManage || !changed || stale || save.isPending} onClick={() => save.mutate()}>
+        <Button type="button" disabled={configurationBusy || !canManage || !changed || stale || save.isPending} onClick={() => save.mutate()}>
           {save.isPending ? "Saving..." : "Save continuity controls"}
         </Button>
       </> : null}

@@ -2102,6 +2102,11 @@ function ConfigurationTab({
   const { tab: urlTab } = useParams<{ tab?: string }>();
   const { pushToast } = useToastActions();
   const [awaitingRefreshAfterSave, setAwaitingRefreshAfterSave] = useState(false);
+  const [configurationDirty, setConfigurationDirty] = useState(false);
+  const reportConfigurationDirty = useCallback((dirty: boolean) => {
+    setConfigurationDirty(dirty);
+    onDirtyChange(dirty);
+  }, [onDirtyChange]);
   const lastAgentRef = useRef(agent);
 
   const catalogProvider = agent.adapterType === "paperclip_runner" ? String(agent.adapterConfig.provider ?? "codex") : undefined;
@@ -2195,7 +2200,7 @@ function ConfigurationTab({
         onSave={(patch) => updateAgent.mutateAsync(patch)}
         isSaving={isConfigSaving}
         adapterModels={adapterModels}
-        onDirtyChange={onDirtyChange}
+        onDirtyChange={reportConfigurationDirty}
         onSaveActionChange={onSaveActionChange}
         onCancelActionChange={onCancelActionChange}
         hideInlineSave
@@ -2212,7 +2217,7 @@ function ConfigurationTab({
 
       {content === "configuration" && agent.status === "paused"
         && agent.permissions.authorizationPolicy?.assignmentPolicy?.mode === "protected" ? (
-        <AgentContinuityControlsPanel agentId={agent.id} companyId={companyId ?? agent.companyId} />
+        <AgentContinuityControlsPanel agentId={agent.id} companyId={companyId ?? agent.companyId} configurationBusy={configurationDirty || isConfigSaving} />
       ) : null}
 
       {content === "configuration" ? <TrustPresetSection

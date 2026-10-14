@@ -136,4 +136,45 @@ describe("AgentContinuityControlsPanel", () => {
       .toBe("false");
     expect(container.textContent).not.toContain("Your choices are preserved");
   });
+  it("blocks scoped saves while configuration edits or their save are pending", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    const render = (configurationBusy: boolean) => root.render(<QueryClientProvider client={client}>
+      <AgentContinuityControlsPanel agentId="agent-1" companyId="company-1" configurationBusy={configurationBusy} />
+    </QueryClientProvider>);
+    await act(async () => render(true));
+    await flush();
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Wake on demand"]')?.click());
+    const save = () => Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("Save continuity controls"));
+    expect(save()?.disabled).toBe(true);
+    await act(async () => save()?.click());
+    expect(patchControls).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("Save or discard configuration edits");
+    await act(async () => render(false));
+    expect(save()?.disabled).toBe(false);
+    expect(container.querySelector('[aria-label="Wake on demand"]')?.getAttribute("aria-checked")).toBe("true");
+    await act(async () => save()?.click());
+    await flush();
+    expect(patchControls).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers a failed read through an explicit retry", async () => {
+    getControls.mockRejectedValueOnce(new Error("temporary outage"));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(async () => root.render(<QueryClientProvider client={client}>
+      <AgentContinuityControlsPanel agentId="agent-1" companyId="company-1" />
+    </QueryClientProvider>));
+    await flush();
+    const retry = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("Retry reading controls"));
+    expect(retry).toBeDefined();
+    await act(async () => retry?.click());
+    await flush();
+    expect(getControls).toHaveBeenCalledTimes(2);
+    expect(container.textContent).not.toContain("Could not read these controls");
+    expect(container.querySelector('[aria-label="Wake on demand"]')).not.toBeNull();
+  });
+
 });
