@@ -76,6 +76,20 @@ describe("buildAgentUpdatePatch", () => {
     }));
     expect(patch.runtimeConfig).toEqual({ heartbeat: agent.runtimeConfig.heartbeat });
   });
+  it.each([
+    { heartbeat: { enabled: false }, debug: {} },
+    { heartbeat: {}, debug: { providerTrace: "raw" } },
+  ])("keeps a connection cleared when saving other runtime edits: %j", (edits) => {
+    const agent = makeAgent();
+    agent.runtimeConfig = { ...agent.runtimeConfig, aiConnection: { mode: "router", connectionId: "old" } };
+    const patch = buildAgentUpdatePatch(agent, makeOverlay({
+      runtime: { runtimeConfig: { aiConnection: undefined } }, ...edits,
+    }));
+    expect(patch.runtimeConfig).not.toHaveProperty("aiConnection");
+    expect(patch.runtimeConfig).toMatchObject({ heartbeat: {
+      ...(agent.runtimeConfig.heartbeat as Record<string, unknown>), ...edits.heartbeat,
+    } });
+  });
   it("keeps heartbeat and debug edits when a connection changes in the same save", () => {
     const agent = makeAgent();
     const patch = buildAgentUpdatePatch(agent, makeOverlay({

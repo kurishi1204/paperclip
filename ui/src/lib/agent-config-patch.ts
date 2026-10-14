@@ -49,40 +49,30 @@ export function buildAgentUpdatePatch(agent: Agent, overlay: AgentConfigOverlay)
 
   if (Object.keys(overlay.runtime).length > 0) {
     Object.assign(patch, overlay.runtime);
-    if (overlay.runtime.runtimeConfig !== undefined) {
-      patch.runtimeConfig = omitUndefinedEntries({
-        ...agent.runtimeConfig,
-        ...(overlay.runtime.runtimeConfig as Record<string, unknown>),
-      });
-    }
   }
 
   if (
-    Object.keys(overlay.heartbeat).length > 0
+    overlay.runtime.runtimeConfig !== undefined
+    || Object.keys(overlay.heartbeat).length > 0
     || Object.keys(overlay.debug).length > 0
   ) {
-    const existingRc = (agent.runtimeConfig ?? {}) as Record<string, unknown>;
+    // Keep explicit clears through every merge; omit them only at the end.
     const nextRuntimeConfig: Record<string, unknown> = {
-      ...existingRc,
-      ...(patch.runtimeConfig as Record<string, unknown> | undefined),
+      ...agent.runtimeConfig,
+      ...(overlay.runtime.runtimeConfig as Record<string, unknown> | undefined),
     };
 
     if (Object.keys(overlay.heartbeat).length > 0) {
       const existingHb = (nextRuntimeConfig.heartbeat ?? {}) as Record<string, unknown>;
       nextRuntimeConfig.heartbeat = { ...existingHb, ...overlay.heartbeat };
     }
-
     if (Object.keys(overlay.debug).length > 0) {
       const existingDebug = (nextRuntimeConfig.debug ?? {}) as Record<string, unknown>;
       const nextDebug = omitUndefinedEntries({ ...existingDebug, ...overlay.debug });
-      if (Object.keys(nextDebug).length === 0) {
-        delete nextRuntimeConfig.debug;
-      } else {
-        nextRuntimeConfig.debug = nextDebug;
-      }
+      if (Object.keys(nextDebug).length === 0) delete nextRuntimeConfig.debug;
+      else nextRuntimeConfig.debug = nextDebug;
     }
-
-    patch.runtimeConfig = nextRuntimeConfig;
+    patch.runtimeConfig = omitUndefinedEntries(nextRuntimeConfig);
   }
 
   return patch;

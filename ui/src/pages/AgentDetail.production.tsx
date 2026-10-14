@@ -2164,7 +2164,7 @@ function ConfigurationTab({
       queryClient.setQueriesData<Agent>({
         queryKey: ["agents", "detail"],
         predicate: query => (query.state.data as Agent | undefined)?.id === updated.id,
-      }, updated);
+      }, previous => previous ? { ...previous, ...updated } : previous);
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.configRevisions(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.continuityControls(agent.id) });
