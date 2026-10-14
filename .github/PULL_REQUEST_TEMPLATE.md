@@ -60,7 +60,10 @@
 <!--
   How can a reviewer confirm this works? Include test commands, manual
   steps, or both. If GitHub Actions is disabled by the repository owner, link
-  the exact-head local receipt and machine-readable failure/skip inventory.
+  the exact-head local receipt, base/head test-ID comparison, and machine-readable
+  failure/skip inventory. List the required gates and results from the recorded
+  base workflow and repository rules. For a baseline exception, link a separate
+  receipt for the recorded base SHA under the same runner conditions.
   State how the test identity was isolated from publishing credentials. A
   baseline full-suite failure needs the same evidence whether Actions is enabled
   or disabled. Include the independent review and owner decision required by
@@ -96,6 +99,9 @@
 -
 
 ## Checklist
+
+<!-- Leave future checks unchecked at PR creation. Update with exact-head evidence
+     before requesting merge; a checked box claims the condition is met now. -->
 
 - [ ] I have included a thinking path that traces from project context to this change
 - [ ] I have specified the model used (with version and capability details)

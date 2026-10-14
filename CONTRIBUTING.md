@@ -122,37 +122,56 @@ For an owner-controlled fork where the repository owner has disabled GitHub Acti
 the owner may use fixed, local verification evidence instead of the missing Actions
 check. This changes the check transport only. It does not enable a test-failure
 exception. When Actions is enabled, all required Actions checks still apply.
+Before replacing the transport, record the required checks and their commands
+from the recorded base revision's workflow and repository rules. The receipt
+must list each applicable gate, including PR-specific tests, the full suite,
+lint, typecheck, build, and static checks, with a result or an explicit reason
+it does not apply. An unknown or omitted gate blocks merge. A still-required
+GitHub check must be satisfied by its configured source; local evidence cannot
+turn a red or missing required check green. Changing required checks is a
+separate owner-controlled repository setting decision, recorded on the PR.
 
 For every local verification receipt, the PR must:
 
-1. Link a receipt for the exact PR head. Record the runner, tool versions, commands,
-   exit codes, test counts, and log hashes. Retain the logs and make the exact
-   hashed artifacts available to the independent reviewer. Attach a machine-readable
-   inventory of every failed and skipped test, with the reason and whether the skip
-   is required or an intentional platform skip. Run the full suite, PR-specific
-   tests, lint, typecheck, build, and all required static gates to completion.
-   The PR-specific tests and non-suite gates must pass. Execute the
+1. Link a receipt for the exact PR head and the recorded PR base SHA. Record the
+   runner identity or image digest, tool versions, commands, exit codes, collected
+   test IDs and outcomes, test counts, and log hashes for both revisions. Retain
+   the exact hashed artifacts for independent review. Publish only redacted
+   copies or artifact locations that do not expose credentials or private host
+   data; record the redacted copy's hash separately from the retained original.
+   Compare the collected test IDs between base and head. A missing, renamed,
+   focused, or excluded test is a changed test and blocks an exception until
+   independently explained and accepted by the owner. Attach a machine-readable
+   inventory of every failed and skipped test, including collection and import
+   errors, with the reason and whether the skip is required or intentional.
+   Run the full suite, PR-specific tests, lint, typecheck, build, and all
+   applicable required static gates to completion. The PR-specific tests and
+   gates outside the full suite must pass. Execute the
    tested PR code under an identity that cannot read GitHub or Paperclip
    publishing credentials; clearing environment variables alone is insufficient.
 2. Treat tests added or changed by the PR, and tests that exercise changed behavior,
    as PR-specific. Treat a disputed test or gate classification as required until
    independent review resolves it. An intentional platform skip must be present
-   on the unchanged base under comparable conditions; otherwise treat it as a
+   on the recorded base SHA under the same runner, tool versions, environment,
+   and test data; otherwise treat it as a
    required-test skip.
-3. Have a reviewer who did not author the change validate the receipt, credential
-   isolation, test inventory, and classifications. Post the review and the artifact
-   locations on the PR. The repository owner must explicitly accept the exact head
-   and any listed exceptions before merge. A new head requires new evidence and a
-   new decision.
+3. Have a reviewer who did not author the change or prepare its evidence,
+   including through another session of the same agent, validate both receipts,
+   the base/head test-ID comparison, credential isolation, complete gate inventory,
+   and classifications. Post the review and safe artifact locations on the PR.
+   The repository owner must separately accept the exact head and any listed
+   exceptions before merge. A new head requires new evidence and a new decision.
 
 ### Baseline Full-Suite Exceptions
 
 This exception is available under the same conditions whether Actions is enabled
 or disabled. It never overrides a required GitHub check or branch protection.
-For each full-suite failure or required-test skip, run the unchanged base on the
-same runner with the same tool versions, environment, and test data. A matching
+For each full-suite failure or required-test skip, run the recorded PR base SHA
+on the same runner with the same tool versions, environment, and test data. A matching
 failure needs the same test ID and failure signature (assertion or error class
 and stable message). A matching skip needs the same test ID and skip reason.
+An import, collection, hook, or worker failure without a stable test ID cannot
+receive the baseline exception.
 The independent reviewer must inspect the changed code path and explain why the
 result is a pre-existing baseline problem rather than a regression. A match alone
 is not enough. If that causal explanation is unknown, do not grant the exception.
