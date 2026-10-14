@@ -9,7 +9,7 @@ import type { Agent, Environment, UserSecretDefinition } from "@paperclipai/shar
 import { getEnvironmentCapabilities } from "@paperclipai/shared";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ToastProvider } from "../context/ToastContext";
-import { AgentConfigForm, AdapterLoginPanel, subtractPersistedOverlay, reconcileStoredAgentOverlay, type AdapterLoginDescriptor } from "./AgentConfigForm";
+import { AgentConfigForm, AdapterLoginPanel, subtractPersistedOverlay, type AdapterLoginDescriptor } from "./AgentConfigForm";
 import { defaultCreateValues } from "./agent-config-defaults";
 import { buildNewAgentHirePayload } from "../lib/new-agent-hire-payload";
 import { ApiError } from "../api/client";
@@ -743,16 +743,18 @@ describe("AgentConfigForm environment selector", () => {
     vi.clearAllMocks();
   });
 
-  it("preserves configuration drafts across scoped refreshes and clears only persisted edits or another agent", async () => {
-    const dirty = vi.fn();
-    let refresh: (agent: Agent) => void = () => {};
+  it("preserves drafts on unrelated refreshes and confirms only the successful save despite normalized data", async () => {
+    const dirty = vi.fn(); let refresh: (agent: Agent) => void = () => {};
+    let save: (() => void) | null = null; let release: () => void = () => {};
+    const onSave = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
     const container = document.createElement("div"); document.body.appendChild(container);
     const root = createRoot(container); roots.push(root);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     function Harness() {
       const [agent, setAgent] = useState(makeAgent()); refresh = setAgent;
-      return <AgentConfigForm mode="edit" agent={agent} onSave={vi.fn()}
-        onDirtyChange={dirty} hidePromptTemplate showAdapterTypeField={false} />;
+      return <AgentConfigForm mode="edit" agent={agent} onSave={onSave}
+        onDirtyChange={dirty} onSaveActionChange={action => { save = action; }} hideInlineSave
+        hidePromptTemplate showAdapterTypeField={false} />;
     }
     await act(async () => root.render(<QueryClientProvider client={client}><ToastProvider><TooltipProvider>
       <Harness />
@@ -760,20 +762,17 @@ describe("AgentConfigForm environment selector", () => {
     await flushReact();
     const input = () => container.querySelector<HTMLInputElement>('input[placeholder="Agent name"]')!;
     await act(async () => setInputValue(input(), "Pending rename"));
-    await flushReact();
-    await act(async () => refresh(makeAgent({ runtimeConfig: { wakeOnDemand: true }, updatedAt: new Date(1) })));
-    await flushReact();
-    expect(input().value).toBe("Pending rename");
-    expect(dirty).toHaveBeenLastCalledWith(true);
-    await act(async () => refresh(makeAgent({ name: "Pending rename", updatedAt: new Date(2) })));
-    await flushReact();
-    expect(input().value).toBe("Pending rename");
-    expect(dirty).toHaveBeenLastCalledWith(false);
+    await act(async () => refresh(makeAgent({ runtimeConfig: { heartbeat: { wakeOnDemand: true } }, updatedAt: new Date(1) })));
+    await flushReact(); expect(input().value).toBe("Pending rename"); expect(dirty).toHaveBeenLastCalledWith(true);
+    let pending: unknown;
+    await act(async () => { pending = save?.(); });
+    await act(async () => refresh(makeAgent({ name: "Server-normalized", updatedAt: new Date(2) })));
+    await flushReact(); expect(input().value).toBe("Pending rename"); expect(dirty).toHaveBeenLastCalledWith(true);
+    await act(async () => { release(); await pending; });
+    await flushReact(); expect(input().value).toBe("Server-normalized"); expect(dirty).toHaveBeenLastCalledWith(false);
     await act(async () => setInputValue(input(), "Another pending edit"));
     await act(async () => refresh(makeAgent({ id: "agent-2", name: "Other agent" })));
-    await flushReact();
-    expect(input().value).toBe("Other agent");
-    expect(dirty).toHaveBeenLastCalledWith(false);
+    await flushReact(); expect(input().value).toBe("Other agent"); expect(dirty).toHaveBeenLastCalledWith(false);
   });
 
   it("promotes environment drafts through the page Save action and discards them through the page Discard action", async () => {
@@ -2259,8 +2258,8 @@ describe("AgentConfigForm environment selector", () => {
       version: "latest",
     });
 
-    // Both saves land, and the page refreshes the agent with the persisted
-    // binding — the same adapter config the bind save sent.
+    // Both saves land. The server merges the ordinary name patch with the
+    // binding patch, which never wrote a name; its refreshed name is the saved rename.
     await act(async () => {
       for (const release of releaseSaves) release();
     });
@@ -2270,13 +2269,13 @@ describe("AgentConfigForm environment selector", () => {
         makeAgent({
           defaultEnvironmentId: "sandbox-1",
           adapterConfig: persistedPatch.adapterConfig as Record<string, unknown>,
+          name: racingPatch.name as string,
         }),
       );
     });
     await flushReact();
 
-    // The rename survives the refresh instead of reverting to the refreshed
-    // agent's name.
+    // The successfully saved rename is visible in the actual server state.
     expect(
       container.querySelector<HTMLInputElement>('input[placeholder="Agent name"]')!.value,
     ).toBe("Renamed during bind");
@@ -4037,21 +4036,5 @@ describe("subtractPersistedOverlay", () => {
     expect(subtractPersistedOverlay(changed, persisted).adapterConfig).toEqual({
       args: ["--flag", "other"],
     });
-  });
-});
-
-describe("reconcileStoredAgentOverlay", () => {
-  const empty = { identity: {}, adapterConfig: {}, heartbeat: {}, debug: {}, runtime: {} };
-  it("clears persisted unset fields while retaining a concurrent edit", () => {
-    const current = { ...empty, adapterConfig: { model: undefined, cwd: null, command: "pending" }, debug: { providerTrace: undefined } };
-    const next = reconcileStoredAgentOverlay(current, makeAgent({ adapterConfig: {}, runtimeConfig: {} }));
-    expect(next.adapterConfig).toEqual({ command: "pending" });
-    expect(next.debug).toEqual({});
-  });
-  it("clears the complete persisted runtime patch and retains a newer connection change", () => {
-    const stored = { aiConnection: { connectionId: "connection-1" }, heartbeat: { enabled: false } };
-    expect(reconcileStoredAgentOverlay({ ...empty, runtime: { runtimeConfig: stored } }, makeAgent({ runtimeConfig: stored })).runtime).toEqual({});
-    const changed = { ...stored, aiConnection: { connectionId: "connection-2" } };
-    expect(reconcileStoredAgentOverlay({ ...empty, runtime: { runtimeConfig: changed } }, makeAgent({ runtimeConfig: stored })).runtime).toEqual({ runtimeConfig: changed });
   });
 });

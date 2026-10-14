@@ -59,6 +59,19 @@ function makeOverlay(patch?: Partial<AgentConfigOverlay>): AgentConfigOverlay {
 }
 
 describe("buildAgentUpdatePatch", () => {
+  it("keeps heartbeat and debug edits when a connection changes in the same save", () => {
+    const agent = makeAgent();
+    const patch = buildAgentUpdatePatch(agent, makeOverlay({
+      runtime: { runtimeConfig: { ...agent.runtimeConfig, aiConnection: { connectionId: "connection-2" } } },
+      heartbeat: { enabled: false },
+      debug: { providerTrace: "raw" },
+    }));
+    expect(patch).toMatchObject({ runtimeConfig: {
+      aiConnection: { connectionId: "connection-2" },
+      heartbeat: { enabled: false, intervalSec: 300 },
+      debug: { providerTrace: "raw" },
+    } });
+  });
   it("merges the agent-scoped provider trace debug setting into runtime config", () => {
     const patch = buildAgentUpdatePatch(
       makeAgent(),

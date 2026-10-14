@@ -258,23 +258,6 @@ export function subtractPersistedOverlay(
   };
 }
 
-/** Stored state is complete: absent/null fields represent an unset value. */
-export function reconcileStoredAgentOverlay(current: AgentConfigOverlay, agent: Agent): AgentConfigOverlay {
-  const keep = (pending: Record<string, unknown>, stored: Record<string, unknown>) =>
-    Object.fromEntries(Object.entries(pending).filter(([key, value]) =>
-      !overlayValuesEqual(value ?? undefined, stored[key] ?? undefined)));
-  const config = agent.runtimeConfig ?? {};
-  return {
-    identity: keep(current.identity, agent as unknown as Record<string, unknown>),
-    ...(current.adapterType !== undefined && current.adapterType !== agent.adapterType
-      ? { adapterType: current.adapterType } : {}),
-    adapterConfig: keep(current.adapterConfig, agent.adapterConfig ?? {}),
-    heartbeat: keep(current.heartbeat, (config.heartbeat ?? {}) as Record<string, unknown>),
-    debug: keep(current.debug, (config.debug ?? {}) as Record<string, unknown>),
-    runtime: keep(current.runtime, { runtimeConfig: config }),
-  };
-}
-
 /* ---- Shared input class ---- */
 const inputClass =
   "w-full rounded-md border border-border px-2.5 py-1.5 bg-transparent outline-none text-sm font-mono placeholder:text-muted-foreground/40";
@@ -506,17 +489,14 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const [environmentDraftDirty, setEnvironmentDraftDirty] = useState(false);
   const [environmentEditorKey, setEnvironmentEditorKey] = useState(0);
   const agentRef = useRef<Agent | null>(null);
-  // Binding saves and ordinary saves share stored-state reconciliation.
-  // A refresh removes only edits already present on the stored agent.
-  // Reconcile stored values; unrelated refreshes must preserve pending edits.
+  // Only a successful submission confirms pending edits. Server reads may be
+  // redacted or unrelated to this editor, so refreshes never clear its draft.
   useEffect(() => {
     if (!isCreate) {
       if (agentRef.current !== null && agentRef.current.id !== props.agent.id) {
         setOverlay({ ...emptyOverlay });
         setEnvironmentDraftDirty(false);
         setEnvironmentEditorKey((key) => key + 1);
-      } else if (agentRef.current !== null && props.agent !== agentRef.current) {
-        setOverlay((previous) => reconcileStoredAgentOverlay(previous, props.agent));
       }
       agentRef.current = props.agent;
     }
@@ -588,7 +568,10 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
         }
       : overlay;
     if (!isOverlayDirty(nextOverlay)) return;
+    const savedAgentId = props.agent.id;
     await props.onSave(buildAgentUpdatePatch(props.agent, nextOverlay));
+    setOverlay(previous => agentRef.current?.id === savedAgentId
+      ? subtractPersistedOverlay(previous, nextOverlay) : previous);
   }, [isCreate, isDirty, overlay, props]);
 
   useEffect(() => {
@@ -695,10 +678,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       adapterConfig: { ...overlay.adapterConfig, env: nextEnv },
     };
     setOverlay(nextOverlay);
+    const savedAgentId = props.agent.id;
     await props.onSave({
       ...buildAgentUpdatePatch(props.agent, nextOverlay),
       applyStoredClaudeLogin: true,
     });
+    setOverlay(previous => agentRef.current?.id === savedAgentId
+      ? subtractPersistedOverlay(previous, nextOverlay) : previous);
     invalidateUserSecretDefinitions();
   };
 
@@ -727,8 +713,10 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       adapterConfig: { ...overlay.adapterConfig, env: nextEnv },
     };
     setOverlay(nextOverlay);
-    // A refresh reconciles stored values while preserving concurrent edits.
+    const savedAgentId = props.agent.id;
     await props.onSave(buildAgentUpdatePatch(props.agent, nextOverlay));
+    setOverlay(previous => agentRef.current?.id === savedAgentId
+      ? subtractPersistedOverlay(previous, nextOverlay) : previous);
     invalidateUserSecretDefinitions();
   };
 
@@ -762,10 +750,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       adapterConfig: { ...overlay.adapterConfig, env: nextEnv },
     };
     setOverlay(nextOverlay);
+    const savedAgentId = props.agent.id;
     await props.onSave({
       ...buildAgentUpdatePatch(props.agent, nextOverlay),
       applyStoredClaudeLogin: true,
     });
+    setOverlay(previous => agentRef.current?.id === savedAgentId
+      ? subtractPersistedOverlay(previous, nextOverlay) : previous);
     invalidateUserSecretDefinitions();
   };
 
