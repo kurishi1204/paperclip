@@ -1446,6 +1446,9 @@ function invalidateActivityQueries(
         queryKey: queryKeys.agents.continuityControls(entityId),
       });
       queryClient.invalidateQueries({
+        queryKey: queryKeys.agents.configRevisions(entityId),
+      });
+      queryClient.invalidateQueries({
         queryKey: queryKeys.heartbeats(companyId, entityId),
       });
     }
