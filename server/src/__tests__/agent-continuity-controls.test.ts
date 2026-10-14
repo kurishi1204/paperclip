@@ -59,6 +59,8 @@ describeDb("agent continuity controls", () => {
       expectedUpdatedAt: before!.updatedAt, blockAssignment: false, wakeOnDemand: true,
     }, "board-user", f.companyId);
     expect(after).toMatchObject({ blockAssignment: false, wakeOnDemand: true });
+    expect(after).not.toHaveProperty("runtimeConfig");
+    expect(after).not.toHaveProperty("adapterConfig");
     expect(JSON.stringify(after)).not.toContain("SYNTHETIC_SECRET_MUST_NOT_LEAK");
     expect(JSON.stringify(after)).not.toContain("SYNTHETIC_ADAPTER_SECRET");
     const [stored] = await db.select().from(agents).where(eq(agents.id, f.agentId));
