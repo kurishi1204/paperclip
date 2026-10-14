@@ -2364,6 +2364,11 @@ describe("agent permission routes", () => {
       .send({ expectedUpdatedAt: updatedAt, blockAssignment: false, wakeOnDemand: true }));
     expect(noGrant.status).toBe(403);
     expect(mockContinuityControls.patch).not.toHaveBeenCalled();
+    expect(mockAccessService.decide).toHaveBeenLastCalledWith(expect.objectContaining({
+      actor: expect.objectContaining({ type: "board", userId: "board-user" }),
+      action: "agents:create",
+      resource: { type: "company", companyId },
+    }));
     mockAccessService.canUser.mockResolvedValue(true);
     const extraField = await requestApp(boardApp, (baseUrl) => request(baseUrl)
       .patch(`/api/agents/${agentId}/continuity-controls`)
@@ -2379,6 +2384,11 @@ describe("agent permission routes", () => {
       .send({ expectedUpdatedAt: updatedAt, blockAssignment: false, wakeOnDemand: true }));
     expect(changed.status).toBe(200);
     expect(changed.body).toEqual({ ...safe, blockAssignment: false, wakeOnDemand: true });
+    expect(mockAccessService.decide).toHaveBeenLastCalledWith(expect.objectContaining({
+      actor: expect.objectContaining({ type: "board", userId: "board-user" }),
+      action: "agents:create",
+      resource: { type: "company", companyId },
+    }));
     expect(JSON.stringify([read.body, changed.body])).not.toMatch(/runtimeConfig|adapterConfig|aiConnection|credentialRef/);
     expect(mockAgentService.getById).not.toHaveBeenCalled();
   });
