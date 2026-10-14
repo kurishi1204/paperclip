@@ -138,6 +138,8 @@ type AgentConfigFormProps = {
   hideInstructionsFile?: boolean;
   /** Allow instance administrators to configure short-lived raw provider capture. */
   canConfigureProviderTrace?: boolean;
+  /** Visible tab containing this build's scoped control panel. */
+  continuityControlsTab?: "Permissions" | "Configuration";
   /** Hide the prompt template field from the Identity section (used when it's shown in a separate Prompts tab). */
   hidePromptTemplate?: boolean;
   /** Render the main configuration sections or the dedicated edit-only Secrets surface. */
@@ -2069,7 +2071,8 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 onChange={(v) => mark("heartbeat", "wakeOnDemand", v)}
               /> : <Field label="Wake on demand" hint={help.wakeOnDemand}>
                 <p className="text-xs text-muted-foreground">
-                  Use Paused agent continuity controls to change this control.
+                  Use Paused agent continuity controls on the {props.continuityControlsTab ?? "Configuration"} tab.
+                  {scopedContinuity.data?.canManage !== true ? " Only an agent manager can save these controls while this agent is eligible." : ""}
                 </p>
               </Field>}
               <Field label="Cooldown (sec)" hint={help.cooldownSec}>

@@ -2081,6 +2081,7 @@ export function ConfigurationTab({
   return (
     <div className="agent-settings-form space-y-6">
       {content !== "permissions" ? <AgentConfigForm
+        continuityControlsTab="Permissions"
         mode="edit"
         agent={agent}
         onSave={(patch) => updateAgent.mutateAsync(patch)}
