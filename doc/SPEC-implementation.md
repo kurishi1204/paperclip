@@ -769,9 +769,10 @@ approval is created. The legacy fields `protectedAgent.requiresApproval` and
 aliases for the same hard block, but API denial copy must describe the block and
 administrator remediation rather than promising a nonexistent approval step.
 
-For a paused, non-CEO agent in protected assignment mode, a board actor with
-company agent-management access may read `GET /api/agents/:id/continuity-controls`
-and use `PATCH /api/agents/:id/continuity-controls` to change only
+Company board members may read `GET /api/agents/:id/continuity-controls` under
+the same company-scoped access as existing configuration reads. For a paused,
+non-CEO agent in protected assignment mode, a board actor with company
+agent-management access may use `PATCH /api/agents/:id/continuity-controls` to change only
 `authorizationPolicy.protectedAgent.blockAssignment` and
 `heartbeat.wakeOnDemand`. PATCH requires the exact `expectedUpdatedAt` from
 GET, boolean values for both controls, a disabled heartbeat, no task-assignment
@@ -788,7 +789,7 @@ would tighten a previously restored value. A partial general permissions policy
 that omits the assignment block retains its live value instead of clearing it.
 Once the agent is ineligible, the general edit path may change these flags again;
 the guard prevents stale overwrites while eligible rather than imposing a
-permanent actor restriction. The scoped endpoints require the same board company
+permanent actor restriction. The scoped PATCH requires the same board company
 agent-management grant as the existing general permissions endpoint. GET and PATCH return selected
 non-secret fields, never the full permissions or runtime configuration. The
 board Agent detail view exposes these two controls for eligible paused protected

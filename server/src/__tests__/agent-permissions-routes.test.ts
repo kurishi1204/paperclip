@@ -2359,6 +2359,10 @@ describe("agent permission routes", () => {
     const boardApp = await createApp({ type: "board", userId: "board-user", source: "session",
       isInstanceAdmin: false, companyIds: [companyId] });
     mockAccessService.canUser.mockResolvedValue(false);
+    const configViewerRead = await requestApp(boardApp, (baseUrl) => request(baseUrl)
+      .get(`/api/agents/${agentId}/continuity-controls`));
+    expect(configViewerRead.status).toBe(200);
+    expect(configViewerRead.body).toEqual(safe);
     const noGrant = await requestApp(boardApp, (baseUrl) => request(baseUrl)
       .patch(`/api/agents/${agentId}/continuity-controls`)
       .send({ expectedUpdatedAt: updatedAt, blockAssignment: false, wakeOnDemand: true }));

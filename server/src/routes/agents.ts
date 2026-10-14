@@ -5182,7 +5182,10 @@ export function agentRoutes(
     if (!isUuidLike(id)) throw notFound("Agent not found");
     const controls = await continuityControls.get(id);
     if (!controls || !hasCompanyAccess(req, controls.companyId)) throw notFound("Agent not found");
-    await assertBoardCanManageAgentsForCompany(req, controls.companyId);
+    // Match existing configuration reads; the mutation below keeps its
+    // stronger management grant. Read-only eligibility must not disable
+    // permitted general configuration editing for a company board member.
+    await assertCanReadConfigurations(req, controls.companyId);
     res.json(controls);
   });
 
