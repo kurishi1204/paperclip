@@ -1440,8 +1440,17 @@ function invalidateActivityQueries(
     });
     queryClient.invalidateQueries({ queryKey: queryKeys.org(companyId) });
     if (entityId) {
+      // Detail records may be keyed by either UUID or route short name.
       queryClient.invalidateQueries({
-        queryKey: queryKeys.agents.detail(entityId),
+        queryKey: queryKeys.agents.detailAll,
+        predicate: query => (query.state.data as { id?: string } | undefined)?.id === entityId
+          || query.queryKey[2] === entityId,
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.agents.continuityControls(entityId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.agents.configRevisions(entityId),
       });
       queryClient.invalidateQueries({
         queryKey: queryKeys.heartbeats(companyId, entityId),

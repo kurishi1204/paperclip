@@ -128,6 +128,8 @@ import { skillVersionSelectionMap } from "../services/runtime-skill-selections.j
 import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { agentTaskAssignmentOptedOut } from "../services/agent-permissions.js";
+import { agentContinuityControls } from "../services/agent-continuity-controls.js";
+import { agentContinuityControlsPatchSchema } from "@paperclipai/shared";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import {
   persistReprojectedWorkspaceDiffs,
@@ -5167,6 +5169,41 @@ export function agentRoutes(
     });
 
     res.json(await buildAgentDetail(agent));
+  });
+
+  const continuityControls = agentContinuityControls(db);
+
+  // Deliberately avoids the general agent detail and update paths: those read
+  // and replace entire runtimeConfig/permissions objects, including bindings.
+  router.get("/agents/:id/continuity-controls", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    if (!isUuidLike(id)) throw notFound("Agent not found");
+    const controls = await continuityControls.get(id);
+    if (!controls || !hasCompanyAccess(req, controls.companyId)) throw notFound("Agent not found");
+    // Match existing configuration reads; the mutation below keeps its
+    // stronger management grant. Read-only eligibility must not disable
+    // permitted general configuration editing for a company board member.
+    await assertCanReadConfigurations(req, controls.companyId);
+    const management = await access.decide({
+      actor: req.actor, action: "agents:create",
+      resource: { type: "company", companyId: controls.companyId },
+    });
+    res.json({ ...controls, canManage: management.allowed });
+  });
+
+  router.patch("/agents/:id/continuity-controls", validate(agentContinuityControlsPatchSchema), async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    if (!isUuidLike(id)) throw notFound("Agent not found");
+    const controls = await continuityControls.get(id);
+    if (!controls || !hasCompanyAccess(req, controls.companyId)) throw notFound("Agent not found");
+    await assertBoardCanManageAgentsForCompany(req, controls.companyId);
+    const actorId = req.actor.userId;
+    if (!actorId) throw forbidden("Board user identity required");
+    const changed = await continuityControls.patch(id, req.body, actorId, controls.companyId);
+    if (!changed) throw notFound("Agent not found");
+    res.json({ ...changed, canManage: true });
   });
 
   router.patch("/agents/:id/instructions-path", validate(updateAgentInstructionsPathSchema), async (req, res) => {
