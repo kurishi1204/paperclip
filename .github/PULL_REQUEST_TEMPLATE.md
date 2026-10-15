@@ -66,9 +66,9 @@
   rules. Link each graph node's full commit SHA and exact-byte SHA-256 in the
   manifest. Re-resolve moving refs immediately before merge; a changed or
   unresolved graph holds merge even if the PR head and base SHAs are unchanged.
-  Compare collected test IDs with the
-  recorded base SHA; for a baseline exception, link a full base-run receipt
-  under the same runner conditions. If the head or base tip moves before merge,
+  Compare collected test IDs with the recorded base SHA. For a baseline
+  exception, link a full base-run receipt under the same runner conditions.
+  If the head or base tip moves before merge,
   update the branch and refresh the evidence, independent review, and human-owner
   decision for the new head/base pair.
   State how the test identity was isolated from publishing credentials. A

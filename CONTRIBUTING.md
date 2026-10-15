@@ -213,9 +213,8 @@ log/artifact hashes. Prove that the run used the same resolved workflow graph.
 If a called commit cannot be tied to the run, its gate remains unresolved.
 A green check name alone is insufficient. For local evidence, link the receipts
 below. The independent reviewer must verify the manifest, complete gate
-inventory, and
-base/head test-ID comparison. Every PR must meet items 2 and 3 below, including
-when Actions is enabled and the full suite passes. Item 1 adds requirements
+inventory, and base/head test-ID comparison. Every PR must meet items 2 and 3
+below, including when Actions is enabled and the full suite passes. Item 1 adds requirements
 whenever tests or gates run locally; a baseline exception also needs the full
 base-run receipt described there.
 
