@@ -226,6 +226,8 @@ A change is done when all are true:
    The full suite passes or each baseline failure and required-test skip meets
    the exact-head/base evidence and exception rules in `CONTRIBUTING.md`.
    Compare base/head test IDs for every PR, including Actions runs.
+   Resolve and hash the full reusable-workflow graph from the recorded base as
+   `CONTRIBUTING.md` requires. Recheck moving refs immediately before merge.
    Independent review and the separate human-owner decision are required even
    if the full suite passes. GitHub Actions status does not change the
    test-failure or required-skip rule.

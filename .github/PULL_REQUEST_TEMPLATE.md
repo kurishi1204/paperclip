@@ -62,7 +62,11 @@
   steps, or both. If GitHub Actions is disabled by the repository owner, link
   the exact-head local receipt, base/head test-ID comparison, and machine-readable
   failure/skip inventory. List the required gates and results from the recorded
-  base workflow and repository rules. Compare collected test IDs with the
+  base workflow, its recursively resolved reusable-workflow graph, and repository
+  rules. Link each graph node's full commit SHA and exact-byte SHA-256 in the
+  manifest. Re-resolve moving refs immediately before merge; a changed or
+  unresolved graph holds merge even if the PR head and base SHAs are unchanged.
+  Compare collected test IDs with the
   recorded base SHA; for a baseline exception, link a full base-run receipt
   under the same runner conditions. If the head or base tip moves before merge,
   update the branch and refresh the evidence, independent review, and human-owner
@@ -121,9 +125,9 @@
 - [ ] I have added or updated tests where applicable
 - [ ] I have updated relevant documentation to reflect my changes
 - [ ] I have considered and documented any risks above
-- [ ] I have linked the exact-head/base verification manifest, compared base/head test IDs, and recorded every failure and required skip, including collection or import errors
+- [ ] I have linked the exact-head/base verification manifest, resolved and hashed every reusable-workflow call recursively, compared base/head test IDs, and recorded every failure and required skip, including collection or import errors
 - [ ] The full suite passes or each baseline failure and required skip has the exact-head/base evidence required by CONTRIBUTING.md; I have not called a disabled or failing gate green
-- [ ] An independent reviewer has validated the exact-head/base manifest, applicable receipts or Actions runs, gate substitutions, and immutable input hash
-- [ ] The human owner has accepted this full head SHA, full base-tip SHA, immutable input hash, independent-review record link, exception list (or `none`), intentional-skip list (or `none`), base-to-head test-ID removals/renames (or `none`), gate substitutions (or `none`), additional-gate not-applicable decisions (or `none`), and any base-race residual risk in a separate PR comment; only the human owner checks this box
+- [ ] An independent reviewer has validated the exact-head/base manifest, resolved workflow graph, applicable receipts or Actions runs, gate substitutions, and immutable input hash
+- [ ] The human owner has accepted this full head SHA, full base-tip SHA, immutable input hash, independent-review record link, exception list (or `none`), intentional-skip list (or `none`), base-to-head test-ID removals/renames (or `none`), gate substitutions (or `none`), additional-gate not-applicable decisions (or `none`), and any base or external-workflow-ref race in a separate PR comment; only the human owner checks this box
 - [ ] Greptile is 5/5 with no open P2s, recommendations, or follow-ups
 - [ ] I will address all Greptile and reviewer comments before requesting merge

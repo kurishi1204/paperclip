@@ -134,6 +134,31 @@ confirm that it covers the same gate and record the command mapping. The human
 owner must name each accepted substitution in the owner decision. Until then,
 the gate is unresolved and blocks merge.
 
+Resolve the full reusable-workflow graph before calling this inventory complete.
+Start with each applicable workflow at the recorded base SHA. Follow every
+`jobs.<job_id>.uses` reusable-workflow call, including calls inside called
+workflows, until no calls remain. Resolve a local `./.github/workflows/` path at
+its caller's commit. Resolve an external `owner/repo/.github/workflows/path@ref`
+against that repository. Record the literal ref and the full resolved commit SHA,
+even when the ref names a branch or tag. Fetch the workflow bytes at that commit.
+For every graph node, record the repository, path, full commit SHA, byte size,
+and SHA-256 of the exact bytes. Record every caller-to-callee edge and the gates
+found in each workflow in the immutable manifest. Do not replace an external
+workflow with a same-named file from this fork. An unreadable or unparseable
+workflow, unresolved ref, unsupported call, cycle, or incomplete graph leaves
+the gate inventory unknown and blocks merge.
+
+Immediately before merge, resolve the full graph again from the live base tip.
+Compare its nodes, edges, full commit SHAs, and byte hashes with the accepted
+manifest. A branch or tag used by an external workflow can move while the PR
+head and base SHAs stay fixed. If any graph entry changes, hold merge. Refresh
+the gate inventory and affected verification evidence, obtain a new independent
+review, and obtain a new human-owner decision for the changed manifest before
+merge. If the graph cannot be resolved again, hold merge.
+An external branch or tag can move between this check and merge. Record that
+residual risk in the human owner's decision. If the owner does not accept it,
+pin the call to a full commit SHA in the workflow and refresh the evidence.
+
 Freeze evidence against both the full PR head SHA and the current base branch
 tip SHA. Read the head from the live PR and the base tip directly from its base
 branch ref (for example, `git ls-remote <remote> refs/heads/<base-branch>`),
@@ -180,12 +205,15 @@ before that alternative can be used. The author and reviewer cannot certify
 their own policy change under the proposed new rule.
 
 Every PR needs an immutable verification manifest for its full head/base pair.
-List the complete PR diff hash, applicable gate inventory and results, and
-comparable base/head test-ID inventories with outcomes, failures, skips, and
-collection/import errors. For Actions evidence, link the exact workflow ref,
-run/job/check IDs, conclusions, and retained log/artifact hashes; a green check
-name alone is insufficient. For local evidence, link the receipts below. The
-independent reviewer must verify the manifest, complete gate inventory, and
+List the complete PR diff hash, resolved reusable-workflow graph, applicable
+gate inventory and results, and comparable base/head test-ID inventories with
+outcomes, failures, skips, and collection/import errors. For Actions evidence,
+link the exact workflow ref, run/job/check IDs, conclusions, and retained
+log/artifact hashes. Prove that the run used the same resolved workflow graph.
+If a called commit cannot be tied to the run, its gate remains unresolved.
+A green check name alone is insufficient. For local evidence, link the receipts
+below. The independent reviewer must verify the manifest, complete gate
+inventory, and
 base/head test-ID comparison. Every PR must meet items 2 and 3 below, including
 when Actions is enabled and the full suite passes. Item 1 adds requirements
 whenever tests or gates run locally; a baseline exception also needs the full
@@ -261,8 +289,9 @@ base-run receipt described there.
    the independent-review record link, the exact accepted-exception list (or
    `none`), each intentional skip (or `none`), each accepted base-to-head test-ID
    removal or rename (or `none`), each accepted gate substitution (or `none`),
-   each additional-gate not-applicable decision (or `none`), and any base-race
-   residual-risk acceptance before merge. The immutable input hash is SHA-256
+   each additional-gate not-applicable decision (or `none`), and any base or
+   external-workflow-ref race acceptance before merge. The immutable input hash
+   is SHA-256
    of the retained verification manifest above, listing the full head/base
    pair, diff, every original receipt or Actions run/job/check record, log,
    test-ID inventory, and failure/skip inventory by path or immutable location,
