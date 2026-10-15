@@ -105,7 +105,10 @@
 ## Checklist
 
 <!-- Leave future checks unchecked at PR creation. Update with exact-head evidence
-     before requesting merge; a checked box claims the condition is met now. -->
+     before requesting merge; a checked box claims the condition is met now.
+     If the head or base tip changes, uncheck the required-tests, base/head
+     inventory, full-suite, independent-review, human-owner, and Greptile boxes
+     below until evidence and decisions are refreshed for the new pair. -->
 
 - [ ] I have included a thinking path that traces from project context to this change
 - [ ] I have specified the model used (with version and capability details)
@@ -121,6 +124,6 @@
 - [ ] For local receipts or baseline exceptions, I have compared base/head test IDs and recorded every failure and required skip, including collection or import errors
 - [ ] The full suite passes or each baseline failure and required skip has the exact-head/base evidence required by CONTRIBUTING.md; I have not called a disabled or failing gate green
 - [ ] An independent reviewer has validated the exact-head/base receipt, gate substitutions, and immutable input hash
-- [ ] The human owner has accepted this full head SHA, full base-tip SHA, exception list (or `none`), and gate substitutions (or `none`) in a separate PR comment; only the human owner checks this box
+- [ ] The human owner has accepted this full head SHA, full base-tip SHA, exception list (or `none`), intentional-skip list (or `none`), gate substitutions (or `none`), and additional-gate not-applicable decisions (or `none`) in a separate PR comment; only the human owner checks this box
 - [ ] Greptile is 5/5 with no open P2s, recommendations, or follow-ups
 - [ ] I will address all Greptile and reviewer comments before requesting merge

@@ -125,7 +125,9 @@ At minimum include `pnpm -r lint`, `pnpm typecheck`, `pnpm build`,
 `pnpm check:issue-material-classification`, and
 `node scripts/check-no-git-push.mjs`; include `pnpm check:token-gates` for UI
 changes and any other applicable check in that base workflow. Record each
-command's result or a reviewed reason it does not apply. An unknown or omitted
+command's result. None of the minimum gates above can be marked not applicable.
+For additional gates, record a reviewed reason when a gate does not apply and
+include that decision in the human owner's PR decision. An unknown or omitted
 gate blocks merge. A missing root script is not a passing gate. The author may
 propose a checked-in workspace command, but the independent reviewer must
 confirm that it covers the same gate and record the command mapping. The human
@@ -133,15 +135,22 @@ owner must name each accepted substitution in the owner decision. Until then,
 the gate is unresolved and blocks merge.
 
 Freeze evidence against both the full PR head SHA and the current PR base-tip
-SHA. Record that pair in the verification receipt and independent-review record,
-whether Actions is enabled or disabled. Immediately before merge, the merger
-must read the live PR head and base tip and compare both with the accepted pair.
+SHA. Before collecting evidence, require
+`git merge-base --is-ancestor <base-tip> <head>` to succeed; otherwise update
+the branch onto the current base first. Record that pair in the verification
+receipt and independent-review record, whether Actions is enabled or disabled.
+Immediately before merge, the
+merger must again confirm the current base tip is an ancestor of the accepted
+head, then read the live PR head and base tip and compare both with the
+accepted pair.
 If the base moved, update the branch onto the current base. If either SHA
 changed, rerun the applicable gates and base/head test-ID comparison, obtain
 a new independent review, and obtain a new human-owner decision for the
 resulting pair. Do not use an auto-generated merge or squash commit as an
 alternative to refreshing stale evidence. Do not rely on auto-merge unless it
-revalidates both SHAs immediately before merging.
+revalidates both SHAs immediately before merging. Merge with
+`gh pr merge --match-head-commit <accepted-head>` after this comparison, so a
+concurrent head push cannot invalidate the accepted evidence.
 
 For an owner-controlled fork where the repository owner has disabled GitHub Actions,
 the owner may use fixed, local verification evidence instead of the missing Actions
@@ -151,14 +160,30 @@ The receipt's base SHA is the PR base-tip SHA recorded above. A still-required
 GitHub check must be satisfied by its configured source; local evidence cannot
 turn a red or missing required check green. Changing required checks is a
 separate owner-controlled repository setting decision, recorded on the PR.
+Do not use an administrator or ruleset bypass to merge around an unsatisfied
+required check. Make any required-check change as a recorded owner decision
+before merge.
+
+A PR that changes these verification rules is governed by the policy at its
+recorded base, not by its proposed head text. If disabled Actions makes a base
+requirement impossible, the human owner must record an explicit transition
+decision on that PR, including the affected check and accepted alternative,
+before that alternative can be used. The author and reviewer cannot certify
+their own policy change under the proposed new rule.
 
 For every local verification receipt, and for every baseline exception even
 when Actions is enabled, the PR must:
 
 1. Link a receipt for the exact PR head and recorded PR base SHA. Record the
-   runner identity and image digest when an image is used, tool versions,
-   relevant environment/configuration hashes, test-data hashes, commands,
+   runner identity, executing OS UID/GID, image digest when an image is used,
+   tool versions, relevant environment/configuration hashes, test-data hashes,
+   commands,
    exit codes, collected test IDs and outcomes, test counts, and log hashes.
+   Include negative credential-isolation probes run under the tested OS identity:
+   use a verified installed client or an actual API request to show that
+   authenticated access fails, and show that configured publishing credential
+   paths are unreadable. A missing client is not a successful denial probe.
+   Record probe exit codes and redacted outputs without disclosing secret values.
    Collect the base test IDs under the same conditions for comparison. If a
    baseline exception is claimed, also link a full base-run receipt with the
    same fields. Retain the exact hashed artifacts for independent review.
@@ -178,18 +203,28 @@ when Actions is enabled, the PR must:
    publishing credentials; clearing environment variables alone is insufficient.
 2. Treat tests added or changed by the PR, and tests that exercise changed behavior,
    as PR-specific. Treat a disputed test or gate classification as required until
-   independent review resolves it. An intentional platform skip must be present
-   on the recorded base SHA under the same runner, tool versions, environment,
-   and test data; otherwise treat it as a
-   required-test skip.
+   independent review resolves it. An intentional platform skip must have the
+   same test ID, skip reason, and triggering condition on the recorded base SHA
+   under the same runner, tool versions, environment, and test data. List each
+   intentional skip in the human owner's decision even when no exception is
+   needed. Otherwise treat it as a required-test skip.
 3. Have a reviewer who did not author the change or prepare its evidence,
-   including through another session of the same agent, validate the receipts,
-   the base/head test-ID comparison, credential isolation, complete gate inventory,
-   and classifications. Record the reviewer's human identity or model/service
+   including through another session of the same agent, validate the receipts.
+   An independent reviewer must be a human or a different model family from
+   the author; another session or harness with the author's model family does
+   not qualify. Record author and reviewer model families when AI is used.
+   The reviewer must validate the base/head test-ID comparison, credential
+   isolation, complete gate inventory, and classifications. Record the
+   reviewer's human identity or model/service
    version, full head and base-tip SHAs, immutable input hash, result, and safe
    artifact locations on the PR. The human repository owner must separately
    comment with the same full head and base-tip SHAs, the exact accepted-exception
-   list (or `none`), and each accepted gate substitution (or `none`) before merge.
+   list (or `none`), each intentional skip (or `none`), each accepted gate
+   substitution (or `none`), and each additional-gate not-applicable decision
+   (or `none`) before merge. The immutable input hash is SHA-256 of a retained
+   manifest listing the full head/base pair and every original receipt, log,
+   test-ID inventory, and failure/skip inventory by path, byte size, and SHA-256.
+   Keep both the manifest and its listed bytes available to the reviewer.
    An agent using the owner's account must not post or prepare a final owner
    acceptance comment, check its PR box, or merge. The human owner must perform
    the acceptance action. A changed head or base requires new evidence, review,
