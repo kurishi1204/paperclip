@@ -64,12 +64,14 @@
   failure/skip inventory. List the required gates and results from the recorded
   base workflow and repository rules. Compare collected test IDs with the
   recorded base SHA; for a baseline exception, link a full base-run receipt
-  under the same runner conditions. If the base tip moves before merge, refresh
-  the evidence or test the exact merge commit.
+  under the same runner conditions. If the head or base tip moves before merge,
+  update the branch and refresh the evidence, independent review, and human-owner
+  decision for the new head/base pair.
   State how the test identity was isolated from publishing credentials. A
   baseline full-suite failure needs the same evidence whether Actions is enabled
   or disabled. Include the independent review and owner decision required by
-  CONTRIBUTING.md. Never mark a failed test or disabled check green.
+  CONTRIBUTING.md. Record each reviewed gate substitution. Never mark a failed
+  test or disabled check green.
 -->
 
 -
@@ -116,6 +118,9 @@
 - [ ] I have added or updated tests where applicable
 - [ ] I have updated relevant documentation to reflect my changes
 - [ ] I have considered and documented any risks above
-- [ ] The full suite passes or each baseline failure has the exact-head evidence, independent review, and owner acceptance required by CONTRIBUTING.md; I have not called a disabled or failing gate green
+- [ ] For local receipts or baseline exceptions, I have compared base/head test IDs and recorded every failure and required skip, including collection or import errors
+- [ ] The full suite passes or each baseline failure and required skip has the exact-head/base evidence required by CONTRIBUTING.md; I have not called a disabled or failing gate green
+- [ ] An independent reviewer has validated the exact-head/base receipt, gate substitutions, and immutable input hash
+- [ ] The human owner has accepted this full head SHA, full base-tip SHA, exception list (or `none`), and gate substitutions (or `none`) in a separate PR comment; only the human owner checks this box
 - [ ] Greptile is 5/5 with no open P2s, recommendations, or follow-ups
 - [ ] I will address all Greptile and reviewer comments before requesting merge

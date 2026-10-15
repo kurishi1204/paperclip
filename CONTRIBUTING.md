@@ -126,23 +126,34 @@ At minimum include `pnpm -r lint`, `pnpm typecheck`, `pnpm build`,
 `node scripts/check-no-git-push.mjs`; include `pnpm check:token-gates` for UI
 changes and any other applicable check in that base workflow. Record each
 command's result or a reviewed reason it does not apply. An unknown or omitted
-gate blocks merge. A missing root script is not a passing gate; use the
-checked-in workspace command and record what ran.
+gate blocks merge. A missing root script is not a passing gate. The author may
+propose a checked-in workspace command, but the independent reviewer must
+confirm that it covers the same gate and record the command mapping. The human
+owner must name each accepted substitution in the owner decision. Until then,
+the gate is unresolved and blocks merge.
+
+Freeze evidence against both the full PR head SHA and the current PR base-tip
+SHA. Record that pair in the verification receipt and independent-review record,
+whether Actions is enabled or disabled. Immediately before merge, the merger
+must read the live PR head and base tip and compare both with the accepted pair.
+If the base moved, update the branch onto the current base. If either SHA
+changed, rerun the applicable gates and base/head test-ID comparison, obtain
+a new independent review, and obtain a new human-owner decision for the
+resulting pair. Do not use an auto-generated merge or squash commit as an
+alternative to refreshing stale evidence. Do not rely on auto-merge unless it
+revalidates both SHAs immediately before merging.
 
 For an owner-controlled fork where the repository owner has disabled GitHub Actions,
 the owner may use fixed, local verification evidence instead of the missing Actions
 check. This changes the check transport only. It does not enable a test-failure
 exception. When Actions is enabled, all required Actions checks still apply.
-The receipt's base SHA is the pull request's `base.sha` at evidence freeze.
-A still-required
+The receipt's base SHA is the PR base-tip SHA recorded above. A still-required
 GitHub check must be satisfied by its configured source; local evidence cannot
 turn a red or missing required check green. Changing required checks is a
 separate owner-controlled repository setting decision, recorded on the PR.
-Before merge, compare that recorded base SHA with the current PR base tip.
-If it moved, regenerate the head/base evidence and independent review against
-the new base, or test and review the exact merge commit before accepting it.
 
-For every local verification receipt, the PR must:
+For every local verification receipt, and for every baseline exception even
+when Actions is enabled, the PR must:
 
 1. Link a receipt for the exact PR head and recorded PR base SHA. Record the
    runner identity and image digest when an image is used, tool versions,
@@ -175,18 +186,27 @@ For every local verification receipt, the PR must:
    including through another session of the same agent, validate the receipts,
    the base/head test-ID comparison, credential isolation, complete gate inventory,
    and classifications. Record the reviewer's human identity or model/service
-   version, immutable input hash, result, and safe artifact locations on the PR.
-   The repository owner must separately comment with the full head SHA and exact
-   accepted-exception list (or `none`) before merge. A new head requires new
-   evidence and a new decision.
+   version, full head and base-tip SHAs, immutable input hash, result, and safe
+   artifact locations on the PR. The human repository owner must separately
+   comment with the same full head and base-tip SHAs, the exact accepted-exception
+   list (or `none`), and each accepted gate substitution (or `none`) before merge.
+   An agent using the owner's account must not post or prepare a final owner
+   acceptance comment, check its PR box, or merge. The human owner must perform
+   the acceptance action. A changed head or base requires new evidence, review,
+   and a new human-owner decision.
 
 ### Baseline Full-Suite Exceptions
 
 This exception is available under the same conditions whether Actions is enabled
 or disabled. It never overrides a required GitHub check or branch protection.
-For each full-suite failure or required-test skip, run the recorded PR base SHA
-on the same runner with the same tool versions, environment, and test data. A matching
-failure needs the same test ID and failure signature (assertion or error class
+The head/base freeze, live pre-merge comparison, test-ID comparison, and
+independent review above apply to every exception. For each full-suite failure
+or required-test skip, run the recorded PR base SHA under the same runner
+conditions, tool versions, environment, and test data. For a persistent runner,
+use the same runner installation. For ephemeral runners, record matching
+immutable image digests, OS/architecture, toolchain, configuration, and test-data
+hashes for both runs. If equivalence cannot be proven, no exception is available.
+A matching failure needs the same test ID and failure signature (assertion or error class
 and stable message). A matching skip needs the same test ID and skip reason.
 Import, collection, hook, and worker failures cannot receive the baseline
 exception, even if a runner gives them a file-level ID.
@@ -195,7 +215,8 @@ result is a pre-existing baseline problem rather than a regression. A match alon
 is not enough. If that causal explanation is unknown, do not grant the exception.
 Map every failure and required skip to its evidence, even when several share one
 cause. Keep the full suite marked **failed with accepted exceptions**. Never
-call it green. The owner must accept the exact list and head in the PR record.
+call it green. The human owner must accept the exact list and head/base pair in
+the PR record.
 
 Mark Actions as **disabled**, and a failing full suite as **failed with accepted
 exceptions** when those states apply. Never label either one green. These rules do
