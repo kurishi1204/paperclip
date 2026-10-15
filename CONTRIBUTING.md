@@ -135,14 +135,13 @@ owner must name each accepted substitution in the owner decision. Until then,
 the gate is unresolved and blocks merge.
 
 Freeze evidence against both the full PR head SHA and the current PR base-tip
-SHA. Before collecting evidence, require
-`git merge-base --is-ancestor <base-tip> <head>` to succeed; otherwise update
+SHA. Read both SHAs from the live PR before collecting evidence, then require
+`git merge-base --is-ancestor <base-tip> <head>` for that pair; otherwise update
 the branch onto the current base first. Record that pair in the verification
 receipt and independent-review record, whether Actions is enabled or disabled.
-Immediately before merge, the
-merger must again confirm the current base tip is an ancestor of the accepted
-head, then read the live PR head and base tip and compare both with the
-accepted pair.
+Immediately before merge, read the live PR head and base tip again, compare
+both with the accepted pair, and confirm that this live base tip is an ancestor
+of the accepted head.
 If the base moved, update the branch onto the current base. If either SHA
 changed, rerun the applicable gates and base/head test-ID comparison, obtain
 a new independent review, and obtain a new human-owner decision for the
@@ -151,6 +150,12 @@ alternative to refreshing stale evidence. Do not rely on auto-merge unless it
 revalidates both SHAs immediately before merging. Merge with
 `gh pr merge --match-head-commit <accepted-head>` after this comparison, so a
 concurrent head push cannot invalidate the accepted evidence.
+`--match-head-commit` does not bind the base tip. If the repository does not
+enforce an up-to-date branch or a merge queue, the base can move between this
+comparison and merge. Record that residual risk in the human owner's decision;
+do not claim the merged tree was the tested pair without verifying its actual
+parents and tree after merge. If the owner does not accept that risk, defer
+merge until a repository-level base-stability rule is in place.
 
 For an owner-controlled fork where the repository owner has disabled GitHub Actions,
 the owner may use fixed, local verification evidence instead of the missing Actions
@@ -171,22 +176,33 @@ decision on that PR, including the affected check and accepted alternative,
 before that alternative can be used. The author and reviewer cannot certify
 their own policy change under the proposed new rule.
 
-For every local verification receipt, and for every baseline exception even
-when Actions is enabled, the PR must:
+Every PR requires the independent review and separate human-owner decision in
+item 3 below, whether Actions is enabled or the full suite passes. For every
+local verification receipt, and for every baseline exception even when Actions
+is enabled, the PR must also meet items 1 and 2:
 
 1. Link a receipt for the exact PR head and recorded PR base SHA. Record the
    runner identity, executing OS UID/GID, image digest when an image is used,
    tool versions, relevant environment/configuration hashes, test-data hashes,
    commands,
    exit codes, collected test IDs and outcomes, test counts, and log hashes.
-   Include negative credential-isolation probes run under the tested OS identity:
-   use a verified installed client or an actual API request to show that
-   authenticated access fails, and show that configured publishing credential
-   paths are unreadable. A missing client is not a successful denial probe.
+   Inventory every configured publishing channel under the tested OS identity:
+   GitHub CLI/API tokens, HTTPS git credential helpers and macOS Keychain,
+   SSH private keys and `SSH_AUTH_SOCK`, and Paperclip API credentials. For each
+   channel, retain a negative probe of the credential source and a non-mutating
+   authenticated-access attempt using a verified installed client, or evidence
+   that the channel is absent or denied by the OS isolation boundary. A public
+   unauthenticated read is not an authenticated-access probe. An absent client
+   alone is not a successful denial probe; a channel whose accessibility cannot
+   be determined blocks merge. Show that configured publishing credential paths
+   are unreadable.
    Record probe exit codes and redacted outputs without disclosing secret values.
-   Collect the base test IDs under the same conditions for comparison. If a
-   baseline exception is claimed, also link a full base-run receipt with the
-   same fields. Retain the exact hashed artifacts for independent review.
+   Collect the base test IDs under the same conditions for comparison. If any
+   intentional skip is claimed, also collect its base outcome, reason, and
+   triggering condition under those conditions; an ID-only list cannot prove a
+   matching skip. If a baseline exception is claimed, also link a full base-run
+   receipt with the same fields. Retain the exact hashed artifacts for
+   independent review.
    Publish only redacted
    copies or artifact locations that do not expose credentials or private host
    data; record the redacted copy's hash separately from the retained original.
@@ -195,7 +211,8 @@ when Actions is enabled, the PR must:
    the PR intentionally changes it and the independent reviewer and owner accept
    that exact-head change. Attach a machine-readable
    inventory of every failed and skipped test, including collection and import
-   errors, with the reason and whether the skip is required or intentional.
+   errors, with the outcome, reason, triggering condition for an intentional
+   skip, and whether the skip is required or intentional.
    Run the full suite, PR-specific tests, lint, typecheck, build, and all
    applicable required static gates to completion. The PR-specific tests and
    gates outside the full suite must pass. Execute the
@@ -212,18 +229,24 @@ when Actions is enabled, the PR must:
    including through another session of the same agent, validate the receipts.
    An independent reviewer must be a human or a different model family from
    the author; another session or harness with the author's model family does
-   not qualify. Record author and reviewer model families when AI is used.
+   not qualify. For this rule, model family means the provider's model lineage:
+   Claude Opus and Claude Sonnet are the same Claude family, while GPT and
+   Claude are different families. Record provider, exact model ID, and family
+   for author and reviewer when AI is used.
    The reviewer must validate the base/head test-ID comparison, credential
    isolation, complete gate inventory, and classifications. Record the
    reviewer's human identity or model/service
    version, full head and base-tip SHAs, immutable input hash, result, and safe
    artifact locations on the PR. The human repository owner must separately
-   comment with the same full head and base-tip SHAs, the exact accepted-exception
-   list (or `none`), each intentional skip (or `none`), each accepted gate
-   substitution (or `none`), and each additional-gate not-applicable decision
-   (or `none`) before merge. The immutable input hash is SHA-256 of a retained
-   manifest listing the full head/base pair and every original receipt, log,
-   test-ID inventory, and failure/skip inventory by path, byte size, and SHA-256.
+   comment with the same full head and base-tip SHAs, the immutable input hash,
+   the independent-review record link, the exact accepted-exception list (or
+   `none`), each intentional skip (or `none`), each accepted base-to-head test-ID
+   removal or rename (or `none`), each accepted gate substitution (or `none`),
+   each additional-gate not-applicable decision (or `none`), and any base-race
+   residual-risk acceptance before merge. The immutable input hash is SHA-256
+   of a retained manifest listing the full head/base pair and every original
+   receipt, log, test-ID inventory, and failure/skip inventory by path, byte
+   size, and SHA-256.
    Keep both the manifest and its listed bytes available to the reviewer.
    An agent using the owner's account must not post or prepare a final owner
    acceptance comment, check its PR box, or merge. The human owner must perform

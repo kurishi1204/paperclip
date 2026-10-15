@@ -124,6 +124,6 @@
 - [ ] For local receipts or baseline exceptions, I have compared base/head test IDs and recorded every failure and required skip, including collection or import errors
 - [ ] The full suite passes or each baseline failure and required skip has the exact-head/base evidence required by CONTRIBUTING.md; I have not called a disabled or failing gate green
 - [ ] An independent reviewer has validated the exact-head/base receipt, gate substitutions, and immutable input hash
-- [ ] The human owner has accepted this full head SHA, full base-tip SHA, exception list (or `none`), intentional-skip list (or `none`), gate substitutions (or `none`), and additional-gate not-applicable decisions (or `none`) in a separate PR comment; only the human owner checks this box
+- [ ] The human owner has accepted this full head SHA, full base-tip SHA, immutable input hash, independent-review record link, exception list (or `none`), intentional-skip list (or `none`), base-to-head test-ID removals/renames (or `none`), gate substitutions (or `none`), additional-gate not-applicable decisions (or `none`), and any base-race residual risk in a separate PR comment; only the human owner checks this box
 - [ ] Greptile is 5/5 with no open P2s, recommendations, or follow-ups
 - [ ] I will address all Greptile and reviewer comments before requesting merge
