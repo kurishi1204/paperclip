@@ -206,21 +206,31 @@ When adding endpoints:
 
 ## 10. Pull Request Requirements
 
-When creating a pull request (via `gh pr create` or any other method), you **must** read and fill in every section of [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md). Do not craft ad-hoc PR bodies — use the template as the structure for your PR description. Required sections:
+When creating a pull request (via `gh pr create` or any other method), you **must** read and fill in every section of [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md). Do not craft ad-hoc PR bodies — use the template as the structure for your PR description. Leave future verification and independent-review boxes unchecked until their evidence exists. Agents must not post or prepare a final owner-acceptance comment, check the owner-acceptance box, or merge, even when acting through the owner's account. Only the human owner can accept the recorded head/base pair and exceptions. Required sections:
 
 - **Thinking Path** — trace reasoning from project context to this change (see `CONTRIBUTING.md` for examples)
 - **What Changed** — bullet list of concrete changes
 - **Verification** — how a reviewer can confirm it works
 - **Risks** — what could go wrong
 - **Model Used** — the AI model that produced or assisted with the change (provider, exact model ID, context window, capabilities). Write "None — human-authored" if no AI was used.
-- **Checklist** — all items checked
+- **Checklist** — checked items have truthful evidence, including any local
+  check receipt or baseline full-suite exception under `CONTRIBUTING.md` instead
+  of a false green claim; incomplete items remain unchecked
 
 ## 11. Definition of Done
 
 A change is done when all are true:
 
 1. Behavior matches `doc/SPEC-implementation.md`
-2. Typecheck, tests, and build pass
+2. PR-specific tests, lint, typecheck, build, and all required static gates pass.
+   The full suite passes or each baseline failure and required-test skip meets
+   the exact-head/base evidence and exception rules in `CONTRIBUTING.md`.
+   Compare base/head test IDs for every PR, including Actions runs.
+   Resolve and hash the full reusable-workflow graph from the recorded base as
+   `CONTRIBUTING.md` requires. Recheck moving refs immediately before merge.
+   Independent review and the separate human-owner decision are required even
+   if the full suite passes. GitHub Actions status does not change the
+   test-failure or required-skip rule.
 3. Contracts are synced across db/shared/server/ui
 4. Docs updated when behavior or commands change
 5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)
