@@ -225,7 +225,7 @@ A change is done when all are true:
 2. PR-specific tests, lint, typecheck, build, and all required static gates pass.
    The full suite passes or each baseline failure and required-test skip meets
    the exact-head/base evidence and exception rules in `CONTRIBUTING.md`.
-   Compare base/head test IDs for local receipts and baseline exceptions.
+   Compare base/head test IDs for every PR, including Actions runs.
    Independent review and the separate human-owner decision are required even
    if the full suite passes. GitHub Actions status does not change the
    test-failure or required-skip rule.

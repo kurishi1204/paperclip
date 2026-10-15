@@ -134,12 +134,15 @@ confirm that it covers the same gate and record the command mapping. The human
 owner must name each accepted substitution in the owner decision. Until then,
 the gate is unresolved and blocks merge.
 
-Freeze evidence against both the full PR head SHA and the current PR base-tip
-SHA. Read both SHAs from the live PR before collecting evidence, then require
+Freeze evidence against both the full PR head SHA and the current base branch
+tip SHA. Read the head from the live PR and the base tip directly from its base
+branch ref (for example, `git ls-remote <remote> refs/heads/<base-branch>`),
+not from a cached PR base field or local tracking ref. Then require
 `git merge-base --is-ancestor <base-tip> <head>` for that pair; otherwise update
 the branch onto the current base first. Record that pair in the verification
-receipt and independent-review record, whether Actions is enabled or disabled.
-Immediately before merge, read the live PR head and base tip again, compare
+manifest, any local receipt, and the independent-review record, whether Actions
+is enabled or disabled.
+Immediately before merge, read the live PR head and base branch ref again, compare
 both with the accepted pair, and confirm that this live base tip is an ancestor
 of the accepted head.
 If the base moved, update the branch onto the current base. If either SHA
@@ -176,19 +179,29 @@ decision on that PR, including the affected check and accepted alternative,
 before that alternative can be used. The author and reviewer cannot certify
 their own policy change under the proposed new rule.
 
-Every PR requires the independent review and separate human-owner decision in
-item 3 below, whether Actions is enabled or the full suite passes. For every
-local verification receipt, and for every baseline exception even when Actions
-is enabled, the PR must also meet items 1 and 2:
+Every PR needs an immutable verification manifest for its full head/base pair.
+List the complete PR diff hash, applicable gate inventory and results, and
+comparable base/head test-ID inventories with outcomes, failures, skips, and
+collection/import errors. For Actions evidence, link the exact workflow ref,
+run/job/check IDs, conclusions, and retained log/artifact hashes; a green check
+name alone is insufficient. For local evidence, link the receipts below. The
+independent reviewer must verify the manifest, complete gate inventory, and
+base/head test-ID comparison. Every PR must meet items 2 and 3 below, including
+when Actions is enabled and the full suite passes. Item 1 adds requirements
+whenever tests or gates run locally; a baseline exception also needs the full
+base-run receipt described there.
 
 1. Link a receipt for the exact PR head and recorded PR base SHA. Record the
    runner identity, executing OS UID/GID, image digest when an image is used,
    tool versions, relevant environment/configuration hashes, test-data hashes,
    commands,
    exit codes, collected test IDs and outcomes, test counts, and log hashes.
-   Inventory every configured publishing channel under the tested OS identity:
-   GitHub CLI/API tokens, HTTPS git credential helpers and macOS Keychain,
-   SSH private keys and `SSH_AUTH_SOCK`, and Paperclip API credentials. For each
+   Inventory every configured publishing channel under the tested OS identity.
+   The minimum inventory includes GitHub CLI/API tokens; HTTPS git helpers,
+   macOS Keychain and `.netrc`; repository-local `.git/config` remote URLs and
+   `http.*.extraheader`; SSH private keys and `SSH_AUTH_SOCK`; Paperclip API
+   credentials; and package-registry publishing tokens. Include any other
+   configured channel rather than treating this list as exhaustive. For each
    channel, retain a negative probe of the credential source and a non-mutating
    authenticated-access attempt using a verified installed client, or evidence
    that the channel is absent or denied by the OS isolation boundary. A public
@@ -215,9 +228,12 @@ is enabled, the PR must also meet items 1 and 2:
    skip, and whether the skip is required or intentional.
    Run the full suite, PR-specific tests, lint, typecheck, build, and all
    applicable required static gates to completion. The PR-specific tests and
-   gates outside the full suite must pass. Execute the
-   tested PR code under an identity that cannot read GitHub or Paperclip
-   publishing credentials; clearing environment variables alone is insufficient.
+   gates outside the full suite must pass. Provision dependencies and run any
+   PR-head install/lifecycle script, build, test, or gate command only under an
+   identity that cannot read GitHub, Paperclip, or other publishing credentials.
+   Do not run `pnpm install` or PR-head `preinstall`, `postinstall`, or `prepare`
+   as the operator before switching identities. Clearing environment variables
+   alone is insufficient.
 2. Treat tests added or changed by the PR, and tests that exercise changed behavior,
    as PR-specific. Treat a disputed test or gate classification as required until
    independent review resolves it. An intentional platform skip must have the
@@ -226,16 +242,19 @@ is enabled, the PR must also meet items 1 and 2:
    intentional skip in the human owner's decision even when no exception is
    needed. Otherwise treat it as a required-test skip.
 3. Have a reviewer who did not author the change or prepare its evidence,
-   including through another session of the same agent, validate the receipts.
-   An independent reviewer must be a human or a different model family from
-   the author; another session or harness with the author's model family does
+   including through another session of the same agent, validate the manifest
+   and underlying receipts or Actions runs. An independent reviewer must be a
+   human or a different model family from both the author and every evidence
+   preparer; another session or harness with any of their model families does
    not qualify. For this rule, model family means the provider's model lineage:
    Claude Opus and Claude Sonnet are the same Claude family, while GPT and
    Claude are different families. Record provider, exact model ID, and family
-   for author and reviewer when AI is used.
-   The reviewer must validate the base/head test-ID comparison, credential
-   isolation, complete gate inventory, and classifications. Record the
-   reviewer's human identity or model/service
+   for the author, each evidence preparer, and reviewer when AI is used.
+   The reviewer must validate the base/head test-ID comparison, complete gate
+   inventory, and classifications. For local runs, validate credential-isolation
+   probes; for Actions runs, validate the job token scopes and secret exposure
+   shown by the workflow and job configuration. Record the reviewer's human
+   identity or model/service
    version, full head and base-tip SHAs, immutable input hash, result, and safe
    artifact locations on the PR. The human repository owner must separately
    comment with the same full head and base-tip SHAs, the immutable input hash,
@@ -244,9 +263,10 @@ is enabled, the PR must also meet items 1 and 2:
    removal or rename (or `none`), each accepted gate substitution (or `none`),
    each additional-gate not-applicable decision (or `none`), and any base-race
    residual-risk acceptance before merge. The immutable input hash is SHA-256
-   of a retained manifest listing the full head/base pair and every original
-   receipt, log, test-ID inventory, and failure/skip inventory by path, byte
-   size, and SHA-256.
+   of the retained verification manifest above, listing the full head/base
+   pair, diff, every original receipt or Actions run/job/check record, log,
+   test-ID inventory, and failure/skip inventory by path or immutable location,
+   byte size, and SHA-256.
    Keep both the manifest and its listed bytes available to the reviewer.
    An agent using the owner's account must not post or prepare a final owner
    acceptance comment, check its PR box, or merge. The human owner must perform
