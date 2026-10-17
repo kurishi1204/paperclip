@@ -127,7 +127,6 @@ export function signalRunningProcess(
   running: Pick<RunningProcess, "child" | "processGroupId"> & { closed?: boolean },
   signal: NodeJS.Signals,
 ) {
-  if (running.closed) return;
   if (
     process.platform !== "win32" &&
     running.processGroupId &&
@@ -140,6 +139,9 @@ export function signalRunningProcess(
       // Fall back to the direct child signal if group signaling fails.
     }
   }
+  // A closed leader may leave its captured group alive through grace KILL.
+  // Never fall back to its direct PID after close, when that PID can be reused.
+  if (running.closed) return;
   // Gate on real liveness: `child.killed` only means a signal was sent, not that
   // the process exited, so escalating on it would suppress a follow-up SIGKILL.
   // `exitCode`/`signalCode` are null until the child actually closes.
@@ -202,8 +204,7 @@ export function requestQaReviewHold(
     if (!control.hold || running.closed) return;
     signalRunningProcess(running, "SIGTERM");
     const kill = setTimeout(() => signalRunningProcess(running, "SIGKILL"), Math.max(1, running.graceSec) * 1000);
-    running.closeCleanups ??= new Set();
-    running.closeCleanups.add(() => clearTimeout(kill));
+    // The group grace period survives leader close; descendants may ignore TERM.
     kill.unref?.();
   };
   const timer = setTimeout(() => { void task(); }, 0);
@@ -5012,7 +5013,7 @@ export async function runChildProcess(
           (code: number | null, signal: NodeJS.Signals | null) => {
             running.closed = true;
             if (timeout) clearTimeout(timeout);
-            if (timeoutKillTimer) clearTimeout(timeoutKillTimer);
+            // An armed deadline KILL belongs to the captured group, not its leader.
             clearTerminalCleanupTimers();
             for (const cleanup of running.closeCleanups ?? []) cleanup();
             if (runningProcesses.get(runId) === running) runningProcesses.delete(runId);

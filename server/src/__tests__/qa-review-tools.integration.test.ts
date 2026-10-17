@@ -77,6 +77,28 @@ describe("run-bound QA review MCP", () => {
     return { fixture, stageId, token, call, tool, rows };
   }
 
+  it("review regression rejects unknown tools before service or paging hold", async () => {
+    const {fixture, tool, rows} = await reviewFixture(); const spy = vi.spyOn(qaReviewTools, "callQaReviewTool");
+    try {
+      for (let i=0;i<2;i++) { const r=await tool("unknown_tool"); expect(r.status).toBe(200);
+        expect(r.body.result.isError).toBe(true); expect(JSON.stringify(r.body)).toContain("Unknown QA review tool"); }
+      expect(spy.mock.calls.length).toBe(0); expect(await rows()).toHaveLength(0);
+      const control=reviewProcesses.getQaReviewProcess(fixture.runId)!.control;
+      expect(control.hold ?? control.requestedHold).toBeNull();
+    } finally {spy.mockRestore();}
+  });
+
+  it("review regression rejects absent params with the existing unknown-tool contract", async () => {
+    const {fixture, call, rows} = await reviewFixture(); const spy=vi.spyOn(qaReviewTools,"callQaReviewTool");
+    try {
+      const r=await call("tools/call"); expect(r.status).toBe(200); expect(r.body.result.isError).toBe(true);
+      expect(JSON.stringify(r.body)).toContain("Unknown QA review tool");
+      expect(spy.mock.calls.length).toBe(0); expect(await rows()).toHaveLength(0);
+      const control=reviewProcesses.getQaReviewProcess(fixture.runId)!.control;
+      expect(control.hold ?? control.requestedHold).toBeNull();
+    } finally {spy.mockRestore();}
+  });
+
   it("exposes only issue-bound read and formal decision tools", async () => {
     const { fixture, token, call, tool } = await reviewFixture();
     expect((await call("tools/list")).body.result.tools.map((item: { name: string }) => item.name)).toEqual([

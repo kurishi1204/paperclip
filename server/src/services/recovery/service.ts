@@ -3965,19 +3965,29 @@ export function recoveryService(
           .where(and(eq(issueApprovals.issueId, current.id),
             inArray(approvals.status, ["pending", "revision_requested"]))).limit(1);
         if (interaction || approval) return null;
-        const actions = issueRecoveryActionService(tx as unknown as Db);
         const fingerprint = `qa_review_read_hold:${source.id}:${hold.currentStageId}`;
-        const active = await actions.getActiveForIssue(current.companyId, current.id);
-        // Existing recovery authority cannot be taken over by this finalizer.
-        if (active) return null;
+        const [active] = await tx.select().from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.companyId, current.companyId),
+          eq(issueRecoveryActions.sourceIssueId, current.id),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        )).for("update").limit(1);
         const blocked = await issuesSvc.update(current.id, {
           status: "blocked", companyGuard: current.companyId, expectedRevision: current.revision,
         }, tx, publications, postCommitActions);
         if (!blocked) throw new Error("QA paging hold lost its locked issue update");
-        // The service retries plain INSERT conflicts. A savepoint encloses the
-        // complete call so any aborted transaction/retry rolls back the outer
-        // blocker as well. Never continue finalization in an aborted tx.
-        const action = await tx.transaction(async (savepoint) =>
+        // An owned action must keep its identity, owner, wake contract and
+        // attempt budget. Upsert would consume that budget, so only append the
+        // bound paging receipt under this row lock. A new action still uses the
+        // existing service/savepoint; any write failure rolls back the blocker.
+        const action = active
+          ? await tx.update(issueRecoveryActions).set({
+              evidence: { ...active.evidence, qaReviewPagingHold: hold }, updatedAt: new Date(),
+            }).where(and(eq(issueRecoveryActions.id, active.id),
+              eq(issueRecoveryActions.companyId, current.companyId),
+              eq(issueRecoveryActions.sourceIssueId, current.id),
+              inArray(issueRecoveryActions.status, ["active", "escalated"]),
+            )).returning().then(rows => rows[0])
+          : await tx.transaction(async (savepoint) =>
           issueRecoveryActionService(savepoint as unknown as Db).upsertSourceScoped({
             companyId: current.companyId, sourceIssueId: current.id,
             kind: "configuration_validation", cause: "configuration_incomplete", fingerprint,
@@ -3990,15 +4000,17 @@ export function recoveryService(
             wakePolicy: { type: "board_escalation", reason: "configuration_incomplete", preservesSourceAssignee: true },
             monitorPolicy: null, maxAttempts: null, lastAttemptAt: new Date(),
           }));
-        if (action.fingerprint !== fingerprint || action.cause !== "configuration_incomplete" ||
-          action.kind !== "configuration_validation" || action.ownerType !== "board" || action.attemptCount !== 1) {
+        if (!action || (!active && (action.fingerprint !== fingerprint || action.cause !== "configuration_incomplete" ||
+          action.kind !== "configuration_validation" || action.ownerType !== "board" || action.attemptCount !== 1))) {
           throw new Error("Another recovery action acquired this issue during QA paging escalation");
         }
         const notice = buildStrandedRecoveryEscalationNotice({
           seed: { title: "QA evidence paging needs repair", tone: "danger",
-            body: "The QA provider started, but evidence paging was rejected or made no progress. The pending review is blocked until paging is repaired and explicitly resumed.",
+            body: "The QA provider started, but evidence paging was rejected or made no progress. The pending review is blocked until paging is repaired and explicitly resumed." +
+              (active ? " The existing recovery action and its owner remain authoritative." : ""),
             nextAction: "Inspect the source run evidence, repair paging, then explicitly resume the review." },
-          recoveryCause: "configuration_incomplete", recoveryActionId: action.id, recoveryOwner: null,
+          recoveryCause: "configuration_incomplete", recoveryActionId: action.id,
+          recoveryOwner: active?.ownerAgentId ? { id: active.ownerAgentId, name: null } : null,
           sourceRun: { id: source.id, agentId: source.agentId, status: source.status,
             errorCode: source.errorCode, errorSummary: null },
         });
@@ -4668,6 +4680,22 @@ export function recoveryService(
         issue.id,
       );
       if (activeRecoveryAction?.ownerType === "board") {
+        // A prior action still owns recovery. If publication of this exact
+        // paging blocker rolled back, retry only the atomic notice path; never
+        // enqueue work or replace the board's existing authority.
+        const pagingSource = issue.status === "in_review" && participantAgentId
+          ? await getLatestIssueRunForAgent(issue.companyId, issue.id, participantAgentId)
+          : null;
+        const pagingHold = readQaPagingHold(pagingSource);
+        if (pagingHold && qaPagingHoldMatchesIssue(pagingHold, issue) &&
+          !await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+          const updated = await escalateQaPagingHold(issue, pagingSource);
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else result.skipped += 1;
+          continue;
+        }
         result.skipped += 1;
         continue;
       }

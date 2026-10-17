@@ -306,6 +306,78 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     return { issue: issue!, run: run!, hold, recovery, release, effects, companyId, issueId, agentId, runId, stageId };
   }
 
+  it.each(["board", "agent"] as const)("review regression preserves active authority and publishes one paging blocker (%s)", async (ownerType) => {
+    const f = await seedQaPagingHoldFixture();
+    const { issueRecoveryActionService } = await import("../services/issue-recovery-actions.js");
+    const active = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId: f.companyId, sourceIssueId: f.issueId, kind: "stranded_assigned_issue",
+      ownerType, ownerAgentId: ownerType === "agent" ? f.agentId : null,
+      cause: "execution_review_participant_recovery", fingerprint: "prior-review-recovery-authority",
+      nextAction: "Existing authority remains owner", evidence: { priorEvidence: "preserved" },
+      attemptCount: 3, maxAttempts: 3,
+      wakePolicy: { type: "retry", reason: "execution_review_participant_recovery" },
+    });
+    const before = (await f.effects()).actions[0];
+    expect((await f.release()).outcome.kind).toBe("blocked");
+    let after = await f.effects();
+    expect(after.issue.status).toBe("blocked"); expect(after.comments).toHaveLength(1);
+    expect(after.actions).toHaveLength(1);
+    const { evidence: priorEvidence, updatedAt: _beforeAt, ...authority } = before;
+    const { evidence, updatedAt: _afterAt, ...retainedAuthority } = after.actions[0];
+    expect(retainedAuthority).toEqual(authority);
+    expect(evidence).toEqual({ ...priorEvidence, qaReviewPagingHold: f.hold });
+    expect(after.comments[0].metadata).toMatchObject({ sourceRunId: f.runId });
+    expect(JSON.stringify(after.comments[0].metadata)).toContain(active.id);
+    if (ownerType === "agent") expect(JSON.stringify(after.comments[0].metadata)).toContain(f.agentId);
+    expect(await heartbeat.invoke(f.agentId, "on_demand", { issueId: f.issueId,
+      wakeReason: "execution_review_participant_recovery", retryReason: "execution_review_participant_recovery",
+      recoveryActionId: active.id }, "system")).toBeNull();
+    await f.release();
+    for (let i = 0; i < 2; i++) await heartbeat.reconcileStrandedAssignedIssues();
+    after = await f.effects();
+    expect(after.comments).toHaveLength(1); expect(after.actions).toHaveLength(1); expect(after.runs).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+    await issueService(db).update(f.issueId, { status: "in_review", companyGuard: f.companyId,
+      expectedRevision: after.issue.revision });
+    const manual = await heartbeat.invoke(f.agentId, "on_demand", { issueId: f.issueId,
+      wakeReason: "execution_review_requested" }, "manual");
+    expect(manual).not.toBeNull();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(await heartbeat.getRun(manual!.id)).not.toBeNull();
+  });
+
+  it.each(["board", "agent"] as const)("review regression rolls back active-action evidence on notice failure and publishes after recovery (%s)", async (ownerType) => {
+    const f = await seedQaPagingHoldFixture();
+    const { issueRecoveryActionService } = await import("../services/issue-recovery-actions.js");
+    await issueRecoveryActionService(db).upsertSourceScoped({ companyId: f.companyId,
+      sourceIssueId: f.issueId, kind: "stranded_assigned_issue", ownerType,
+      ownerAgentId: ownerType === "agent" ? f.agentId : null,
+      cause: "execution_review_participant_recovery", fingerprint: "prior-notice-failure",
+      nextAction: "Preserve authority", evidence: { priorEvidence: "retained" } });
+    const before = (await f.effects()).actions[0];
+    await db.execute(sql.raw("CREATE SEQUENCE qa_active_hold_notice_attempt"));
+    await db.execute(sql.raw("CREATE FUNCTION qa_active_hold_notice_probe() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('qa_active_hold_notice_attempt'); RAISE EXCEPTION 'injected active notice failure'; END $$"));
+    await db.execute(sql.raw("CREATE TRIGGER qa_active_hold_notice_probe BEFORE INSERT ON issue_comments FOR EACH ROW EXECUTE FUNCTION qa_active_hold_notice_probe()"));
+    try {
+      expect((await f.release()).outcome.kind).toBe("blocked");
+      const attempted = await db.execute(sql.raw("SELECT is_called FROM qa_active_hold_notice_attempt"));
+      expect(attempted[0]?.is_called).toBe(true);
+      const after = await f.effects();
+      expect(after.issue.status).toBe("in_review"); expect(after.actions).toEqual([before]);
+      expect(after.comments).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, f.issueId))).toHaveLength(0);
+    } finally {
+      await db.execute(sql.raw("DROP TRIGGER qa_active_hold_notice_probe ON issue_comments"));
+      await db.execute(sql.raw("DROP FUNCTION qa_active_hold_notice_probe()"));
+      await db.execute(sql.raw("DROP SEQUENCE qa_active_hold_notice_attempt"));
+    }
+    for (let i = 0; i < 2; i++) await heartbeat.reconcileStrandedAssignedIssues();
+    const after = await f.effects();
+    expect(after.issue.status).toBe("blocked"); expect(after.comments).toHaveLength(1);
+    expect(after.actions).toHaveLength(1);
+    expect(after.actions[0].id).toBe(before.id); expect(after.actions[0].ownerType).toBe(before.ownerType);
+  });
+
   it("does not schedule any retry policy for a bound QA paging HOLD", async () => {
     const f = await seedQaPagingHoldFixture();
     for (const retryReason of ["transient_failure", MAX_TURN_CONTINUATION_RETRY_REASON,

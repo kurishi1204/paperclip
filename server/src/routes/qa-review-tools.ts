@@ -56,8 +56,11 @@ export function qaReviewToolRoutes(db: Db) {
     if (method !== "tools/call") return res.type("application/json").send(JSON.stringify({
       jsonrpc: "2.0", id: boundedId, error: { code: -32601, message: "Method not found" },
     }));
-    const binding = getQaReviewProcess(context.run.id);
     try {
+      if (!qaReviewToolDefinitions.some(tool => tool.name === params?.name)) {
+        throw forbidden("Unknown QA review tool");
+      }
+      const binding = getQaReviewProcess(context.run.id);
       const receiptOnly = params?.name === "read_assigned_review_receipt";
       if (!binding && !receiptOnly) throw forbidden("QA review process is not bound to this run");
       if (!activeParticipant && params?.name !== "read_assigned_review_receipt") {

@@ -118,17 +118,93 @@ it("kills a held review group after its leader exits while a descendant retains 
   expect(runningProcesses.has(id)).toBe(false);
 }, 7000);
 
-it("clears the child deadline's grace KILL after real close", async () => {
-  const signals = vi.spyOn(process, "kill");
-  let pid = 0;
-  try {
-    await runChildProcess(randomUUID(), process.execPath, ["-e", "setInterval(()=>{},1000)"], {
-      cwd: os.tmpdir(), env: {}, timeoutSec: 0.1, graceSec: 1,
-      onSpawn: async meta => { pid = meta.pid; }, onLog: async () => {},
+it.skipIf(process.platform === "win32").each(["deadline", "qa-hold"] as const)(
+  "finishes the captured %s group after its TERM-exiting leader closes all pipes",
+  async mode => {
+    const id = randomUUID();
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-group-grace-"));
+    const ready = path.join(directory, "ready.json");
+    let leaderPid: number | null = null;
+    let descendantPid: number | null = null;
+    const descendant = [
+      "process.on('SIGTERM',()=>{});",
+      `require('node:fs').writeFileSync(${JSON.stringify(ready)},JSON.stringify({pid:process.pid,owner:process.argv[1]}));`,
+      "setInterval(()=>{},1000);",
+    ].join("");
+    const leader = [
+      "process.on('SIGTERM',()=>process.exit(0));",
+      `const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)},process.argv[1]],{stdio:'ignore'});`,
+      "child.unref();setInterval(()=>{},1000);",
+    ].join("");
+    const resultPromise = runChildProcess(id, process.execPath, ["-e", leader, id], {
+      cwd: directory, env: {}, timeoutSec: mode === "deadline" ? 0.5 : 0, graceSec: 1,
+      onSpawn: async meta => { leaderPid = meta.pid; }, onLog: async () => {},
     });
-    await new Promise(resolve => setTimeout(resolve, 1100));
-    expect(signals.mock.calls.some(([group, signal]) => group === -pid && signal === "SIGKILL")).toBe(false);
+    try {
+      const deadline = Date.now() + 2_000;
+      let captured: { pid: number; owner: string } | null = null;
+      while (!captured && Date.now() < deadline) {
+        try { captured = JSON.parse(await fs.readFile(ready, "utf8")); }
+        catch { await new Promise(resolve => setTimeout(resolve, 10)); }
+      }
+      expect(captured?.owner).toBe(id);
+      descendantPid = captured!.pid;
+      expect(descendantPid).toBeGreaterThan(0);
+      if (mode === "qa-hold") {
+        const binding = bindQaReviewProcess(id, leaderPid!);
+        expect(binding).not.toBeNull();
+        requestQaReviewHold(binding!, { reason: "qa_review_read_hold" });
+      }
+      const result = await resultPromise;
+      expect(result.exitCode).toBe(0);
+      expect(result.timedOut).toBe(mode === "deadline");
+      expect(isPidAlive(descendantPid)).toBe(true); // close precedes grace KILL
+      expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
+      expect(runningProcesses.has(id)).toBe(false);
+    } finally {
+      // Only the leader captured by onSpawn and the UUID-bound descendant.
+      for (const pid of [descendantPid, leaderPid]) {
+        if (pid && isPidAlive(pid)) process.kill(pid, "SIGKILL");
+        if (pid) expect(await waitForPidExit(pid)).toBe(true);
+      }
+      await resultPromise;
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  },
+  7_000,
+);
+
+it("never falls back to a late direct-child signal after its captured group is gone", () => {
+  const kill = vi.fn();
+  const signals = vi.spyOn(process, "kill").mockImplementation(() => {
+    throw Object.assign(new Error("captured group exited"), { code: "ESRCH" });
+  });
+  try {
+    signalRunningProcess({ child: { exitCode: null, signalCode: null, kill } as never,
+      processGroupId: 12345678, closed: true }, "SIGKILL");
+    expect(signals).toHaveBeenCalledWith(-12345678, "SIGKILL");
+    expect(kill).not.toHaveBeenCalled();
   } finally { signals.mockRestore(); }
+});
+
+it("keeps a replacement run mapping when the earlier captured child closes", async () => {
+  const id = randomUUID();
+  const replacementKill = vi.fn();
+  const replacement = { child: { pid: 12345678, kill: replacementKill } as never,
+    graceSec: 1, processGroupId: null, closed: false };
+  try {
+    const result = await runChildProcess(id, process.execPath,
+      ["-e", "setTimeout(()=>process.exit(0),50)"], {
+        cwd: os.tmpdir(), env: {}, timeoutSec: 0, graceSec: 1, onLog: async () => {},
+        onSpawn: async () => { await Promise.resolve(); runningProcesses.set(id, replacement); },
+      });
+    expect(result.exitCode).toBe(0);
+    expect(runningProcesses.get(id)).toBe(replacement);
+    expect(replacementKill).not.toHaveBeenCalled();
+    expect(getQaReviewProcess(id)).toBeNull();
+  } finally {
+    if (runningProcesses.get(id) === replacement) runningProcesses.delete(id);
+  }
 });
 
 it("reserves identity credentials even for mixed-case inherited or configured keys", () => {
