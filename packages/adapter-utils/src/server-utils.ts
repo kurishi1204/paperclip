@@ -91,6 +91,8 @@ interface RunningProcess {
   child: ChildProcess;
   graceSec: number;
   processGroupId: number | null;
+  closed?: boolean;
+  closeCleanups?: Set<() => void>;
 }
 
 interface SpawnTarget {
@@ -122,9 +124,10 @@ function resolveProcessGroupId(child: ChildProcess) {
 
 // Exported so the direct-child fallback branch can be unit-tested directly.
 export function signalRunningProcess(
-  running: Pick<RunningProcess, "child" | "processGroupId">,
+  running: Pick<RunningProcess, "child" | "processGroupId"> & { closed?: boolean },
   signal: NodeJS.Signals,
 ) {
+  if (running.closed) return;
   if (
     process.platform !== "win32" &&
     running.processGroupId &&
@@ -146,6 +149,67 @@ export function signalRunningProcess(
 }
 
 export const runningProcesses = new Map<string, RunningProcess>();
+
+/** Volatile state of the actual review child, never a caller-supplied PID. */
+export interface QaReviewProcessControl {
+  hold: Record<string, unknown> | null;
+  requestedHold: Record<string, unknown> | null;
+  verdict: "none" | "pending" | "committed" | "unknown";
+  verdictPromise?: Promise<unknown>;
+  reads: Map<string, {
+    tail: Promise<void>;
+    errors: number;
+    result: string | null;
+    repeats: number;
+  }>;
+}
+const qaReviewControls = new WeakMap<RunningProcess, QaReviewProcessControl>();
+export class QaReviewProcessBindingError extends Error {}
+
+export function bindQaReviewProcess(runId: string, pid: number) {
+  const running = runningProcesses.get(runId);
+  if (!running || running.closed || running.child.pid !== pid) return null;
+  const control: QaReviewProcessControl = {
+    hold: null, requestedHold: null, verdict: "none", reads: new Map(),
+  };
+  qaReviewControls.set(running, control);
+  return { running, control };
+}
+
+export function getQaReviewProcess(runId: string) {
+  const running = runningProcesses.get(runId);
+  const control = running && qaReviewControls.get(running);
+  return running && !running.closed && control ? { running, control } : null;
+}
+
+export function requestQaReviewHold(
+  binding: NonNullable<ReturnType<typeof getQaReviewProcess>>,
+  payload: Record<string, unknown>,
+) {
+  const { running, control } = binding;
+  if (control.verdict === "committed" || control.verdict === "unknown") return;
+  if (control.requestedHold || control.hold) return;
+  control.requestedHold = payload;
+  // Return the HTTP error before stopping the client. An admitted verdict is
+  // server work: its settlement is not revoked by killing its caller.
+  const task = async () => {
+    if (control.verdictPromise) await control.verdictPromise.catch(() => undefined);
+    if (control.verdict === "committed" || control.verdict === "unknown") {
+      control.requestedHold = null;
+      return;
+    }
+    control.hold = control.requestedHold;
+    if (!control.hold || running.closed) return;
+    signalRunningProcess(running, "SIGTERM");
+    const kill = setTimeout(() => signalRunningProcess(running, "SIGKILL"), Math.max(1, running.graceSec) * 1000);
+    running.closeCleanups ??= new Set();
+    running.closeCleanups.add(() => clearTimeout(kill));
+    kill.unref?.();
+  };
+  const timer = setTimeout(() => { void task(); }, 0);
+  running.closeCleanups ??= new Set();
+  running.closeCleanups.add(() => clearTimeout(timer));
+}
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
 const TERMINAL_RESULT_SCAN_OVERLAP_CHARS = 64 * 1024;
@@ -4753,11 +4817,18 @@ export async function runChildProcess(
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 
+        let qaBindingFailed = false;
         const spawnPersistPromise =
           typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
             ? opts
                 .onSpawn({ pid: child.pid, processGroupId, startedAt })
                 .catch((err) => {
+                  if (err instanceof QaReviewProcessBindingError) {
+                    qaBindingFailed = true;
+                    // This is the child just spawned by this closure, before
+                    // its prompt is delivered. No registry/PID guess is used.
+                    child.kill("SIGTERM");
+                  }
                   onLogError(
                     err,
                     runId,
@@ -4766,11 +4837,14 @@ export async function runChildProcess(
                 })
             : Promise.resolve();
 
-        runningProcesses.set(runId, {
+        const running: RunningProcess = {
           child,
           graceSec: opts.graceSec,
           processGroupId,
-        });
+          closed: false,
+          closeCleanups: new Set(),
+        };
+        runningProcesses.set(runId, running);
 
         let timedOut = false;
         let stdout = "";
@@ -4782,6 +4856,7 @@ export async function runChildProcess(
         let terminalCleanupForceKilled = false;
         let terminalCleanupTimer: NodeJS.Timeout | null = null;
         let terminalCleanupKillTimer: NodeJS.Timeout | null = null;
+        let timeoutKillTimer: NodeJS.Timeout | null = null;
         let terminalResultStdoutScanOffset = 0;
         let terminalResultStderrScanOffset = 0;
 
@@ -4837,13 +4912,13 @@ export async function runChildProcess(
             if (terminalCleanupStarted || timedOut) return;
             terminalCleanupStarted = true;
             terminalCleanupSignal = "SIGTERM";
-            signalRunningProcess({ child, processGroupId }, "SIGTERM");
+            signalRunningProcess(running, "SIGTERM");
             terminalCleanupKillTimer = setTimeout(
               () => {
                 terminalCleanupKillTimer = null;
                 terminalCleanupSignal = "SIGKILL";
                 terminalCleanupForceKilled = true;
-                signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                signalRunningProcess(running, "SIGKILL");
               },
               Math.max(1, opts.graceSec) * 1000,
             );
@@ -4855,10 +4930,11 @@ export async function runChildProcess(
             ? setTimeout(() => {
                 timedOut = true;
                 clearTerminalCleanupTimers();
-                signalRunningProcess({ child, processGroupId }, "SIGTERM");
-                setTimeout(
+                signalRunningProcess(running, "SIGTERM");
+                timeoutKillTimer = setTimeout(
                   () => {
-                    signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                    timeoutKillTimer = null;
+                    signalRunningProcess(running, "SIGKILL");
                   },
                   Math.max(1, opts.graceSec) * 1000,
                 );
@@ -4904,16 +4980,19 @@ export async function runChildProcess(
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
           void spawnPersistPromise.finally(() => {
-            if (child.killed || stdin.destroyed) return;
+            if (qaBindingFailed || child.killed || stdin.destroyed) return;
             stdin.write(opts.stdin as string);
             stdin.end();
           });
         }
 
         child.on("error", (err: Error) => {
+          running.closed = true;
           if (timeout) clearTimeout(timeout);
+          if (timeoutKillTimer) clearTimeout(timeoutKillTimer);
           clearTerminalCleanupTimers();
-          runningProcesses.delete(runId);
+          for (const cleanup of running.closeCleanups ?? []) cleanup();
+          if (runningProcesses.get(runId) === running) runningProcesses.delete(runId);
           void target.cleanup?.();
           const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
@@ -4931,9 +5010,12 @@ export async function runChildProcess(
         child.on(
           "close",
           (code: number | null, signal: NodeJS.Signals | null) => {
+            running.closed = true;
             if (timeout) clearTimeout(timeout);
+            if (timeoutKillTimer) clearTimeout(timeoutKillTimer);
             clearTerminalCleanupTimers();
-            runningProcesses.delete(runId);
+            for (const cleanup of running.closeCleanups ?? []) cleanup();
+            if (runningProcesses.get(runId) === running) runningProcesses.delete(runId);
             void logChain.finally(() => {
               void Promise.resolve()
                 .then(() => target.cleanup?.())
@@ -4944,6 +5026,7 @@ export async function runChildProcess(
                     timedOut,
                     stdout,
                     stderr,
+                    ...(qaBindingFailed ? { errorCode: "qa_review_configuration_invalid" } : {}),
                     pid: child.pid ?? null,
                     startedAt,
                     terminalResultCleanup: terminalCleanupStarted

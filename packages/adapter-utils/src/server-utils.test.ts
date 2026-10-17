@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import {
   readPaperclipRuntimeSkillEntries,
@@ -31,6 +31,10 @@ import {
   hydrateFreshSessionHandoff,
   runningProcesses,
   runChildProcess,
+  bindQaReviewProcess,
+  getQaReviewProcess,
+  requestQaReviewHold,
+  QaReviewProcessBindingError,
   sanitizeSshRemoteEnv,
   sanitizeInheritedPaperclipEnv,
   isForbiddenConfigEnvKey,
@@ -42,6 +46,90 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
+
+it("binds only the captured review PID and never signals a process after close", () => {
+  const kill = vi.fn();
+  const running = { child: { pid: 12345678, exitCode: null, signalCode: null, kill } as never,
+    graceSec: 1, processGroupId: null, closed: false };
+  runningProcesses.set("qa-binding", running);
+  expect(getQaReviewProcess("qa-binding")).toBeNull();
+  expect(bindQaReviewProcess("qa-binding", 9)).toBeNull();
+  expect(bindQaReviewProcess("qa-binding", 12345678)?.running).toBe(running);
+  running.closed = true;
+  signalRunningProcess(running, "SIGKILL");
+  expect(kill).not.toHaveBeenCalled();
+  expect(getQaReviewProcess("qa-binding")).toBeNull();
+  runningProcesses.delete("qa-binding");
+});
+
+it("does not deliver a provider prompt after a review registry binding failure", async () => {
+  const result = await runChildProcess(randomUUID(), process.execPath,
+    ["-e", "process.stdin.on('data',()=>console.log('PROMPT_WAS_DELIVERED'));setInterval(()=>{},1000)"], {
+      cwd: os.tmpdir(), env: {}, timeoutSec: 2, graceSec: 1, stdin: "must not send",
+      onLog: async () => {}, onLogError: () => {},
+      onSpawn: async () => { throw new QaReviewProcessBindingError("fixture binding failed"); },
+    });
+  expect(result.errorCode).toBe("qa_review_configuration_invalid");
+  expect(result.stdout).not.toContain("PROMPT_WAS_DELIVERED");
+});
+
+it.each(["committed", "unknown"] as const)("keeps an admitted %s verdict out of the paging configuration stop", async verdict => {
+  const id = randomUUID(), kill = vi.fn();
+  const running = { child: { pid: 12345678, exitCode: null, signalCode: null, kill } as never,
+    graceSec: 1, processGroupId: null, closed: false, closeCleanups: new Set<() => void>() };
+  runningProcesses.set(id, running);
+  const binding = bindQaReviewProcess(id, 12345678)!;
+  let settle!: () => void;
+  binding.control.verdict = "pending";
+  binding.control.verdictPromise = new Promise<void>(resolve => { settle = resolve; });
+  requestQaReviewHold(binding, { reason: "qa_review_read_hold" });
+  await new Promise(resolve => setTimeout(resolve, 5));
+  expect(kill).not.toHaveBeenCalled();
+  binding.control.verdict = verdict;
+  settle();
+  await new Promise(resolve => setTimeout(resolve, 5));
+  expect(binding.control.requestedHold).toBeNull();
+  expect(binding.control.hold).toBeNull();
+  expect(kill).not.toHaveBeenCalled();
+  running.closed = true;
+  for (const cleanup of running.closeCleanups) cleanup();
+  runningProcesses.delete(id);
+});
+
+it("kills a held review group after its leader exits while a descendant retains stdout", async () => {
+  const id = randomUUID();
+  let binding: ReturnType<typeof bindQaReviewProcess> = null;
+  const descendant = "process.on('SIGTERM',()=>{}); console.log('descendant-ready');setInterval(()=>{},1000)";
+  const leader = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:['ignore',process.stdout,process.stderr]});setTimeout(()=>process.exit(0),150)`;
+  const started = Date.now();
+  const result = await runChildProcess(id, process.execPath, ["-e", leader], {
+    cwd: os.tmpdir(), env: {}, timeoutSec: 4, graceSec: 1,
+    onSpawn: async meta => { await Promise.resolve(); binding = bindQaReviewProcess(id, meta.pid); },
+    onLog: async (_stream, text) => {
+      if (text.includes("descendant-ready")) setTimeout(() => {
+        requestQaReviewHold(binding!, { reason: "qa_review_read_hold" });
+      }, 300);
+    },
+  });
+  expect(result.exitCode).toBe(0); // leader had exited before the group signal
+  expect(result.timedOut).toBe(false);
+  expect(Date.now() - started).toBeGreaterThanOrEqual(1000);
+  expect((binding as ReturnType<typeof bindQaReviewProcess>)?.running.closed).toBe(true);
+  expect(runningProcesses.has(id)).toBe(false);
+}, 7000);
+
+it("clears the child deadline's grace KILL after real close", async () => {
+  const signals = vi.spyOn(process, "kill");
+  let pid = 0;
+  try {
+    await runChildProcess(randomUUID(), process.execPath, ["-e", "setInterval(()=>{},1000)"], {
+      cwd: os.tmpdir(), env: {}, timeoutSec: 0.1, graceSec: 1,
+      onSpawn: async meta => { pid = meta.pid; }, onLog: async () => {},
+    });
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    expect(signals.mock.calls.some(([group, signal]) => group === -pid && signal === "SIGKILL")).toBe(false);
+  } finally { signals.mockRestore(); }
+});
 
 it("reserves identity credentials even for mixed-case inherited or configured keys", () => {
   const keys = ["PAPERCLIP_AGENT_KEY_ID", "Paperclip_Agent_Public_Key", "paperclip_agent_private_key"];

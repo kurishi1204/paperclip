@@ -54,6 +54,7 @@ import {
   heartbeatRuns,
   issueAttachments,
   issueComments,
+  issueExecutionDecisions,
   issueApprovals,
   issueRecoveryActions,
   issueRelations,
@@ -153,6 +154,24 @@ import {
   type RunOutputSilenceSummary,
   type WatchdogDecisionActor,
 } from "../../modules/active-run-watchdog/index.js";
+
+function readQaPagingHold(run: LatestIssueRun) {
+  if (!run || run.status !== "failed" || run.errorCode !== "configuration_incomplete") return null;
+  const result = parseObject(run.resultJson), hold = parseObject(result.configurationIncomplete);
+  return result.errorFamily === "configuration" && hold.reason === "qa_review_read_hold" &&
+    hold.runId === run.id && hold.agentId === run.agentId && readNonEmptyString(hold.companyId) &&
+    readNonEmptyString(hold.issueId) && readNonEmptyString(hold.currentStageId) &&
+    Number.isInteger(hold.statusVersion) && (hold.lastDecisionId === null || typeof hold.lastDecisionId === "string")
+    ? hold : null;
+}
+
+function qaPagingHoldMatchesIssue(hold: Record<string, unknown>, issue: typeof issues.$inferSelect) {
+  const state = parseObject(issue.executionState), participant = parseObject(state.currentParticipant);
+  return hold.companyId === issue.companyId && hold.issueId === issue.id && issue.status === "in_review" &&
+    !issue.assigneeUserId && state.status === "pending" && state.currentStageType === "review" && state.currentStageId === hold.currentStageId &&
+    participant.type === "agent" && participant.agentId === hold.agentId &&
+    issue.statusVersion === hold.statusVersion && (state.lastDecisionId ?? null) === hold.lastDecisionId;
+}
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -1003,6 +1022,7 @@ export function recoveryService(
         and(
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, agentId),
+          sql`coalesce(${heartbeatRuns.errorCode}, '') <> 'qa_review_hold_suppressed'`,
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
         ),
       )
@@ -3913,6 +3933,102 @@ export function recoveryService(
     return scheduled ? "queued" : "skipped";
   }
 
+  async function escalateQaPagingHold(issue: typeof issues.$inferSelect, latestRun: LatestIssueRun) {
+    const publications: ActivityPublication[] = [];
+    const postCommitActions: IssuePostCommitAction[] = [];
+    let updated: typeof issues.$inferSelect | null;
+    try {
+      updated = await db.transaction(async (tx) => {
+        const [current] = await tx.select().from(issues).where(and(
+          eq(issues.companyId, issue.companyId), eq(issues.id, issue.id),
+        )).for("update").limit(1);
+        if (!current || current.assigneeAgentId !== issue.assigneeAgentId ||
+          current.assigneeUserId !== issue.assigneeUserId || current.hiddenAt || !latestRun) return null;
+        const [source] = await tx.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, current.companyId), eq(heartbeatRuns.id, latestRun.id),
+        )).limit(1);
+        const hold = readQaPagingHold(source ?? null);
+        if (!hold || !qaPagingHoldMatchesIssue(hold, current)) return null;
+        const [decision] = await tx.select({ id: issueExecutionDecisions.id }).from(issueExecutionDecisions).where(and(
+          eq(issueExecutionDecisions.companyId, current.companyId), eq(issueExecutionDecisions.issueId, current.id),
+          eq(issueExecutionDecisions.createdByRunId, source.id),
+        )).limit(1);
+        if (decision) return null;
+        const paths = await collectDispositionRepairSourceState(tx as unknown as Db, { issue: current });
+        if (paths.hasActiveExecutionPath ||
+          (paths.hasDurableWaitingPath && paths.durablePathReason !== "execution_stage")) return null;
+        const [interaction] = await tx.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions)
+          .where(and(eq(issueThreadInteractions.companyId, current.companyId),
+            eq(issueThreadInteractions.issueId, current.id), eq(issueThreadInteractions.status, "pending"))).limit(1);
+        const [approval] = await tx.select({ id: approvals.id }).from(issueApprovals)
+          .innerJoin(approvals, eq(approvals.id, issueApprovals.approvalId))
+          .where(and(eq(issueApprovals.issueId, current.id),
+            inArray(approvals.status, ["pending", "revision_requested"]))).limit(1);
+        if (interaction || approval) return null;
+        const actions = issueRecoveryActionService(tx as unknown as Db);
+        const fingerprint = `qa_review_read_hold:${source.id}:${hold.currentStageId}`;
+        const active = await actions.getActiveForIssue(current.companyId, current.id);
+        // Existing recovery authority cannot be taken over by this finalizer.
+        if (active) return null;
+        const blocked = await issuesSvc.update(current.id, {
+          status: "blocked", companyGuard: current.companyId, expectedRevision: current.revision,
+        }, tx, publications, postCommitActions);
+        if (!blocked) throw new Error("QA paging hold lost its locked issue update");
+        // The service retries plain INSERT conflicts. A savepoint encloses the
+        // complete call so any aborted transaction/retry rolls back the outer
+        // blocker as well. Never continue finalization in an aborted tx.
+        const action = await tx.transaction(async (savepoint) =>
+          issueRecoveryActionService(savepoint as unknown as Db).upsertSourceScoped({
+            companyId: current.companyId, sourceIssueId: current.id,
+            kind: "configuration_validation", cause: "configuration_incomplete", fingerprint,
+            preserveExistingOwner: true,
+            ownerType: "board", ownerAgentId: null, ownerUserId: null,
+            previousOwnerAgentId: current.assigneeAgentId, returnOwnerAgentId: current.assigneeAgentId,
+            evidence: { sourceRunId: source.id, configurationIncomplete: hold,
+              routingPolicy: STRANDED_BOARD_ESCALATION_POLICY },
+            nextAction: "Repair QA paging using the failed run evidence, then explicitly resume the review.",
+            wakePolicy: { type: "board_escalation", reason: "configuration_incomplete", preservesSourceAssignee: true },
+            monitorPolicy: null, maxAttempts: null, lastAttemptAt: new Date(),
+          }));
+        if (action.fingerprint !== fingerprint || action.cause !== "configuration_incomplete" ||
+          action.kind !== "configuration_validation" || action.ownerType !== "board" || action.attemptCount !== 1) {
+          throw new Error("Another recovery action acquired this issue during QA paging escalation");
+        }
+        const notice = buildStrandedRecoveryEscalationNotice({
+          seed: { title: "QA evidence paging needs repair", tone: "danger",
+            body: "The QA provider started, but evidence paging was rejected or made no progress. The pending review is blocked until paging is repaired and explicitly resumed.",
+            nextAction: "Inspect the source run evidence, repair paging, then explicitly resume the review." },
+          recoveryCause: "configuration_incomplete", recoveryActionId: action.id, recoveryOwner: null,
+          sourceRun: { id: source.id, agentId: source.agentId, status: source.status,
+            errorCode: source.errorCode, errorSummary: null },
+        });
+        await issuesSvc.addComment(current.id, notice.body, {}, { authorType: "system",
+          presentation: notice.presentation, metadata: notice.metadata }, tx);
+        await logActivity(tx as unknown as Db, { companyId: current.companyId, actorType: "system",
+          actorId: "recovery", action: "issue.updated", entityType: "issue", entityId: current.id,
+          details: { source: "recovery.qa_review_read_hold", previousStatus: "in_review", status: "blocked",
+            latestRunId: source.id, recoveryActionId: action.id } }, publications);
+        return blocked;
+      });
+    } catch (error) {
+      // A unique conflict or any domain write failure leaves no partial blocker,
+      // action or notice, and must not throw into the run's finalization chain.
+      logger.warn({ err: error, issueId: issue.id, runId: latestRun?.id },
+        "QA paging escalation rolled back; no finalization retry was started");
+      return null;
+    }
+    if (updated) {
+      try {
+        for (const publication of publications) publishActivity(publication);
+        await executeIssuePostCommitActions(db, postCommitActions);
+      } catch (error) {
+        logger.warn({ err: error, issueId: issue.id, runId: latestRun?.id },
+          "QA paging blocker committed; postcommit delivery is unconfirmed");
+      }
+    }
+    return updated;
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -3922,6 +4038,9 @@ export function recoveryService(
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
+    if (readQaPagingHold(input.latestRun)) {
+      return escalateQaPagingHold(input.issue, input.latestRun);
+    }
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
         issue: input.issue,
