@@ -1,5 +1,6 @@
 import { Router } from "express";
-import type { Db } from "@paperclipai/db";
+import { agents, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
 import { ZodError } from "zod";
 import { getQaReviewProcess, requestQaReviewHold } from "@paperclipai/adapter-utils/server-utils";
 import { projectToolContext } from "../services/project-tool-context.js";
@@ -62,7 +63,16 @@ export function qaReviewToolRoutes(db: Db) {
       }
       const binding = getQaReviewProcess(context.run.id);
       const receiptOnly = params?.name === "read_assigned_review_receipt";
-      if (!binding && !receiptOnly) throw forbidden("QA review process is not bound to this run");
+      if (!binding && !receiptOnly) {
+        // Claude's supported restricted QA executor predates the process
+        // control registry. Preserve its existing authenticated run/participant
+        // authority; caller arguments and context snapshots cannot opt in.
+        const [agent] = await db.select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig })
+          .from(agents).where(and(eq(agents.id, context.run.agentId), eq(agents.companyId, context.run.companyId)));
+        if (agent?.adapterType !== "claude_local" || agent.adapterConfig?.qaReviewToolsOnly !== true) {
+          throw forbidden("QA review process is not bound to this run");
+        }
+      }
       if (!activeParticipant && params?.name !== "read_assigned_review_receipt") {
         throw forbidden("Only this run's review receipt remains available after the decision");
       }

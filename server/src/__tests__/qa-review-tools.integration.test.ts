@@ -77,6 +77,53 @@ describe("run-bound QA review MCP", () => {
     return { fixture, stageId, token, call, tool, rows };
   }
 
+  it("preserves unbound Claude QA reads and one formal decision for the server-owned QA adapter", async () => {
+    const { fixture, stageId, tool, rows } = await reviewFixture();
+    await server.db.update(agents).set({ adapterType: "claude_local", adapterConfig: {
+      engine: "cli", qaReviewToolsOnly: true, dangerouslySkipPermissions: false,
+    } }).where(eq(agents.id, fixture.agentId));
+    reviewProcesses.runningProcesses.delete(fixture.runId);
+    const read = await tool("read_assigned_issue");
+    expect(read.body.result.isError).not.toBe(true);
+    const issue = read.body.result.structuredContent;
+    expect(issue.id).toBe(fixture.issueId);
+    const verdict = await tool("submit_review_decision", {
+      decision: "approve", summary: "Claude QA evidence checked.", expectedStageId: stageId,
+      expectedStatusVersion: issue.statusVersion, expectedRevision: issue.revision,
+      expectedLastDecisionId: issue.reviewStage.lastDecisionId,
+    });
+    expect(verdict.body.result.isError).not.toBe(true);
+    const decisions = await rows();
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({ createdByRunId: fixture.runId, actorAgentId: fixture.agentId });
+  });
+
+  it("does not infer the unbound Claude exception from caller context or another adapter", async () => {
+    for (const config of [
+      { adapterType: "codex_local", adapterConfig: { qaReviewToolsOnly: true } },
+      { adapterType: "paperclip_runner", adapterConfig: { qaReviewToolsOnly: true } },
+      { adapterType: "claude_local", adapterConfig: { qaReviewToolsOnly: false } },
+      { adapterType: "claude_local", adapterConfig: { qaReviewToolsOnly: "true" } },
+    ]) {
+      const { fixture, tool, rows } = await reviewFixture();
+      await server.db.update(agents).set(config).where(eq(agents.id, fixture.agentId));
+      await server.db.update(heartbeatRuns).set({ contextSnapshot: {
+        issueId: fixture.issueId, adapterType: "claude_local", qaReviewToolsOnly: true,
+      } }).where(eq(heartbeatRuns.id, fixture.runId));
+      reviewProcesses.runningProcesses.delete(fixture.runId);
+      const spy = vi.spyOn(qaReviewTools, "callQaReviewTool");
+      try {
+        for (const name of ["read_assigned_issue", "submit_review_decision"]) {
+          const rejected = await tool(name);
+          expect(rejected.body.result.isError).toBe(true);
+          expect(JSON.stringify(rejected.body)).toContain("not bound");
+        }
+        expect(spy).not.toHaveBeenCalled();
+        expect(await rows()).toHaveLength(0);
+      } finally { spy.mockRestore(); }
+    }
+  });
+
   it("review regression rejects unknown tools before service or paging hold", async () => {
     const {fixture, tool, rows} = await reviewFixture(); const spy = vi.spyOn(qaReviewTools, "callQaReviewTool");
     try {
