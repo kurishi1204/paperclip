@@ -2917,6 +2917,52 @@ export function isConfigurationIncompleteFailedRun(
   );
 }
 
+/** Internal, route-produced paging proof. Never infer a hold from failure prose. */
+export function readQaPagingHold(run: {
+  id: string; companyId: string; agentId: string; errorCode?: string | null;
+  resultJson?: Record<string, unknown> | null;
+}) {
+  const result = parseObject(run.resultJson);
+  const hold = parseObject(result.configurationIncomplete);
+  return run.errorCode === "configuration_incomplete" && result.errorFamily === "configuration" &&
+    hold.reason === "qa_review_read_hold" && hold.runId === run.id &&
+    hold.companyId === run.companyId && hold.agentId === run.agentId &&
+    readNonEmptyString(hold.issueId) && readNonEmptyString(hold.currentStageId) &&
+    Number.isInteger(hold.statusVersion) &&
+    (hold.lastDecisionId === null || typeof hold.lastDecisionId === "string")
+    ? hold : null;
+}
+
+function qaPagingHoldMatchesIssue(hold: Record<string, unknown>, issue: typeof issues.$inferSelect) {
+  const state = parseObject(issue.executionState);
+  const participant = parseObject(state.currentParticipant);
+  return issue.companyId === hold.companyId && issue.id === hold.issueId &&
+    issue.status === "in_review" && !issue.assigneeUserId &&
+    state.status === "pending" && state.currentStageType === "review" && state.currentStageId === hold.currentStageId &&
+    participant.type === "agent" && participant.agentId === hold.agentId &&
+    issue.statusVersion === hold.statusVersion && (state.lastDecisionId ?? null) === hold.lastDecisionId;
+}
+
+function qaPagingRecoveryActionMatchesHold(action: Pick<typeof issueRecoveryActions.$inferSelect,
+  "cause" | "fingerprint" | "evidence"> | undefined, sourceRunId: string, hold: Record<string, unknown>) {
+  return Boolean(action && ((action.cause === "configuration_incomplete" &&
+    action.fingerprint === `qa_review_read_hold:${sourceRunId}:${hold.currentStageId}`) ||
+    stableStringifyForFingerprint(parseObject(action.evidence).qaReviewPagingHold) ===
+      stableStringifyForFingerprint(hold)));
+}
+
+function isAutomaticQaPagingWake(context: Record<string, unknown>, authority: {
+  requestedByActorType?: string | null; triggerDetail?: string | null;
+  payload?: Record<string, unknown> | null;
+} = {}) {
+  if (authority.requestedByActorType === "user" || authority.triggerDetail === "manual" ||
+      authority.payload?.manualUserWake === true || authority.payload?.mutation === "interaction" ||
+      readNonEmptyString(context.wakeCommentId) ||
+      (Array.isArray(context.wakeCommentIds) && context.wakeCommentIds.length > 0)) return false;
+  return ["execution_review_requested", "execution_approval_requested", "execution_review_participant_recovery"]
+    .includes(String(context.wakeReason ?? "")) || Boolean(readNonEmptyString(context.retryReason));
+}
+
 async function hasGitMetadata(cwd: string | null | undefined) {
   const normalized = readNonEmptyString(cwd);
   if (!normalized) return false;
@@ -15475,6 +15521,10 @@ export function heartbeatService(
       delayMs?: number;
     },
   ) {
+    if (readQaPagingHold(run)) {
+      return { outcome: "not_scheduled" as const, reason: "Repair QA paging before explicit resumption.",
+        issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
+    }
     if (run.errorCode === "provider_tool_definition_invalid") {
       return { outcome: "not_scheduled" as const,
         reason: "Repair the invalid tool definitions before starting a new attempt.",
@@ -20265,6 +20315,17 @@ export function heartbeatService(
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
+        const queuedContext = parseObject(queuedRun.contextSnapshot);
+        const queuedIssueId = readNonEmptyString(queuedContext.issueId);
+        if (queuedIssueId) {
+          const held = await latestApplicableQaPagingHold(queuedRun.companyId, queuedIssueId, queuedRun.agentId);
+          // The queued row itself can be newest. Look through it only while
+          // cancelling from a proven source at terminal release; do not bypass
+          // an independently admitted human run here.
+          if (held) { await suppressQaPagingSuccessors(held.source); }
+          const current = await getRun(queuedRun.id);
+          if (current?.status !== "queued") continue;
+        }
         let claimed: typeof heartbeatRuns.$inferSelect | null;
         try {
           claimed = await claimQueuedRun(queuedRun, companyAgents);
@@ -25634,6 +25695,8 @@ export function heartbeatService(
           processRunCancellationSettlements.get(run.id) ??
           failedProcessRunCancellations.get(run.id);
         await processCancellation?.settled;
+        const qaPagingHold = readQaPagingHold({ ...run, errorCode: adapterResult.errorCode,
+          resultJson: { ...adapterResult.resultJson, errorFamily: adapterResult.errorFamily } });
         let outcome: RunSessionOutcome;
         const latestRun = await getRun(run.id);
         if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
@@ -25649,6 +25712,8 @@ export function heartbeatService(
               : nativeTerminal === "cancelled"
                 ? "cancelled"
                 : "failed";
+        } else if (qaPagingHold) {
+          outcome = "failed";
         } else if (adapterResult.timedOut) {
           outcome = "timed_out";
         } else if (adapterResult.resultJson?.status === "cancelled") {
@@ -26086,7 +26151,9 @@ export function heartbeatService(
               `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
             );
           }
-          if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+          if (readQaPagingHold(livenessRun)) {
+            // Explicit paging repair owns this failed review, including raw deadline races.
+          } else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
             const policy = parseMaxTurnContinuationPolicy(agent);
             if (policy.enabled && policy.maxAttempts > 0) {
               await scheduleBoundedRetryForRun(livenessRun, agent, {
@@ -27091,12 +27158,124 @@ export function heartbeatService(
     }
   }
 
+  async function latestApplicableQaPagingHold(companyId: string, issueId: string, agentId: string) {
+    const [issue] = await db.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).limit(1);
+    if (!issue) return null;
+    // Only our own cancelled successors are transparent. A later real/manual
+    // attempt remains authoritative and must invalidate the historical source.
+    // Bound materialized history without truncating a transparent queued tail.
+    // Keep the database timestamp text: a JS Date loses PostgreSQL microseconds.
+    type HistoryRow = Pick<typeof heartbeatRuns.$inferSelect,
+      "id" | "companyId" | "agentId" | "status" | "errorCode" | "resultJson" |
+      "contextSnapshot" | "wakeupRequestId" | "triggerDetail"> & { createdAtCursor: string };
+    let cursor: { createdAt: string; id: string } | null = null;
+    for (;;) {
+      const candidates: HistoryRow[] = await db.select({
+        id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
+        resultJson: sql<Record<string, unknown> | null>`case when ${heartbeatRuns.status} = 'failed'
+          then jsonb_build_object('errorFamily', ${heartbeatRuns.resultJson}->'errorFamily',
+            'configurationIncomplete', ${heartbeatRuns.resultJson}->'configurationIncomplete') else null end`,
+        contextSnapshot: heartbeatRuns.contextSnapshot, wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        triggerDetail: heartbeatRuns.triggerDetail,
+        createdAtCursor: sql<string>`${heartbeatRuns.createdAt}::text`,
+      }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+        sql`coalesce(${heartbeatRuns.errorCode}, '') <> 'qa_review_hold_suppressed'`,
+        cursor ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) <
+          (${cursor.createdAt}::timestamptz, ${cursor.id}::uuid)` : undefined,
+      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(32);
+      for (const source of candidates) {
+        if (["queued", "scheduled_retry"].includes(source.status)) {
+          const wake = source.wakeupRequestId ? await db.select().from(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.id, source.wakeupRequestId)).limit(1).then(rows => rows[0]) : null;
+          if (isAutomaticQaPagingWake(parseObject(source.contextSnapshot), {
+            requestedByActorType: wake?.requestedByActorType, triggerDetail: source.triggerDetail, payload: wake?.payload,
+          })) continue;
+        }
+        const hold = source.status === "failed" ? readQaPagingHold(source) : null;
+        if (!hold) return null;
+        if (qaPagingHoldMatchesIssue(hold, issue)) return { source, hold };
+        // Our atomic blocker changes statusVersion once. The committed action is
+        // the receipt for that transition; an unrelated blocked state is not.
+        const state = parseObject(issue.executionState), participant = parseObject(state.currentParticipant);
+        if (issue.status === "blocked" && issue.statusVersion === Number(hold.statusVersion) + 1 &&
+          state.status === "pending" && state.currentStageType === "review" && state.currentStageId === hold.currentStageId &&
+          (state.lastDecisionId ?? null) === hold.lastDecisionId && participant.type === "agent" &&
+          participant.agentId === hold.agentId && !issue.assigneeUserId) {
+          const [action] = await db.select({ evidence: issueRecoveryActions.evidence,
+            cause: issueRecoveryActions.cause, fingerprint: issueRecoveryActions.fingerprint,
+          }).from(issueRecoveryActions).where(and(
+            eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+            inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          )).limit(1);
+          // A prior action keeps its original identity/authority; its complete
+          // receipt proves this same blocker without relying on the old cause.
+          if (qaPagingRecoveryActionMatchesHold(action, source.id, hold)) return { source, hold };
+        }
+        return null;
+      }
+      if (candidates.length < 32) return null;
+      const last = candidates[candidates.length - 1]!;
+      cursor = { createdAt: last.createdAtCursor, id: last.id };
+    }
+  }
+
+  async function suppressQaPagingSuccessors(source: Pick<typeof heartbeatRuns.$inferSelect,
+    "id" | "companyId" | "agentId" | "status" | "errorCode" | "resultJson">) {
+    const hold = readQaPagingHold(source);
+    if (!hold || source.status !== "failed") return;
+    await db.transaction(async (tx) => {
+      const [issue] = await tx.select().from(issues).where(and(
+        eq(issues.companyId, source.companyId), eq(issues.id, String(hold.issueId)),
+      )).for("update").limit(1);
+      if (!issue) return;
+      if (!qaPagingHoldMatchesIssue(hold, issue)) {
+        const state = parseObject(issue.executionState), participant = parseObject(state.currentParticipant);
+        if (issue.status !== "blocked" || issue.statusVersion !== Number(hold.statusVersion) + 1 ||
+          state.status !== "pending" || state.currentStageType !== "review" || state.currentStageId !== hold.currentStageId ||
+          (state.lastDecisionId ?? null) !== hold.lastDecisionId || participant.type !== "agent" ||
+          participant.agentId !== hold.agentId || issue.assigneeUserId) return;
+        const [action] = await tx.select({ evidence: issueRecoveryActions.evidence,
+          cause: issueRecoveryActions.cause, fingerprint: issueRecoveryActions.fingerprint,
+        }).from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        )).limit(1);
+        if (!qaPagingRecoveryActionMatchesHold(action, source.id, hold)) return;
+      }
+      const candidates = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, source.companyId), eq(heartbeatRuns.agentId, source.agentId),
+        sql`${heartbeatRuns.id} <> ${source.id}`,
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
+        inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+      ));
+      for (const candidate of candidates) {
+        const wake = candidate.wakeupRequestId ? await tx.select().from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, candidate.wakeupRequestId)).limit(1).then(rows => rows[0]) : null;
+        const context = parseObject(candidate.contextSnapshot);
+        if (!isAutomaticQaPagingWake(context, { requestedByActorType: wake?.requestedByActorType,
+          triggerDetail: candidate.triggerDetail, payload: wake?.payload })) continue;
+        // A candidate explicitly bound to another stage is not this family.
+        if (context.currentStageId && context.currentStageId !== hold.currentStageId) continue;
+        await tx.update(heartbeatRuns).set({ status: "cancelled", errorCode: "qa_review_hold_suppressed",
+          error: "Automatic QA successor cancelled: paging repair requires explicit resumption.",
+          finishedAt: new Date(), updatedAt: new Date(), scheduledRetryAt: null,
+        }).where(and(eq(heartbeatRuns.id, candidate.id), inArray(heartbeatRuns.status, ["queued", "scheduled_retry"])));
+        if (wake) await tx.update(agentWakeupRequests).set({ status: "cancelled", updatedAt: new Date() })
+          .where(eq(agentWakeupRequests.id, wake.id));
+      }
+    });
+  }
+
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
     options: { suppressImmediateRecovery?: boolean } = {},
   ) {
     try {
-      const source = await getRun(run.id);
+      const source = await getRun(run.id, { unsafeFullResultJson: true });
+      if (source) await suppressQaPagingSuccessors(source);
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
         companyId: run.companyId,
         runId: run.id,
@@ -27172,6 +27351,9 @@ export function heartbeatService(
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    if (issueId && isAutomaticQaPagingWake(enrichedContextSnapshot, {
+      requestedByActorType: opts.requestedByActorType, triggerDetail, payload,
+    }) && await latestApplicableQaPagingHold(agent.companyId, issueId, agentId)) return null;
     // Mentions only annotate comments. Ignore legacy callers before creating
     // a run or deferred request; assignment and review have their own wakes.
     if (reason === "issue_comment_mentioned" || enrichedContextSnapshot.wakeReason === "issue_comment_mentioned") return null;

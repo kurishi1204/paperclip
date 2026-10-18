@@ -19,6 +19,8 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueRelations,
+  issueComments,
+  issueRecoveryActions,
   issues,
   projects,
 } from "@paperclipai/db";
@@ -65,6 +67,11 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
 } from "../services/heartbeat.ts";
+
+import { recoveryService } from "../services/recovery/service.js";
+import { issueService } from "../services/issues.js";
+import { createWakeQueue } from "../modules/wake-queue/index.js";
+import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 
 const mockedAppendHeartbeatRunEvent = vi.mocked(appendHeartbeatRunEvent);
 
@@ -252,6 +259,372 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     });
   }
 
+
+  async function seedQaPagingHoldFixture() {
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const stageId = randomUUID(), now = new Date();
+    await seedRetryFixture({ runId, companyId, agentId, now, errorCode: "configuration_incomplete",
+      adapterType: PROVIDER_QUOTA_TEST_ADAPTER });
+    const [issue] = await db.insert(issues).values({ id: issueId, companyId, title: "QA paging hold",
+      status: "in_review", assigneeAgentId: agentId, responsibleUserId: "responsible-user",
+      executionRunId: runId, executionLockedAt: now,
+      executionPolicy: normalizeIssueExecutionPolicy({ stages: [{ id: stageId, type: "review",
+        participants: [{ type: "agent", agentId }] }] }),
+      executionState: { status: "pending", currentStageId: stageId, currentStageIndex: 0,
+        currentStageType: "review", currentParticipant: { type: "agent", agentId },
+        returnAssignee: { type: "agent", agentId }, reviewRequest: null, completedStageIds: [],
+        lastDecisionId: null, lastDecisionOutcome: null, monitor: null },
+    }).returning();
+    const hold = { reason: "qa_review_read_hold", companyId, issueId, runId, agentId,
+      currentStageId: stageId, statusVersion: issue!.statusVersion, lastDecisionId: null,
+      kind: "repeated_contract_error", evidence: { tool: "read_assigned_issue_comment", count: 2 } };
+    const [run] = await db.update(heartbeatRuns).set({
+      resultJson: { errorFamily: "configuration", configurationIncomplete: hold,
+        conversationContinuation: "continue_conversation_v1", stopReason: "max_turns_exhausted" },
+      contextSnapshot: { issueId, wakeReason: "execution_review_requested" },
+    }).where(eq(heartbeatRuns.id, runId)).returning();
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const release = () => createWakeQueue(db, {
+      resolveResponsibleUserId: async () => "responsible-user",
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null, wakeAdmissionHelpers: {} as never,
+      recovery: {
+        escalateStrandedAssignedIssue: async () => {
+          const [current] = await db.select().from(issues).where(eq(issues.id, issueId));
+          const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+          await recovery.escalateStrandedAssignedIssue({ issue: current!, latestRun: source!, previousStatus: "in_review" });
+        },
+        escalateStrandedRecoveryIssueInPlace: async () => {},
+      },
+    }).releaseIssueExecution({ companyId, runId, now: new Date() });
+    const effects = async () => ({
+      issue: (await db.select().from(issues).where(eq(issues.id, issueId)))[0],
+      actions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)),
+      comments: await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)),
+      runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)),
+    });
+    return { issue: issue!, run: run!, hold, recovery, release, effects, companyId, issueId, agentId, runId, stageId };
+  }
+
+  it.each(["board", "agent"] as const)("review regression preserves active authority and publishes one paging blocker (%s)", async (ownerType) => {
+    const f = await seedQaPagingHoldFixture();
+    const { issueRecoveryActionService } = await import("../services/issue-recovery-actions.js");
+    const active = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId: f.companyId, sourceIssueId: f.issueId, kind: "stranded_assigned_issue",
+      ownerType, ownerAgentId: ownerType === "agent" ? f.agentId : null,
+      cause: "execution_review_participant_recovery", fingerprint: "prior-review-recovery-authority",
+      nextAction: "Existing authority remains owner", evidence: { priorEvidence: "preserved" },
+      attemptCount: 3, maxAttempts: 3,
+      wakePolicy: { type: "retry", reason: "execution_review_participant_recovery" },
+    });
+    const before = (await f.effects()).actions[0];
+    expect((await f.release()).outcome.kind).toBe("blocked");
+    let after = await f.effects();
+    expect(after.issue.status).toBe("blocked"); expect(after.comments).toHaveLength(1);
+    expect(after.actions).toHaveLength(1);
+    const { evidence: priorEvidence, updatedAt: _beforeAt, ...authority } = before;
+    const { evidence, updatedAt: _afterAt, ...retainedAuthority } = after.actions[0];
+    expect(retainedAuthority).toEqual(authority);
+    expect(evidence).toEqual({ ...priorEvidence, qaReviewPagingHold: f.hold });
+    expect(after.comments[0].metadata).toMatchObject({ sourceRunId: f.runId });
+    expect(JSON.stringify(after.comments[0].metadata)).toContain(active.id);
+    if (ownerType === "agent") expect(JSON.stringify(after.comments[0].metadata)).toContain(f.agentId);
+    expect(await heartbeat.invoke(f.agentId, "on_demand", { issueId: f.issueId,
+      wakeReason: "execution_review_participant_recovery", retryReason: "execution_review_participant_recovery",
+      recoveryActionId: active.id }, "system")).toBeNull();
+    await f.release();
+    for (let i = 0; i < 2; i++) await heartbeat.reconcileStrandedAssignedIssues();
+    after = await f.effects();
+    expect(after.comments).toHaveLength(1); expect(after.actions).toHaveLength(1); expect(after.runs).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+    await issueService(db).update(f.issueId, { status: "in_review", companyGuard: f.companyId,
+      expectedRevision: after.issue.revision });
+    const manual = await heartbeat.invoke(f.agentId, "on_demand", { issueId: f.issueId,
+      wakeReason: "execution_review_requested" }, "manual");
+    expect(manual).not.toBeNull();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(await heartbeat.getRun(manual!.id)).not.toBeNull();
+  });
+
+  it.each(["board", "agent"] as const)("cancels a directly queued late QA wake under preserved active authority (%s)", async (ownerType) => {
+    const f = await seedQaPagingHoldFixture();
+    const { issueRecoveryActionService } = await import("../services/issue-recovery-actions.js");
+    const active = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId: f.companyId, sourceIssueId: f.issueId, kind: "stranded_assigned_issue", ownerType,
+      ownerAgentId: ownerType === "agent" ? f.agentId : null,
+      cause: "execution_review_participant_recovery", fingerprint: "preexisting-late-queue-authority",
+      nextAction: "Preserve existing authority", evidence: { priorEvidence: "preserved" },
+      attemptCount: 3, maxAttempts: 3,
+      wakePolicy: { type: "retry", reason: "execution_review_participant_recovery" },
+    });
+    expect((await f.release()).outcome.kind).toBe("blocked");
+    const before = await f.effects();
+    const adapterType = `qa_paging_late_wake_${ownerType}`;
+    const execute = vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false }));
+    registerServerAdapter({ type: adapterType, execute,
+      testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }) });
+    try {
+      await db.update(agents).set({ adapterType, status: "idle" }).where(eq(agents.id, f.agentId));
+      const lateId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: lateId, companyId: f.companyId, agentId: f.agentId,
+        invocationSource: "on_demand", triggerDetail: "system", status: "queued", responsibleUserId: "responsible-user",
+        contextSnapshot: { issueId: f.issueId, currentStageId: f.stageId,
+          wakeReason: "execution_review_participant_recovery", recoveryActionId: active.id } });
+      await heartbeat.resumeQueuedRuns();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const after = await f.effects();
+      const late = after.runs.find(run => run.id === lateId);
+      expect({ lateStatus: late?.status, lateErrorCode: late?.errorCode, adapterCalls: execute.mock.calls.length })
+        .toEqual({ lateStatus: "cancelled", lateErrorCode: "qa_review_hold_suppressed", adapterCalls: 0 });
+      expect(after.actions).toEqual(before.actions);
+      expect(after.comments).toEqual(before.comments);
+      expect(after.issue).toEqual(before.issue);
+    } finally { unregisterServerAdapter(adapterType); }
+  });
+
+  it.each(["board", "agent"] as const)("review regression rolls back active-action evidence on notice failure and publishes after recovery (%s)", async (ownerType) => {
+    const f = await seedQaPagingHoldFixture();
+    const { issueRecoveryActionService } = await import("../services/issue-recovery-actions.js");
+    await issueRecoveryActionService(db).upsertSourceScoped({ companyId: f.companyId,
+      sourceIssueId: f.issueId, kind: "stranded_assigned_issue", ownerType,
+      ownerAgentId: ownerType === "agent" ? f.agentId : null,
+      cause: "execution_review_participant_recovery", fingerprint: "prior-notice-failure",
+      nextAction: "Preserve authority", evidence: { priorEvidence: "retained" } });
+    const before = (await f.effects()).actions[0];
+    await db.execute(sql.raw("CREATE SEQUENCE qa_active_hold_notice_attempt"));
+    await db.execute(sql.raw("CREATE FUNCTION qa_active_hold_notice_probe() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('qa_active_hold_notice_attempt'); RAISE EXCEPTION 'injected active notice failure'; END $$"));
+    await db.execute(sql.raw("CREATE TRIGGER qa_active_hold_notice_probe BEFORE INSERT ON issue_comments FOR EACH ROW EXECUTE FUNCTION qa_active_hold_notice_probe()"));
+    try {
+      expect((await f.release()).outcome.kind).toBe("blocked");
+      const attempted = await db.execute(sql.raw("SELECT is_called FROM qa_active_hold_notice_attempt"));
+      expect(attempted[0]?.is_called).toBe(true);
+      const after = await f.effects();
+      expect(after.issue.status).toBe("in_review"); expect(after.actions).toEqual([before]);
+      expect(after.comments).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, f.issueId))).toHaveLength(0);
+    } finally {
+      await db.execute(sql.raw("DROP TRIGGER qa_active_hold_notice_probe ON issue_comments"));
+      await db.execute(sql.raw("DROP FUNCTION qa_active_hold_notice_probe()"));
+      await db.execute(sql.raw("DROP SEQUENCE qa_active_hold_notice_attempt"));
+    }
+    for (let i = 0; i < 2; i++) await heartbeat.reconcileStrandedAssignedIssues();
+    const after = await f.effects();
+    expect(after.issue.status).toBe("blocked"); expect(after.comments).toHaveLength(1);
+    expect(after.actions).toHaveLength(1);
+    expect(after.actions[0].id).toBe(before.id); expect(after.actions[0].ownerType).toBe(before.ownerType);
+  });
+
+  it("does not schedule any retry policy for a bound QA paging HOLD", async () => {
+    const f = await seedQaPagingHoldFixture();
+    for (const retryReason of ["transient_failure", MAX_TURN_CONTINUATION_RETRY_REASON,
+      "execution_review_participant_recovery", INTERACTION_CONTINUATION_INFRA_RETRY_REASON]) {
+      expect(await heartbeat.scheduleBoundedRetry(f.runId, { retryReason, maxAttempts: 9 }))
+        .toMatchObject({ outcome: "not_scheduled", reason: expect.stringContaining("paging") });
+    }
+    expect((await f.effects()).runs).toHaveLength(1);
+  });
+
+  it("reads QA hold history in bounded pages without losing equal-microsecond runs", async () => {
+    const f = await seedQaPagingHoldFixture();
+    const ids = Array.from({ length: 65 }, () => randomUUID());
+    await db.insert(heartbeatRuns).values(ids.map(id => ({ id, companyId: f.companyId,
+      agentId: f.agentId, invocationSource: "on_demand", triggerDetail: "system", status: "queued",
+      createdAt: sql`'2050-01-01T00:00:00.123456Z'::timestamptz`,
+      contextSnapshot: { issueId: f.issueId, wakeReason: "execution_review_participant_recovery" },
+      resultJson: { unrelatedPayload: "x".repeat(16_384) }, stdoutExcerpt: "y".repeat(16_384),
+    })));
+    // Observe real query results; do not replace SQL execution or returned rows.
+    const batches: Array<{ ids: string[]; bytes: number; hasExcerpt: boolean }> = [];
+    const observers: Array<{ mockRestore(): void }> = [];
+    const originalSelect = db.select.bind(db);
+    const select = vi.spyOn(db, "select").mockImplementation(((...args: Parameters<typeof db.select>) => {
+      const builder = originalSelect(...args);
+      const originalFrom = builder.from.bind(builder);
+      builder.from = ((...fromArgs: Parameters<typeof builder.from>) => {
+        const query = originalFrom(...fromArgs);
+        if (fromArgs[0] === heartbeatRuns) {
+          const execute = query.execute.bind(query);
+          const observer = vi.spyOn(query, "execute").mockImplementation(async () => {
+            const rows = await execute();
+            if (query.toSQL().sql.includes("<> 'qa_review_hold_suppressed'")) {
+              const records = rows as Array<Record<string, unknown>>;
+              batches.push({ ids: records.map(row => String(row.id)),
+                bytes: Buffer.byteLength(JSON.stringify(records)),
+                hasExcerpt: records.some(row => Object.hasOwn(row, "stdoutExcerpt")) });
+            }
+            return rows;
+          });
+          observers.push(observer);
+        }
+        return query;
+      }) as typeof builder.from;
+      return builder;
+    }) as typeof db.select);
+    try {
+      expect(await heartbeat.invoke(f.agentId, "on_demand", { issueId: f.issueId,
+        wakeReason: "execution_review_participant_recovery" }, "system")).toBeNull();
+      const seen = batches.flatMap(batch => batch.ids);
+      console.info("QA hold history readback", { batchRows: batches.map(batch => batch.ids.length),
+        batchBytes: batches.map(batch => batch.bytes), uniqueRuns: new Set(seen).size });
+      expect(seen).toHaveLength(66);
+      expect(new Set(seen)).toEqual(new Set([...ids, f.runId]));
+      expect(Math.max(...batches.map(batch => batch.ids.length))).toBeLessThanOrEqual(32);
+      expect(batches.every(batch => !batch.hasExcerpt)).toBe(true);
+      expect(Math.max(...batches.map(batch => batch.bytes))).toBeLessThan(32_768);
+    } finally {
+      select.mockRestore();
+      for (const observer of observers) observer.mockRestore();
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
+        .where(inArray(heartbeatRuns.id, ids));
+    }
+  });
+
+  it("blocks the first held review release atomically and does not enqueue participant recovery", async () => {
+    const f = await seedQaPagingHoldFixture();
+    const first = await f.release();
+    expect(first.outcome.kind).toBe("blocked");
+    expect(first.postCommitEffects).toEqual([]);
+    let effect = await f.effects();
+    expect(effect.issue.status).toBe("blocked");
+    expect(effect.actions).toHaveLength(1);
+    expect(effect.actions[0]).toMatchObject({ kind: "configuration_validation", cause: "configuration_incomplete", attemptCount: 1 });
+    expect(effect.comments).toHaveLength(1);
+    expect(effect.comments[0]!.body).toContain("QA provider started");
+    expect(effect.comments[0]!.body).not.toContain("missing secret");
+    expect(effect.runs).toHaveLength(1);
+    await f.release();
+    await heartbeat.reconcileStrandedAssignedIssues();
+    effect = await f.effects();
+    expect(effect.actions).toHaveLength(1); expect(effect.comments).toHaveLength(1);
+    expect(effect.runs).toHaveLength(1);
+  });
+
+  it("cancels already queued and late automatic successors through real terminal/finally dispatch", async () => {
+    const f = await seedQaPagingHoldFixture();
+    const adapterType = "qa_paging_hold_terminal_test";
+    const spawned: string[] = [];
+    const successorId = randomUUID();
+    registerServerAdapter({ type: adapterType, execute: async (ctx) => {
+      spawned.push(ctx.runId);
+      const [current] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      await db.insert(heartbeatRuns).values({ id: successorId, companyId: f.companyId, agentId: f.agentId,
+        invocationSource: "on_demand", triggerDetail: "system", status: "queued", responsibleUserId: "responsible-user",
+        contextSnapshot: { issueId: f.issueId, wakeReason: "execution_review_participant_recovery" } });
+      return { exitCode: 1, signal: null, timedOut: true, errorCode: "configuration_incomplete",
+        errorFamily: "configuration", errorMessage: "QA evidence paging needs repair",
+        resultJson: { errorFamily: "configuration", configurationIncomplete: {
+          ...f.hold, runId: ctx.runId, statusVersion: current!.statusVersion },
+          qaReviewRawOutcome: { exitCode: 0, timedOut: true },
+          conversationContinuation: "continue_conversation_v1", stopReason: "max_turns_exhausted" } };
+    }, testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }) });
+    try {
+      await db.update(agents).set({ adapterType, status: "idle" }).where(eq(agents.id, f.agentId));
+      await db.update(issues).set({ executionRunId: null, executionLockedAt: null }).where(eq(issues.id, f.issueId));
+      const run = await heartbeat.invoke(f.agentId, "on_demand", {
+        issueId: f.issueId, wakeReason: "execution_review_requested" }, "manual");
+      expect(run).not.toBeNull();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const terminal = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id)).then(rows => rows[0]);
+      expect(terminal).toMatchObject({ status: "failed", errorCode: "configuration_incomplete", exitCode: 1 });
+      expect(terminal!.resultJson?.qaReviewRawOutcome).toEqual({ exitCode: 0, timedOut: true });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successorId)))
+        .toEqual([expect.objectContaining({ status: "cancelled", errorCode: "qa_review_hold_suppressed" })]);
+      let effect = await f.effects();
+      expect(effect.issue.status).toBe("blocked"); expect(effect.actions).toHaveLength(1); expect(effect.comments).toHaveLength(1);
+      const lateId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: lateId, companyId: f.companyId, agentId: f.agentId,
+        invocationSource: "on_demand", triggerDetail: "system", status: "queued", responsibleUserId: "responsible-user",
+        contextSnapshot: { issueId: f.issueId, wakeReason: "execution_review_participant_recovery" } });
+      await heartbeat.resumeQueuedRuns();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, lateId)))
+        .toEqual([expect.objectContaining({ status: "cancelled", errorCode: "qa_review_hold_suppressed" })]);
+      await heartbeat.reconcileStrandedAssignedIssues();
+      effect = await f.effects();
+      expect(spawned).toEqual([run!.id]); expect(effect.actions).toHaveLength(1); expect(effect.comments).toHaveLength(1);
+    } finally { unregisterServerAdapter(adapterType); }
+  });
+
+  it.each(["done", "stage_changed", "status_version_changed", "owner_changed"])(
+    "does not overwrite a newer QA disposition (%s)", async (change) => {
+      const f = await seedQaPagingHoldFixture();
+      await db.update(issues).set(change === "done" ? { status: "done" } :
+        change === "stage_changed" ? { executionState: { ...f.issue.executionState!, currentStageId: randomUUID() } } :
+        change === "owner_changed" ? { assigneeAgentId: null, assigneeUserId: "new-owner" } :
+        { statusVersion: f.issue.statusVersion + 1 }).where(eq(issues.id, f.issueId));
+      expect(await f.recovery.escalateStrandedAssignedIssue({ issue: f.issue, latestRun: f.run, previousStatus: "in_review" })).toBeNull();
+      const effect = await f.effects();
+      expect(effect.actions).toHaveLength(0); expect(effect.comments).toHaveLength(0);
+      expect(effect.issue.status).toBe(change === "done" ? "done" : "in_review");
+    });
+
+  it.each(["decision", "hold"])("serializes QA HOLD and revision-checked disposition on the same issue lock (%s wins)", async (winner) => {
+    const f = await seedQaPagingHoldFixture();
+    let holdResult!: Promise<unknown>, decisionResult!: Promise<unknown>;
+    const waitForLockWaiters = async (count: number) => {
+      await expect.poll(async () => {
+        const rows = await db.execute(sql<{ count: string }>`SELECT count(*)::text AS count
+          FROM pg_stat_activity WHERE datname=current_database() AND cardinality(pg_blocking_pids(pid)) > 0`);
+        return Number(rows[0]?.count ?? 0);
+      }, { timeout: 10000 }).toBeGreaterThanOrEqual(count);
+    };
+    const startHold = () => f.recovery.escalateStrandedAssignedIssue({ issue: f.issue,
+      latestRun: f.run, previousStatus: "in_review" });
+    const startDecision = () => issueService(db).update(f.issueId, { status: "done",
+      companyGuard: f.companyId, expectedRevision: f.issue.revision }).catch(error => error);
+    await db.transaction(async (tx) => {
+      await tx.select().from(issues).where(eq(issues.id, f.issueId)).for("update");
+      if (winner === "decision") decisionResult = startDecision(); else holdResult = startHold();
+      await waitForLockWaiters(1);
+      if (winner === "decision") holdResult = startHold(); else decisionResult = startDecision();
+      await waitForLockWaiters(2);
+    });
+    const [held, decision] = await Promise.all([holdResult, decisionResult]);
+    const effect = await f.effects();
+    if (winner === "decision") {
+      expect(held).toBeNull(); expect(decision).toMatchObject({ status: "done" });
+      expect(effect.issue.status).toBe("done"); expect(effect.actions).toHaveLength(0); expect(effect.comments).toHaveLength(0);
+    } else {
+      expect(held).toMatchObject({ status: "blocked" });
+      expect(decision).toMatchObject({ status: 409, details: { code: "issue_revision_conflict" } });
+      expect(effect.issue.status).toBe("blocked"); expect(effect.actions).toHaveLength(1); expect(effect.comments).toHaveLength(1);
+    }
+  }, 45000);
+
+  it("keeps a held source visible to periodic recovery behind its own cancelled successor", async () => {
+    const f = await seedQaPagingHoldFixture();
+    await db.update(issues).set({ executionRunId: null, executionLockedAt: null }).where(eq(issues.id, f.issueId));
+    await db.insert(heartbeatRuns).values({ id: randomUUID(), companyId: f.companyId, agentId: f.agentId,
+      invocationSource: "on_demand", status: "cancelled", errorCode: "qa_review_hold_suppressed",
+      contextSnapshot: { issueId: f.issueId, wakeReason: "execution_review_participant_recovery" },
+      createdAt: new Date(Date.now() + 1000), finishedAt: new Date() });
+    await heartbeat.reconcileStrandedAssignedIssues();
+    const effect = await f.effects();
+    expect(effect.issue.status).toBe("blocked"); expect(effect.actions).toHaveLength(1);
+    expect(effect.comments).toHaveLength(1); expect(effect.runs).toHaveLength(2);
+  });
+
+  it.each(["action_failure", "comment_failure", "unique_conflict"])(
+    "rolls back every QA HOLD domain effect without throwing on %s", async (mode) => {
+      const f = await seedQaPagingHoldFixture();
+      const table = mode === "comment_failure" ? "issue_comments" : "issue_recovery_actions";
+      const body = mode === "unique_conflict"
+        ? `IF pg_trigger_depth() = 1 THEN INSERT INTO issue_recovery_actions(company_id,source_issue_id,kind,cause,fingerprint,next_action) VALUES (NEW.company_id,NEW.source_issue_id,NEW.kind,NEW.cause,NEW.fingerprint,'competing writer'); END IF; RETURN NEW;`
+        : `RAISE EXCEPTION 'injected QA hold domain write failure';`;
+      await db.execute(sql.raw(`CREATE FUNCTION qa_paging_rollback_probe() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN ${body} END $$`));
+      await db.execute(sql.raw(`CREATE TRIGGER qa_paging_rollback_probe BEFORE INSERT ON ${table} FOR EACH ROW EXECUTE FUNCTION qa_paging_rollback_probe()`));
+      try {
+        await expect(f.recovery.escalateStrandedAssignedIssue({ issue: f.issue, latestRun: f.run,
+          previousStatus: "in_review" })).resolves.toBeNull();
+        const effect = await f.effects();
+        expect(effect.issue.status).toBe("in_review");
+        expect(effect.actions).toHaveLength(0); expect(effect.comments).toHaveLength(0);
+        expect(await db.select().from(activityLog).where(eq(activityLog.entityId, f.issueId))).toHaveLength(0);
+      } finally {
+        await db.execute(sql.raw(`DROP TRIGGER qa_paging_rollback_probe ON ${table}`));
+        await db.execute(sql.raw("DROP FUNCTION qa_paging_rollback_probe()"));
+      }
+    });
 
   it("never schedules invalid provider definitions even when a caller supplies a retry policy", async () => {
     const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID();

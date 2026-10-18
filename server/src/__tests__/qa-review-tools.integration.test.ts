@@ -9,6 +9,8 @@ import { normalizeIssueExecutionPolicy } from "../services/issue-execution-polic
 import { createWakeQueue } from "../modules/wake-queue/index.js";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 import * as qaReviewTools from "../services/qa-review-tools.js";
+import * as reviewProcesses from "@paperclipai/adapter-utils/server-utils";
+import { HttpError } from "../errors.js";
 
 it("requires the bound numeric loopback family for its bearer URL", () => {
   expect(qaReviewTools.qaReviewLocalApiUrl({
@@ -26,7 +28,14 @@ describe("run-bound QA review MCP", () => {
     server = await startRunnerApiTestServer();
     vi.stubEnv("PAPERCLIP_API_URL", server.apiUrl);
   }, 90_000);
-  afterAll(async () => { await server?.close(); vi.unstubAllEnvs(); });
+  afterAll(async () => {
+    for (const running of reviewProcesses.runningProcesses.values()) {
+      running.closed = true;
+      for (const cleanup of running.closeCleanups ?? []) cleanup();
+    }
+    reviewProcesses.runningProcesses.clear();
+    await server?.close(); vi.unstubAllEnvs();
+  });
 
   async function reviewFixture(withResponsibleUser = false) {
     const fixture = await server.fixture(withResponsibleUser ? { connectionScenario: "fresh" } : {});
@@ -45,6 +54,13 @@ describe("run-bound QA review MCP", () => {
       },
     }).where(eq(issues.id, fixture.issueId));
     const token = createLocalAgentJwt(fixture.agentId, fixture.companyId, "paperclip_runner", fixture.runId)!;
+    // No OS process or provider is started by this fixture. Match the actual
+    // review-only registry binding while retaining the old-source RED probe.
+    reviewProcesses.runningProcesses.set(fixture.runId, {
+      child: { pid: 12345678, exitCode: null, signalCode: null, kill: vi.fn() } as never,
+      graceSec: 10, processGroupId: null,
+    });
+    if ("bindQaReviewProcess" in reviewProcesses) reviewProcesses.bindQaReviewProcess(fixture.runId, 12345678);
     const call = async (method: string, params?: object) => {
       const response = await fetch(`${server.apiUrl}/api/mcp/qa-review`, {
         method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
@@ -60,6 +76,28 @@ describe("run-bound QA review MCP", () => {
     ));
     return { fixture, stageId, token, call, tool, rows };
   }
+
+  it("review regression rejects unknown tools before service or paging hold", async () => {
+    const {fixture, tool, rows} = await reviewFixture(); const spy = vi.spyOn(qaReviewTools, "callQaReviewTool");
+    try {
+      for (let i=0;i<2;i++) { const r=await tool("unknown_tool"); expect(r.status).toBe(200);
+        expect(r.body.result.isError).toBe(true); expect(JSON.stringify(r.body)).toContain("Unknown QA review tool"); }
+      expect(spy.mock.calls.length).toBe(0); expect(await rows()).toHaveLength(0);
+      const control=reviewProcesses.getQaReviewProcess(fixture.runId)!.control;
+      expect(control.hold ?? control.requestedHold).toBeNull();
+    } finally {spy.mockRestore();}
+  });
+
+  it("review regression rejects absent params with the existing unknown-tool contract", async () => {
+    const {fixture, call, rows} = await reviewFixture(); const spy=vi.spyOn(qaReviewTools,"callQaReviewTool");
+    try {
+      const r=await call("tools/call"); expect(r.status).toBe(200); expect(r.body.result.isError).toBe(true);
+      expect(JSON.stringify(r.body)).toContain("Unknown QA review tool");
+      expect(spy.mock.calls.length).toBe(0); expect(await rows()).toHaveLength(0);
+      const control=reviewProcesses.getQaReviewProcess(fixture.runId)!.control;
+      expect(control.hold ?? control.requestedHold).toBeNull();
+    } finally {spy.mockRestore();}
+  });
 
   it("exposes only issue-bound read and formal decision tools", async () => {
     const { fixture, token, call, tool } = await reviewFixture();
@@ -84,6 +122,64 @@ describe("run-bound QA review MCP", () => {
     });
     expect(unauthenticated.status).toBe(403);
     expect(token).toBeTruthy();
+  });
+
+  it("stops repeated invalid paging arguments after two observed errors, including parallel calls", async () => {
+    const { fixture, tool } = await reviewFixture();
+    const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
+    const spy = vi.spyOn(qaReviewTools, "callQaReviewTool");
+    try {
+      const args = { commentId: randomUUID(), expectedRevision: issue.revision, limit: 8000 };
+      const responses = await Promise.all(Array.from({ length: 8 }, () => tool("read_assigned_issue_comment", args)));
+      expect(responses.every(v => v.body.result.isError)).toBe(true);
+      expect(responses.some(v => JSON.stringify(v.body).includes("held"))).toBe(true);
+      expect(spy).toHaveBeenCalledTimes(2);
+      const binding = reviewProcesses.getQaReviewProcess(fixture.runId)!;
+      expect(binding.control.hold ?? binding.control.requestedHold).toMatchObject({
+        reason: "qa_review_read_hold", runId: fixture.runId, issueId: fixture.issueId,
+        companyId: fixture.companyId, agentId: fixture.agentId, statusVersion: issue.statusVersion,
+      });
+    } finally { spy.mockRestore(); }
+  });
+
+  it("preserves offset0 versus absent identity in the recorded c8 error sequence", async () => {
+    const { tool } = await reviewFixture();
+    const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
+    const args = { commentId: randomUUID(), expectedRevision: issue.revision, limit: 8000 };
+    const spy = vi.spyOn(qaReviewTools, "callQaReviewTool");
+    try {
+      await tool("read_assigned_issue_comment", { ...args, offset: 0 });
+      await tool("read_assigned_issue_comment", args);
+      await tool("read_assigned_issue_comment", args);
+      expect(spy).toHaveBeenCalledTimes(3);
+      expect(JSON.stringify((await tool("read_assigned_issue")).body)).toContain("held");
+      expect(spy).toHaveBeenCalledTimes(3);
+    } finally { spy.mockRestore(); }
+  });
+
+  it("allows overview rereads and does not turn transient transport errors into a configuration hold", async () => {
+    const { fixture, tool } = await reviewFixture();
+    for (let i = 0; i < 3; i++) expect((await tool("read_assigned_issue")).body.result.isError).not.toBe(true);
+    const spy = vi.spyOn(qaReviewTools, "callQaReviewTool");
+    try {
+      spy.mockRejectedValueOnce(new Error("ECONNRESET")).mockRejectedValueOnce(new Error("transport timeout"));
+      await tool("read_assigned_issue"); await tool("read_assigned_issue");
+      expect(reviewProcesses.getQaReviewProcess(fixture.runId)?.control.requestedHold).toBeNull();
+      spy.mockRejectedValueOnce(new HttpError(409, "unchanged version conflict"));
+      await tool("read_assigned_issue");
+      expect((await tool("read_assigned_issue")).body.result.isError).not.toBe(true);
+      expect(reviewProcesses.getQaReviewProcess(fixture.runId)?.control.requestedHold).toBeNull();
+    } finally { spy.mockRestore(); }
+  });
+
+  it("holds actual unchanged paginated results on the third repeat but rejects missing review binding", async () => {
+    const { fixture, tool } = await reviewFixture();
+    const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
+    const args = { expectedRevision: issue.revision };
+    for (let i = 0; i < 2; i++) expect((await tool("list_assigned_issue_comments", args)).body.result.isError).not.toBe(true);
+    expect((await tool("list_assigned_issue_comments", args)).body.result.isError).toBe(true);
+    reviewProcesses.runningProcesses.delete(fixture.runId);
+    expect(JSON.stringify((await tool("read_assigned_issue")).body)).toContain("not bound");
   });
 
   it("uses its accepted local listener for self-reads even when the public API URL is remote", async () => {

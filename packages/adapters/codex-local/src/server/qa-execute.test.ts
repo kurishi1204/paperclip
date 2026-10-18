@@ -8,7 +8,32 @@ const { run, acl } = vi.hoisted(() => ({ run: vi.fn(), acl:vi.fn() }));
 vi.mock("node:child_process",()=>{const execFile=()=>{};Object.assign(execFile,{[Symbol.for("nodejs.util.promisify.custom")]:async()=>({stdout:acl(),stderr:""})});return {execFile};});
 vi.mock("@paperclipai/adapter-utils/execution-target", () => ({ runAdapterExecutionTargetProcess: run }));
 import { executeCodexQa, QA_TOOLS, QA_TRUSTED_COMMAND, QA_TRUSTED_CODE_MODE_HOST } from "./qa-execute.js";
+import { runningProcesses, getQaReviewProcess } from "@paperclipai/adapter-utils/server-utils";
 const homes: string[] = [];
+it("retains a route hold after map deletion and raw exit0/deadline, bound only after the version probe", async () => {
+  const ctx = await context();
+  ctx.onSpawn = async () => { throw new Error("metadata persistence fixture"); };
+  run.mockResolvedValueOnce({ exitCode: 0, stdout: "codex-cli 0.154.0" }).mockImplementationOnce(async (...args) => {
+    expect(getQaReviewProcess(ctx.runId)).toBeNull();
+    const spawned = args[4].onSpawn({ pid: 12345678, processGroupId: null, startedAt: new Date().toISOString() });
+    runningProcesses.set(ctx.runId, { child: { pid: 12345678 } as never, graceSec: 10, processGroupId: null });
+    await spawned.catch(() => undefined); // real runner logs metadata failures
+    const binding = getQaReviewProcess(ctx.runId)!;
+    expect(binding).not.toBeNull();
+    binding.control.requestedHold = { reason: "qa_review_read_hold", runId: ctx.runId,
+      companyId: "fixture-company", issueId: "fixture-issue", agentId: "fixture-agent",
+      currentStageId: "fixture-stage", statusVersion: 3, lastDecisionId: null };
+    runningProcesses.delete(ctx.runId);
+    expect(args[4].stdin).toContain("comment/annotation text max2000");
+    return { exitCode: 0, signal: "SIGTERM", timedOut: true, stdout: '{"type":"turn.completed"}\n', stderr: "" };
+  });
+  const result = await executeCodexQa(ctx);
+  expect(result).toMatchObject({ exitCode: 1, signal: null, timedOut: false,
+    errorCode: "configuration_incomplete", errorFamily: "configuration" });
+  expect(result.resultJson).toMatchObject({ configurationIncomplete: { reason: "qa_review_read_hold" },
+    qaReviewRawOutcome: { exitCode: 0, signal: "SIGTERM", timedOut: true } });
+  expect(run.mock.calls[0][4].onSpawn).toBe(ctx.onSpawn);
+});
 it("uses the sealed executor for a commander with no MCP, no run token and only its server snapshot",async()=>{
   const ctx=await context();ctx.config={...ctx.config,qaReviewToolsOnly:false,commanderCycleToolsOnly:true};
   ctx.authToken=undefined;ctx.runtimeMcp={getServers:()=>[]};ctx.context={paperclipCommanderPrompt:"SERVER SNAPSHOT ONLY"};

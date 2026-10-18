@@ -82,6 +82,18 @@ function currentAgentParticipant(issue: IssueSnapshot): { agentId: string } | nu
   return agentId ? { agentId } : null;
 }
 
+function isCurrentQaPagingHold(issue: IssueSnapshot, run: RunSnapshot): boolean {
+  const hold = run.configurationIncompletePayload;
+  const state = parseObject(issue.executionState);
+  const participant = parseObject(state.currentParticipant);
+  return run.status === "failed" && run.errorCode === "configuration_incomplete" &&
+    hold?.reason === "qa_review_read_hold" && hold.runId === run.id &&
+    hold.companyId === run.companyId && hold.issueId === issue.id && hold.agentId === run.agentId &&
+    issue.status === "in_review" && state.status === "pending" && state.currentStageType === "review" && !issue.assigneeUserId &&
+    participant.type === "agent" && participant.agentId === run.agentId &&
+    state.currentStageId === hold.currentStageId && (state.lastDecisionId ?? null) === hold.lastDecisionId;
+}
+
 /**
  * Resolves the responsible user for a heartbeat run the module is about to
  * queue. The promote path and the immediate-recovery path both call this
@@ -167,6 +179,21 @@ async function runReleaseDrain(
       );
     }
     processedWakeIds.add(candidate.id);
+
+    if (isCurrentQaPagingHold(issue, run) && candidate.agentId === run.agentId &&
+      candidate.requestedByActorType !== "user" && candidate.triggerDetail !== "manual" &&
+      !candidate.authorizedFailedChatRetry && !candidate.preservesIndependentContinuation &&
+      candidate.payload.mutation !== "interaction" &&
+      candidate.queuedCommentIds.length === 0 && candidate.deferredCommentIds.length === 0 &&
+      (["execution_review_requested", "execution_approval_requested", "execution_review_participant_recovery"]
+        .includes(candidate.wakeReason ?? candidate.reason ?? "") ||
+        readNonEmptyString(candidate.deferredContextSeed.retryReason) !== null) &&
+      (!candidate.deferredContextSeed.currentStageId ||
+        candidate.deferredContextSeed.currentStageId === run.configurationIncompletePayload?.currentStageId)) {
+      await ports.transaction.cancelDeferredWake({ companyId: run.companyId, wakeId: candidate.id,
+        reason: "QA paging requires explicit repair and resumption", now: input.now });
+      continue;
+    }
 
     // A lead can post its closing comment before committing Done. Check
     // again when the source run releases its queue, using every original
@@ -578,6 +605,11 @@ async function runReleaseRecoveryTail(
           runId: run.id,
         })
       : false;
+
+  if (isCurrentQaPagingHold(issue, run) && !hasExistingExecutionPath) {
+    return { outcome: { kind: "blocked", issue, previousStatus: "in_review",
+      noticeKind: "configuration_incomplete" }, postCommitEffects };
+  }
 
   const decision = decideReleaseRecovery({
     suppressImmediateRecovery,

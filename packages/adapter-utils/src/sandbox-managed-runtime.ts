@@ -671,8 +671,8 @@ function buildRemoveDeletedPathsCommand(input: { remoteDir: string; manifestPath
       parent=\${parent%/*}
       if [ -L "$parent" ] || { [ -e "$parent" ] && [ ! -d "$parent" ]; }; then exit 42; fi
     done
-    rm -rf -- "$entry" || exit
-  done`;
+  done
+  rm -rf -- "$@"`;
   return `cd ${shellQuote(input.remoteDir)} && xargs -0 -r -n 64 sh -c ${shellQuote(remove)} sh < ${shellQuote(input.manifestPath)} && rm -f -- ${shellQuote(input.manifestPath)}`;
 }
 

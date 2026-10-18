@@ -27,7 +27,7 @@ afterEach(async () => {
   for (const directory of directories.splice(0)) await fs.rm(directory, { recursive: true, force: true });
 }, 60_000);
 
-function localClient(commands: string[]): SandboxManagedRuntimeClient {
+function localClient(commands: string[], stage: string): SandboxManagedRuntimeClient {
   return {
     makeDir: async (dir) => { await fs.mkdir(dir, { recursive: true }); },
     writeFile: async (file, bytes) => { await fs.writeFile(file, Buffer.from(bytes)); },
@@ -43,7 +43,10 @@ function localClient(commands: string[]): SandboxManagedRuntimeClient {
         }
         for (const command of operation.postUploadCommands ?? []) {
           commands.push(command.command);
+          const started = performance.now();
+          console.info("streaming fixture command start", { stage, commandIndex: commands.length });
           await execute("sh", ["-c", command.command], { maxBuffer: 64 * 1024 });
+          console.info("streaming fixture command complete", { stage, commandIndex: commands.length, elapsedMs: performance.now() - started });
         }
       }
       return { operations: [] };
@@ -110,15 +113,27 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   await fs.writeFile(path.join(parent, "late.js"), "must not stage");
   const commands: string[] = [];
   const remote = path.join(root, "remote");
-  const stage = async (gitSnapshot: GitWorkspaceSnapshot) => {
+  const stage = async (gitSnapshot: GitWorkspaceSnapshot, label: "overlay" | "deleted") => {
+    const started = performance.now();
+    console.info("streaming fixture stage start", { stage: label });
     const runtime = await prepareSandboxManagedRuntime({
       spec: { transport: "sandbox", provider: "test", sandboxId: "test", remoteCwd: remote, timeoutMs: 120_000, apiKey: null },
-      client: localClient(commands), adapterKey: "stream-test", workspaceLocalDir: repo, workspaceGitSnapshot: gitSnapshot,
+      client: localClient(commands, label), adapterKey: "stream-test", workspaceLocalDir: repo, workspaceGitSnapshot: gitSnapshot,
+      runtimeSpan: async (name, work) => {
+        const spanStarted = performance.now();
+        console.info("streaming fixture span start", { stage: label, name });
+        try {
+          return await work();
+        } finally {
+          console.info("streaming fixture span settled", { stage: label, name, elapsedMs: performance.now() - spanStarted });
+        }
+      },
     });
     runtimes.push(runtime);
+    console.info("streaming fixture stage complete", { stage: label, elapsedMs: performance.now() - started });
     return runtime;
   };
-  const runtime = await stage(snapshot);
+  const runtime = await stage(snapshot, "overlay");
   const remoteParent = path.join(remote, path.relative(repo, parent));
   let stagedCount = 0;
   for await (const entry of await fs.opendir(remoteParent)) {
@@ -146,7 +161,7 @@ it("streams and stages all four real Git filename lanes above 32 MiB through the
   await fs.rm(parent, { recursive: true });
   const deleted = await scan();
   checkLargeLane(deleted.deletedPaths);
-  await stage(deleted);
+  await stage(deleted, "deleted");
   let remaining = 0;
   for await (const _entry of await fs.opendir(remoteParent)) remaining++;
   expect(remaining).toBe(0);
