@@ -77,33 +77,55 @@ describe("run-bound QA review MCP", () => {
     return { fixture, stageId, token, call, tool, rows };
   }
 
-  it("preserves unbound Claude QA reads and one formal decision for the server-owned QA adapter", async () => {
-    const { fixture, stageId, tool, rows } = await reviewFixture();
-    await server.db.update(agents).set({ adapterType: "claude_local", adapterConfig: {
-      engine: "cli", qaReviewToolsOnly: true, dangerouslySkipPermissions: false,
-    } }).where(eq(agents.id, fixture.agentId));
+  it("preserves unbound Claude participant authority regardless of QA delivery configuration", async () => {
+    for (const config of [
+      { stored: false, override: true },
+      { stored: true, override: false },
+      { stored: true, override: undefined },
+      { stored: false, override: undefined },
+      { stored: "true", override: undefined },
+    ]) {
+      const { fixture, stageId, tool, rows } = await reviewFixture();
+      await server.db.update(agents).set({ adapterType: "claude_local", adapterConfig: {
+        engine: "cli", qaReviewToolsOnly: config.stored, dangerouslySkipPermissions: false,
+      } }).where(eq(agents.id, fixture.agentId));
+      if (config.override !== undefined) await server.db.update(issues).set({
+        assigneeAdapterOverrides: { adapterConfig: { qaReviewToolsOnly: config.override } },
+      }).where(eq(issues.id, fixture.issueId));
+      reviewProcesses.runningProcesses.delete(fixture.runId);
+      const read = await tool("read_assigned_issue");
+      expect(read.body.result.isError).not.toBe(true);
+      const issue = read.body.result.structuredContent;
+      expect(issue.id).toBe(fixture.issueId);
+      const verdict = await tool("submit_review_decision", {
+        decision: "approve", summary: "Claude QA evidence checked.", expectedStageId: stageId,
+        expectedStatusVersion: issue.statusVersion, expectedRevision: issue.revision,
+        expectedLastDecisionId: issue.reviewStage.lastDecisionId,
+      });
+      expect(verdict.body.result.isError).not.toBe(true);
+      const decisions = await rows();
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]).toMatchObject({ createdByRunId: fixture.runId, actorAgentId: fixture.agentId });
+    }
+  });
+
+  it("does not retain unbound Claude authority after the review assignee changes", async () => {
+    const { fixture, tool, rows } = await reviewFixture();
+    await server.db.update(agents).set({ adapterType: "claude_local", adapterConfig: { qaReviewToolsOnly: true } })
+      .where(eq(agents.id, fixture.agentId));
     reviewProcesses.runningProcesses.delete(fixture.runId);
-    const read = await tool("read_assigned_issue");
-    expect(read.body.result.isError).not.toBe(true);
-    const issue = read.body.result.structuredContent;
-    expect(issue.id).toBe(fixture.issueId);
-    const verdict = await tool("submit_review_decision", {
-      decision: "approve", summary: "Claude QA evidence checked.", expectedStageId: stageId,
-      expectedStatusVersion: issue.statusVersion, expectedRevision: issue.revision,
-      expectedLastDecisionId: issue.reviewStage.lastDecisionId,
-    });
-    expect(verdict.body.result.isError).not.toBe(true);
-    const decisions = await rows();
-    expect(decisions).toHaveLength(1);
-    expect(decisions[0]).toMatchObject({ createdByRunId: fixture.runId, actorAgentId: fixture.agentId });
+    expect((await tool("read_assigned_issue")).body.result.isError).not.toBe(true);
+    await server.db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, fixture.issueId));
+    for (const name of ["read_assigned_issue", "submit_review_decision"]) {
+      expect((await tool(name)).status).toBe(403);
+    }
+    expect(await rows()).toHaveLength(0);
   });
 
   it("does not infer the unbound Claude exception from caller context or another adapter", async () => {
     for (const config of [
       { adapterType: "codex_local", adapterConfig: { qaReviewToolsOnly: true } },
       { adapterType: "paperclip_runner", adapterConfig: { qaReviewToolsOnly: true } },
-      { adapterType: "claude_local", adapterConfig: { qaReviewToolsOnly: false } },
-      { adapterType: "claude_local", adapterConfig: { qaReviewToolsOnly: "true" } },
     ]) {
       const { fixture, tool, rows } = await reviewFixture();
       await server.db.update(agents).set(config).where(eq(agents.id, fixture.agentId));

@@ -66,10 +66,12 @@ export function qaReviewToolRoutes(db: Db) {
       if (!binding && !receiptOnly) {
         // Claude's supported restricted QA executor predates the process
         // control registry. Preserve its existing authenticated run/participant
-        // authority; caller arguments and context snapshots cannot opt in.
-        const [agent] = await db.select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig })
+        // authority. QA-only mode controls tool delivery, not this authority;
+        // re-reading configuration here would diverge from issue/run overrides.
+        // Caller arguments and context snapshots cannot choose the adapter.
+        const [agent] = await db.select({ adapterType: agents.adapterType })
           .from(agents).where(and(eq(agents.id, context.run.agentId), eq(agents.companyId, context.run.companyId)));
-        if (agent?.adapterType !== "claude_local" || agent.adapterConfig?.qaReviewToolsOnly !== true) {
+        if (agent?.adapterType !== "claude_local") {
           throw forbidden("QA review process is not bound to this run");
         }
       }
