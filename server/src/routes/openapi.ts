@@ -33,6 +33,7 @@ import {
   createAgentHireSchema,
   updateAgentSchema,
   updateAgentPermissionsSchema,
+  agentContinuityControlsPatchSchema,
   updateAgentInstructionsPathSchema,
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,
@@ -1348,6 +1349,8 @@ const browserUseOperations = [
 ] as const;
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  "GET /api/agents/{id}/continuity-controls",
+  "PATCH /api/agents/{id}/continuity-controls",
   ...browserUseOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
   "POST /api/issues/{id}/commander-admission",
   "GET /api/companies/{companyId}/ai-connections",
@@ -3520,6 +3523,58 @@ registry.registerPath({
     body: jsonBody(updateAgentPermissionsSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+const agentContinuityControlsResponseSchema = z.object({
+  id: z.string(),
+  companyId: z.string(),
+  status: z.string(),
+  role: z.string(),
+  adapterType: z.string(),
+  updatedAt: agentContinuityControlsPatchSchema.shape.expectedUpdatedAt,
+  assignmentMode: z.string().nullable(),
+  blockAssignment: z.boolean().nullable(),
+  wakeOnDemand: z.boolean().nullable(),
+  heartbeatEnabled: z.boolean().nullable(),
+  canAssignTasks: z.boolean().nullable(),
+  canCreateAgents: z.boolean().nullable(),
+  eligible: z.boolean(),
+  canManage: z.boolean(),
+}).strict();
+
+registry.registerPath({
+  method: "get",
+  path: "/api/agents/{id}/continuity-controls",
+  tags: ["agents"],
+  summary: "Read an agent's non-secret continuity controls",
+  description: "Requires board access to the agent's company and configuration-read permission. canManage reports the separate agents:create decision and does not grant mutation permission. Malformed, absent, or inaccessible agent IDs return 404.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(agentContinuityControlsResponseSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/agents/{id}/continuity-controls",
+  tags: ["agents"],
+  summary: "Compare and set two eligible agent continuity controls",
+  description: "Requires an identified board user with agent-management permission for the agent's company. Only blockAssignment and wakeOnDemand may change. The agent must remain eligible, including paused and protected assignment, with background heartbeat disabled. expectedUpdatedAt is the exact six-fractional-digit UTC value returned by GET. A changed company/version or ineligible agent returns 409. The response exposes only non-secret controls.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(agentContinuityControlsPatchSchema),
+  },
+  responses: {
+    200: r.ok(agentContinuityControlsResponseSchema.extend({ canManage: z.literal(true) })),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 registry.registerPath({
