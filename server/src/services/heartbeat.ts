@@ -2943,6 +2943,14 @@ function qaPagingHoldMatchesIssue(hold: Record<string, unknown>, issue: typeof i
     issue.statusVersion === hold.statusVersion && (state.lastDecisionId ?? null) === hold.lastDecisionId;
 }
 
+function qaPagingRecoveryActionMatchesHold(action: Pick<typeof issueRecoveryActions.$inferSelect,
+  "cause" | "fingerprint" | "evidence"> | undefined, sourceRunId: string, hold: Record<string, unknown>) {
+  return Boolean(action && ((action.cause === "configuration_incomplete" &&
+    action.fingerprint === `qa_review_read_hold:${sourceRunId}:${hold.currentStageId}`) ||
+    stableStringifyForFingerprint(parseObject(action.evidence).qaReviewPagingHold) ===
+      stableStringifyForFingerprint(hold)));
+}
+
 function isAutomaticQaPagingWake(context: Record<string, unknown>, authority: {
   requestedByActorType?: string | null; triggerDetail?: string | null;
   payload?: Record<string, unknown> | null;
@@ -27186,10 +27194,7 @@ export function heartbeatService(
         )).limit(1);
         // A prior action keeps its original identity/authority; its complete
         // receipt proves this same blocker without relying on the old cause.
-        if (action && ((action.cause === "configuration_incomplete" &&
-            action.fingerprint === `qa_review_read_hold:${source.id}:${hold.currentStageId}`) ||
-            stableStringifyForFingerprint(parseObject(action.evidence).qaReviewPagingHold) ===
-              stableStringifyForFingerprint(hold))) return { source, hold };
+        if (qaPagingRecoveryActionMatchesHold(action, source.id, hold)) return { source, hold };
       }
       return null;
     }
@@ -27210,13 +27215,13 @@ export function heartbeatService(
           state.status !== "pending" || state.currentStageType !== "review" || state.currentStageId !== hold.currentStageId ||
           (state.lastDecisionId ?? null) !== hold.lastDecisionId || participant.type !== "agent" ||
           participant.agentId !== hold.agentId || issue.assigneeUserId) return;
-        const [action] = await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+        const [action] = await tx.select({ evidence: issueRecoveryActions.evidence,
+          cause: issueRecoveryActions.cause, fingerprint: issueRecoveryActions.fingerprint,
+        }).from(issueRecoveryActions).where(and(
           eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
           inArray(issueRecoveryActions.status, ["active", "escalated"]),
-          eq(issueRecoveryActions.cause, "configuration_incomplete"),
-          eq(issueRecoveryActions.fingerprint, `qa_review_read_hold:${source.id}:${hold.currentStageId}`),
         )).limit(1);
-        if (!action) return;
+        if (!qaPagingRecoveryActionMatchesHold(action, source.id, hold)) return;
       }
       const candidates = await tx.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, source.companyId), eq(heartbeatRuns.agentId, source.agentId),

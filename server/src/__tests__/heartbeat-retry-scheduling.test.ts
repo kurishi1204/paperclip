@@ -346,6 +346,42 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(await heartbeat.getRun(manual!.id)).not.toBeNull();
   });
 
+  it.each(["board", "agent"] as const)("cancels a directly queued late QA wake under preserved active authority (%s)", async (ownerType) => {
+    const f = await seedQaPagingHoldFixture();
+    const { issueRecoveryActionService } = await import("../services/issue-recovery-actions.js");
+    const active = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId: f.companyId, sourceIssueId: f.issueId, kind: "stranded_assigned_issue", ownerType,
+      ownerAgentId: ownerType === "agent" ? f.agentId : null,
+      cause: "execution_review_participant_recovery", fingerprint: "preexisting-late-queue-authority",
+      nextAction: "Preserve existing authority", evidence: { priorEvidence: "preserved" },
+      attemptCount: 3, maxAttempts: 3,
+      wakePolicy: { type: "retry", reason: "execution_review_participant_recovery" },
+    });
+    expect((await f.release()).outcome.kind).toBe("blocked");
+    const before = await f.effects();
+    const adapterType = `qa_paging_late_wake_${ownerType}`;
+    const execute = vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false }));
+    registerServerAdapter({ type: adapterType, execute,
+      testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }) });
+    try {
+      await db.update(agents).set({ adapterType, status: "idle" }).where(eq(agents.id, f.agentId));
+      const lateId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: lateId, companyId: f.companyId, agentId: f.agentId,
+        invocationSource: "on_demand", triggerDetail: "system", status: "queued", responsibleUserId: "responsible-user",
+        contextSnapshot: { issueId: f.issueId, currentStageId: f.stageId,
+          wakeReason: "execution_review_participant_recovery", recoveryActionId: active.id } });
+      await heartbeat.resumeQueuedRuns();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const after = await f.effects();
+      const late = after.runs.find(run => run.id === lateId);
+      expect({ lateStatus: late?.status, lateErrorCode: late?.errorCode, adapterCalls: execute.mock.calls.length })
+        .toEqual({ lateStatus: "cancelled", lateErrorCode: "qa_review_hold_suppressed", adapterCalls: 0 });
+      expect(after.actions).toEqual(before.actions);
+      expect(after.comments).toEqual(before.comments);
+      expect(after.issue).toEqual(before.issue);
+    } finally { unregisterServerAdapter(adapterType); }
+  });
+
   it.each(["board", "agent"] as const)("review regression rolls back active-action evidence on notice failure and publishes after recovery (%s)", async (ownerType) => {
     const f = await seedQaPagingHoldFixture();
     const { issueRecoveryActionService } = await import("../services/issue-recovery-actions.js");
