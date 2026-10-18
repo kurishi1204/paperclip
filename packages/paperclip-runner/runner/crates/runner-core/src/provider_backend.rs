@@ -2885,7 +2885,7 @@ impl CodexCommandExecutor {
         Ok(())
     }
 
-    fn turn_effort<'a>(&self, payload: &'a Value) -> Result<Option<&'a str>, DurableRunnerError> {
+    fn parse_turn_effort(payload: &Value) -> Result<Option<&str>, DurableRunnerError> {
         let effort = match payload.get("effort") {
             None | Some(Value::Null) => None,
             Some(Value::String(effort)) => Some(effort.as_str()),
@@ -2895,6 +2895,14 @@ impl CodexCommandExecutor {
                 ));
             }
         };
+        // Shape validation is independent of durable recovery and provider kind.
+        validate_codex_turn_effort("codex", effort)
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        Ok(effort)
+    }
+
+    fn turn_effort<'a>(&self, payload: &'a Value) -> Result<Option<&'a str>, DurableRunnerError> {
+        let effort = Self::parse_turn_effort(payload)?;
         let state = self
             .state
             .as_ref()
@@ -2905,8 +2913,8 @@ impl CodexCommandExecutor {
     }
 
     fn start_turn(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
-        // Execute loaded only the private metadata for this command. Validate
-        // before provider recovery or marking dispatch ambiguous.
+        // execute() completes ordinary durable recovery first. Validate the
+        // actual provider kind before sending a turn or marking it ambiguous.
         let effort = self.turn_effort(payload)?;
         let skills: Vec<CodexSkillInput> =
             serde_json::from_value(payload.get("skills").cloned().unwrap_or_else(|| json!([])))
@@ -2921,16 +2929,7 @@ impl CodexCommandExecutor {
                 .validate()
                 .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
         }
-        if let Err(error) = self.restore_provider_if_needed() {
-            if !self.restore_checked {
-                self.restore_error = Some(error.clone());
-            }
-            return Err(error);
-        }
-        // Recovery can close a contradictory provider before admitting its
-        // startup. Preserve restore()'s post-recovery admission boundary.
-        self.assert_startup_admitted()?;
-        self.restore_checked = true;
+        self.restore_provider_if_needed()?;
         if self
             .state
             .as_ref()
@@ -4491,24 +4490,9 @@ impl CommandExecutor for CodexCommandExecutor {
         });
         let outcome = (|| {
             if command.command_type == "turn.start" {
-                if let Some(error) = self.restore_error.as_ref() {
-                    return Err(error.clone());
-                }
-                self.assert_startup_admitted()?;
-                if !self.restore_checked {
-                    // Keep the existing reconciliation gates below, but do not
-                    // launch a cold provider before validating this turn.
-                    if let Err(error) = self
-                        .load_state_without_provider()
-                        .and_then(|()| self.assert_startup_admitted())
-                    {
-                        self.restore_error = Some(error.clone());
-                        return Err(error);
-                    }
-                }
-            } else {
-                self.restore()?;
+                Self::parse_turn_effort(&command.payload)?;
             }
+            self.restore()?;
             if self
                 .state
                 .as_ref()
@@ -5063,14 +5047,13 @@ mod tests {
             json!("é".repeat(121)),
         ]
         .into_iter()
-        .map(|effort| ("codex", effort))
-        .chain(std::iter::once(("opencode", json!("high"))));
+        .map(|effort| ("codex", effort));
         for (provider, effort) in cases {
             let directory = std::env::temp_dir().join(format!(
                 "paperclip-cold-turn-effort-{}",
                 uuid::Uuid::new_v4()
             ));
-            let mut writer = CodexCommandExecutor::new(&directory);
+            let writer = CodexCommandExecutor::new(&directory);
             let mut state = opencode_result_state();
             state.config.provider = provider.to_owned();
             state.config.driver = if provider == "codex" {
@@ -5083,28 +5066,23 @@ mod tests {
             state.active_provider_turn_id = None;
             state.provider_process_generation = 1;
             state.lifecycle = "session_open".to_owned();
-            if provider == "opencode" {
-                let artifact = |name: &str| crate::durable::QualifiedLaunchArtifact {
-                    path: directory.join(name),
-                    sha256: "a".repeat(64),
-                };
-                let profile = OpenCodeLaunchProfile {
-                    command: artifact("must-not-launch"),
-                    proxy_script: artifact("proxy.mjs"),
-                    executable: artifact("opencode"),
-                };
-                state.config.args = vec![profile.proxy_script.path.to_string_lossy().into_owned()];
-                writer.opencode_launch_profile = Some(profile);
-                state.opencode_launch_profile_digest =
-                    writer.bind_opencode_launch_profile(&state.config).unwrap();
+            let backpressured = provider == "codex" && effort == json!(true);
+            if backpressured {
+                state.active_provider_turn_id = Some("turn-1".to_owned());
+                state.lifecycle = "turn_active".to_owned();
+                state
+                    .begin_receipt_limit_stop(
+                        "call-1".to_owned(),
+                        "get_task_context".to_owned(),
+                        receipt_limit_deadline_after(60_000).unwrap(),
+                    )
+                    .unwrap();
             }
             writer.persist_state(&state).unwrap();
             let state_path = writer.state_path();
             let before = fs::read(&state_path).unwrap();
-            let profile = writer.opencode_launch_profile.clone();
             drop(writer);
             let mut executor = CodexCommandExecutor::new(&directory);
-            executor.opencode_launch_profile = profile;
             assert!(executor.state.is_none());
             let error = executor
                 .execute(&Command {
@@ -5125,13 +5103,15 @@ mod tests {
                 executor.restore_error.is_none(),
                 "bad input must not poison recovery"
             );
-            assert!(executor.state.as_ref().unwrap().startup_attempt.is_none());
+            // Malformed input never creates the partially restored state that
+            // backpressure maintenance could otherwise mistake for an owner.
+            assert!(executor.state.is_none());
             assert_eq!(fs::read(&state_path).unwrap(), before);
-            assert_eq!(
-                serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
-                serde_json::from_slice::<Value>(&before).unwrap()
-            );
             assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+            executor.maintain_backpressured_provider().unwrap();
+            assert!(executor.state.is_none());
+            assert!(executor.provider.is_none());
+            assert_eq!(fs::read(&state_path).unwrap(), before);
             fs::remove_dir_all(directory).unwrap();
         }
     }
@@ -5142,6 +5122,38 @@ mod tests {
         assert!(validate_codex_turn_effort("codex", Some("é".repeat(121).as_str())).is_err());
         assert!(validate_codex_turn_effort("codex", Some("future-advertised-effort")).is_ok());
         assert!(validate_codex_turn_effort("opencode", None).is_ok());
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-noncodex-turn-effort-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut executor = CodexCommandExecutor::new(&directory);
+        let mut state = opencode_result_state();
+        state.lifecycle = "prepared".to_owned();
+        state.active_provider_turn_id = None;
+        executor.state = Some(state);
+        executor.restore_checked = true;
+        let error = executor
+            .execute(&Command {
+                schema: "paperclip.prp.command.v1".to_owned(),
+                command_id: "noncodex-effort".to_owned(),
+                controller_seq: 1,
+                command_type: "turn.start".to_owned(),
+                issued_at: "2026-10-19T00:00:00.000Z".to_owned(),
+                deadline_at: None,
+                precondition: None,
+                payload: json!({"text":"must not start", "effort":"high"}),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("effort requires Codex"));
+        assert!(executor.provider.is_none());
+        assert!(executor.state.as_ref().unwrap().startup_attempt.is_none());
+        assert!(
+            !executor
+                .state
+                .as_ref()
+                .unwrap()
+                .ambiguous_turn_start_pending
+        );
     }
 
     #[test]
