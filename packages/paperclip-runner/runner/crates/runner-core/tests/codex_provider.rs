@@ -2743,7 +2743,19 @@ fn durable_backend_rejects_an_older_provider_turn_id_after_restart() {
 
 #[test]
 fn durable_recovery_closes_a_provider_that_reopens_a_settled_turn() {
-    let directory = temporary_directory("durable-settled-turn-active-on-recovery");
+    for (kind, payload) in [
+        (
+            "turn.start",
+            json!({"text": "Do not reopen settled work.", "effort": "high"}),
+        ),
+        ("runner.suspend", json!({})),
+    ] {
+        assert_durable_recovery_closes_a_reopened_settled_turn(kind, payload);
+    }
+}
+
+fn assert_durable_recovery_closes_a_reopened_settled_turn(kind: &str, payload: Value) {
+    let directory = temporary_directory(&format!("durable-settled-turn-active-on-recovery-{kind}"));
     let config = provider_config(&directory, &[]);
     let runner_config = durable_config(&directory);
     let mut first = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
@@ -2793,15 +2805,22 @@ fn durable_recovery_closes_a_provider_that_reopens_a_settled_turn() {
     .expect("write contradictory fake provider state");
 
     let resumes_before_recovery = call_count(&directory, "thread/resume");
+    let starts_before_recovery = call_count(&directory, "turn/start");
     let mut recovered = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
-    assert!(recovered
-        .execute(&command(
-            "suspend-rejected",
-            99,
-            "runner.suspend",
-            json!({})
-        ))
-        .is_err());
+    let error = recovered
+        .execute(&command("cold-command-rejected", 99, kind, payload))
+        .expect_err("cold-first command must retain the post-restore admission fence");
+    assert!(
+        error
+            .to_string()
+            .contains("provider startup ownership remains unadmitted"),
+        "cold-first rejected with: {error}",
+    );
+    assert_eq!(
+        call_count(&directory, "turn/start"),
+        starts_before_recovery,
+        "contradictory recovery must not dispatch a new provider turn",
+    );
     let events = recovered
         .retained_events()
         .expect("fail-closed recovery facts remain observable without launch");
@@ -6451,7 +6470,7 @@ fn explicit_skill_input_survives_durable_turn_and_cold_restore() {
             "turn",
             3,
             "turn.start",
-            json!({"text":"$first-task Continue after approval", "skills":[skill]}),
+            json!({"text":"$first-task Continue after approval", "skills":[skill], "effort":"high"}),
         ))
         .unwrap();
     restored.shutdown().unwrap();
@@ -6459,6 +6478,14 @@ fn explicit_skill_input_survives_durable_turn_and_cold_restore() {
     assert!(frames.iter().any(|f| f["method"] == "thread/resume"));
     let turn = frames.iter().find(|f| f["method"] == "turn/start").unwrap();
     assert_eq!(turn["params"]["input"][1], skill);
+    assert_eq!(turn["params"]["effort"], "high");
+    assert!(turn["params"].get("collaborationMode").is_none());
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(directory.join("codex-provider-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(persisted["config"]["args"], json!(config.args));
+    assert!(persisted["config"].get("effort").is_none());
+    assert!(persisted["config"].get("reasoningEffort").is_none());
     fs::remove_dir_all(directory).unwrap();
 }
 

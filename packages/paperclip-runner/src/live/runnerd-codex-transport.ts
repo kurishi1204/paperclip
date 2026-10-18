@@ -5735,6 +5735,18 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (!Number.isSafeInteger(turnStartTimeoutMs) || turnStartTimeoutMs <= 0) {
       throw new Error("turnStartTimeoutMs must be a positive safe integer");
     }
+    // Null has the protocol's omitted-value meaning. Keep effort on the turn,
+    // rather than launch args, so a warm provider receives the current value.
+    const effort = params.effort ?? undefined;
+    if (effort !== undefined && (
+      typeof effort !== "string" || effort.trim().length === 0 ||
+      Buffer.byteLength(effort, "utf8") > 240
+    )) {
+      throw new Error("turn/start effort must be a non-empty string of at most 240 UTF-8 bytes");
+    }
+    if (effort !== undefined && (this.options.provider ?? "codex") !== "codex") {
+      throw new Error("turn/start effort requires Codex");
+    }
     const commandDeadline = Date.now() + turnStartTimeoutMs;
     const input = Array.isArray(params.input) ? params.input.map(record) : [];
     const message = input
@@ -5775,6 +5787,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         {
           text: message,
           ...(skills.length ? { skills } : {}),
+          ...(effort !== undefined ? { effort } : {}),
           turnId: pendingTurnId,
         },
         commandDeadline,

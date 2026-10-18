@@ -132,6 +132,62 @@ async function expectTurnStarted(
   );
 }
 
+async function readProviderRequestFrames(tracePath: string): Promise<Record<string, unknown>[]> {
+  return (await readFile(tracePath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((entry) => entry.kind === "frame" && entry.direction === "client_to_provider")
+    .map((entry) => JSON.parse(
+      Buffer.from(String(entry.rawBase64), "base64").toString("utf8"),
+    ) as Record<string, unknown>);
+}
+
+it("rejects invalid turn effort before queuing provider work", async () => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-invalid-effort-"));
+  let core!: DurablePrpControlPlane;
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: defaultCapabilityRunnerdBinary(),
+    codexCommand: fakeCodex,
+    codexArgs: fakeCodexArgs(stateDirectory),
+    stateDirectory,
+    controlPlaneRegistration: async (authority) => {
+      core = authority;
+      await authority.start();
+      return { release: () => undefined };
+    },
+  });
+  try {
+    await bundle.transport.request("thread/start", { cwd: tmpdir(), dynamicTools: [] });
+    const commandsBefore = core.store.state.commands.map((command) => command.commandId);
+    for (const effort of [true, 1, {}, [], "", " \t", "x".repeat(241), "é".repeat(121)]) {
+      await expect(bundle.transport.request("turn/start", {
+        input: [{ type: "text", text: "must not start" }], effort,
+      })).rejects.toThrow("effort must be a non-empty string of at most 240 UTF-8 bytes");
+    }
+    expect(core.store.state.commands.map((command) => command.commandId)).toEqual(commandsBefore);
+    expect(core.store.state.commands.some((command) => command.type === "turn.start")).toBe(false);
+  } finally {
+    await bundle.transport.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+}, 30_000);
+
+it("rejects Codex effort for another provider before starting a runner", async () => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-noncodex-effort-"));
+  const bundle = createCapabilityRunnerdCodexTransport({ provider: "opencode", stateDirectory });
+  try {
+    await expect(bundle.transport.request("turn/start", {
+      input: [{ type: "text", text: "must not start" }], effort: "high",
+    })).rejects.toThrow("effort requires Codex");
+    expect(bundle.evidence().runnerPid).toBeNull();
+    expect(bundle.evidence().codexPid).toBeNull();
+  } finally {
+    await bundle.transport.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+});
+
 it("replaces an owned v1 runner with fresh v2 authorization before warm attachment", async () => {
   const directory = await mkdtemp(join(tmpdir(), "runnerd-v1-v2-replacement-"));
   const handles: durableControlPlane.RunnerProcessHandle[] = [];
@@ -6017,11 +6073,14 @@ it.each([
 
 it("rotates PRP authority in place for a warm cross-run attachment", async () => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-warm-attach-"));
+  const tracePath = join(stateDirectory, "provider-trace.ndjson");
+  const originalArgs = fakeCodexArgs(stateDirectory);
   const bundle = createCapabilityRunnerdCodexTransport({
     runnerBinary: defaultCapabilityRunnerdBinary(),
     codexCommand: fakeCodex,
-    codexArgs: fakeCodexArgs(stateDirectory),
+    codexArgs: originalArgs,
     stateDirectory,
+    environment: { PAPERCLIP_PROVIDER_TRACE_PATH: tracePath },
     lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
   });
   bundle.transport.setServerRequestHandler(async () => ({
@@ -6083,6 +6142,7 @@ it("rotates PRP authority in place for a warm cross-run attachment", async () =>
       "first turn start",
       bundle.transport.request("turn/start", {
         input: [{ type: "text", text: "first run" }],
+        effort: "high",
       }),
     );
     await waitForCompletion("first run");
@@ -6099,6 +6159,7 @@ it("rotates PRP authority in place for a warm cross-run attachment", async () =>
       "second turn start",
       bundle.transport.request("turn/start", {
         input: [{ type: "text", text: "second run" }],
+        effort: "medium",
       }),
     );
     await waitForCompletion("second run");
@@ -6119,6 +6180,16 @@ it("rotates PRP authority in place for a warm cross-run attachment", async () =>
     );
     await waitForCompletion("third run");
 
+    const turnFrames = (await readProviderRequestFrames(tracePath))
+      .filter((frame) => frame.method === "turn/start");
+    expect(turnFrames.map((frame) => (frame.params as Record<string, unknown>).effort))
+      .toEqual(["high", "medium", undefined]);
+    expect(turnFrames[2]!.params).not.toHaveProperty("effort");
+    for (const frame of turnFrames) expect(frame.params).not.toHaveProperty("collaborationMode");
+    const persisted = JSON.parse(await readFile(join(stateDirectory, "runner", "codex-provider-state.json"), "utf8"));
+    expect(persisted.config.args).toEqual(originalArgs);
+    expect(persisted.config).not.toHaveProperty("effort");
+    expect(persisted.config).not.toHaveProperty("reasoningEffort");
     expect(bundle.evidence()).toMatchObject({
       runnerPid,
       codexPid: providerPid,
@@ -6685,6 +6756,7 @@ it("cold-restores a suspended provider session under its durable run binding", a
     ).toBe(0);
     await first.transport.request("turn/start", {
       input: [{ type: "text", text: "$assigned first process" }, { type: "skill", name: "assigned", path: join(skillRoot, "SKILL.md") }],
+      effort: "high",
     });
     for await (const event of first.transport.notifications()) {
       if (event.method === "turn/completed") break;
@@ -6721,6 +6793,9 @@ it("cold-restores a suspended provider session under its durable run binding", a
     const read = await rotated.transport.request("thread/read", {});
     const persistedProvider = JSON.parse(await readFile(join(stateDirectory, "runner", "codex-provider-state.json"), "utf8"));
     expect(persistedProvider.config.args.join("\n")).toContain('/run/B');
+    expect(persistedProvider.config.args).toEqual(options.codexArgs.map((arg) => arg.replace('/run/A', '/run/B')));
+    expect(persistedProvider.config).not.toHaveProperty("effort");
+    expect(persistedProvider.config).not.toHaveProperty("reasoningEffort");
     expect(JSON.stringify(persistedProvider)).not.toContain("test-run-B-capability");
     expect(read.thread).toMatchObject({
       id: firstProviderThread.id,
@@ -6729,6 +6804,7 @@ it("cold-restores a suspended provider session under its durable run binding", a
     });
     await rotated.transport.request("turn/start", {
       input: [{ type: "text", text: "$assigned second authority epoch" }, { type: "skill", name: "assigned", path: join(skillRoot, "SKILL.md") }],
+      effort: "medium",
     });
     for await (const event of rotated.transport.notifications()) {
       if (event.method === "paperclip/runResult") break;
@@ -6740,27 +6816,15 @@ it("cold-restores a suspended provider session under its durable run binding", a
   } finally {
     await rotated.transport.close();
   }
-  const requestFrames = (await readFile(tracePath, "utf8"))
-    .trim()
-    .split("\n")
-    .map((line) => JSON.parse(line) as Record<string, unknown>)
-    .filter(
-      (entry) =>
-        entry.kind === "frame" && entry.direction === "client_to_provider",
-    )
-    .map(
-      (entry) =>
-        JSON.parse(
-          Buffer.from(String(entry.rawBase64), "base64").toString("utf8"),
-        ) as Record<string, unknown>,
-    )
-    ;
+  const requestFrames = await readProviderRequestFrames(tracePath);
   const resumeFrames = requestFrames.filter((frame) => frame.method === "thread/resume");
   for (const frame of requestFrames.filter((f) => ["thread/start", "thread/resume"].includes(String(f.method)))) {
     expect(frame.params).toMatchObject({ config: { "skills.include_instructions": true } });
   }
   const turnFrames = requestFrames.filter((f) => f.method === "turn/start");
   expect(turnFrames).toHaveLength(2);
+  expect(turnFrames.map((frame) => (frame.params as Record<string, unknown>).effort))
+    .toEqual(["high", "medium"]);
   for (const frame of turnFrames) {
     expect(frame.params).toMatchObject({ input: expect.arrayContaining([{ type: "skill", name: "assigned", path: join(stateDirectory, "codex-home", "skills", "assigned", "SKILL.md") }]) });
   }
@@ -6951,10 +7015,15 @@ it("cold-restores a suspended provider session under its durable run binding", a
     ]);
     await restored.transport.request("turn/start", {
       input: [{ type: "text", text: "restored process" }],
+      effort: null,
     });
     for await (const event of restored.transport.notifications()) {
       if (event.method === "turn/completed") break;
     }
+    const restoredTurns = (await readProviderRequestFrames(tracePath))
+      .filter((frame) => frame.method === "turn/start");
+    expect(restoredTurns).toHaveLength(3);
+    expect(restoredTurns[2]!.params).not.toHaveProperty("effort");
     expect(restored.evidence()).toMatchObject({
       runnerExited: false,
       codexPid: expect.any(Number),

@@ -61,6 +61,27 @@ const OPENCODE_RUNTIME_REQUEST_METHOD: &str = "paperclip/runtimeRequest";
 pub(crate) const MAX_SETTLED_PROVIDER_TURN_IDS: usize = 4_096;
 pub(crate) const MAX_DESCENDANT_THREAD_IDS: usize = 4_096;
 
+pub(crate) fn validate_codex_turn_effort(
+    provider: &str,
+    effort: Option<&str>,
+) -> Result<(), LocalRunnerError> {
+    if let Some(effort) = effort {
+        if provider != "codex" {
+            return Err(LocalRunnerError::invalid(
+                "turn.start effort requires Codex",
+            ));
+        }
+        // Bound the wire value like a model identifier, without copying the
+        // caller's catalog of model-advertised effort names.
+        if effort.trim().is_empty() || effort.len() > 240 {
+            return Err(LocalRunnerError::invalid(
+                "turn.start effort must be a non-empty string of at most 240 UTF-8 bytes",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn remember_descendant_thread(ids: &mut BTreeSet<String>, id: &str) -> Result<bool, &'static str> {
     if ids.contains(id) {
         return Ok(false);
@@ -1679,6 +1700,17 @@ impl CodexProvider {
         cwd: &str,
         skills: &[CodexSkillInput],
     ) -> Result<Value, LocalRunnerError> {
+        self.start_turn_with_skills_and_effort(message, cwd, skills, None)
+    }
+
+    pub(crate) fn start_turn_with_skills_and_effort(
+        &mut self,
+        message: &str,
+        cwd: &str,
+        skills: &[CodexSkillInput],
+        effort: Option<&str>,
+    ) -> Result<Value, LocalRunnerError> {
+        validate_codex_turn_effort(&self.config.provider, effort)?;
         if skills.len() > 64 || (self.config.provider != "codex" && !skills.is_empty()) {
             return Err(LocalRunnerError::invalid(
                 "explicit skills require Codex and at most 64 selections",
@@ -1727,6 +1759,9 @@ impl CodexProvider {
         let turn_params_object = turn_params
             .as_object_mut()
             .expect("Codex turn parameters are an object");
+        if let Some(effort) = effort {
+            turn_params_object.insert("effort".to_owned(), json!(effort));
+        }
         if self.permission_profile == "paperclip-runner-external-sandbox" {
             turn_params_object.insert(
                 "sandboxPolicy".to_owned(),
