@@ -29,6 +29,8 @@ it("retains a route hold after map deletion and raw exit0/deadline, bound only a
     expect(args[4].stdin).toContain("Omit optional limit and offset on the first call");
     expect(args[4].stdin).toContain("each successful response's actual returned continuation field");
     expect(args[4].stdin).toContain("Treat null as EOF only on a successful page");
+    expect(args[4].stdin).toContain("Retain each successful page and its EOF marker at the same issue revision");
+    expect(args[4].stdin).toContain("reuse returned item IDs to read text instead of re-requesting a completed page");
     expect(args[4].stdin).not.toMatch(/max\d|\d/);
     return { exitCode: 0, signal: "SIGTERM", timedOut: true, stdout: '{"type":"turn.completed"}\n', stderr: "" };
   });
