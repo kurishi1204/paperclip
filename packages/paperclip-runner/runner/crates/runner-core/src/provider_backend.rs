@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::codex_provider::{
-    CodexProvider, CodexProviderConfig, CodexProviderEvent, CodexSkillInput,
-    ProviderStartupObservation, ProviderStartupStage, RejectedAcceptedTurn,
+    validate_codex_turn_effort, CodexProvider, CodexProviderConfig, CodexProviderEvent,
+    CodexSkillInput, ProviderStartupObservation, ProviderStartupStage, RejectedAcceptedTurn,
     MAX_SETTLED_PROVIDER_TURN_IDS,
 };
 use crate::durable::{
@@ -2885,9 +2885,29 @@ impl CodexCommandExecutor {
         Ok(())
     }
 
+    fn turn_effort<'a>(&self, payload: &'a Value) -> Result<Option<&'a str>, DurableRunnerError> {
+        let effort = match payload.get("effort") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(effort)) => Some(effort.as_str()),
+            Some(_) => {
+                return Err(DurableRunnerError::invalid(
+                    "turn.start effort must be a string or null",
+                ));
+            }
+        };
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider is not prepared"))?;
+        validate_codex_turn_effort(&state.config.provider, effort)
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        Ok(effort)
+    }
+
     fn start_turn(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
-        // Validate before recovery or marking dispatch ambiguous: malformed
-        // selections must not launch a provider or poison a durable session.
+        // Execute loaded only the private metadata for this command. Validate
+        // before provider recovery or marking dispatch ambiguous.
+        let effort = self.turn_effort(payload)?;
         let skills: Vec<CodexSkillInput> =
             serde_json::from_value(payload.get("skills").cloned().unwrap_or_else(|| json!([])))
                 .map_err(|error| {
@@ -2901,7 +2921,13 @@ impl CodexCommandExecutor {
                 .validate()
                 .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
         }
-        self.restore_provider_if_needed()?;
+        if let Err(error) = self.restore_provider_if_needed() {
+            if !self.restore_checked {
+                self.restore_error = Some(error.clone());
+            }
+            return Err(error);
+        }
+        self.restore_checked = true;
         if self
             .state
             .as_ref()
@@ -2984,7 +3010,7 @@ impl CodexCommandExecutor {
             rejected_accepted_turn,
         ) = {
             let provider = self.ensure_provider()?;
-            let result = provider.start_turn_with_skills(text, &cwd, &skills);
+            let result = provider.start_turn_with_skills_and_effort(text, &cwd, &skills, effort);
             (
                 result,
                 provider.completed_turn_authority().is_some(),
@@ -4452,7 +4478,25 @@ impl CommandExecutor for CodexCommandExecutor {
             command_type: command.command_type.clone(),
         });
         let outcome = (|| {
-            self.restore()?;
+            if command.command_type == "turn.start" {
+                if let Some(error) = self.restore_error.as_ref() {
+                    return Err(error.clone());
+                }
+                self.assert_startup_admitted()?;
+                if !self.restore_checked {
+                    // Keep the existing reconciliation gates below, but do not
+                    // launch a cold provider before validating this turn.
+                    if let Err(error) = self
+                        .load_state_without_provider()
+                        .and_then(|()| self.assert_startup_admitted())
+                    {
+                        self.restore_error = Some(error.clone());
+                        return Err(error);
+                    }
+                }
+            } else {
+                self.restore()?;
+            }
             if self
                 .state
                 .as_ref()
@@ -4992,6 +5036,100 @@ mod tests {
             "attentionRequests": [],
             "artifacts": [],
         })
+    }
+
+    #[test]
+    fn invalid_turn_effort_is_rejected_through_public_cold_execute_before_provider_restore() {
+        let cases = [
+            json!(true),
+            json!(1),
+            json!({}),
+            json!([]),
+            json!(""),
+            json!(" \t"),
+            json!("x".repeat(241)),
+            json!("é".repeat(121)),
+        ]
+        .into_iter()
+        .map(|effort| ("codex", effort))
+        .chain(std::iter::once(("opencode", json!("high"))));
+        for (provider, effort) in cases {
+            let directory = std::env::temp_dir().join(format!(
+                "paperclip-cold-turn-effort-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let mut writer = CodexCommandExecutor::new(&directory);
+            let mut state = opencode_result_state();
+            state.config.provider = provider.to_owned();
+            state.config.driver = if provider == "codex" {
+                "codex_app_server"
+            } else {
+                "opencode_server"
+            }
+            .to_owned();
+            state.config.command = directory.join("must-not-launch");
+            state.active_provider_turn_id = None;
+            state.provider_process_generation = 1;
+            state.lifecycle = "session_open".to_owned();
+            if provider == "opencode" {
+                let artifact = |name: &str| crate::durable::QualifiedLaunchArtifact {
+                    path: directory.join(name),
+                    sha256: "a".repeat(64),
+                };
+                let profile = OpenCodeLaunchProfile {
+                    command: artifact("must-not-launch"),
+                    proxy_script: artifact("proxy.mjs"),
+                    executable: artifact("opencode"),
+                };
+                state.config.args = vec![profile.proxy_script.path.to_string_lossy().into_owned()];
+                writer.opencode_launch_profile = Some(profile);
+                state.opencode_launch_profile_digest =
+                    writer.bind_opencode_launch_profile(&state.config).unwrap();
+            }
+            writer.persist_state(&state).unwrap();
+            let state_path = writer.state_path();
+            let before = fs::read(&state_path).unwrap();
+            let profile = writer.opencode_launch_profile.clone();
+            drop(writer);
+            let mut executor = CodexCommandExecutor::new(&directory);
+            executor.opencode_launch_profile = profile;
+            assert!(executor.state.is_none());
+            let error = executor
+                .execute(&Command {
+                    schema: "paperclip.prp.command.v1".to_owned(),
+                    command_id: "invalid-effort".to_owned(),
+                    controller_seq: 1,
+                    command_type: "turn.start".to_owned(),
+                    issued_at: "2026-10-19T00:00:00.000Z".to_owned(),
+                    deadline_at: None,
+                    precondition: None,
+                    payload: json!({"text":"must not start", "effort":effort}),
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("effort"), "{provider}: {error}");
+            assert!(executor.provider.is_none());
+            assert!(!executor.restore_checked);
+            assert!(
+                executor.restore_error.is_none(),
+                "bad input must not poison recovery"
+            );
+            assert!(executor.state.as_ref().unwrap().startup_attempt.is_none());
+            assert_eq!(fs::read(&state_path).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
+                serde_json::from_slice::<Value>(&before).unwrap()
+            );
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn turn_effort_validation_uses_bytes_without_a_model_catalog() {
+        assert!(validate_codex_turn_effort("codex", Some("é".repeat(120).as_str())).is_ok());
+        assert!(validate_codex_turn_effort("codex", Some("é".repeat(121).as_str())).is_err());
+        assert!(validate_codex_turn_effort("codex", Some("future-advertised-effort")).is_ok());
+        assert!(validate_codex_turn_effort("opencode", None).is_ok());
     }
 
     #[test]

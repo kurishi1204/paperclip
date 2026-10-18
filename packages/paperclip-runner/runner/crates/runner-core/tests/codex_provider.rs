@@ -6451,7 +6451,7 @@ fn explicit_skill_input_survives_durable_turn_and_cold_restore() {
             "turn",
             3,
             "turn.start",
-            json!({"text":"$first-task Continue after approval", "skills":[skill]}),
+            json!({"text":"$first-task Continue after approval", "skills":[skill], "effort":"high"}),
         ))
         .unwrap();
     restored.shutdown().unwrap();
@@ -6459,6 +6459,14 @@ fn explicit_skill_input_survives_durable_turn_and_cold_restore() {
     assert!(frames.iter().any(|f| f["method"] == "thread/resume"));
     let turn = frames.iter().find(|f| f["method"] == "turn/start").unwrap();
     assert_eq!(turn["params"]["input"][1], skill);
+    assert_eq!(turn["params"]["effort"], "high");
+    assert!(turn["params"].get("collaborationMode").is_none());
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(directory.join("codex-provider-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(persisted["config"]["args"], json!(config.args));
+    assert!(persisted["config"].get("effort").is_none());
+    assert!(persisted["config"].get("reasoningEffort").is_none());
     fs::remove_dir_all(directory).unwrap();
 }
 
