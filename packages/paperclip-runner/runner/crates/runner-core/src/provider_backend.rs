@@ -2927,7 +2927,19 @@ impl CodexCommandExecutor {
             }
             return Err(error);
         }
+        // Recovery can close a contradictory provider before admitting its
+        // startup. Preserve restore()'s post-recovery admission boundary.
+        self.assert_startup_admitted()?;
         self.restore_checked = true;
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.lifecycle == "reconciliation_required")
+        {
+            return Err(DurableRunnerError::invalid(
+                "Codex provider session requires explicit reconciliation and a fresh session",
+            ));
+        }
         if self
             .state
             .as_ref()

@@ -2793,15 +2793,27 @@ fn durable_recovery_closes_a_provider_that_reopens_a_settled_turn() {
     .expect("write contradictory fake provider state");
 
     let resumes_before_recovery = call_count(&directory, "thread/resume");
+    let starts_before_recovery = call_count(&directory, "turn/start");
     let mut recovered = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
-    assert!(recovered
+    let error = recovered
         .execute(&command(
-            "suspend-rejected",
+            "cold-turn-rejected",
             99,
-            "runner.suspend",
-            json!({})
+            "turn.start",
+            json!({"text": "Do not reopen settled work.", "effort": "high"}),
         ))
-        .is_err());
+        .expect_err("cold-first turn must retain the post-restore admission fence");
+    assert!(
+        error
+            .to_string()
+            .contains("provider startup ownership remains unadmitted"),
+        "cold-first rejected with: {error}",
+    );
+    assert_eq!(
+        call_count(&directory, "turn/start"),
+        starts_before_recovery,
+        "contradictory recovery must not dispatch a new provider turn",
+    );
     let events = recovered
         .retained_events()
         .expect("fail-closed recovery facts remain observable without launch");
