@@ -925,6 +925,80 @@ describe("sandbox managed runtime", () => {
     expect(await git(host, ["status", "--porcelain"])).toBe("");
   });
 
+  it.each(["special names", "symlink ancestor", "remove failure"])("applies deleted-path batches without losing guards: %s", async (mode) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-delete-batch-"));
+    cleanupDirs.push(root);
+    const host = path.join(root, "host");
+    const remote = path.join(root, "remote");
+    const outside = path.join(root, "outside");
+    const names = [" space ", "line\nbreak", "-option", "雪-💾", "wild[?]*"];
+    await mkdir(path.join(host, "removed"), { recursive: true });
+    await git(host, ["init"]);
+    await git(host, ["config", "user.name", "Paperclip Test"]);
+    await git(host, ["config", "user.email", "test@paperclip.dev"]);
+    for (const name of names) await writeFile(path.join(host, "removed", name), "remove me");
+    await git(host, ["add", "."]);
+    await git(host, ["commit", "-m", "deletion fixture"]);
+    for (const name of names) await rm(path.join(host, "removed", name));
+
+    const manifest = path.join(remote, ".paperclip-runtime", "delete-test", "deleted.nul");
+    const client = makeFilesystemClient();
+    const syncIn = client.syncIn!;
+    let deleteCommand: string | undefined;
+    client.syncIn = async (operations) => {
+      const operation = operations.find((item) => item.files.some((mapping) => mapping.targetPath === manifest));
+      expect(operation).toBeDefined();
+      // The existing runtime contract orders remove-deleted after both extracts.
+      deleteCommand = operation!.postUploadCommands!.at(-1)!.command;
+      return syncIn(operations);
+    };
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: { transport: "sandbox", provider: "test", sandboxId: "delete", remoteCwd: remote, timeoutMs: 30_000, apiKey: null },
+      adapterKey: "delete-test", client, workspaceLocalDir: host,
+    });
+    try {
+      expect(deleteCommand).toBeDefined();
+      for (const name of names) await expect(stat(path.join(remote, "removed", name))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(manifest)).rejects.toMatchObject({ code: "ENOENT" });
+      if (mode === "special names") return;
+
+      await writeFile(manifest, names.map((name) => `removed/${name}\0`).join(""));
+      if (mode === "symlink ancestor") {
+        await rm(path.join(remote, "removed"), { recursive: true, force: true });
+        await mkdir(outside);
+        await writeFile(path.join(outside, names[0]!), "outside sentinel");
+        await symlink(outside, path.join(remote, "removed"));
+      } else {
+        await mkdir(path.join(remote, "removed"), { recursive: true });
+        for (const name of names) await writeFile(path.join(remote, "removed", name), "remove me");
+      }
+      const env = { ...process.env };
+      const failureMarker = path.join(root, "rm-failure-arguments");
+      if (mode === "remove failure") {
+        const bin = path.join(root, "bin");
+        await mkdir(bin);
+        await writeFile(path.join(bin, "rm"), "#!/bin/sh\nprintf '%s\\n' \"$#\" > \"$PAPERCLIP_TEST_DELETE_RM_PROBE\"\nexit 73\n", { mode: 0o755 });
+        env.PATH = `${bin}${path.delimiter}${env.PATH ?? ""}`;
+        env.PAPERCLIP_TEST_DELETE_RM_PROBE = failureMarker;
+      }
+      let failure: unknown;
+      try { await execFile("/bin/sh", ["-c", deleteCommand!], { env }); }
+      catch (error) { failure = error; }
+      expect(failure).toMatchObject({ code: expect.any(Number) });
+      expect((failure as { code: number }).code).not.toBe(0);
+      expect((await stat(manifest)).isFile()).toBe(true);
+      if (mode === "symlink ancestor") {
+        expect((await lstat(path.join(remote, "removed"))).isSymbolicLink()).toBe(true);
+        expect(await readFile(path.join(outside, names[0]!), "utf8")).toBe("outside sentinel");
+      } else {
+        expect(await readFile(failureMarker, "utf8")).toBe(`${names.length + 2}\n`);
+        for (const name of names) expect(await readFile(path.join(remote, "removed", name), "utf8")).toBe("remove me");
+      }
+    } finally {
+      await prepared.cleanupWorkspaceSnapshot();
+    }
+  });
+
   it("syncs git-backed workspaces through a shallow standalone clone and keeps .git out of archives", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-git-"));
     cleanupDirs.push(rootDir);
