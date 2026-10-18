@@ -156,52 +156,52 @@ export const qaReviewToolDefinitions = [
   {
     name: QA_REVIEW_TOOL_NAMES[1],
     description: "Read bounded, ascending pages of assigned-issue comments at the expected issue revision. Use nextAfterCommentId until null. If bodyOmitted is true, page that comment with read_assigned_issue_comment.",
-    inputSchema: z.toJSONSchema(commentPageSchema),
+    inputSchema: z.toJSONSchema(commentPageSchema, { io: "input" }),
   },
   {
     name: QA_REVIEW_TOOL_NAMES[2],
     description: "Read a bounded page of one document attached to the assigned issue at the expected issue revision. Discover keys in read_assigned_issue.documentSummaries; continue with nextOffset until null.",
-    inputSchema: z.toJSONSchema(documentPageSchema),
+    inputSchema: z.toJSONSchema(documentPageSchema, { io: "input" }),
   },
   {
     name: QA_REVIEW_TOOL_NAMES[3],
     description: "List bounded metadata pages for attachments on the assigned issue at the expected issue revision; object storage keys and content are never returned here.",
-    inputSchema: z.toJSONSchema(attachmentListSchema),
+    inputSchema: z.toJSONSchema(attachmentListSchema, { io: "input" }),
   },
   {
     name: QA_REVIEW_TOOL_NAMES[4],
     description: "Read a bounded UTF-8 text page of an attachment listed on the assigned issue at the expected issue revision. Binary and invalid UTF-8 attachments require another evidence path; continue with nextOffset until null.",
-    inputSchema: z.toJSONSchema(attachmentTextPageSchema),
+    inputSchema: z.toJSONSchema(attachmentTextPageSchema, { io: "input" }),
   },
   {
     name: QA_REVIEW_TOOL_NAMES[5],
     description: "Record the current review-stage decision with a reason. Copy expectedStageId, expectedStatusVersion, expectedRevision and expectedLastDecisionId from read_assigned_issue. A request for changes returns the issue to its recorded assignee.",
-    inputSchema: z.toJSONSchema(reviewDecisionSchema),
+    inputSchema: z.toJSONSchema(reviewDecisionSchema, { io: "input" }),
   },
   {
     name: QA_REVIEW_TOOL_NAMES[6],
     description: "Read a bounded page of the assigned issue description, including any legacy embedded plan, at the expected issue revision. Continue with nextOffset until null.",
-    inputSchema: z.toJSONSchema(descriptionPageSchema),
+    inputSchema: z.toJSONSchema(descriptionPageSchema, { io: "input" }),
   },
   {
     name: QA_REVIEW_TOOL_NAMES[7],
     description: "Read bounded pages of every annotation and comment on one assigned-issue document at the expected issue revision. Use status=all implicitly; continue with nextOffset until null. Page omitted selectedText or body with read_assigned_issue_annotation_text.",
-    inputSchema: z.toJSONSchema(annotationPageSchema),
+    inputSchema: z.toJSONSchema(annotationPageSchema, { io: "input" }),
   },
   {
     name: QA_REVIEW_TOOL_NAMES[8],
     description: "After a verdict response is missing, read only this run's matching formal review decision. Supply the original stage, decision, and summary. A missing receipt is unknown; do not resend the verdict.",
-    inputSchema: z.toJSONSchema(receiptSchema),
+    inputSchema: z.toJSONSchema(receiptSchema, { io: "input" }),
   },
   {
     name: QA_REVIEW_TOOL_NAMES[9],
     description: "Read a bounded Unicode text page of one comment on the assigned issue. Continue with nextOffset until null; use the same issue revision as the comment list.",
-    inputSchema: z.toJSONSchema(commentTextPageSchema),
+    inputSchema: z.toJSONSchema(commentTextPageSchema, { io: "input" }),
   },
   {
     name: QA_REVIEW_TOOL_NAMES[10],
     description: "Read a bounded Unicode text page of an omitted annotation selectedText or body. Use the document, thread and comment identifiers returned by list_assigned_issue_annotations, and continue with nextOffset until null.",
-    inputSchema: z.toJSONSchema(annotationTextPageSchema),
+    inputSchema: z.toJSONSchema(annotationTextPageSchema, { io: "input" }),
   },
 ];
 
