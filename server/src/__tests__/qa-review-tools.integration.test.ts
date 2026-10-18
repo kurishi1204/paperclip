@@ -37,7 +37,7 @@ describe("run-bound QA review MCP", () => {
     await server?.close(); vi.unstubAllEnvs();
   });
 
-  async function reviewFixture(withResponsibleUser = false) {
+  async function reviewFixture(withResponsibleUser = false, claimedAdapter = "paperclip_runner") {
     const fixture = await server.fixture(withResponsibleUser ? { connectionScenario: "fresh" } : {});
     const stageId = randomUUID();
     const policy = normalizeIssueExecutionPolicy({
@@ -53,6 +53,9 @@ describe("run-bound QA review MCP", () => {
         lastDecisionId: null, lastDecisionOutcome: null, monitor: null,
       },
     }).where(eq(issues.id, fixture.issueId));
+    await server.db.update(heartbeatRuns).set({
+      runnerProfileJson: { adapterDispatch: { adapterType: claimedAdapter } },
+    }).where(eq(heartbeatRuns.id, fixture.runId));
     const token = createLocalAgentJwt(fixture.agentId, fixture.companyId, "paperclip_runner", fixture.runId)!;
     // No OS process or provider is started by this fixture. Match the actual
     // review-only registry binding while retaining the old-source RED probe.
@@ -85,7 +88,7 @@ describe("run-bound QA review MCP", () => {
       { stored: false, override: undefined },
       { stored: "true", override: undefined },
     ]) {
-      const { fixture, stageId, tool, rows } = await reviewFixture();
+      const { fixture, stageId, tool, rows } = await reviewFixture(false, "claude_local");
       await server.db.update(agents).set({ adapterType: "claude_local", adapterConfig: {
         engine: "cli", qaReviewToolsOnly: config.stored, dangerouslySkipPermissions: false,
       } }).where(eq(agents.id, fixture.agentId));
@@ -110,7 +113,7 @@ describe("run-bound QA review MCP", () => {
   });
 
   it("does not retain unbound Claude authority after the review assignee changes", async () => {
-    const { fixture, tool, rows } = await reviewFixture();
+    const { fixture, tool, rows } = await reviewFixture(false, "claude_local");
     await server.db.update(agents).set({ adapterType: "claude_local", adapterConfig: { qaReviewToolsOnly: true } })
       .where(eq(agents.id, fixture.agentId));
     reviewProcesses.runningProcesses.delete(fixture.runId);
@@ -139,6 +142,62 @@ describe("run-bound QA review MCP", () => {
           const rejected = await tool(name);
           expect(rejected.body.result.isError).toBe(true);
           expect(JSON.stringify(rejected.body)).toContain("not bound");
+        }
+        expect(spy).not.toHaveBeenCalled();
+        expect(await rows()).toHaveLength(0);
+      } finally { spy.mockRestore(); }
+    }
+  });
+
+  it("keeps the claimed Claude authority after the agent adapter changes", async () => {
+    const { fixture, stageId, tool, rows } = await reviewFixture(false, "claude_local");
+    await server.db.update(agents).set({ adapterType: "codex_local" }).where(eq(agents.id, fixture.agentId));
+    reviewProcesses.runningProcesses.delete(fixture.runId);
+    const read = await tool("read_assigned_issue");
+    expect(read.body.result.isError).not.toBe(true);
+    const issue = read.body.result.structuredContent;
+    expect(issue.id).toBe(fixture.issueId);
+    const verdict = await tool("submit_review_decision", {
+      decision: "approve", summary: "Claimed Claude participant evidence checked.", expectedStageId: stageId,
+      expectedStatusVersion: issue.statusVersion, expectedRevision: issue.revision,
+      expectedLastDecisionId: issue.reviewStage.lastDecisionId,
+    });
+    expect(verdict.body.result.isError).not.toBe(true);
+    expect(await rows()).toMatchObject([{ createdByRunId: fixture.runId, actorAgentId: fixture.agentId }]);
+  });
+
+  it("does not grant a claimed Codex run Claude authority after the agent adapter changes", async () => {
+    const { fixture, tool, rows } = await reviewFixture(false, "codex_local");
+    await server.db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, fixture.agentId));
+    await server.db.update(heartbeatRuns).set({ contextSnapshot: {
+      issueId: fixture.issueId, adapterType: "claude_local", qaReviewToolsOnly: true,
+    } }).where(eq(heartbeatRuns.id, fixture.runId));
+    reviewProcesses.runningProcesses.delete(fixture.runId);
+    const spy = vi.spyOn(qaReviewTools, "callQaReviewTool");
+    try {
+      for (const name of ["read_assigned_issue", "submit_review_decision"]) {
+        const response = await tool(name);
+        expect(response.body.result.isError).toBe(true);
+        expect(JSON.stringify(response.body)).toContain("not bound");
+      }
+      expect(spy).not.toHaveBeenCalled();
+      expect(await rows()).toHaveLength(0);
+    } finally { spy.mockRestore(); }
+  });
+
+  it("does not replace missing or unknown claim identity with mutable Claude settings", async () => {
+    for (const profile of [null, {}, { adapterDispatch: null },
+      { adapterDispatch: { adapterType: 123 } }, { adapterDispatch: { adapterType: "unknown" } }]) {
+      const { fixture, tool, rows } = await reviewFixture();
+      await server.db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, fixture.agentId));
+      await server.db.update(heartbeatRuns).set({ runnerProfileJson: profile }).where(eq(heartbeatRuns.id, fixture.runId));
+      reviewProcesses.runningProcesses.delete(fixture.runId);
+      const spy = vi.spyOn(qaReviewTools, "callQaReviewTool");
+      try {
+        for (const name of ["read_assigned_issue", "submit_review_decision"]) {
+          const response = await tool(name);
+          expect(response.body.result.isError).toBe(true);
+          expect(JSON.stringify(response.body)).toContain("not bound");
         }
         expect(spy).not.toHaveBeenCalled();
         expect(await rows()).toHaveLength(0);

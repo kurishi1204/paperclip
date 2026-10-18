@@ -1,9 +1,9 @@
 import { Router } from "express";
-import { agents, type Db } from "@paperclipai/db";
-import { and, eq } from "drizzle-orm";
+import type { Db } from "@paperclipai/db";
 import { ZodError } from "zod";
 import { getQaReviewProcess, requestQaReviewHold } from "@paperclipai/adapter-utils/server-utils";
 import { projectToolContext } from "../services/project-tool-context.js";
+import { claimedAdapterType } from "../services/conversation-continuation.js";
 import { assertActiveQaParticipant, callQaReviewTool, hasOwnQaDecision, QaDecisionOutcomeUnknownError, qaReviewToolDefinitions } from "../services/qa-review-tools.js";
 import { assertCompanyAccess } from "./authz.js";
 import { forbidden, HttpError } from "../errors.js";
@@ -63,17 +63,12 @@ export function qaReviewToolRoutes(db: Db) {
       }
       const binding = getQaReviewProcess(context.run.id);
       const receiptOnly = params?.name === "read_assigned_review_receipt";
-      if (!binding && !receiptOnly) {
-        // Claude's supported restricted QA executor predates the process
-        // control registry. Preserve its existing authenticated run/participant
-        // authority. QA-only mode controls tool delivery, not this authority;
-        // re-reading configuration here would diverge from issue/run overrides.
-        // Caller arguments and context snapshots cannot choose the adapter.
-        const [agent] = await db.select({ adapterType: agents.adapterType })
-          .from(agents).where(and(eq(agents.id, context.run.agentId), eq(agents.companyId, context.run.companyId)));
-        if (agent?.adapterType !== "claude_local") {
-          throw forbidden("QA review process is not bound to this run");
-        }
+      // Claude's restricted QA executor predates the process registry. Keep
+      // its authenticated run/participant authority using the server-owned
+      // claim identity, never the agent's mutable settings or caller context.
+      // Missing/unknown historical dispatch identity cannot grant an exception.
+      if (!binding && !receiptOnly && claimedAdapterType(context.run) !== "claude_local") {
+        throw forbidden("QA review process is not bound to this run");
       }
       if (!activeParticipant && params?.name !== "read_assigned_review_receipt") {
         throw forbidden("Only this run's review receipt remains available after the decision");
