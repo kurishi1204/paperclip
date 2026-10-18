@@ -86,6 +86,7 @@ describe("managed install store", () => {
     ).toThrow("simulated crash");
 
     expect(fs.realpathSync(paths.currentPath)).toBe(fs.realpathSync(oldPayload));
+    expect(fs.existsSync(newPayload)).toBe(true);
     expect(fs.readdirSync(paths.cliRoot).filter((entry) => entry.startsWith(".current-"))).toEqual([]);
   });
 
@@ -218,10 +219,13 @@ describe("managed install store", () => {
     const localDir = path.join(root, "home", ".local");
     const outsideBin = path.join(root, "outside-bin");
     fs.mkdirSync(outsideBin);
+    const outsideSentinel = path.join(outsideBin, "keep.txt");
+    fs.writeFileSync(outsideSentinel, "keep\n");
     fs.symlinkSync(outsideBin, localDir, "dir");
     expect(() => writeManagedShim(paths)).toThrow("unsafe shim directory");
 
-    fs.rmSync(localDir);
+    fs.unlinkSync(localDir);
+    expect(fs.readFileSync(outsideSentinel, "utf8")).toBe("keep\n");
     fs.mkdirSync(path.dirname(paths.shimPath), { recursive: true });
     fs.writeFileSync(paths.shimPath, `# ${MANAGED_SHIM_MARKER}\n`);
     fs.linkSync(paths.shimPath, path.join(root, "linked-shim"));
