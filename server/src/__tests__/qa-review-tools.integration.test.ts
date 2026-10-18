@@ -252,6 +252,78 @@ describe("run-bound QA review MCP", () => {
     expect(token).toBeTruthy();
   });
 
+  it("publishes input required sets and preserves every default and maximum through tools/list", async () => {
+    const { call } = await reviewFixture();
+    const tools = (await call("tools/list")).body.result.tools;
+    const required: Record<string, string[]> = {
+      read_assigned_issue: [],
+      list_assigned_issue_comments: ["expectedRevision"],
+      read_assigned_issue_document: ["key", "expectedRevision"],
+      list_assigned_issue_attachments: ["expectedRevision"],
+      read_assigned_issue_attachment_text: ["attachmentId", "expectedRevision"],
+      submit_review_decision: ["decision", "summary", "expectedStageId", "expectedStatusVersion", "expectedRevision", "expectedLastDecisionId"],
+      read_assigned_issue_description: ["expectedRevision"],
+      list_assigned_issue_annotations: ["key", "expectedRevision"],
+      read_assigned_review_receipt: ["expectedStageId", "decision", "summary"],
+      read_assigned_issue_comment: ["commentId", "expectedRevision"],
+      read_assigned_issue_annotation_text: ["key", "threadId", "commentId", "field", "expectedRevision"],
+    };
+    const defaults: Record<string, Record<string, [number, number]>> = {
+      list_assigned_issue_comments: { limit: [100, 100] },
+      read_assigned_issue_document: { offset: [0, 10_000_000], limit: [8_000, 16_000] },
+      list_assigned_issue_attachments: { offset: [0, 1_000_000], limit: [50, 100] },
+      read_assigned_issue_attachment_text: { offset: [0, 1_000_000_000], limit: [8_192, 16_384] },
+      read_assigned_issue_description: { offset: [0, 10_000_000], limit: [8_000, 16_000] },
+      list_assigned_issue_annotations: { offset: [0, 1_000_000], limit: [10, 25] },
+      read_assigned_issue_comment: { offset: [0, 10_000_000], limit: [2_000, 2_000] },
+      read_assigned_issue_annotation_text: { offset: [0, 10_000_000], limit: [2_000, 2_000] },
+    };
+    expect(tools.map((tool: { name: string }) => tool.name).sort()).toEqual(Object.keys(required).sort());
+    let defaultCount = 0;
+    for (const tool of tools) {
+      const schema = tool.inputSchema;
+      expect([...(schema.required ?? [])].sort()).toEqual([...required[tool.name]!].sort());
+      expect(schema.additionalProperties).toBe(false);
+      const properties = schema.properties as Record<string, { default?: number; maximum?: number }>;
+      const actualDefaults = Object.fromEntries(Object.entries(properties)
+        .filter(([, property]) => Object.hasOwn(property, "default"))
+        .map(([name, property]) => [name, [property.default, property.maximum]]));
+      expect(actualDefaults).toEqual(defaults[tool.name] ?? {});
+      for (const name of Object.keys(actualDefaults)) {
+        expect(schema.required ?? []).not.toContain(name);
+        defaultCount += 1;
+      }
+    }
+    expect(defaultCount).toBe(15);
+    const documentKey = tools.find((tool: { name: string }) => tool.name === "read_assigned_issue_document").inputSchema.properties.key;
+    expect(documentKey).toMatchObject({ type: "string", minLength: 1, maxLength: 64, pattern: "^[a-z0-9][a-z0-9_-]*$" });
+  });
+
+  it("recovers comments-list limits through defaults while retaining text limits and repeated-rejection hold", async () => {
+    const { fixture, tool } = await reviewFixture();
+    const [comment] = await server.db.insert(issueComments).values({
+      companyId: fixture.companyId, issueId: fixture.issueId,
+      authorAgentId: fixture.agentId, body: "あ".repeat(2_001),
+    }).returning();
+    const expectedRevision = (await tool("read_assigned_issue")).body.result.structuredContent.revision;
+    for (const limit of [101, 2_000]) {
+      const response = await tool("list_assigned_issue_comments", { expectedRevision, limit });
+      expect(response.body.result.isError).toBe(true);
+      expect(JSON.stringify(response.body.result)).toContain("<=100");
+    }
+    const listed = await tool("list_assigned_issue_comments", { expectedRevision });
+    expect(listed.body.result.isError).not.toBe(true);
+    expect(listed.body.result.structuredContent.comments.map((item: { id: string }) => item.id)).toEqual([comment!.id]);
+    const text = await tool("read_assigned_issue_comment", { commentId: comment!.id, expectedRevision, limit: 2_000 });
+    expect(text.body.result.isError).not.toBe(true);
+    expect(text.body.result.structuredContent).toMatchObject({ text: "あ".repeat(2_000), offset: 0, nextOffset: 2_000, totalCharacters: 2_001 });
+    const control = reviewProcesses.getQaReviewProcess(fixture.runId)!.control;
+    expect(control.hold ?? control.requestedHold).toBeNull();
+    const repeated = await tool("list_assigned_issue_comments", { expectedRevision, limit: 2_000 });
+    expect(repeated.body.result.isError).toBe(true);
+    expect(control.hold ?? control.requestedHold).toMatchObject({ kind: "repeated_rejection", evidence: { errors: 2 } });
+  });
+
   it("stops repeated invalid paging arguments after two observed errors, including parallel calls", async () => {
     const { fixture, tool } = await reviewFixture();
     const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
