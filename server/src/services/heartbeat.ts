@@ -27163,45 +27163,67 @@ export function heartbeatService(
     if (!issue) return null;
     // Only our own cancelled successors are transparent. A later real/manual
     // attempt remains authoritative and must invalidate the historical source.
-    const candidates = await db.select().from(heartbeatRuns).where(and(
-      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
-      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
-      sql`coalesce(${heartbeatRuns.errorCode}, '') <> 'qa_review_hold_suppressed'`,
-    )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
-    for (const source of candidates) {
-      if (["queued", "scheduled_retry"].includes(source.status)) {
-        const wake = source.wakeupRequestId ? await db.select().from(agentWakeupRequests)
-          .where(eq(agentWakeupRequests.id, source.wakeupRequestId)).limit(1).then(rows => rows[0]) : null;
-        if (isAutomaticQaPagingWake(parseObject(source.contextSnapshot), {
-          requestedByActorType: wake?.requestedByActorType, triggerDetail: source.triggerDetail, payload: wake?.payload,
-        })) continue;
+    // Bound materialized history without truncating a transparent queued tail.
+    // Keep the database timestamp text: a JS Date loses PostgreSQL microseconds.
+    type HistoryRow = Pick<typeof heartbeatRuns.$inferSelect,
+      "id" | "companyId" | "agentId" | "status" | "errorCode" | "resultJson" |
+      "contextSnapshot" | "wakeupRequestId" | "triggerDetail"> & { createdAtCursor: string };
+    let cursor: { createdAt: string; id: string } | null = null;
+    for (;;) {
+      const candidates: HistoryRow[] = await db.select({
+        id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
+        resultJson: sql<Record<string, unknown> | null>`case when ${heartbeatRuns.status} = 'failed'
+          then jsonb_build_object('errorFamily', ${heartbeatRuns.resultJson}->'errorFamily',
+            'configurationIncomplete', ${heartbeatRuns.resultJson}->'configurationIncomplete') else null end`,
+        contextSnapshot: heartbeatRuns.contextSnapshot, wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        triggerDetail: heartbeatRuns.triggerDetail,
+        createdAtCursor: sql<string>`${heartbeatRuns.createdAt}::text`,
+      }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+        sql`coalesce(${heartbeatRuns.errorCode}, '') <> 'qa_review_hold_suppressed'`,
+        cursor ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) <
+          (${cursor.createdAt}::timestamptz, ${cursor.id}::uuid)` : undefined,
+      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(32);
+      for (const source of candidates) {
+        if (["queued", "scheduled_retry"].includes(source.status)) {
+          const wake = source.wakeupRequestId ? await db.select().from(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.id, source.wakeupRequestId)).limit(1).then(rows => rows[0]) : null;
+          if (isAutomaticQaPagingWake(parseObject(source.contextSnapshot), {
+            requestedByActorType: wake?.requestedByActorType, triggerDetail: source.triggerDetail, payload: wake?.payload,
+          })) continue;
+        }
+        const hold = source.status === "failed" ? readQaPagingHold(source) : null;
+        if (!hold) return null;
+        if (qaPagingHoldMatchesIssue(hold, issue)) return { source, hold };
+        // Our atomic blocker changes statusVersion once. The committed action is
+        // the receipt for that transition; an unrelated blocked state is not.
+        const state = parseObject(issue.executionState), participant = parseObject(state.currentParticipant);
+        if (issue.status === "blocked" && issue.statusVersion === Number(hold.statusVersion) + 1 &&
+          state.status === "pending" && state.currentStageType === "review" && state.currentStageId === hold.currentStageId &&
+          (state.lastDecisionId ?? null) === hold.lastDecisionId && participant.type === "agent" &&
+          participant.agentId === hold.agentId && !issue.assigneeUserId) {
+          const [action] = await db.select({ evidence: issueRecoveryActions.evidence,
+            cause: issueRecoveryActions.cause, fingerprint: issueRecoveryActions.fingerprint,
+          }).from(issueRecoveryActions).where(and(
+            eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+            inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          )).limit(1);
+          // A prior action keeps its original identity/authority; its complete
+          // receipt proves this same blocker without relying on the old cause.
+          if (qaPagingRecoveryActionMatchesHold(action, source.id, hold)) return { source, hold };
+        }
+        return null;
       }
-      const hold = source.status === "failed" ? readQaPagingHold(source) : null;
-      if (!hold) return null;
-      if (qaPagingHoldMatchesIssue(hold, issue)) return { source, hold };
-      // Our atomic blocker changes statusVersion once. The committed action is
-      // the receipt for that transition; an unrelated blocked state is not.
-      const state = parseObject(issue.executionState), participant = parseObject(state.currentParticipant);
-      if (issue.status === "blocked" && issue.statusVersion === Number(hold.statusVersion) + 1 &&
-        state.status === "pending" && state.currentStageType === "review" && state.currentStageId === hold.currentStageId &&
-        (state.lastDecisionId ?? null) === hold.lastDecisionId && participant.type === "agent" &&
-        participant.agentId === hold.agentId && !issue.assigneeUserId) {
-        const [action] = await db.select({ evidence: issueRecoveryActions.evidence,
-          cause: issueRecoveryActions.cause, fingerprint: issueRecoveryActions.fingerprint,
-        }).from(issueRecoveryActions).where(and(
-          eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
-          inArray(issueRecoveryActions.status, ["active", "escalated"]),
-        )).limit(1);
-        // A prior action keeps its original identity/authority; its complete
-        // receipt proves this same blocker without relying on the old cause.
-        if (qaPagingRecoveryActionMatchesHold(action, source.id, hold)) return { source, hold };
-      }
-      return null;
+      if (candidates.length < 32) return null;
+      const last = candidates[candidates.length - 1]!;
+      cursor = { createdAt: last.createdAtCursor, id: last.id };
     }
-    return null;
   }
 
-  async function suppressQaPagingSuccessors(source: typeof heartbeatRuns.$inferSelect) {
+  async function suppressQaPagingSuccessors(source: Pick<typeof heartbeatRuns.$inferSelect,
+    "id" | "companyId" | "agentId" | "status" | "errorCode" | "resultJson">) {
     const hold = readQaPagingHold(source);
     if (!hold || source.status !== "failed") return;
     await db.transaction(async (tx) => {

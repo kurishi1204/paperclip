@@ -424,6 +424,61 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect((await f.effects()).runs).toHaveLength(1);
   });
 
+  it("reads QA hold history in bounded pages without losing equal-microsecond runs", async () => {
+    const f = await seedQaPagingHoldFixture();
+    const ids = Array.from({ length: 65 }, () => randomUUID());
+    await db.insert(heartbeatRuns).values(ids.map(id => ({ id, companyId: f.companyId,
+      agentId: f.agentId, invocationSource: "on_demand", triggerDetail: "system", status: "queued",
+      createdAt: sql`'2050-01-01T00:00:00.123456Z'::timestamptz`,
+      contextSnapshot: { issueId: f.issueId, wakeReason: "execution_review_participant_recovery" },
+      resultJson: { unrelatedPayload: "x".repeat(16_384) }, stdoutExcerpt: "y".repeat(16_384),
+    })));
+    // Observe real query results; do not replace SQL execution or returned rows.
+    const batches: Array<{ ids: string[]; bytes: number; hasExcerpt: boolean }> = [];
+    const observers: Array<{ mockRestore(): void }> = [];
+    const originalSelect = db.select.bind(db);
+    const select = vi.spyOn(db, "select").mockImplementation(((...args: Parameters<typeof db.select>) => {
+      const builder = originalSelect(...args);
+      const originalFrom = builder.from.bind(builder);
+      builder.from = ((...fromArgs: Parameters<typeof builder.from>) => {
+        const query = originalFrom(...fromArgs);
+        if (fromArgs[0] === heartbeatRuns) {
+          const execute = query.execute.bind(query);
+          const observer = vi.spyOn(query, "execute").mockImplementation(async () => {
+            const rows = await execute();
+            if (query.toSQL().sql.includes("<> 'qa_review_hold_suppressed'")) {
+              const records = rows as Array<Record<string, unknown>>;
+              batches.push({ ids: records.map(row => String(row.id)),
+                bytes: Buffer.byteLength(JSON.stringify(records)),
+                hasExcerpt: records.some(row => Object.hasOwn(row, "stdoutExcerpt")) });
+            }
+            return rows;
+          });
+          observers.push(observer);
+        }
+        return query;
+      }) as typeof builder.from;
+      return builder;
+    }) as typeof db.select);
+    try {
+      expect(await heartbeat.invoke(f.agentId, "on_demand", { issueId: f.issueId,
+        wakeReason: "execution_review_participant_recovery" }, "system")).toBeNull();
+      const seen = batches.flatMap(batch => batch.ids);
+      console.info("QA hold history readback", { batchRows: batches.map(batch => batch.ids.length),
+        batchBytes: batches.map(batch => batch.bytes), uniqueRuns: new Set(seen).size });
+      expect(seen).toHaveLength(66);
+      expect(new Set(seen)).toEqual(new Set([...ids, f.runId]));
+      expect(Math.max(...batches.map(batch => batch.ids.length))).toBeLessThanOrEqual(32);
+      expect(batches.every(batch => !batch.hasExcerpt)).toBe(true);
+      expect(Math.max(...batches.map(batch => batch.bytes))).toBeLessThan(32_768);
+    } finally {
+      select.mockRestore();
+      for (const observer of observers) observer.mockRestore();
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
+        .where(inArray(heartbeatRuns.id, ids));
+    }
+  });
+
   it("blocks the first held review release atomically and does not enqueue participant recovery", async () => {
     const f = await seedQaPagingHoldFixture();
     const first = await f.release();
