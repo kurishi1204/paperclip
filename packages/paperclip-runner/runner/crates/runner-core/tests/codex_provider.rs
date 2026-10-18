@@ -2743,7 +2743,19 @@ fn durable_backend_rejects_an_older_provider_turn_id_after_restart() {
 
 #[test]
 fn durable_recovery_closes_a_provider_that_reopens_a_settled_turn() {
-    let directory = temporary_directory("durable-settled-turn-active-on-recovery");
+    for (kind, payload) in [
+        (
+            "turn.start",
+            json!({"text": "Do not reopen settled work.", "effort": "high"}),
+        ),
+        ("runner.suspend", json!({})),
+    ] {
+        assert_durable_recovery_closes_a_reopened_settled_turn(kind, payload);
+    }
+}
+
+fn assert_durable_recovery_closes_a_reopened_settled_turn(kind: &str, payload: Value) {
+    let directory = temporary_directory(&format!("durable-settled-turn-active-on-recovery-{kind}"));
     let config = provider_config(&directory, &[]);
     let runner_config = durable_config(&directory);
     let mut first = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
@@ -2796,13 +2808,8 @@ fn durable_recovery_closes_a_provider_that_reopens_a_settled_turn() {
     let starts_before_recovery = call_count(&directory, "turn/start");
     let mut recovered = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
     let error = recovered
-        .execute(&command(
-            "cold-turn-rejected",
-            99,
-            "turn.start",
-            json!({"text": "Do not reopen settled work.", "effort": "high"}),
-        ))
-        .expect_err("cold-first turn must retain the post-restore admission fence");
+        .execute(&command("cold-command-rejected", 99, kind, payload))
+        .expect_err("cold-first command must retain the post-restore admission fence");
     assert!(
         error
             .to_string()
