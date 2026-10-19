@@ -3360,6 +3360,7 @@ export function trustedRuntimeReadOnlyRoots(
   environment: NodeJS.ProcessEnv | undefined,
   host: {
     platform?: NodeJS.Platform;
+    localFilesystem?: boolean;
     realpath?: (path: string) => string;
     stat?: (path: string) => Pick<Stats, "isFile" | "isDirectory" | "mode" | "uid">;
   } = {},
@@ -3378,7 +3379,7 @@ export function trustedRuntimeReadOnlyRoots(
       roots.add("/nix/store");
     }
   }
-  if (platform === "darwin") {
+  if (platform === "darwin" && host.localFilesystem !== false) {
     // A fixed public system dependency, never a path supplied by an agent.
     // Qualify its parents as well so an unprivileged directory cannot replace
     // the checked toolchain between qualification and provider launch.
@@ -3386,13 +3387,16 @@ export function trustedRuntimeReadOnlyRoots(
     const realpath = host.realpath ?? realpathSync;
     const stat = host.stat ?? statSync;
     try {
-      const directories = ["/Library", "/Library/Developer", root];
+      const git = resolve(root, "usr/bin/git");
+      const directories: string[] = [];
+      for (let directory = dirname(git); directory !== dirname(directory); directory = dirname(directory)) {
+        directories.unshift(directory);
+      }
       const trustedDirectories = directories.every((directory) => {
         const info = stat(directory);
         return realpath(directory) === directory && info.isDirectory()
           && info.uid === 0 && (info.mode & 0o022) === 0;
       });
-      const git = resolve(root, "usr/bin/git");
       const gitInfo = stat(git);
       if (trustedDirectories && realpath(git) === git && gitInfo.isFile()
         && gitInfo.uid === 0 && (gitInfo.mode & 0o022) === 0
@@ -4853,6 +4857,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                           readOnlyRoots: [
                             ...trustedRuntimeReadOnlyRoots(
                               this.options.environment,
+                              {
+                                localFilesystem: this.options.runnerFilesystemRoot === undefined
+                                  && this.options.runnerProcessLauncher === undefined,
+                              },
                             ),
                             ...(runtimeContext
                               ? [
@@ -5334,7 +5342,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             codexCommand: this.options.codexCommand,
             instructionWorkingCopyRoot: runtimeContext?.instructions.workingCopy?.rootPath,
             readOnlyRoots: [
-              ...trustedRuntimeReadOnlyRoots(this.options.environment),
+              ...trustedRuntimeReadOnlyRoots(this.options.environment, {
+                localFilesystem: this.options.runnerFilesystemRoot === undefined
+                  && this.options.runnerProcessLauncher === undefined,
+              }),
               ...(runtimeContext
                 ? [
                     resolve(codexHome, "skills"),
