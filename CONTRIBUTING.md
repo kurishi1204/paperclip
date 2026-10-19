@@ -23,7 +23,7 @@ Affirm that you did this search by checking the dedup-search box in the PR templ
 - Pick **one** clear thing to fix/improve
 - Touch the **smallest possible number of files**
 - Make sure the change is very targeted and easy to review
-- All tests pass and CI is green
+- Verification satisfies [Tests Must Pass](#tests-must-pass) and [Paperclip Gates Must Pass](#paperclip-gates-must-pass)
 - Greptile score is 5/5 with all comments addressed
 - Use the [PR template](.github/PULL_REQUEST_TEMPLATE.md)
 
@@ -38,7 +38,7 @@ These almost always get merged quickly when they're clean.
 - In your PR include:
   - Clear description of what & why
   - Proof it works (manual testing notes)
-  - All tests passing and CI green
+  - Verification satisfying [Tests Must Pass](#tests-must-pass) and [Paperclip Gates Must Pass](#paperclip-gates-must-pass)
   - Greptile score 5/5 with all comments addressed
   - [PR template](.github/PULL_REQUEST_TEMPLATE.md) fully filled out
 
@@ -100,7 +100,10 @@ Every PR must include a **Model Used** section specifying which AI model produce
 
 ### Tests Must Pass
 
-All tests must pass before a PR can be merged. Run them locally first and verify CI is green after pushing.
+Run the required tests locally before requesting merge. PR-specific tests, lint,
+typecheck, build, and other required static gates must pass. A full-suite failure
+may receive only the baseline exception below, regardless of whether GitHub
+Actions is enabled. Do not describe a failed or unfinished test run as passing.
 
 ### Telemetry Changes
 
@@ -110,7 +113,221 @@ If your change adds, removes, or modifies emitted telemetry events, update the [
 
 ### Paperclip Gates Must Pass
 
-All Paperclip CI gates (lint, typecheck, tests, build, and any other required checks) must be satisfied before a PR can be merged. Don't ask for a merge while gates are red — fix them first.
+Run all Paperclip gates (lint, typecheck, tests, build, and other required checks).
+PR-specific tests, lint, typecheck, build, and other required static gates must
+pass before merge. A full-suite failure may receive only the baseline exception
+below. A red required GitHub check still blocks merge under branch protection.
+
+For every PR, inventory the applicable gates from the recorded base SHA's
+`.github/workflows/` and repository rules, whether Actions is enabled or not.
+At minimum include `pnpm -r lint`, `pnpm typecheck`, `pnpm build`,
+`pnpm test:run`, `pnpm check:node-version`, `pnpm check:module-boundaries`,
+`pnpm check:issue-material-classification`, and
+`node scripts/check-no-git-push.mjs`; include `pnpm check:token-gates` for UI
+changes and any other applicable check in that base workflow. Record each
+command's result. None of the minimum gates above can be marked not applicable.
+For additional gates, record a reviewed reason when a gate does not apply and
+include that decision in the human owner's PR decision. An unknown or omitted
+gate blocks merge. A missing root script is not a passing gate. The author may
+propose a checked-in workspace command, but the independent reviewer must
+confirm that it covers the same gate and record the command mapping. The human
+owner must name each accepted substitution in the owner decision. Until then,
+the gate is unresolved and blocks merge.
+
+Resolve the full reusable-workflow graph before calling this inventory complete.
+Start with each applicable workflow at the recorded base SHA. Follow every
+`jobs.<job_id>.uses` reusable-workflow call, including calls inside called
+workflows, until no calls remain. Resolve a local `./.github/workflows/` path at
+its caller's commit. Resolve an external `owner/repo/.github/workflows/path@ref`
+against that repository. Record the literal ref and the full resolved commit SHA,
+even when the ref names a branch or tag. Fetch the workflow bytes at that commit.
+For every graph node, record the repository, path, full commit SHA, byte size,
+and SHA-256 of the exact bytes. Record every caller-to-callee edge and the gates
+found in each workflow in the immutable manifest. Do not replace an external
+workflow with a same-named file from this fork. An unreadable or unparseable
+workflow, unresolved ref, unsupported call, cycle, or incomplete graph leaves
+the gate inventory unknown and blocks merge.
+
+Immediately before merge, resolve the full graph again from the live base tip.
+Compare its nodes, edges, full commit SHAs, and byte hashes with the accepted
+manifest. A branch or tag used by an external workflow can move while the PR
+head and base SHAs stay fixed. If any graph entry changes, hold merge. Refresh
+the gate inventory and affected verification evidence, obtain a new independent
+review, and obtain a new human-owner decision for the changed manifest before
+merge. If the graph cannot be resolved again, hold merge.
+An external branch or tag can move between this check and merge. Record that
+residual risk in the human owner's decision. If the owner does not accept it,
+pin the call to a full commit SHA in the workflow and refresh the evidence.
+
+Freeze evidence against both the full PR head SHA and the current base branch
+tip SHA. Read the head from the live PR and the base tip directly from its base
+branch ref (for example, `git ls-remote <remote> refs/heads/<base-branch>`),
+not from a cached PR base field or local tracking ref. Then require
+`git merge-base --is-ancestor <base-tip> <head>` for that pair; otherwise update
+the branch onto the current base first. Record that pair in the verification
+manifest, any local receipt, and the independent-review record, whether Actions
+is enabled or disabled.
+Immediately before merge, read the live PR head and base branch ref again, compare
+both with the accepted pair, and confirm that this live base tip is an ancestor
+of the accepted head.
+If the base moved, update the branch onto the current base. If either SHA
+changed, rerun the applicable gates and base/head test-ID comparison, obtain
+a new independent review, and obtain a new human-owner decision for the
+resulting pair. Do not use an auto-generated merge or squash commit as an
+alternative to refreshing stale evidence. Do not rely on auto-merge unless it
+revalidates both SHAs immediately before merging. Merge with
+`gh pr merge --match-head-commit <accepted-head>` after this comparison, so a
+concurrent head push cannot invalidate the accepted evidence.
+`--match-head-commit` does not bind the base tip. If the repository does not
+enforce an up-to-date branch or a merge queue, the base can move between this
+comparison and merge. Record that residual risk in the human owner's decision;
+do not claim the merged tree was the tested pair without verifying its actual
+parents and tree after merge. If the owner does not accept that risk, defer
+merge until a repository-level base-stability rule is in place.
+
+For an owner-controlled fork where the repository owner has disabled GitHub Actions,
+the owner may use fixed, local verification evidence instead of the missing Actions
+check. This changes the check transport only. It does not enable a test-failure
+exception. When Actions is enabled, all required Actions checks still apply.
+The receipt's base SHA is the PR base-tip SHA recorded above. A still-required
+GitHub check must be satisfied by its configured source; local evidence cannot
+turn a red or missing required check green. Changing required checks is a
+separate owner-controlled repository setting decision, recorded on the PR.
+Do not use an administrator or ruleset bypass to merge around an unsatisfied
+required check. Make any required-check change as a recorded owner decision
+before merge.
+
+A PR that changes these verification rules is governed by the policy at its
+recorded base, not by its proposed head text. If disabled Actions makes a base
+requirement impossible, the human owner must record an explicit transition
+decision on that PR, including the affected check and accepted alternative,
+before that alternative can be used. The author and reviewer cannot certify
+their own policy change under the proposed new rule.
+
+Every PR needs an immutable verification manifest for its full head/base pair.
+List the complete PR diff hash, resolved reusable-workflow graph, applicable
+gate inventory and results, and comparable base/head test-ID inventories with
+outcomes, failures, skips, and collection/import errors. For Actions evidence,
+link the exact workflow ref, run/job/check IDs, conclusions, and retained
+log/artifact hashes. Prove that the run used the same resolved workflow graph.
+If a called commit cannot be tied to the run, its gate remains unresolved.
+A green check name alone is insufficient. For local evidence, link the receipts
+below. The independent reviewer must verify the manifest, complete gate
+inventory, and base/head test-ID comparison. Every PR must meet items 2 and 3
+below, including when Actions is enabled and the full suite passes. Item 1 adds requirements
+whenever tests or gates run locally; a baseline exception also needs the full
+base-run receipt described there.
+
+1. Link a receipt for the exact PR head and recorded PR base SHA. Record the
+   runner identity, executing OS UID/GID, image digest when an image is used,
+   tool versions, relevant environment/configuration hashes, test-data hashes,
+   commands,
+   exit codes, collected test IDs and outcomes, test counts, and log hashes.
+   Inventory every configured publishing channel under the tested OS identity.
+   The minimum inventory includes GitHub CLI/API tokens; HTTPS git helpers,
+   macOS Keychain and `.netrc`; repository-local `.git/config` remote URLs and
+   `http.*.extraheader`; SSH private keys and `SSH_AUTH_SOCK`; Paperclip API
+   credentials; and package-registry publishing tokens. Include any other
+   configured channel rather than treating this list as exhaustive. For each
+   channel, retain a negative probe of the credential source and a non-mutating
+   authenticated-access attempt using a verified installed client, or evidence
+   that the channel is absent or denied by the OS isolation boundary. A public
+   unauthenticated read is not an authenticated-access probe. An absent client
+   alone is not a successful denial probe; a channel whose accessibility cannot
+   be determined blocks merge. Show that configured publishing credential paths
+   are unreadable.
+   Record probe exit codes and redacted outputs without disclosing secret values.
+   Collect the base test IDs under the same conditions for comparison. If any
+   intentional skip is claimed, also collect its base outcome, reason, and
+   triggering condition under those conditions; an ID-only list cannot prove a
+   matching skip. If a baseline exception is claimed, also link a full base-run
+   receipt with the same fields. Retain the exact hashed artifacts for
+   independent review.
+   Publish only redacted
+   copies or artifact locations that do not expose credentials or private host
+   data; record the redacted copy's hash separately from the retained original.
+   Compare the collected test IDs between base and head. Any test ID present on
+   base but missing, renamed, focused, or excluded on head blocks merge unless
+   the PR intentionally changes it and the independent reviewer and owner accept
+   that exact-head change. Attach a machine-readable
+   inventory of every failed and skipped test, including collection and import
+   errors, with the outcome, reason, triggering condition for an intentional
+   skip, and whether the skip is required or intentional.
+   Run the full suite, PR-specific tests, lint, typecheck, build, and all
+   applicable required static gates to completion. The PR-specific tests and
+   gates outside the full suite must pass. Provision dependencies and run any
+   PR-head install/lifecycle script, build, test, or gate command only under an
+   identity that cannot read GitHub, Paperclip, or other publishing credentials.
+   Do not run `pnpm install` or PR-head `preinstall`, `postinstall`, or `prepare`
+   as the operator before switching identities. Clearing environment variables
+   alone is insufficient.
+2. Treat tests added or changed by the PR, and tests that exercise changed behavior,
+   as PR-specific. Treat a disputed test or gate classification as required until
+   independent review resolves it. An intentional platform skip must have the
+   same test ID, skip reason, and triggering condition on the recorded base SHA
+   under the same runner, tool versions, environment, and test data. List each
+   intentional skip in the human owner's decision even when no exception is
+   needed. Otherwise treat it as a required-test skip.
+3. Have a reviewer who did not author the change or prepare its evidence,
+   including through another session of the same agent, validate the manifest
+   and underlying receipts or Actions runs. An independent reviewer must be a
+   human or a different model family from both the author and every evidence
+   preparer; another session or harness with any of their model families does
+   not qualify. For this rule, model family means the provider's model lineage:
+   Claude Opus and Claude Sonnet are the same Claude family, while GPT and
+   Claude are different families. Record provider, exact model ID, and family
+   for the author, each evidence preparer, and reviewer when AI is used.
+   The reviewer must validate the base/head test-ID comparison, complete gate
+   inventory, and classifications. For local runs, validate credential-isolation
+   probes; for Actions runs, validate the job token scopes and secret exposure
+   shown by the workflow and job configuration. Record the reviewer's human
+   identity or model/service
+   version, full head and base-tip SHAs, immutable input hash, result, and safe
+   artifact locations on the PR. The human repository owner must separately
+   comment with the same full head and base-tip SHAs, the immutable input hash,
+   the independent-review record link, the exact accepted-exception list (or
+   `none`), each intentional skip (or `none`), each accepted base-to-head test-ID
+   removal or rename (or `none`), each accepted gate substitution (or `none`),
+   each additional-gate not-applicable decision (or `none`), and any base or
+   external-workflow-ref race acceptance before merge. The immutable input hash
+   is SHA-256
+   of the retained verification manifest above, listing the full head/base
+   pair, diff, every original receipt or Actions run/job/check record, log,
+   test-ID inventory, and failure/skip inventory by path or immutable location,
+   byte size, and SHA-256.
+   Keep both the manifest and its listed bytes available to the reviewer.
+   An agent using the owner's account must not post or prepare a final owner
+   acceptance comment, check its PR box, or merge. The human owner must perform
+   the acceptance action. A changed head or base requires new evidence, review,
+   and a new human-owner decision.
+
+### Baseline Full-Suite Exceptions
+
+This exception is available under the same conditions whether Actions is enabled
+or disabled. It never overrides a required GitHub check or branch protection.
+The head/base freeze, live pre-merge comparison, test-ID comparison, and
+independent review above apply to every exception. For each full-suite failure
+or required-test skip, run the recorded PR base SHA under the same runner
+conditions, tool versions, environment, and test data. For a persistent runner,
+use the same runner installation. For ephemeral runners, record matching
+immutable image digests, OS/architecture, toolchain, configuration, and test-data
+hashes for both runs. If equivalence cannot be proven, no exception is available.
+A matching failure needs the same test ID and failure signature (assertion or error class
+and stable message). A matching skip needs the same test ID and skip reason.
+Import, collection, hook, and worker failures cannot receive the baseline
+exception, even if a runner gives them a file-level ID.
+The independent reviewer must inspect the changed code path and explain why the
+result is a pre-existing baseline problem rather than a regression. A match alone
+is not enough. If that causal explanation is unknown, do not grant the exception.
+Map every failure and required skip to its evidence, even when several share one
+cause. Keep the full suite marked **failed with accepted exceptions**. Never
+call it green. The human owner must accept the exact list and head/base pair in
+the PR record.
+
+Mark Actions as **disabled**, and a failing full suite as **failed with accepted
+exceptions** when those states apply. Never label either one green. These rules do
+not bypass a failed PR-specific test, lint, typecheck, build, another required
+static gate, an unresolved regression, or the Greptile review requirement.
 
 ### Greptile Review
 

@@ -59,7 +59,23 @@
 
 <!--
   How can a reviewer confirm this works? Include test commands, manual
-  steps, or both.
+  steps, or both. If GitHub Actions is disabled by the repository owner, link
+  the exact-head local receipt, base/head test-ID comparison, and machine-readable
+  failure/skip inventory. List the required gates and results from the recorded
+  base workflow, its recursively resolved reusable-workflow graph, and repository
+  rules. Link each graph node's full commit SHA and exact-byte SHA-256 in the
+  manifest. Re-resolve moving refs immediately before merge; a changed or
+  unresolved graph holds merge even if the PR head and base SHAs are unchanged.
+  Compare collected test IDs with the recorded base SHA. For a baseline
+  exception, link a full base-run receipt under the same runner conditions.
+  If the head or base tip moves before merge,
+  update the branch and refresh the evidence, independent review, and human-owner
+  decision for the new head/base pair.
+  State how the test identity was isolated from publishing credentials. A
+  baseline full-suite failure needs the same evidence whether Actions is enabled
+  or disabled. Include the independent review and owner decision required by
+  CONTRIBUTING.md. Record each reviewed gate substitution. Never mark a failed
+  test or disabled check green.
 -->
 
 -
@@ -92,6 +108,12 @@
 
 ## Checklist
 
+<!-- Leave future checks unchecked at PR creation. Update with exact-head evidence
+     before requesting merge; a checked box claims the condition is met now.
+     If the head or base tip changes, uncheck the required-tests, base/head
+     inventory, full-suite, independent-review, human-owner, and Greptile boxes
+     below until evidence and decisions are refreshed for the new pair. -->
+
 - [ ] I have included a thinking path that traces from project context to this change
 - [ ] I have specified the model used (with version and capability details)
 - [ ] I have checked ROADMAP.md and confirmed this PR does not duplicate planned core work
@@ -99,10 +121,13 @@
 - [ ] I have either (a) linked existing issues with `Fixes: #` / `Closes #` / `Refs #` OR (b) described the issue in-PR following the relevant issue template
 - [ ] I have not referenced internal/instance-local Paperclip issues or links (only public GitHub `#NNN` / `github.com/paperclipai/paperclip` URLs)
 - [ ] My branch name describes the change (e.g. `docs/...`, `fix/...`) and contains no internal Paperclip ticket id or instance-derived details
-- [ ] I have run tests locally and they pass
+- [ ] I have run required tests locally; PR-specific tests, lint, typecheck, build, and required static gates pass
 - [ ] I have added or updated tests where applicable
 - [ ] I have updated relevant documentation to reflect my changes
 - [ ] I have considered and documented any risks above
-- [ ] All Paperclip CI gates are green
+- [ ] I have linked the exact-head/base verification manifest, resolved and hashed every reusable-workflow call recursively, compared base/head test IDs, and recorded every failure and required skip, including collection or import errors
+- [ ] The full suite passes or each baseline failure and required skip has the exact-head/base evidence required by CONTRIBUTING.md; I have not called a disabled or failing gate green
+- [ ] An independent reviewer has validated the exact-head/base manifest, resolved workflow graph, applicable receipts or Actions runs, gate substitutions, and immutable input hash
+- [ ] The human owner has accepted this full head SHA, full base-tip SHA, immutable input hash, independent-review record link, exception list (or `none`), intentional-skip list (or `none`), base-to-head test-ID removals/renames (or `none`), gate substitutions (or `none`), additional-gate not-applicable decisions (or `none`), and any base or external-workflow-ref race in a separate PR comment; only the human owner checks this box
 - [ ] Greptile is 5/5 with no open P2s, recommendations, or follow-ups
 - [ ] I will address all Greptile and reviewer comments before requesting merge
