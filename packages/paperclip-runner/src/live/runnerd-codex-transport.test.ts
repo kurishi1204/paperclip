@@ -2003,7 +2003,8 @@ it("qualifies only the fixed public CommandLineTools dependency on Darwin", () =
     DEVELOPER_DIR: "/private/user/tools",
   }, probe)).toEqual([publicToolchainRoot]);
   expect(probe.stat.mock.calls.map(([path]) => path)).toEqual([
-    "/Library", "/Library/Developer", publicToolchainRoot, publicToolchainGit,
+    "/Library", "/Library/Developer", publicToolchainRoot,
+    `${publicToolchainRoot}/usr`, `${publicToolchainRoot}/usr/bin`, publicToolchainGit,
   ]);
   probe.stat.mockClear();
   expect(trustedRuntimeReadOnlyRoots({ PATH: "/usr/bin" }, {
@@ -2012,7 +2013,7 @@ it("qualifies only the fixed public CommandLineTools dependency on Darwin", () =
   expect(probe.stat).not.toHaveBeenCalled();
 });
 
-it.each(["missing", "escaped-root", "escaped-git", "writable-parent", "user-owned", "non-executable", "not-file"])(
+it.each(["missing", "escaped-root", "escaped-git", "writable-parent", "writable-intermediate-usr", "writable-intermediate-bin", "user-owned", "non-executable", "not-file"])(
   "does not grant public CommandLineTools read for an unqualified toolchain: %s",
   (condition) => {
     const probe = publicToolchainProbe();
@@ -2026,6 +2027,8 @@ it.each(["missing", "escaped-root", "escaped-git", "writable-parent", "user-owne
         if (condition === "missing") throw Object.assign(new Error("missing"), { code: "ENOENT" });
         const info = stat(path);
         if (condition === "writable-parent" && path === "/Library/Developer") info.mode = 0o40777;
+        if (condition === "writable-intermediate-usr" && path === `${publicToolchainRoot}/usr`) info.mode = 0o40777;
+        if (condition === "writable-intermediate-bin" && path === `${publicToolchainRoot}/usr/bin`) info.mode = 0o40777;
         if (condition === "user-owned" && path === publicToolchainRoot) info.uid = 501;
         if (condition === "non-executable" && path === publicToolchainGit) info.mode = 0o100644;
         if (condition === "not-file" && path === publicToolchainGit) info.isFile = () => false;
@@ -2036,6 +2039,15 @@ it.each(["missing", "escaped-root", "escaped-git", "writable-parent", "user-owne
       .toEqual(["/opt/homebrew"]);
   },
 );
+
+it("does not use controller public CommandLineTools qualification for a non-local filesystem", () => {
+  const probe = publicToolchainProbe();
+  expect(trustedRuntimeReadOnlyRoots({ PATH: "/opt/homebrew/bin:/usr/bin" }, {
+    ...probe, localFilesystem: false,
+  })).toEqual(["/opt/homebrew"]);
+  expect(probe.stat).not.toHaveBeenCalled();
+  expect(probe.realpath).not.toHaveBeenCalled();
+});
 
 it("adds only public CommandLineTools read to both complete permission profiles", () => {
   const input = { environment: { HOME: "/private/user", PATH: "/usr/bin:/bin" }, codexHome: "/isolated/codex" };
@@ -6279,7 +6291,8 @@ it("rotates PRP authority in place for a warm cross-run attachment", async () =>
   }
 }, 30_000);
 
-it("carries generated public runtime read permissions through initial and resumed launch args", async () => {
+it.each(["local", "mapped-filesystem", "custom-launcher"] as const)(
+  "carries generated public runtime read permissions through initial and resumed launch args: %s", async (runnerLocation) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-public-runtime-roots-"));
   const launcher = join(stateDirectory, "fake-codex-launcher");
   // The existing fake parses its named flags and ignores other Codex args.
@@ -6288,7 +6301,9 @@ it("carries generated public runtime read permissions through initial and resume
   await writeFile(launcher, `#!/bin/sh\nexec ${quotedFake} --state-file-in-codex-home --durable-turn-ids "$@"\n`);
   await chmod(launcher, 0o755);
   const environment = { PATH: "/usr/bin:/bin" };
-  const initialRoots = trustedRuntimeReadOnlyRoots(environment);
+  const initialRoots = trustedRuntimeReadOnlyRoots(environment).filter(
+    (root) => runnerLocation === "local" || root !== publicToolchainRoot,
+  );
   const attachments: Record<string, unknown>[] = [];
   const restorers: (() => void)[] = [];
   const OriginalCore = durableControlPlane.DurablePrpControlPlane;
@@ -6311,6 +6326,33 @@ it("carries generated public runtime read permissions through initial and resume
   const options = {
     runnerBinary: defaultCapabilityRunnerdBinary(), codexCommand: launcher, stateDirectory,
     environment, lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null },
+    runnerFilesystemRoot: runnerLocation === "mapped-filesystem" ? stateDirectory : undefined,
+    readRunnerState: runnerLocation === "mapped-filesystem"
+      ? async () => JSON.parse(await readFile(join(stateDirectory, "runner/runner-state.json"), "utf8")) as Record<string, unknown>
+      : undefined,
+    prepareExternalRunnerState: runnerLocation === "mapped-filesystem" ? async () => undefined : undefined,
+    archiveExternalRunnerState: runnerLocation === "mapped-filesystem"
+      ? async ({ archiveKey }: { archiveKey: string }) => {
+        const runnerState = join(stateDirectory, "runner/runner-state.json");
+        const archived = join(stateDirectory, "external-authority-epochs", archiveKey);
+        await mkdir(archived, { recursive: true });
+        const saved = JSON.parse(await readFile(runnerState, "utf8")) as Record<string, unknown>;
+        await rename(runnerState, join(archived, "runner-state.json"));
+        return saved;
+      }
+      : undefined,
+    runnerProcessLauncher: runnerLocation === "custom-launcher"
+      ? (spec: durableControlPlane.RunnerProcessLaunchSpec) => {
+        const child = spawn(spec.command, [...spec.args], {
+          cwd: spec.cwd, env: spec.environment, stdio: "ignore",
+        });
+        const completion = new Promise<durableControlPlane.RunnerProcessResult>((resolveExit, rejectExit) => {
+          child.once("error", rejectExit);
+          child.once("exit", (code, signal) => resolveExit({ code, signal, stdout: "", stderr: "" }));
+        });
+        return { child, completion };
+      }
+      : undefined,
   };
   const first = createCapabilityRunnerdCodexTransport({ ...options, prpIdentity: identity });
   let resumed: ReturnType<typeof createCapabilityRunnerdCodexTransport> | undefined;
@@ -6326,11 +6368,12 @@ it("carries generated public runtime read permissions through initial and resume
   const readProvider = async () => JSON.parse(await readFile(
     join(stateDirectory, "runner/codex-provider-state.json"), "utf8",
   )) as { config: { args: string[] }; threadId: string };
-  const assertRoots = (args: string[], roots: string[]) => {
+  const assertRoots = (args: string[], roots: string[], phase: "initial" | "restored") => {
     const permissions = parsedLaunchConfig(args).permissions as Record<string, { filesystem: Record<string, unknown> }>;
     for (const profile of ["paperclip-runner-workspace-only", "paperclip-runner-workspace-read-only"]) {
       for (const root of roots) expect(permissions[profile]!.filesystem[root]).toBe("read");
-      expect(permissions[profile]!.filesystem[publicToolchainRoot])
+      expect.soft(permissions[profile]!.filesystem[publicToolchainRoot],
+        `${runnerLocation}:${phase}:${profile}:public CLT read`)
         .toBe(roots.includes(publicToolchainRoot) ? "read" : undefined);
       expect(permissions[profile]!.filesystem[resolve(stateDirectory, "codex-home")]).toBe("none");
       expect(permissions[profile]!.filesystem[":tmpdir"]).toBe("none");
@@ -6340,7 +6383,7 @@ it("carries generated public runtime read permissions through initial and resume
   try {
     await within("initial open", first.transport.request("thread/start", { cwd: tmpdir(), dynamicTools: [] }));
     const initial = await readProvider();
-    assertRoots(initial.config.args, initialRoots);
+    assertRoots(initial.config.args, initialRoots, "initial");
     const notifications = first.transport.notifications()[Symbol.asyncIterator]();
     await within("first turn", first.transport.request("turn/start", { input: [{ type: "text", text: "first fixture run" }] }));
     let completed = false;
@@ -6356,7 +6399,7 @@ it("carries generated public runtime read permissions through initial and resume
     const restored = await readProvider();
     expect(attachments).toHaveLength(1);
     expect(attachments[0]!.runtimeLaunchArgs).toEqual(restored.config.args);
-    assertRoots(restored.config.args, ["/opt/homebrew", ...initialRoots]);
+    assertRoots(restored.config.args, ["/opt/homebrew", ...initialRoots], "restored");
     expect(restored.threadId).toBe(initial.threadId);
     verified = true;
   } finally {
