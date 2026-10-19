@@ -13,11 +13,13 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
+  type Stats,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
@@ -3356,10 +3358,16 @@ export function resolveSourceCodexHome(
 
 export function trustedRuntimeReadOnlyRoots(
   environment: NodeJS.ProcessEnv | undefined,
+  host: {
+    platform?: NodeJS.Platform;
+    realpath?: (path: string) => string;
+    stat?: (path: string) => Pick<Stats, "isFile" | "isDirectory" | "mode" | "uid">;
+  } = {},
 ): string[] {
   const path = environment?.PATH ?? "";
+  const platform = host.platform ?? process.platform;
   const roots = new Set<string>();
-  for (const entry of path.split(process.platform === "win32" ? ";" : ":")) {
+  for (const entry of path.split(platform === "win32" ? ";" : ":")) {
     if (entry === "/opt/homebrew" || entry.startsWith("/opt/homebrew/")) {
       roots.add("/opt/homebrew");
     } else if (entry === "/usr/local" || entry.startsWith("/usr/local/")) {
@@ -3368,6 +3376,32 @@ export function trustedRuntimeReadOnlyRoots(
       roots.add("/opt/local");
     } else if (entry === "/nix/store" || entry.startsWith("/nix/store/")) {
       roots.add("/nix/store");
+    }
+  }
+  if (platform === "darwin") {
+    // A fixed public system dependency, never a path supplied by an agent.
+    // Qualify its parents as well so an unprivileged directory cannot replace
+    // the checked toolchain between qualification and provider launch.
+    const root = "/Library/Developer/CommandLineTools";
+    const realpath = host.realpath ?? realpathSync;
+    const stat = host.stat ?? statSync;
+    try {
+      const directories = ["/Library", "/Library/Developer", root];
+      const trustedDirectories = directories.every((directory) => {
+        const info = stat(directory);
+        return realpath(directory) === directory && info.isDirectory()
+          && info.uid === 0 && (info.mode & 0o022) === 0;
+      });
+      const git = resolve(root, "usr/bin/git");
+      const gitInfo = stat(git);
+      if (trustedDirectories && realpath(git) === git && gitInfo.isFile()
+        && gitInfo.uid === 0 && (gitInfo.mode & 0o022) === 0
+        && (gitInfo.mode & 0o111) !== 0) {
+        roots.add(root);
+      }
+    } catch {
+      // Missing or unqualified tools grant nothing. The job's actual Git
+      // preflight reports an unavailable dependency instead of widening scope.
     }
   }
   return [...roots];

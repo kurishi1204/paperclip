@@ -23,6 +23,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { expect, it, vi } from "vitest";
+import { parse as parseToml } from "smol-toml";
 import type { ControlPlanePort } from "../contracts/control-plane-port.js";
 import type { NativeExecutionInputV1 } from "../contracts/native-execution.js";
 import type {
@@ -1970,8 +1971,85 @@ it("allows trusted package-manager runtime roots without exposing HOME paths", (
     trustedRuntimeReadOnlyRoots({
       HOME: "/Users/tester",
       PATH: "/Users/tester/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-    }),
+    }, { platform: "linux" }),
   ).toEqual(["/opt/homebrew", "/usr/local"]);
+});
+
+const publicToolchainRoot = "/Library/Developer/CommandLineTools";
+const publicToolchainGit = `${publicToolchainRoot}/usr/bin/git`;
+
+function publicToolchainProbe() {
+  return {
+    platform: "darwin" as NodeJS.Platform,
+    realpath: vi.fn((path: string) => path),
+    stat: vi.fn((path: string) => ({
+      isDirectory: () => path !== publicToolchainGit,
+      isFile: () => path === publicToolchainGit,
+      mode: path === publicToolchainGit ? 0o100755 : 0o40755,
+      uid: 0,
+    })),
+  };
+}
+
+function parsedLaunchConfig(args: string[]) {
+  return parseToml(args.filter((_arg, index) => args[index - 1] === "-c").join("\n"));
+}
+
+it("qualifies only the fixed public CommandLineTools dependency on Darwin", () => {
+  const probe = publicToolchainProbe();
+  expect(trustedRuntimeReadOnlyRoots({
+    PATH: "/usr/bin:/bin",
+    HOME: "/private/user",
+    DEVELOPER_DIR: "/private/user/tools",
+  }, probe)).toEqual([publicToolchainRoot]);
+  expect(probe.stat.mock.calls.map(([path]) => path)).toEqual([
+    "/Library", "/Library/Developer", publicToolchainRoot, publicToolchainGit,
+  ]);
+  probe.stat.mockClear();
+  expect(trustedRuntimeReadOnlyRoots({ PATH: "/usr/bin" }, {
+    ...probe, platform: "linux",
+  })).toEqual([]);
+  expect(probe.stat).not.toHaveBeenCalled();
+});
+
+it.each(["missing", "escaped-root", "escaped-git", "writable-parent", "user-owned", "non-executable", "not-file"])(
+  "does not grant public CommandLineTools read for an unqualified toolchain: %s",
+  (condition) => {
+    const probe = publicToolchainProbe();
+    const stat = probe.stat.getMockImplementation()!;
+    if (condition === "escaped-root" || condition === "escaped-git") {
+      probe.realpath.mockImplementation((path) =>
+        path === (condition === "escaped-root" ? publicToolchainRoot : publicToolchainGit)
+          ? "/private/user/tools" : path);
+    } else {
+      probe.stat.mockImplementation((path) => {
+        if (condition === "missing") throw Object.assign(new Error("missing"), { code: "ENOENT" });
+        const info = stat(path);
+        if (condition === "writable-parent" && path === "/Library/Developer") info.mode = 0o40777;
+        if (condition === "user-owned" && path === publicToolchainRoot) info.uid = 501;
+        if (condition === "non-executable" && path === publicToolchainGit) info.mode = 0o100644;
+        if (condition === "not-file" && path === publicToolchainGit) info.isFile = () => false;
+        return info;
+      });
+    }
+    expect(trustedRuntimeReadOnlyRoots({ PATH: "/opt/homebrew/bin:/private/user/bin" }, probe))
+      .toEqual(["/opt/homebrew"]);
+  },
+);
+
+it("adds only public CommandLineTools read to both complete permission profiles", () => {
+  const input = { environment: { HOME: "/private/user", PATH: "/usr/bin:/bin" }, codexHome: "/isolated/codex" };
+  const before = parsedLaunchConfig(createRunnerdCodexAppServerArgs(input));
+  const roots = trustedRuntimeReadOnlyRoots(input.environment, publicToolchainProbe());
+  const after = parsedLaunchConfig(createRunnerdCodexAppServerArgs({ ...input, readOnlyRoots: roots }));
+  const permissions = after.permissions as Record<string, { filesystem: Record<string, unknown> }>;
+  for (const profile of ["paperclip-runner-workspace-only", "paperclip-runner-workspace-read-only"]) {
+    expect(permissions[profile]!.filesystem[publicToolchainRoot]).toBe("read");
+    delete permissions[profile]!.filesystem[publicToolchainRoot];
+  }
+  // Compare the entire parsed config: every other root, write/deny rule,
+  // network decision and shell environment must be identical.
+  expect(after).toEqual(before);
 });
 
 it("denies the isolated Codex home without denying a remote execution workspace", () => {
@@ -6198,6 +6276,113 @@ it("rotates PRP authority in place for a warm cross-run attachment", async () =>
   } finally {
     await bundle.transport.close();
     await rm(stateDirectory, { recursive: true, force: true });
+  }
+}, 30_000);
+
+it("carries generated public runtime read permissions through initial and resumed launch args", async () => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-public-runtime-roots-"));
+  const launcher = join(stateDirectory, "fake-codex-launcher");
+  // The existing fake parses its named flags and ignores other Codex args.
+  // Leave codexArgs unset to exercise both default-generation call sites.
+  const quotedFake = `'${fakeCodex.replaceAll("'", "'\\''")}'`;
+  await writeFile(launcher, `#!/bin/sh\nexec ${quotedFake} --state-file-in-codex-home --durable-turn-ids "$@"\n`);
+  await chmod(launcher, 0o755);
+  const environment = { PATH: "/usr/bin:/bin" };
+  const initialRoots = trustedRuntimeReadOnlyRoots(environment);
+  const attachments: Record<string, unknown>[] = [];
+  const restorers: (() => void)[] = [];
+  const OriginalCore = durableControlPlane.DurablePrpControlPlane;
+  const coreSpy = vi.spyOn(durableControlPlane, "DurablePrpControlPlane")
+    .mockImplementation(function (options: ConstructorParameters<typeof OriginalCore>[0]) {
+      const core = new OriginalCore(options);
+      const queue = core.queueCommand.bind(core);
+      const spy = vi.spyOn(core, "queueCommand").mockImplementation((type, payload = {}, id, immediate) => {
+        if (type === "run.attach") attachments.push(structuredClone(payload));
+        return queue(type, payload, id, immediate);
+      });
+      restorers.push(() => spy.mockRestore());
+      return core;
+    } as unknown as typeof OriginalCore);
+  const identity = {
+    runnerInstanceId: "public-runtime-roots-runner", environmentLeaseId: "public-runtime-roots-lease",
+    normalizedSessionId: "public-runtime-roots-session", runId: "public-runtime-roots-first",
+    turnId: "public-runtime-roots-turn-first", itemId: "public-runtime-roots-item-first",
+  };
+  const options = {
+    runnerBinary: defaultCapabilityRunnerdBinary(), codexCommand: launcher, stateDirectory,
+    environment, lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null },
+  };
+  const first = createCapabilityRunnerdCodexTransport({ ...options, prpIdentity: identity });
+  let resumed: ReturnType<typeof createCapabilityRunnerdCodexTransport> | undefined;
+  let verified = false;
+  const within = async <T>(label: string, promise: Promise<T>): Promise<T> => {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([promise, new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`public runtime roots ${label} timeout`)), 5_000);
+      })]);
+    } finally { if (timer) clearTimeout(timer); }
+  };
+  const readProvider = async () => JSON.parse(await readFile(
+    join(stateDirectory, "runner/codex-provider-state.json"), "utf8",
+  )) as { config: { args: string[] }; threadId: string };
+  const assertRoots = (args: string[], roots: string[]) => {
+    const permissions = parsedLaunchConfig(args).permissions as Record<string, { filesystem: Record<string, unknown> }>;
+    for (const profile of ["paperclip-runner-workspace-only", "paperclip-runner-workspace-read-only"]) {
+      for (const root of roots) expect(permissions[profile]!.filesystem[root]).toBe("read");
+      expect(permissions[profile]!.filesystem[publicToolchainRoot])
+        .toBe(roots.includes(publicToolchainRoot) ? "read" : undefined);
+      expect(permissions[profile]!.filesystem[resolve(stateDirectory, "codex-home")]).toBe("none");
+      expect(permissions[profile]!.filesystem[":tmpdir"]).toBe("none");
+    }
+  };
+  first.transport.setServerRequestHandler(async () => ({ success: true, contentItems: [] }));
+  try {
+    await within("initial open", first.transport.request("thread/start", { cwd: tmpdir(), dynamicTools: [] }));
+    const initial = await readProvider();
+    assertRoots(initial.config.args, initialRoots);
+    const notifications = first.transport.notifications()[Symbol.asyncIterator]();
+    await within("first turn", first.transport.request("turn/start", { input: [{ type: "text", text: "first fixture run" }] }));
+    let completed = false;
+    while (!completed) completed = (await within("first completion", notifications.next())).value?.method === "turn/completed";
+    await within("first suspend", first.transport.close());
+    resumed = createCapabilityRunnerdCodexTransport({
+      ...options, environment: { PATH: "/opt/homebrew/bin:/usr/bin:/bin" },
+      prpIdentity: { ...identity, runId: "public-runtime-roots-next", turnId: "public-runtime-roots-next-turn", itemId: "public-runtime-roots-next-item" },
+      resumeDynamicTools: [],
+    });
+    resumed.transport.setServerRequestHandler(async () => ({ success: true, contentItems: [] }));
+    await within("resumed open", resumed.transport.request("thread/read", {}));
+    const restored = await readProvider();
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0]!.runtimeLaunchArgs).toEqual(restored.config.args);
+    assertRoots(restored.config.args, ["/opt/homebrew", ...initialRoots]);
+    expect(restored.threadId).toBe(initial.threadId);
+    verified = true;
+  } finally {
+    const bundles = [resumed, first].filter((value) => value !== undefined);
+    const ownedPids = bundles.flatMap((bundle) => [bundle.evidence().codexPid, bundle.evidence().runnerPid]);
+    try {
+      for (const bundle of bundles) await bundle.transport.close();
+    } finally {
+      for (const restore of restorers) restore();
+      coreSpy.mockRestore();
+      for (const pid of new Set(ownedPids)) {
+        if (!pid) continue;
+        try { process.kill(pid, "SIGTERM"); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        }
+        await vi.waitFor(() => {
+          try { process.kill(pid, 0); } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+            throw error;
+          }
+          throw new Error(`fixture process ${pid} remains alive`);
+        }, { timeout: 5_000 });
+      }
+      if (verified) await rm(stateDirectory, { recursive: true, force: true });
+      else console.error(`Retained failed public runtime roots fixture: ${stateDirectory}`);
+    }
   }
 }, 30_000);
 
