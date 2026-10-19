@@ -6327,6 +6327,20 @@ it.each(["local", "mapped-filesystem", "custom-launcher"] as const)(
     runnerBinary: defaultCapabilityRunnerdBinary(), codexCommand: launcher, stateDirectory,
     environment, lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null },
     runnerFilesystemRoot: runnerLocation === "mapped-filesystem" ? stateDirectory : undefined,
+    readRunnerState: runnerLocation === "mapped-filesystem"
+      ? async () => JSON.parse(await readFile(join(stateDirectory, "runner/runner-state.json"), "utf8")) as Record<string, unknown>
+      : undefined,
+    prepareExternalRunnerState: runnerLocation === "mapped-filesystem" ? async () => undefined : undefined,
+    archiveExternalRunnerState: runnerLocation === "mapped-filesystem"
+      ? async ({ archiveKey }: { archiveKey: string }) => {
+        const runnerState = join(stateDirectory, "runner/runner-state.json");
+        const archived = join(stateDirectory, "external-authority-epochs", archiveKey);
+        await mkdir(archived, { recursive: true });
+        const saved = JSON.parse(await readFile(runnerState, "utf8")) as Record<string, unknown>;
+        await rename(runnerState, join(archived, "runner-state.json"));
+        return saved;
+      }
+      : undefined,
     runnerProcessLauncher: runnerLocation === "custom-launcher"
       ? (spec: durableControlPlane.RunnerProcessLaunchSpec) => {
         const child = spawn(spec.command, [...spec.args], {
@@ -6354,11 +6368,12 @@ it.each(["local", "mapped-filesystem", "custom-launcher"] as const)(
   const readProvider = async () => JSON.parse(await readFile(
     join(stateDirectory, "runner/codex-provider-state.json"), "utf8",
   )) as { config: { args: string[] }; threadId: string };
-  const assertRoots = (args: string[], roots: string[]) => {
+  const assertRoots = (args: string[], roots: string[], phase: "initial" | "restored") => {
     const permissions = parsedLaunchConfig(args).permissions as Record<string, { filesystem: Record<string, unknown> }>;
     for (const profile of ["paperclip-runner-workspace-only", "paperclip-runner-workspace-read-only"]) {
       for (const root of roots) expect(permissions[profile]!.filesystem[root]).toBe("read");
-      expect(permissions[profile]!.filesystem[publicToolchainRoot])
+      expect.soft(permissions[profile]!.filesystem[publicToolchainRoot],
+        `${runnerLocation}:${phase}:${profile}:public CLT read`)
         .toBe(roots.includes(publicToolchainRoot) ? "read" : undefined);
       expect(permissions[profile]!.filesystem[resolve(stateDirectory, "codex-home")]).toBe("none");
       expect(permissions[profile]!.filesystem[":tmpdir"]).toBe("none");
@@ -6368,7 +6383,7 @@ it.each(["local", "mapped-filesystem", "custom-launcher"] as const)(
   try {
     await within("initial open", first.transport.request("thread/start", { cwd: tmpdir(), dynamicTools: [] }));
     const initial = await readProvider();
-    assertRoots(initial.config.args, initialRoots);
+    assertRoots(initial.config.args, initialRoots, "initial");
     const notifications = first.transport.notifications()[Symbol.asyncIterator]();
     await within("first turn", first.transport.request("turn/start", { input: [{ type: "text", text: "first fixture run" }] }));
     let completed = false;
@@ -6384,7 +6399,7 @@ it.each(["local", "mapped-filesystem", "custom-launcher"] as const)(
     const restored = await readProvider();
     expect(attachments).toHaveLength(1);
     expect(attachments[0]!.runtimeLaunchArgs).toEqual(restored.config.args);
-    assertRoots(restored.config.args, ["/opt/homebrew", ...initialRoots]);
+    assertRoots(restored.config.args, ["/opt/homebrew", ...initialRoots], "restored");
     expect(restored.threadId).toBe(initial.threadId);
     verified = true;
   } finally {
