@@ -14729,13 +14729,7 @@ export function heartbeatService(
         skipDrain: false as const,
         activeRunIds: [] as string[],
       };
-    if (intent.drainRequired)
-      return {
-        mode: "drain_required" as const,
-        skipDrain: false as const,
-        activeRunIds: [] as string[],
-      };
-    if (!shouldHonorHotRestartIntentForProcess(intent)) {
+    if (!intent.drainRequired && !shouldHonorHotRestartIntentForProcess(intent)) {
       logger.warn(
         { expectedPid: intent.previousServerPid, currentPid: process.pid },
         "hot-restart intent targets a different server pid; falling back to normal shutdown drain",
@@ -14761,6 +14755,22 @@ export function heartbeatService(
       ...intent,
       previousServerVersion: intent.previousServerVersion ?? serverVersion,
     };
+
+    if (intent.drainRequired) {
+      // Explicit drains still need the complete live set so startup can report
+      // the runs interrupted by the normal shutdown path.
+      await writeHotRestartShutdownSnapshot({
+        intent: intentWithVersion,
+        signal,
+        activeRuns: snapshotRuns,
+        capturedAt: now,
+      });
+      return {
+        mode: "drain_required" as const,
+        skipDrain: false as const,
+        activeRunIds: snapshotRuns.map((run) => run.runId),
+      };
+    }
 
     const serverStdioRuns = activeRuns.filter(isServerStdioBoundHotRestartRun);
     if (serverStdioRuns.length > 0) {

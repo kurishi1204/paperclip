@@ -200,8 +200,8 @@ export function registerServiceCommands(program: Command): void {
     });
   }
 
-  common(service.command("restart").description("Hot-restart the service while preserving active agent runs"))
-    .option("--wait", "Wait for active runs to drain instead of adopting them", false)
+  common(service.command("restart").description("Restart; adopt live local child-process runs when possible (server-stdio runs are drained)"))
+    .option("--wait", "Do not adopt: interrupt active runs at shutdown (may queue retry). Does not wait for completion.", false)
     .option("--expected-version <version>", "Require the restarted server to report this version")
     .action(async (opts) => output(await restartManagedService({ instanceId: opts.instance, expectedVersion: opts.expectedVersion, waitForDrain: opts.wait }), opts.json));
 

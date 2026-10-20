@@ -244,6 +244,8 @@ import {
   readProcessStartedAt,
   resolveLegacyHotRestartIntentPath,
   resolveHotRestartReportPath,
+  resolveHotRestartIntentPath,
+  type HotRestartReport,
   writeHotRestartIntent,
 } from "../services/hot-restart.ts";
 import { secretService } from "../services/secrets.ts";
@@ -3217,6 +3219,96 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           },
         ],
       });
+    });
+  });
+
+  it("reports every interrupted run from a CLI drain-required restart", async () => {
+    const activeRunIds: string[] = [];
+    const ownedChildren: ChildProcess[] = [];
+    for (const adapterType of ["claude_local", "codex_local"]) {
+      const child = spawnAliveProcess();
+      childProcesses.add(child);
+      ownedChildren.push(child);
+      expect(child.pid).toBeGreaterThan(0);
+      const { runId } = await seedRunFixture({
+        adapterType,
+        agentStatus: "running",
+        includeIssue: false,
+        processPid: child.pid,
+        contextSnapshot: {
+          executionEngine: "cli",
+          processTopology: "detached",
+        },
+      });
+      activeRunIds.push(runId);
+      runningProcesses.set(runId, { child, graceSec: 1, processGroupId: null });
+    }
+    await seedRunFixture({ runStatus: "failed", includeIssue: false });
+
+    await withTempPaperclipHome(async (home) => {
+      // Match the CLI producer: it has no preflight IDs, drain reason, or
+      // process-start identity. A drain must still record the actual live set.
+      const intentPath = resolveHotRestartIntentPath(home);
+      await fs.mkdir(path.dirname(intentPath), { recursive: true });
+      await fs.writeFile(intentPath, JSON.stringify({
+        version: 1,
+        requestedAt: "2026-08-04T00:05:00.000Z",
+        previousServerPid: process.pid,
+        previousServerVersion: "old-cli-version",
+        drainRequired: true,
+        requestedByRunId: null,
+      }));
+      const heartbeat = heartbeatService(db);
+      const preparation = await heartbeat.prepareHotRestartShutdown(
+        "SIGTERM", new Date("2026-08-04T00:06:00.000Z"),
+      );
+      const snapshot = await readHotRestartIntent();
+      const drain = await heartbeat.drainRunningRunsForShutdown(
+        "SIGTERM", new Date("2026-08-04T00:06:01.000Z"),
+      );
+      for (const child of ownedChildren) {
+        expect(await waitForPidExit(child.pid!)).toBe(true);
+      }
+      const interrupted = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.status, "interrupted"),
+          eq(heartbeatRuns.errorCode, "server_shutdown_interrupted"),
+        ));
+      await heartbeat.reconcileHotRestartAdoption(
+        new Date("2026-08-04T00:07:00.000Z"),
+      );
+      const report = JSON.parse(
+        await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
+      ) as HotRestartReport;
+
+      // Compare complete sets across the actual producer, drain, persisted
+      // terminal rows, and report. A count alone would hide missing/replaced IDs.
+      const expectedIds = [...activeRunIds].sort();
+      expect(drain.interruptedRunIds.toSorted()).toEqual(expectedIds);
+      expect(interrupted.map((run) => run.id).sort()).toEqual(expectedIds);
+      expect(report.runs.map((run) => run.runId).sort()).toEqual(expectedIds);
+      expect(snapshot?.shutdownSnapshot?.activeRuns.map((run) => run.runId).sort())
+        .toEqual(expectedIds);
+      expect(preparation).toEqual({
+        mode: "drain_required", skipDrain: false,
+        activeRunIds: expect.arrayContaining(expectedIds),
+      });
+      expect(preparation.activeRunIds.toSorted()).toEqual(expectedIds);
+      expect(snapshot).toMatchObject({
+        drainRequired: true, drainReason: null, preflightActiveRunIds: [],
+      });
+      expect(report.finalizedWhileDownRunIds.toSorted()).toEqual(expectedIds);
+      expect([report.adoptedRunIds, report.lostRunIds, report.skippedRunIds])
+        .toEqual([[], [], []]);
+      expect(report.drainReason).toBe("requested");
+      for (const run of report.runs) {
+        expect(run).toMatchObject({
+          status: "interrupted", classification: "finalized_while_down",
+          reason: "run_status_interrupted",
+        });
+      }
     });
   });
 

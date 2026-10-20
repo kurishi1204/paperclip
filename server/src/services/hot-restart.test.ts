@@ -12,6 +12,7 @@ import {
   resolveHotRestartIntentPath,
   resolveLegacyHotRestartIntentPath,
   writeHotRestartIntent,
+  writeHotRestartShutdownSnapshot,
 } from "./hot-restart.js";
 
 const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
@@ -31,6 +32,35 @@ async function withTempHome<T>(fn: (homeDir: string) => Promise<T>) {
 }
 
 describe("hot-restart path compatibility", () => {
+  it("keeps CLI drain intent fields when the shutdown snapshot is written", async () => {
+    await withTempHome(async (homeDir) => {
+      const intent = parseHotRestartIntent({
+        version: 1,
+        requestedAt: "2026-08-04T00:05:00.000Z",
+        previousServerPid: 123,
+        previousServerVersion: "old-cli-version",
+        drainRequired: true,
+        requestedByRunId: null,
+      });
+      expect(intent).not.toBeNull();
+      expect(intent?.preflightActiveRunIds).toEqual([]);
+      expect(findMissingHotRestartSnapshotRunIds(intent!)).toEqual([]);
+      const activeRuns = [{
+        runId: "run-1", companyId: "company-1", agentId: "agent-1",
+        adapterType: "claude_local", status: "running", processPid: 456,
+        processGroupId: null, issueId: null,
+      }];
+      await writeHotRestartShutdownSnapshot({
+        intent: intent!, signal: "SIGTERM", activeRuns,
+        capturedAt: new Date("2026-08-04T00:06:00.000Z"), homeDir,
+      });
+      expect(await readHotRestartIntent(homeDir)).toMatchObject({
+        drainRequired: true, drainReason: null, preflightActiveRunIds: [],
+        shutdownSnapshot: { activeRuns },
+      });
+    });
+  });
+
   it("reads version-1 native recovery fields without making them mandatory", () => {
     expect(
       parseHotRestartIntent({
