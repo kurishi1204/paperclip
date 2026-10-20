@@ -49,6 +49,37 @@ function dryRunJson(args, envOverrides = {}) {
   return JSON.parse(result.stdout);
 }
 
+test("dry-run remains byte-identical when ownership tools are unavailable", () => {
+  const expected = dryRun([]);
+  const unavailable = dryRun([], { PATH: "" });
+  assert.equal(expected.status, 0);
+  assert.equal(unavailable.status, 0);
+  assert.equal(unavailable.stdout, expected.stdout);
+  assert.equal(unavailable.stderr, expected.stderr);
+});
+
+test("unavailable ownership lookup stops the common entry before any Vitest job", () => {
+  const result = spawnSync(process.execPath, [script, "--mode", "general", "--group", "general-workspaces-b"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: workflowEnv({ PATH: "" }),
+    timeout: 20_000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.doesNotMatch(result.stdout, /\[test:run\]/);
+  assert.match(result.stderr, /Port-owner lookup returned no owner/);
+  assert.match(result.stderr, /Preserve the host PATH/);
+});
+
+test("the real host lookup identifies the probe's own ephemeral listener", () => {
+  const result = spawnSync(process.execPath, [
+    "--import", path.join(repoRoot, "cli/node_modules/tsx/dist/loader.mjs"),
+    path.join(repoRoot, "scripts/check-vitest-test-host.mjs"),
+  ], { cwd: repoRoot, encoding: "utf8", env: workflowEnv(), timeout: 20_000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, new RegExp(`Local listener belongs to probe PID ${result.pid}\\.`));
+});
+
 const SHARD_COUNT = 12;
 const SERIALIZED_SHARD_COUNT = 9;
 

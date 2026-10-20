@@ -610,6 +610,23 @@ if (options.dryRun) {
   process.exit(0);
 }
 
+// Use the production lookup before any expensive suite starts. The child owns
+// the listener and is bounded even if the host's lookup command does not return.
+const testHost = spawnSync(process.execPath, [
+  "--import", path.join(repoRoot, "cli/node_modules/tsx/dist/loader.mjs"),
+  path.join(scriptsDir, "check-vitest-test-host.mjs"),
+], {
+  cwd: repoRoot,
+  env: process.env,
+  stdio: "inherit",
+  timeout: 15_000,
+  killSignal: "SIGKILL",
+});
+if (testHost.error || testHost.status !== 0) {
+  console.error(`[test:host] Preflight failed before Vitest: ${testHost.error?.message ?? `probe exit ${testHost.status ?? testHost.signal}`}`);
+  process.exit(1);
+}
+
 if (options.mode === generalModeName || options.mode === allModeName) {
   if (options.group) {
     runGeneralGroup(routeTests, options.group, options.shardIndex, options.shardCount);
