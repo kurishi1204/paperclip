@@ -35,8 +35,16 @@ lookup to verify its PID. If this fails, install missing ownership tools and kee
 the original host `PATH` when adding toolchain directories. On macOS, this normally includes `/usr/sbin` for `lsof`.
 The probe cannot change managed services and has a 15-second process limit.
 `--dry-run` only prints the existing plan and does not run the probe.
-Run `node --test scripts/check-vitest-test-host.test.mjs` after dependency
-installation to check both missing-lookup rejection and the real owner match.
+After dependency installation, check missing-lookup rejection, the real owner
+match, and the existing isolated chat CLI fixture:
+
+```sh
+node --test scripts/check-vitest-test-host.test.mjs
+pnpm exec vitest run --project @paperclipai/server server/src/__tests__/vitest-chat-shards.test.ts
+```
+
+The probe and its loader resolve from the runner source. The current working
+directory still selects the target test tree, including isolated CLI fixtures.
 
 ## Trusted PR Workflow
 

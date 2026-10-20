@@ -612,8 +612,9 @@ if (options.dryRun) {
 
 // Use the production lookup before any expensive suite starts. The child owns
 // the listener and is bounded even if the host's lookup command does not return.
+// Resolve probe dependencies beside this source; cwd selects the target tests.
 const testHost = spawnSync(process.execPath, [
-  "--import", pathToFileURL(path.join(repoRoot, "cli/node_modules/tsx/dist/loader.mjs")).href,
+  "--import", pathToFileURL(path.join(scriptsDir, "../cli/node_modules/tsx/dist/loader.mjs")).href,
   path.join(scriptsDir, "check-vitest-test-host.mjs"),
 ], {
   cwd: repoRoot,
