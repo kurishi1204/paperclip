@@ -3601,7 +3601,9 @@ export function recoveryService(
             prior.ownerType === "board" && prior.wakePolicy?.type === "board_escalation") return null;
         // A newly committed recovery hold or execution/wait path wins over
         // the sweep's earlier snapshot. Do not cancel or overwrite that owner.
-        if (prior && (prior.kind !== "deliberate_wait_without_target" || prior.fingerprint !== input.fingerprint)) return null;
+        if (prior && (prior.kind !== "deliberate_wait_without_target" || prior.ownerType !== "agent")) return null;
+        // An agent-owned stale fingerprint still uses the existing reset
+        // below. A changed source must not strand an unavailable owner.
         const paths = await collectDispositionRepairSourceState(tx as unknown as Db, { issue: current });
         if (paths.hasActiveExecutionPath || paths.hasDurableWaitingPath) return null;
         const action = await ensureDispositionRepairAction({

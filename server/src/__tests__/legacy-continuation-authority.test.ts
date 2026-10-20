@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { legacyExecutionNeedsReconciliationWithEvidence, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -397,6 +398,34 @@ describe("legacy continuation persisted authority", () => {
     expect(escalationRows(state).comments).toHaveLength(0);
     expect(state.runs).toHaveLength(3);
   });
+  it.each(["legacy", "non-legacy"])("resets an agent-owned stale fingerprint before %s escalation", async kind => {
+    const f = kind === "legacy" ? await finalRepair(2, true) : await fixture();
+    const staleFingerprint = "disposition_repair:v1:previous-state";
+    if (kind === "legacy") {
+      await db.update(issueRecoveryActions).set({ fingerprint: staleFingerprint }).where(eq(issueRecoveryActions.companyId, f.companyId));
+    } else {
+      await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "issue_continuation_waiting_on_review",
+        finishedAt: new Date(), contextSnapshot: { issueId: f.issueId, dispositionRepairAttempt: 1,
+          dispositionRepairFingerprint: staleFingerprint }, resultJson: { conversationContinuation: "continue_conversation_v1" },
+      }).where(eq(heartbeatRuns.id, f.runId));
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, f.agentId));
+      await issueRecoveryActionService(db).upsertSourceScoped({ companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "deliberate_wait_without_target", ownerType: "agent", ownerAgentId: f.agentId,
+        cause: "deliberate_wait_without_target", fingerprint: staleFingerprint, nextAction: "Record a disposition.",
+        wakePolicy: { type: "bounded_owner_disposition_repair", attempt: 1, maxAttempts: 5 }, attemptCount: 1, maxAttempts: 5 });
+    }
+    const before = await snapshot(f);
+    await f.createRecovery().reconcileStrandedAssignedIssues();
+    const state = await snapshot(f), rows = escalationRows(state);
+    expect(state.issue[0]).toMatchObject({ status: "blocked", assigneeAgentId: f.agentId });
+    expect(rows.actions).toHaveLength(1); expect(rows.actions[0]).toMatchObject({ ownerType: "board" });
+    expect(rows.actions[0].fingerprint).not.toBe(staleFingerprint);
+    const previous = state.actions.find(row => row.id === before.actions.find(row => row.status === "active")!.id)!;
+    expect(previous).toMatchObject({ status: "cancelled", resolutionNote: "source_state_changed", fingerprint: staleFingerprint });
+    expect(state.activity.filter(row => row.action === "issue.disposition_repair_fingerprint_reset")).toHaveLength(1);
+    expect(rows.comments).toHaveLength(1); expect(rows.activity).toHaveLength(1);
+    expect(state.runs).toEqual(before.runs); expect(state.wakes).toEqual(before.wakes);
+  });
   async function holdIssueLock(issueId: string) {
     let acquired!: (tx: any) => void, release!: () => void;
     const locked = new Promise<any>(resolve => { acquired = resolve; });
@@ -463,7 +492,7 @@ describe("legacy continuation persisted authority", () => {
     }
     expect(state.runs).toEqual(before.runs); expect(state.wakes).toEqual(before.wakes);
   });
-  it.each(["run", "wake", "hold", "monitor", "approval"])("preserves a new %s committed before the escalation lock", async change => {
+  it.each(["run", "wake", "hold", "monitor", "approval", "board-fingerprint"])("preserves a new %s committed before the escalation lock", async change => {
     const f = await finalRepair(), held = await holdIssueLock(f.issueId);
     const pending = f.createRecovery().reconcileStrandedAssignedIssues();
     let expected: Awaited<ReturnType<typeof snapshot>>;
@@ -480,6 +509,10 @@ describe("legacy continuation persisted authority", () => {
         const [run] = await held.tx.update(heartbeatRuns).set({ resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" } }).where(eq(heartbeatRuns.id, f.failed.id)).returning();
         await terminalizeLegacyExecution({ db: held.tx, run, status: "failed", fromStatuses: ["failed"] });
       }
+      if (change === "board-fingerprint") await issueRecoveryActionService(held.tx).upsertSourceScoped({
+        companyId: f.companyId, sourceIssueId: f.issueId, kind: "deliberate_wait_without_target",
+        ownerType: "board", cause: "deliberate_wait_without_target", fingerprint: "different-board-state",
+        nextAction: "Inspect the board-owned source.", wakePolicy: { type: "board_escalation" } });
       if (change === "monitor") await held.tx.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 60_000) }).where(eq(issues.id, f.issueId));
       if (change === "approval") await held.tx.insert(issueThreadInteractions).values({ companyId: f.companyId,
         issueId: f.issueId, kind: "request_confirmation", status: "pending", payload: { version: 1, prompt: "Continue?" } });
