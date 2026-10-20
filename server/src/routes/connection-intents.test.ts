@@ -8,8 +8,13 @@ import {
   RUNTIME_CONNECTION_TOOL_DEFINITIONS,
   wakeConnectionIntentAfterResolution,
 } from "./connection-intents.js";
+import { RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES } from "../services/connection-tool-definitions.js";
 
 describe("runtime connection MCP contract", () => {
+  it("derives client read approvals only from the first-party advertised read tool", () => {
+    expect(RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES).toEqual(["connections_search"]);
+    expect(RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES.every((name) => RUNTIME_CONNECTION_TOOL_DEFINITIONS.some((tool) => tool.name === name && tool.annotations.readOnlyHint))).toBe(true);
+  });
   it("advertises both canonical tools with the shared descriptions and narrow schemas", () => {
     expect(
       RUNTIME_CONNECTION_TOOL_DEFINITIONS.map((tool) => tool.name),
@@ -17,6 +22,7 @@ describe("runtime connection MCP contract", () => {
     expect(RUNTIME_CONNECTION_TOOL_DEFINITIONS).toEqual([
       {
         name: "connections_search",
+        annotations: { readOnlyHint: true },
         description: CONNECTIONS_SEARCH_TOOL_DESCRIPTION,
         inputSchema: {
           type: "object",
@@ -32,6 +38,7 @@ describe("runtime connection MCP contract", () => {
       },
       {
         name: "connection_request",
+        annotations: { readOnlyHint: false },
         description: CONNECTION_REQUEST_TOOL_DESCRIPTION,
         inputSchema: {
           type: "object",

@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { parse as parseToml } from "smol-toml";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 import { isCodexAuthCachePath, readSubscriptionAccountId } from "./codex-auth-cache.js";
@@ -31,6 +32,7 @@ export type ManagedCodexMcpGateway = {
   name: string;
   endpointPath: string;
   bearerToken: string;
+  readOnlyAutoApproveTools?: readonly string[];
 };
 
 export function mergeManagedCodexMcpGateways(
@@ -41,7 +43,8 @@ export function mergeManagedCodexMcpGateways(
   const names = new Set(primary.map((gateway) => gateway.name));
   for (const gateway of secondary) {
     if (names.has(gateway.name)) continue;
-    merged.push(gateway);
+    // Invocation context is data, not the server-owned runtime approval source.
+    merged.push({ name: gateway.name, endpointPath: gateway.endpointPath, bearerToken: gateway.bearerToken });
     names.add(gateway.name);
   }
   return merged;
@@ -277,18 +280,19 @@ function stripManagedMcpBlock(config: string): string {
 }
 
 function readCodexMcpServerNames(config: string): Set<string> {
-  const names = new Set<string>();
-  for (const match of config.matchAll(/^\s*\[\s*mcp_servers\s*\.\s*(?:"([^"]+)"|'([^']+)'|([^\]\s#]+))\s*\]/gm)) {
-    const name = match[1] ?? match[2] ?? match[3];
-    if (name) names.add(name.trim());
+  const servers = parseToml(config).mcp_servers;
+  if (servers === undefined) return new Set();
+  if (!servers || typeof servers !== "object" || Array.isArray(servers) || servers instanceof Date) {
+    throw new Error("mcp_servers must be a TOML table");
   }
-  return names;
+  return new Set(Object.keys(servers));
 }
 
 function buildManagedMcpBlock(input: {
   gateways: ManagedCodexMcpGateway[];
   apiBaseUrl: string;
   existingNames: Set<string>;
+  allowReadOnlyAutoApproval: boolean;
 }): { block: string; warnings: string[] } {
   const warnings: string[] = [];
   const usedNames = new Set<string>();
@@ -318,6 +322,18 @@ function buildManagedMcpBlock(input: {
       `url = ${tomlString(url)}`,
       `http_headers = { Authorization = ${tomlString(`Bearer ${gateway.bearerToken}`)} }`,
     );
+    if (input.allowReadOnlyAutoApproval && gateway.readOnlyAutoApproveTools !== undefined) {
+      const tools = gateway.readOnlyAutoApproveTools;
+      // Quoted TOML keys preserve exact MCP names (including colons). A malformed
+      // array is rejected as a whole; never silently truncate or guess a name.
+      if (!Array.isArray(tools) || tools.some((tool) => typeof tool !== "string" || !tool.length || /[\uD800-\uDFFF]/u.test(tool))) {
+        warnings.push(`Ignored malformed runtime read approvals for MCP server "${managedName}".`);
+      } else {
+        for (const tool of [...new Set(tools)].sort()) {
+          lines.push("", `[mcp_servers.${tomlString(managedName)}.tools.${tomlString(tool)}]`, 'approval_mode = "approve"');
+        }
+      }
+    }
   });
   lines.push(MANAGED_MCP_BLOCK_END);
   return { block: lines.join("\n"), warnings };
@@ -327,6 +343,8 @@ export async function writeManagedCodexMcpConfig(input: {
   codexHome: string;
   apiBaseUrl: string;
   gateways: ManagedCodexMcpGateway[];
+  /** Caller verified a disposable run home and a compatible actual Codex binary. */
+  allowReadOnlyAutoApproval?: boolean;
 }): Promise<{ configPath: string; warnings: string[] }> {
   const configPath = path.join(input.codexHome, "config.toml");
   await fs.mkdir(input.codexHome, { recursive: true });
@@ -335,10 +353,16 @@ export async function writeManagedCodexMcpConfig(input: {
     throw error;
   });
   const unmanagedConfig = stripManagedMcpBlock(existing);
+  let existingNames: Set<string>;
+  try { existingNames = readCodexMcpServerNames(unmanagedConfig); }
+  catch {
+    throw new Error("Unmanaged Codex config could not be parsed; managed MCP config was not changed.");
+  }
   const { block, warnings } = buildManagedMcpBlock({
     gateways: input.gateways,
     apiBaseUrl: input.apiBaseUrl,
-    existingNames: readCodexMcpServerNames(unmanagedConfig),
+    existingNames,
+    allowReadOnlyAutoApproval: input.allowReadOnlyAutoApproval === true,
   });
   const next = input.gateways.length > 0
     ? `${unmanagedConfig}${unmanagedConfig ? "\n\n" : ""}${block}\n`
@@ -346,6 +370,20 @@ export async function writeManagedCodexMcpConfig(input: {
   await fs.writeFile(configPath, next, { mode: 0o600 });
   await fs.chmod(configPath, 0o600);
   return { configPath, warnings };
+}
+
+export function supportsCodexMcpReadApproval(version: string): boolean {
+  const match = /^codex-cli (\d+)\.(\d+)\.(\d+)(?:[-+][\w.-]+)?$/.exec(version.trim());
+  return Boolean(match && (Number(match[1]) > 0 || Number(match[2]) >= 154));
+}
+
+export function isRunScopedManagedCodexHome(config: Record<string, unknown>, codexHome: string): boolean {
+  const env = config.env as Record<string, unknown> | undefined;
+  const managed = config.managedAiConnection as Record<string, unknown> | undefined;
+  const home = typeof env?.HOME === "string" ? env.HOME : "";
+  return managed?.provider === "openai" && path.isAbsolute(home) && home !== process.env.HOME &&
+    codexHome === path.join(home, "provider") && env?.CODEX_HOME === codexHome &&
+    env?.XDG_CONFIG_HOME === path.join(home, "config") && env?.XDG_DATA_HOME === path.join(home, "data");
 }
 
 /**

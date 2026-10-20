@@ -83,6 +83,8 @@ import {
   stageCodexHomeForSync,
   mergeManagedCodexMcpGateways,
   writeManagedCodexMcpConfig,
+  supportsCodexMcpReadApproval,
+  isRunScopedManagedCodexHome,
   type ManagedCodexMcpGateway,
 } from "./codex-home.js";
 import {
@@ -762,7 +764,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       name: server.name,
       endpointPath: server.url,
       bearerToken: server.token,
+      readOnlyAutoApproveTools: server.readOnlyAutoApproveTools,
     }));
+    let allowReadOnlyAutoApproval = false;
+    if (runtimeMcpGateways.some((gateway) => gateway.readOnlyAutoApproveTools?.length)) {
+      if (!executionTargetIsRemote && isRunScopedManagedCodexHome(config, effectiveCodexHome)) {
+        const version = await runAdapterExecutionTargetProcess(runId, null, command, ["--version"], {
+          cwd, env: envConfigStrings, timeoutSec: 10, graceSec: 1, onLog,
+        });
+        allowReadOnlyAutoApproval = version.exitCode === 0 && !version.timedOut && supportsCodexMcpReadApproval(version.stdout);
+      }
+      if (!allowReadOnlyAutoApproval) await onLog("stderr", "[paperclip] Runtime read approvals require a disposable local managed Codex home and codex-cli >= 0.154.0; approvals were not projected.\n");
+    }
     const managedMcpGateways = mergeManagedCodexMcpGateways(
       runtimeMcpGateways,
       managedMcpGatewaysFromContext(context),
@@ -771,6 +784,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       codexHome: effectiveCodexHome,
       apiBaseUrl: paperclipBaseEnv.PAPERCLIP_API_URL,
       gateways: managedMcpGateways,
+      allowReadOnlyAutoApproval,
     });
     if (managedMcpGateways.length > 0) {
       await onLog(

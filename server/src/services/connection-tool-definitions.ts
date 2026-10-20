@@ -3,6 +3,7 @@ import { CONNECTION_REQUEST_TOOL_DESCRIPTION, CONNECTIONS_SEARCH_TOOL_DESCRIPTIO
 export const RUNTIME_CONNECTION_TOOL_DEFINITIONS = [
   {
     name: "connections_search",
+    annotations: { readOnlyHint: true },
     description: CONNECTIONS_SEARCH_TOOL_DESCRIPTION,
     inputSchema: {
       type: "object",
@@ -12,6 +13,7 @@ export const RUNTIME_CONNECTION_TOOL_DEFINITIONS = [
   },
   {
     name: "connection_request",
+    annotations: { readOnlyHint: false },
     description: CONNECTION_REQUEST_TOOL_DESCRIPTION,
     inputSchema: {
       type: "object",
@@ -21,3 +23,9 @@ export const RUNTIME_CONNECTION_TOOL_DEFINITIONS = [
     },
   },
 ] as const;
+
+// These are Paperclip-owned definitions, not upstream MCP risk hints. Never
+// derive client approvals from catalog names, provider hints or default risks.
+export const RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES = RUNTIME_CONNECTION_TOOL_DEFINITIONS
+  .filter((tool) => tool.annotations.readOnlyHint === true)
+  .map((tool) => tool.name);

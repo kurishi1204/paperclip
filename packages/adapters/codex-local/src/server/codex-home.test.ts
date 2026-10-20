@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { parse as parseToml } from "smol-toml";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CODEX_SYNC_ALLOWLIST,
@@ -14,6 +15,8 @@ import {
   seedManagedCodexHome,
   stageCodexHomeForSync,
   writeManagedCodexMcpConfig,
+  supportsCodexMcpReadApproval,
+  isRunScopedManagedCodexHome,
 } from "./codex-home.js";
 
 describe("mergeManagedCodexMcpGateways", () => {
@@ -34,6 +37,78 @@ describe("mergeManagedCodexMcpGateways", () => {
 });
 
 describe("codex managed home", () => {
+  it("projects only runtime read approvals onto the final managed server name and removes stale approvals", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-read-approval-"));
+    try {
+      await fs.writeFile(path.join(root, "config.toml"), '[mcp_servers."runtime".tools."unmanaged"]\napproval_mode="prompt"\n');
+      const gateways = [{ name: "runtime", endpointPath: "/mcp", bearerToken: "run-token", readOnlyAutoApproveTools: ["read:exact", "read:exact"] }];
+      await writeManagedCodexMcpConfig({ codexHome: root, apiBaseUrl: "https://paperclip.example", gateways, allowReadOnlyAutoApproval: true });
+      let config = await fs.readFile(path.join(root, "config.toml"), "utf8");
+      expect(config).toContain('[mcp_servers."paperclip-runtime".tools."read:exact"]\napproval_mode = "approve"');
+      expect(config.match(/approval_mode = "approve"/g)).toHaveLength(1);
+      expect(config).not.toContain("default_tools");
+      expect(config).not.toContain("approval_policy");
+      await writeManagedCodexMcpConfig({ codexHome: root, apiBaseUrl: "https://paperclip.example", gateways: [{ ...gateways[0]!, readOnlyAutoApproveTools: [] }], allowReadOnlyAutoApproval: true });
+      config = await fs.readFile(path.join(root, "config.toml"), "utf8");
+      expect(config).not.toContain("read:exact");
+      expect(config).toContain('approval_mode="prompt"');
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it("never accepts approval metadata from the secondary invocation context", () => {
+    expect(mergeManagedCodexMcpGateways([], [{ name: "context", endpointPath: "/mcp", bearerToken: "token", readOnlyAutoApproveTools: ["write"] }]))
+      .toEqual([{ name: "context", endpointPath: "/mcp", bearerToken: "token" }]);
+  });
+
+  it("does not project read approvals unless the caller verified its isolated runtime and Codex capability", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-read-approval-"));
+    try {
+      await writeManagedCodexMcpConfig({ codexHome: root, apiBaseUrl: "https://paperclip.example", gateways: [{ name: "runtime", endpointPath: "/mcp", bearerToken: "run-token", readOnlyAutoApproveTools: ["read"] }] });
+      expect(await fs.readFile(path.join(root, "config.toml"), "utf8")).not.toContain("approval_mode");
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each([null, "read", ["read", 3], ["read", "\uD800"]])("rejects malformed read approval metadata as a whole: %j", async (tools) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-read-approval-"));
+    try {
+      const result = await writeManagedCodexMcpConfig({ codexHome: root, apiBaseUrl: "https://paperclip.example", gateways: [{ name: "runtime", endpointPath: "/mcp", bearerToken: "token", readOnlyAutoApproveTools: tools as never }], allowReadOnlyAutoApproval: true });
+      expect(await fs.readFile(path.join(root, "config.toml"), "utf8")).not.toContain("approval_mode");
+      expect(result.warnings).toHaveLength(1);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it("quotes exact tool names without creating other TOML tables", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-read-approval-"));
+    try {
+      const tool = 'read\"]\n[mcp_servers.evil]\nurl="unexpected';
+      await writeManagedCodexMcpConfig({ codexHome: root, apiBaseUrl: "https://paperclip.example", gateways: [{ name: "runtime", endpointPath: "/mcp", bearerToken: "token", readOnlyAutoApproveTools: [tool] }], allowReadOnlyAutoApproval: true });
+      const parsed = parseToml(await fs.readFile(path.join(root, "config.toml"), "utf8")) as { mcp_servers: Record<string, { tools: Record<string, unknown> }> };
+      expect(Object.keys(parsed.mcp_servers)).toEqual(["runtime"]);
+      expect(Object.keys(parsed.mcp_servers.runtime!.tools)).toEqual([tool]);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['[mcp_servers."unfinished"', 'mcp_servers="invalid"'])('stops before changing an invalid unmanaged config: %s', async (original) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-read-approval-"));
+    try {
+      await fs.writeFile(path.join(root, "config.toml"), original);
+      await expect(writeManagedCodexMcpConfig({ codexHome: root, apiBaseUrl: "https://paperclip.example", gateways: [{ name: "runtime", endpointPath: "/mcp", bearerToken: "token", readOnlyAutoApproveTools: ["read"] }], allowReadOnlyAutoApproval: true })).rejects.toThrow("config was not changed");
+      expect(await fs.readFile(path.join(root, "config.toml"), "utf8")).toBe(original);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it("requires the run's disposable managed provider home and actual supported CLI version", () => {
+    const home = path.join(os.tmpdir(), "paperclip-ai-test-run");
+    const env = { HOME: home, CODEX_HOME: path.join(home, "provider"), XDG_CONFIG_HOME: path.join(home, "config"), XDG_DATA_HOME: path.join(home, "data") };
+    const config = { env, managedAiConnection: { provider: "openai" } };
+    expect(isRunScopedManagedCodexHome(config, env.CODEX_HOME)).toBe(true);
+    expect(isRunScopedManagedCodexHome(config, path.join(home, "shared-connector"))).toBe(false);
+    expect(isRunScopedManagedCodexHome({ env }, env.CODEX_HOME)).toBe(false);
+    expect(supportsCodexMcpReadApproval("codex-cli 0.154.0\n")).toBe(true);
+    expect(supportsCodexMcpReadApproval("codex-cli 0.153.9")).toBe(false);
+    expect(supportsCodexMcpReadApproval("unknown")).toBe(false);
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
   });
