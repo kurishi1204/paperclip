@@ -97,6 +97,7 @@ describe("issueRecoveryActionService", () => {
     });
 
     const fakeDb = {
+      transaction: async <T>(callback: (tx: any) => Promise<T>): Promise<T> => callback(fakeDb),
       select: vi.fn(() => makeSelectQuery(selectResults.shift() ?? [])),
       update: vi.fn(() => ({
         set: vi.fn(() => ({
@@ -134,6 +135,7 @@ describe("issueRecoveryActionService", () => {
   function conflictDb(error: unknown, recover: boolean) {
     const row = makeRecoveryActionRow(); let reads = 0;
     const fakeDb = {
+      transaction: async <T>(callback: (tx: any) => Promise<T>): Promise<T> => callback(fakeDb),
       select: vi.fn(() => ({ from() { return this; }, where() { return this; }, orderBy() { return this; },
         limit: async () => recover && reads++ > 0 ? [row] : [] })),
       insert: vi.fn(() => ({ values: () => ({ returning: async () => { throw error; } }) })),
@@ -284,7 +286,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       const sourceIssueId = randomUUID();
       await db.insert(issues).values({ id: sourceIssueId, companyId: f.companyId, title: "Driver control", status: "in_progress", assigneeAgentId: f.coderId });
       const insert = vi.fn(() => ({ values: () => ({ returning: async () => { throw failure; } }) }));
-      const proxy = new Proxy(db, { get(target, key) { const value = key === "insert" ? insert : Reflect.get(target, key); return typeof value === "function" ? value.bind(target) : value; } });
+      function failingDb(connection: typeof db): typeof db {
+        return new Proxy(connection, { get(target, key) {
+          if (key === "transaction") return (callback: (tx: typeof db) => Promise<unknown>) => target.transaction(tx => callback(failingDb(tx as unknown as typeof db)));
+          const value = key === "insert" ? insert : Reflect.get(target, key);
+          return typeof value === "function" ? value.bind(target) : value;
+        } });
+      }
+      const proxy = failingDb(db);
       await expect(issueRecoveryActionService(proxy).upsertSourceScoped({ ...base, sourceIssueId })).rejects.toBe(failure);
       expect(insert).toHaveBeenCalledTimes(1);
       expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId))).toHaveLength(0);
@@ -311,11 +320,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           };
         } });
       }
-      return new Proxy(db, { get(target, key) {
-        if (key === "select") return (...args: unknown[]) => wrap((target.select as any)(...args), "read");
-        if (key === "insert") return (...args: unknown[]) => wrap((target.insert as any)(...args), "insert");
-        const value = Reflect.get(target, key); return typeof value === "function" ? value.bind(target) : value;
-      } });
+      function connectionProxy(connection: typeof db): typeof db {
+        return new Proxy(connection, { get(target, key) {
+          if (key === "transaction") return (callback: (tx: typeof db) => Promise<unknown>) => target.transaction(tx => callback(connectionProxy(tx as unknown as typeof db)));
+          if (key === "select") return (...args: unknown[]) => wrap((target.select as any)(...args), "read");
+          if (key === "insert") return (...args: unknown[]) => wrap((target.insert as any)(...args), "insert");
+          const value = Reflect.get(target, key); return typeof value === "function" ? value.bind(target) : value;
+        } });
+      }
+      return connectionProxy(db);
     }
     const input = { companyId: f.companyId, sourceIssueId: f.sourceIssueId, kind: "deliberate_wait_without_target" as const,
       ownerType: "agent" as const, ownerAgentId: f.coderId, cause: "deliberate_wait_without_target" as const,
@@ -334,6 +347,46 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await sequential.upsertSourceScoped({ ...input, sourceIssueId: secondIssueId });
     const control = await sequential.upsertSourceScoped({ ...input, sourceIssueId: secondIssueId });
     expect(rows[0]).toMatchObject({ status: control.status, ownerType: control.ownerType, attemptCount: control.attemptCount, maxAttempts: control.maxAttempts });
+  });
+
+  it("keeps the outer transaction usable after a real scoped insert conflict", async () => {
+    const f = await seedCompany();
+    const input = { companyId: f.companyId, sourceIssueId: f.sourceIssueId,
+      kind: "deliberate_wait_without_target" as const, ownerType: "agent" as const, ownerAgentId: f.coderId,
+      cause: "deliberate_wait_without_target" as const, fingerprint: "transaction-race",
+      nextAction: "Choose a disposition.", attemptCount: 2, maxAttempts: 2 };
+    let winnerId: string | undefined;
+    const result = await db.transaction(async tx => {
+      let firstRead = true;
+      function wrap(query: any): any {
+        return new Proxy(query, { get(target, key) {
+          const value = Reflect.get(target, key);
+          if (typeof value !== "function") return value;
+          return (...args: unknown[]) => {
+            const next = value.apply(target, args);
+            if (key === "limit") return Promise.resolve(next).then(async rows => {
+              if (firstRead) {
+                firstRead = false; expect(rows).toEqual([]);
+                winnerId = (await issueRecoveryActionService(db).upsertSourceScoped(input)).id;
+              }
+              return rows;
+            });
+            return ["from", "where", "orderBy"].includes(String(key)) ? wrap(next) : next;
+          };
+        } });
+      }
+      const proxy = new Proxy(tx, { get(target, key) {
+        if (key === "select") return (...args: unknown[]) => wrap((target.select as any)(...args));
+        const value = Reflect.get(target, key); return typeof value === "function" ? value.bind(target) : value;
+      } });
+      const action = await issueRecoveryActionService(proxy as unknown as typeof db).upsertSourceScoped(input);
+      // A recovered insert must not poison its caller's transaction.
+      const rows = await tx.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+      expect(rows).toHaveLength(1);
+      return action;
+    });
+    expect(result.id).toBe(winnerId);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.sourceIssueId))).toHaveLength(1);
   });
 
   async function seedHeartbeatRun(input: {

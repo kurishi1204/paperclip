@@ -3584,147 +3584,161 @@ export function recoveryService(
   }) {
     const publications: ActivityPublication[] = [];
     const postCommitActions: IssuePostCommitAction[] = [];
-    const updated = await db.transaction(async tx => {
-      const [current] = await tx.select().from(issues).where(and(
-        eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id),
-      )).for("update").limit(1);
-      // A newer owner/disposition or another escalation wins this source.
-      if (!current || current.hiddenAt || current.assigneeAgentId !== input.issue.assigneeAgentId ||
-          current.assigneeUserId !== input.issue.assigneeUserId || current.status !== input.issue.status) return null;
-      const [prior] = await tx.select().from(issueRecoveryActions).where(and(
-        eq(issueRecoveryActions.companyId, current.companyId), eq(issueRecoveryActions.sourceIssueId, current.id),
-        inArray(issueRecoveryActions.status, ["active", "escalated"]),
-      )).for("update").limit(1);
-      if (prior?.kind === "deliberate_wait_without_target" && prior.fingerprint === input.fingerprint &&
-          prior.ownerType === "board" && prior.wakePolicy?.type === "board_escalation") return null;
-      const action = await ensureDispositionRepairAction({
-        issue: current,
-        latestRun: input.latestRun,
-        fingerprint: input.fingerprint,
-        attemptCount: input.attemptCount,
-        legacyEpisode: input.legacyEpisode,
-      }, tx as unknown as Db, publications);
-      const now = new Date();
-      const [boarded] = await tx
-        .update(issueRecoveryActions)
-        .set({
-          status: "active",
-          ownerType: "board",
-          ownerAgentId: null,
-          ownerUserId: null,
-          maxAttempts: null,
-          evidence: {
-            ...action.evidence,
-            latestRunId: input.latestRun?.id ?? null,
-            latestRunStatus: input.latestRun?.status ?? null,
-            latestRunErrorCode: input.latestRun?.errorCode ?? null,
-            terminalReason: input.terminalReason,
-            sourceAttemptCount: input.attemptCount,
-            sourceMaxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
-            routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
-          },
-          nextAction:
-            "Inspect the evidence and choose whether to repair, retry the original owner, explicitly reassign, or resolve the source issue.",
-          wakePolicy: {
-            type: "board_escalation",
-            reason: input.terminalReason,
-            preservesSourceAssignee: true,
-          },
-          timeoutAt: null,
-          resolutionNote: input.terminalReason,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issueRecoveryActions.id, action.id),
-            eq(issueRecoveryActions.companyId, current.companyId),
-            eq(issueRecoveryActions.sourceIssueId, current.id),
-            inArray(issueRecoveryActions.status, ["active", "escalated"]),
-          ),
-        ).returning();
-      if (!boarded) throw new Error("Disposition repair action changed during board escalation");
-
-      const updated = await issuesSvc.update(current.id, {
-        status: "blocked", companyGuard: current.companyId, expectedRevision: current.revision,
-      }, tx, publications, postCommitActions);
-      if (!updated) throw new Error("Disposition repair escalation lost its locked issue update");
-      const sourceAssigneePreserved =
-        updated.assigneeAgentId === current.assigneeAgentId &&
-        updated.assigneeUserId === current.assigneeUserId;
-
-      await issuesSvc.addComment(
-        current.id,
-        [
-          "Paperclip exhausted the bounded original-owner disposition repair without a durable source-state change.",
-          "",
-          `- Attempts: ${input.attemptCount}/${input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS}`,
-          `- Terminal reason: \`${input.terminalReason}\``,
-          "- Recovery owner: board",
-          "- Source ownership: unchanged; reassignment requires an explicit decision or a policy-defined serious failure.",
-          "",
-          "Next action: repair the liveness disposition or request an explicit source-owner decision.",
-        ].join("\n"),
-        {},
-        {
-          authorType: "system",
-          presentation: compactRecoveryPresentation(
-            "Agent needs attention",
-          ),
-          metadata: {
-            ...recoveryNoticeMetadata({
-              cause: "deliberate_wait_without_target",
-              latestRun: input.latestRun,
-              recoveryActionId: action.id,
-              previousStatus: current.status,
-              recoveryOwner: null,
-            }),
-            recovery: {
-              kind: "disposition_repair_escalated",
-              actionId: action.id,
-              attemptCount: input.attemptCount,
-              maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
+    let updated: typeof issues.$inferSelect | null;
+    try {
+      updated = await db.transaction(async tx => {
+        const [current] = await tx.select().from(issues).where(and(
+          eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id),
+        )).for("update").limit(1);
+        // A newer owner/disposition or another escalation wins this source.
+        if (!current || current.hiddenAt || current.assigneeAgentId !== input.issue.assigneeAgentId ||
+            current.assigneeUserId !== input.issue.assigneeUserId || current.status !== input.issue.status) return null;
+        const [prior] = await tx.select().from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.companyId, current.companyId), eq(issueRecoveryActions.sourceIssueId, current.id),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        )).for("update").limit(1);
+        if (prior?.kind === "deliberate_wait_without_target" && prior.fingerprint === input.fingerprint &&
+            prior.ownerType === "board" && prior.wakePolicy?.type === "board_escalation") return null;
+        // A newly committed recovery hold or execution/wait path wins over
+        // the sweep's earlier snapshot. Do not cancel or overwrite that owner.
+        if (prior && (prior.kind !== "deliberate_wait_without_target" || prior.fingerprint !== input.fingerprint)) return null;
+        const paths = await collectDispositionRepairSourceState(tx as unknown as Db, { issue: current });
+        if (paths.hasActiveExecutionPath || paths.hasDurableWaitingPath) return null;
+        const action = await ensureDispositionRepairAction({
+          issue: current,
+          latestRun: input.latestRun,
+          fingerprint: input.fingerprint,
+          attemptCount: input.attemptCount,
+          legacyEpisode: input.legacyEpisode,
+        }, tx as unknown as Db, publications);
+        const now = new Date();
+        const [boarded] = await tx
+          .update(issueRecoveryActions)
+          .set({
+            status: "active",
+            ownerType: "board",
+            ownerAgentId: null,
+            ownerUserId: null,
+            maxAttempts: null,
+            evidence: {
+              ...action.evidence,
+              latestRunId: input.latestRun?.id ?? null,
+              latestRunStatus: input.latestRun?.status ?? null,
+              latestRunErrorCode: input.latestRun?.errorCode ?? null,
+              terminalReason: input.terminalReason,
+              sourceAttemptCount: input.attemptCount,
+              sourceMaxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
+              routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
+            },
+            nextAction:
+              "Inspect the evidence and choose whether to repair, retry the original owner, explicitly reassign, or resolve the source issue.",
+            wakePolicy: {
+              type: "board_escalation",
               reason: input.terminalReason,
-              assigneeAgentId: current.assigneeAgentId,
+              preservesSourceAssignee: true,
+            },
+            timeoutAt: null,
+            resolutionNote: input.terminalReason,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issueRecoveryActions.id, action.id),
+              eq(issueRecoveryActions.companyId, current.companyId),
+              eq(issueRecoveryActions.sourceIssueId, current.id),
+              inArray(issueRecoveryActions.status, ["active", "escalated"]),
+            ),
+          ).returning();
+        if (!boarded) throw new Error("Disposition repair action changed during board escalation");
+
+        const updated = await issuesSvc.update(current.id, {
+          status: "blocked", companyGuard: current.companyId, expectedRevision: current.revision,
+        }, tx, publications, postCommitActions);
+        if (!updated) throw new Error("Disposition repair escalation lost its locked issue update");
+        const sourceAssigneePreserved =
+          updated.assigneeAgentId === current.assigneeAgentId &&
+          updated.assigneeUserId === current.assigneeUserId;
+
+        await issuesSvc.addComment(
+          current.id,
+          [
+            "Paperclip exhausted the bounded original-owner disposition repair without a durable source-state change.",
+            "",
+            `- Attempts: ${input.attemptCount}/${input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS}`,
+            `- Terminal reason: \`${input.terminalReason}\``,
+            "- Recovery owner: board",
+            "- Source ownership: unchanged; reassignment requires an explicit decision or a policy-defined serious failure.",
+            "",
+            "Next action: repair the liveness disposition or request an explicit source-owner decision.",
+          ].join("\n"),
+          {},
+          {
+            authorType: "system",
+            presentation: compactRecoveryPresentation(
+              "Agent needs attention",
+            ),
+            metadata: {
+              ...recoveryNoticeMetadata({
+                cause: "deliberate_wait_without_target",
+                latestRun: input.latestRun,
+                recoveryActionId: action.id,
+                previousStatus: current.status,
+                recoveryOwner: null,
+              }),
+              recovery: {
+                kind: "disposition_repair_escalated",
+                actionId: action.id,
+                attemptCount: input.attemptCount,
+                maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
+                reason: input.terminalReason,
+                assigneeAgentId: current.assigneeAgentId,
+              },
             },
           },
-        },
-        tx,
-      );
+          tx,
+        );
 
-      await logActivity(tx as unknown as Db, {
-        companyId: current.companyId,
-        actorType: "system",
-        actorId: "recovery",
-        agentId: null,
-        runId: input.latestRun?.id ?? null,
-        action: "issue.disposition_repair_escalated",
-        entityType: "issue",
-        entityId: current.id,
-        details: {
-          identifier: current.identifier,
-          status: "blocked",
-          previousStatus: current.status,
-          sourceStateFingerprint: input.fingerprint,
-          attemptCount: input.attemptCount,
-          maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
-          terminalReason: input.terminalReason,
-          recoveryActionId: action.id,
-          recoveryOwnerAgentId: null,
-          recoveryOwnerType: "board",
-          routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
-          sourceAssigneeBefore: {
-            agentId: current.assigneeAgentId,
-            userId: current.assigneeUserId,
+        await logActivity(tx as unknown as Db, {
+          companyId: current.companyId,
+          actorType: "system",
+          actorId: "recovery",
+          agentId: null,
+          runId: input.latestRun?.id ?? null,
+          action: "issue.disposition_repair_escalated",
+          entityType: "issue",
+          entityId: current.id,
+          details: {
+            identifier: current.identifier,
+            status: "blocked",
+            previousStatus: current.status,
+            sourceStateFingerprint: input.fingerprint,
+            attemptCount: input.attemptCount,
+            maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
+            terminalReason: input.terminalReason,
+            recoveryActionId: action.id,
+            recoveryOwnerAgentId: null,
+            recoveryOwnerType: "board",
+            routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
+            sourceAssigneeBefore: {
+              agentId: current.assigneeAgentId,
+              userId: current.assigneeUserId,
+            },
+            sourceAssigneeAfter: {
+              agentId: updated.assigneeAgentId,
+              userId: updated.assigneeUserId,
+            },
+            sourceAssigneePreserved,
           },
-          sourceAssigneeAfter: {
-            agentId: updated.assigneeAgentId,
-            userId: updated.assigneeUserId,
-          },
-          sourceAssigneePreserved,
-        },
-      }, publications);
-      return updated;
-    });
+        }, publications);
+        return updated;
+      });
+    } catch (error) {
+      // Keep the whole source unchanged, report this failure, and let the
+      // sweep inspect other issues instead of retrying the same partial write.
+      logger.warn({ err: error, issueId: input.issue.id, runId: input.latestRun?.id },
+        "Disposition repair escalation rolled back; the source remains unchanged");
+      return null;
+    }
     if (!updated) return null;
     try {
       for (const publication of publications) publishActivity(publication);

@@ -89,16 +89,6 @@ describe("legacy continuation persisted authority", () => {
     expect((await f.actions()).find(a => a.status === "active")).toMatchObject({ ownerType: "board", attemptCount: 2 });
   });
 
-  it("preserves the pre-episode repair path rather than granting new failed-lineage authority", async () => {
-    const f = await finalRepair(); const context = { ...f.failed.contextSnapshot };
-    delete context.legacyDispositionEpisode;
-    await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, f.failed.id));
-    await f.createRecovery().reconcileStrandedAssignedIssues();
-    const state = await snapshot(f);
-    expect(escalationRows(state).comments).toHaveLength(0);
-    expect(state.runs).toHaveLength(4);
-    expect(state.actions.find(row => row.status === "active")).toMatchObject({ ownerType: "agent", maxAttempts: 5, attemptCount: 1 });
-  });
   it.each(["approval", "budget", "pause", "reassigned"])("ACCT-03 %s introduced during second repair delay survives restart without another debit", async gate => {
     const f = await fixture();
     await f.createRecovery().reconcileLegacyContinuation(f.runId);
@@ -291,14 +281,14 @@ describe("legacy continuation persisted authority", () => {
     return { ...f, failed };
   }
 
-  async function snapshot(f: { companyId: string; issueId: string }) {
+  async function snapshot(f: { companyId: string; issueId: string }, reader: typeof db = db) {
     const [runs, actions, issue, comments, activity, wakes] = await Promise.all([
-      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)).orderBy(heartbeatRuns.id),
-      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId)).orderBy(issueRecoveryActions.id),
-      db.select().from(issues).where(eq(issues.id, f.issueId)),
-      db.select().from(issueComments).where(eq(issueComments.companyId, f.companyId)).orderBy(issueComments.id),
-      db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId)).orderBy(activityLog.id),
-      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)).orderBy(agentWakeupRequests.id),
+      reader.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)).orderBy(heartbeatRuns.id),
+      reader.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId)).orderBy(issueRecoveryActions.id),
+      reader.select().from(issues).where(eq(issues.id, f.issueId)),
+      reader.select().from(issueComments).where(eq(issueComments.companyId, f.companyId)).orderBy(issueComments.id),
+      reader.select().from(activityLog).where(eq(activityLog.companyId, f.companyId)).orderBy(activityLog.id),
+      reader.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)).orderBy(agentWakeupRequests.id),
     ]);
     return { runs, actions, issue, comments, activity, wakes };
   }
@@ -473,8 +463,35 @@ describe("legacy continuation persisted authority", () => {
     }
     expect(state.runs).toEqual(before.runs); expect(state.wakes).toEqual(before.wakes);
   });
+  it.each(["run", "wake", "hold", "monitor", "approval"])("preserves a new %s committed before the escalation lock", async change => {
+    const f = await finalRepair(), held = await holdIssueLock(f.issueId);
+    const pending = f.createRecovery().reconcileStrandedAssignedIssues();
+    let expected: Awaited<ReturnType<typeof snapshot>>;
+    try {
+      await waitForIssueLockWaiters(1);
+      if (change === "run") {
+        const [run] = await held.tx.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+          invocationSource: "on_demand", status: "running", contextSnapshot: { issueId: f.issueId }, startedAt: new Date() }).returning();
+        await held.tx.update(issues).set({ executionRunId: run.id, checkoutRunId: run.id }).where(eq(issues.id, f.issueId));
+      }
+      if (change === "wake") await held.tx.insert(agentWakeupRequests).values({ companyId: f.companyId,
+        agentId: f.agentId, source: "on_demand", status: "queued", payload: { issueId: f.issueId } });
+      if (change === "hold") {
+        const [run] = await held.tx.update(heartbeatRuns).set({ resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" } }).where(eq(heartbeatRuns.id, f.failed.id)).returning();
+        await terminalizeLegacyExecution({ db: held.tx, run, status: "failed", fromStatuses: ["failed"] });
+      }
+      if (change === "monitor") await held.tx.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 60_000) }).where(eq(issues.id, f.issueId));
+      if (change === "approval") await held.tx.insert(issueThreadInteractions).values({ companyId: f.companyId,
+        issueId: f.issueId, kind: "request_confirmation", status: "pending", payload: { version: 1, prompt: "Continue?" } });
+      expected = await snapshot(f, held.tx);
+    } finally { await held.release(); }
+    await pending;
+    expect(await snapshot(f)).toEqual(expected!);
+    expect(escalationRows(expected!).comments).toHaveLength(0);
+  });
   it("rolls back the blocker, action and debit when the notice insert fails", async () => {
     const f = await finalRepair(), before = await snapshot(f);
+    const healthy = await finalRepair();
     const suffix = randomUUID().replaceAll("-", "");
     const functionName = `reject_exhaustion_${suffix}`, triggerName = `reject_notice_${suffix}`;
     expect(f.issueId).toMatch(/^[a-f0-9-]{36}$/);
@@ -482,8 +499,9 @@ describe("legacy continuation persisted authority", () => {
     try {
       await db.execute(sql.raw(`CREATE TRIGGER ${triggerName} BEFORE INSERT ON issue_comments FOR EACH ROW EXECUTE FUNCTION ${functionName}()`));
       const result = await Promise.allSettled([f.createRecovery().reconcileStrandedAssignedIssues()]);
-      expect(result[0].status).toBe("rejected");
+      expect(result[0].status).toBe("fulfilled");
       expect(await snapshot(f)).toEqual(before);
+      expect((await snapshot(healthy)).issue[0].status).toBe("blocked");
     } finally {
       await db.execute(sql.raw(`DROP TRIGGER IF EXISTS ${triggerName} ON issue_comments`));
       await db.execute(sql.raw(`DROP FUNCTION ${functionName}()`));

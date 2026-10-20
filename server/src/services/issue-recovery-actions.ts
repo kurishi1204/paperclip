@@ -522,10 +522,12 @@ export function issueRecoveryActionService(db: Db) {
     }
 
     try {
-      const [created] = await db
+      // Catch the conflict outside its transaction/savepoint. Postgres aborts
+      // a transaction after 23505, so a retry on that same handle cannot read.
+      const [created] = await db.transaction(tx => tx
         .insert(issueRecoveryActions)
         .values(buildInsertValues(input, ownerType, now))
-        .returning();
+        .returning());
       return toReadModel(created!);
     } catch (error) {
       if (!isUniqueRecoveryActionConflict(error)) throw error;
