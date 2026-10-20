@@ -3373,6 +3373,101 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it.each(["cli", "server"])("reports an unfinished %s requested drain as lost", async (producer) => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      includeIssue: false, processPid: child.pid,
+      contextSnapshot: { executionEngine: "cli", processTopology: "detached" },
+    });
+    runningProcesses.set(runId, { child, graceSec: 1, processGroupId: null });
+    await withTempPaperclipHome(async (home) => {
+      if (producer === "server") {
+        await writeHotRestartIntent({
+          previousServerPid: process.pid, drainRequired: true,
+          preflightActiveRunIds: [runId],
+        });
+      } else {
+        const intentPath = resolveHotRestartIntentPath(home);
+        await fs.mkdir(path.dirname(intentPath), { recursive: true });
+        await fs.writeFile(intentPath, JSON.stringify({
+          version: 1, requestedAt: new Date().toISOString(),
+          previousServerPid: process.pid, previousServerVersion: null,
+          drainRequired: true, requestedByRunId: null,
+        }));
+      }
+      const heartbeat = heartbeatService(db);
+      await heartbeat.prepareHotRestartShutdown("SIGTERM");
+      mockTerminateLocalService.mockRejectedValueOnce(new Error("cannot stop owned fixture"));
+      await expect(heartbeat.drainRunningRunsForShutdown("SIGTERM"))
+        .rejects.toThrow("cannot stop owned fixture");
+      expect(isPidAlive(child.pid)).toBe(true);
+      expect((await heartbeat.getRun(runId))?.status).toBe("running");
+      await heartbeat.reconcileHotRestartAdoption();
+      const report = JSON.parse(
+        await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
+      ) as HotRestartReport;
+      expect(report.runs.map((run) => run.runId)).toEqual([runId]);
+      expect(report.lostRunIds).toEqual([runId]);
+      expect([report.skippedRunIds, report.adoptedRunIds, report.finalizedWhileDownRunIds])
+        .toEqual([[], [], []]);
+      expect(report.runs[0]).toMatchObject({
+        classification: "lost", reason: "drain_not_finalized", status: "running",
+      });
+    });
+  });
+
+  it("records only interruption targets without narrowing a requested full drain", async () => {
+    const owned = await seedRunFixture({ includeIssue: false });
+    const foreign = await seedRunFixture({ includeIssue: false, runtimeMode: "legacy" });
+    await db.update(heartbeatRuns).set({ controllerBootId: randomUUID() })
+      .where(eq(heartbeatRuns.id, foreign.runId));
+    const held = await seedRunFixture({
+      includeIssue: false, runtimeMode: "native",
+      runErrorCode: "native_adopted_runner_authentication_timeout",
+    });
+    const native = await seedRunFixture({
+      includeIssue: false, runtimeMode: "native", adapterType: "paperclip_runner",
+    });
+    const allIds = [owned.runId, foreign.runId, held.runId, native.runId].sort();
+    await withTempPaperclipHome(async (home) => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid, drainRequired: true,
+        preflightActiveRunIds: allIds,
+      });
+      const heartbeat = heartbeatService(db);
+      const preparation = await heartbeat.prepareHotRestartShutdown("SIGTERM");
+      const snapshot = await readHotRestartIntent();
+      expect(snapshot?.shutdownSnapshot?.activeRuns.map((run) => run.runId).sort())
+        .toEqual(allIds);
+      expect(snapshot?.drainRunIds).toEqual([owned.runId]);
+      // index.ts uses this return value to select a partial drain. Receipt
+      // metadata must not shrink the normal full-drain call.
+      expect(preparation).not.toHaveProperty("drainRunIds");
+      const selectedRunIds = preparation.drainRunIds ?? null;
+      expect(selectedRunIds).toBeNull();
+      const drain = await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date(), selectedRunIds);
+      expect(drain.interruptedRunIds).toEqual([owned.runId]);
+      expect(drain.restartSuspendedRunIds).toEqual([native.runId]);
+      const interrupted = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.status, "interrupted"));
+      expect(interrupted.map((run) => run.id)).toEqual([owned.runId]);
+      for (const retained of [foreign, held, native]) {
+        expect((await heartbeat.getRun(retained.runId))?.status).toBe("running");
+      }
+      await heartbeat.reconcileHotRestartAdoption();
+      const report = JSON.parse(
+        await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
+      ) as HotRestartReport;
+      expect(report.runs.map((run) => run.runId).sort()).toEqual(allIds);
+      expect(report.finalizedWhileDownRunIds).toEqual([owned.runId]);
+      expect(report.skippedRunIds.toSorted()).toEqual([foreign.runId, held.runId, native.runId].sort());
+      expect(report.lostRunIds).toEqual([]);
+      expect(report.runs.find((run) => run.runId === native.runId))
+        .toMatchObject({ classification: "skipped", reason: "native_restart_recovery_owned" });
+    });
+  });
+
   it("snapshots and drains a server-stdio ACP run before embedded database shutdown", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);

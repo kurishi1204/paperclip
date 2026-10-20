@@ -377,7 +377,11 @@ The service CLI follows the same interrupt-and-retry behavior when you use
 active runs at shutdown. It does not wait for their work to finish. Explicit
 drains with an instance-scoped intent also save the running set before shutdown,
 so the startup report can identify interrupted runs as `finalized_while_down` with reason
-`run_status_interrupted`.
+`run_status_interrupted`. The receipt also records which runs the existing
+ownership checks select for interruption. If one is still running at startup,
+the report marks it lost with reason `drain_not_finalized`. Native suspended
+runs and runs owned by other controllers keep their ownership; the receipt does
+not turn a full drain into a selective drain.
 
 When Paperclip manages embedded PostgreSQL, it suppresses that dependency's eager
 `SIGINT`/`SIGTERM` cleanup hooks. Paperclip owns signal ordering so the heartbeat

@@ -14700,6 +14700,19 @@ export function heartbeatService(
     );
   }
 
+  function getShutdownRunDisposition(
+    run: typeof heartbeatRuns.$inferSelect,
+    adapterType: string,
+  ) {
+    // Both the receipt and the drain use the same ownership decision.
+    if (run.runtimeMode === "legacy" && run.controllerBootId &&
+        run.controllerBootId !== legacyControllerBootId) return "unowned" as const;
+    if (isNativeRunnerOwnershipHeld(run)) return "unowned" as const;
+    if (run.runtimeMode === "native" && adapterType === "paperclip_runner")
+      return "suspend" as const;
+    return "interrupt" as const;
+  }
+
   async function prepareHotRestartShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
@@ -14771,7 +14784,12 @@ export function heartbeatService(
       // Explicit drains still need the complete live set so startup can report
       // the runs interrupted by the normal shutdown path.
       await writeHotRestartShutdownSnapshot({
-        intent: intentWithVersion,
+        intent: {
+          ...intentWithVersion,
+          drainRunIds: activeRuns
+            .filter(({ run, adapterType }) => getShutdownRunDisposition(run, adapterType) === "interrupt")
+            .map(({ run }) => run.id),
+        },
         signal,
         activeRuns: snapshotRuns,
         capturedAt: now,
@@ -15021,13 +15039,14 @@ export function heartbeatService(
         classify(candidate, "lost", "selective_drain_not_finalized", patch);
         continue;
       }
-      if (intent.drainRequired && !hasSelectiveAcpDrain) {
-        classify(candidate, "skipped", "drain_required", patch);
-        continue;
-      }
-
       if (run.runtimeMode === "native" && adapterType === "paperclip_runner") {
         classify(candidate, "skipped", "native_restart_recovery_owned", patch);
+        continue;
+      }
+      if (intent.drainRequired && !hasSelectiveAcpDrain) {
+        const interruptionExpected = intent.drainRunIds?.includes(candidate.runId);
+        classify(candidate, interruptionExpected ? "lost" : "skipped",
+          interruptionExpected ? "drain_not_finalized" : "drain_required", patch);
         continue;
       }
 
@@ -15354,13 +15373,9 @@ export function heartbeatService(
     for (const { run, agent } of activeRuns) {
       // Shutdown owns only this boot's legacy executions. Expired foreign
       // owners belong to the reaper, not another container's drain.
-      if (run.runtimeMode === "legacy" && run.controllerBootId &&
-          run.controllerBootId !== legacyControllerBootId) continue;
-      if (isNativeRunnerOwnershipHeld(run)) continue;
-      if (
-        run.runtimeMode === "native" &&
-        agent.adapterType === "paperclip_runner"
-      ) {
+      const disposition = getShutdownRunDisposition(run, agent.adapterType);
+      if (disposition === "unowned") continue;
+      if (disposition === "suspend") {
         // A graceful shutdown relinquishes controller authority just like a
         // hot restart. Leaving the old event consumer attached lets its
         // finalizer interrupt/suspend Claude while the next server is adopting
