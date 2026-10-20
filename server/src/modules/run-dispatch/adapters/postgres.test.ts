@@ -382,6 +382,57 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   }
 
   describe("evaluateScheduledRetryGate", () => {
+    it("preserves a new standing wait committed after the initial transition read", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID(), blockerId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      await seedIssue({ companyId, issueId: blockerId, status: "todo" });
+      await db.update(issues).set({ unblockDescriptor: { owner: "board", action: "Historical wait" } }).where(eq(issues.id, issueId));
+      const current = { owner: "board", action: "New committed receipt wait" } as const;
+      const transact = db.transaction.bind(db);
+      let intervened = false;
+      const spy = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
+        if (!intervened) {
+          intervened = true;
+          // The update request already read in_progress; another writer now
+          // commits a current blocked wait before its locked receipt baseline.
+          await db.update(issues).set({ status: "blocked", unblockDescriptor: current }).where(eq(issues.id, issueId));
+        }
+        return transact(callback, config);
+      });
+      try {
+        const updated = await issueService(db).update(issueId, { status: "blocked", blockedByIssueIds: [blockerId] });
+        expect(intervened).toBe(true);
+        expect(updated?.unblockDescriptor).toEqual(current);
+      } finally { spy.mockRestore(); }
+    });
+
+    it.each(["omitted", "explicit", "already_blocked"])("does not reactivate a historical wait when entering blocked (%s)", async descriptorMode => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID(), blockerId = randomUUID();
+      const previous = { owner: "board", action: "Historical receipt wait" } as const;
+      const current = { owner: "board", action: "Current receipt wait" } as const;
+      await seedIssue({ companyId, issueId,
+        status: descriptorMode === "already_blocked" ? "blocked" : "in_progress", assigneeAgentId: agentId });
+      await seedIssue({ companyId, issueId: blockerId, status: "todo" });
+      await db.update(issues).set({ unblockDescriptor: previous }).where(eq(issues.id, issueId));
+      const svc = issueService(db);
+      const updated = await svc.update(issueId, {
+        status: "blocked", blockedByIssueIds: [blockerId],
+        ...(descriptorMode === "explicit" ? { unblockDescriptor: current } : {}),
+      });
+      expect(updated?.unblockDescriptor).toEqual(descriptorMode === "omitted" ? null
+        : descriptorMode === "explicit" ? current : previous);
+      await svc.update(blockerId, { status: "done" });
+      expect(await svc.getDependencyReadiness(issueId)).toMatchObject({ isDependencyReady: true });
+      const checkout = svc.checkout(issueId, agentId, ["blocked"], null);
+      if (descriptorMode === "omitted") {
+        await expect(checkout).resolves.toMatchObject({ status: "in_progress", unblockDescriptor: null });
+      } else {
+        await expect(checkout).rejects.toMatchObject({ status: 409, details: { reason: "typed_blocked_wait" } });
+      }
+    });
+
     it("keeps a pre-upgrade v1 repair eligible when only a stale nonblocked descriptor differs", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();
       const issueId = randomUUID();

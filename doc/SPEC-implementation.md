@@ -1227,6 +1227,9 @@ checkout, then use the existing authorized status-update/resume path to leave
 without a descriptor retain the existing dependency-readiness behavior. Valid
 descriptors count as durable waits for disposition repair; malformed persisted
 descriptors preserve the checkout guard but do not establish a healthy wait.
+Entering `blocked` starts a new wait: omitting the descriptor clears a historical
+non-blocked descriptor. An explicitly supplied descriptor, or an unchanged
+descriptor while remaining `blocked`, is preserved.
 
 `POST /issues/:issueId/release` clears checkout and execution locks. For terminal
 issues (`done` or `cancelled`), it preserves the assignee, status, and disposition

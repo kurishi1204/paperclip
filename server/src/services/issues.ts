@@ -10975,6 +10975,10 @@ export function issueService(db: Db) {
             currentRevision: receiptExisting.revision,
           });
         }
+        // Omission starts a new wait without reviving historical state. Use
+        // the locked baseline so a newly committed standing wait survives.
+        if (receiptExisting.status !== "blocked" && issueData.status === "blocked" &&
+          issueData.unblockDescriptor === undefined) patch.unblockDescriptor = null;
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.
