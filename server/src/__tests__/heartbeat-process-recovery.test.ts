@@ -3312,6 +3312,67 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("does not overwrite another instance's drain snapshot through the legacy marker", async () => {
+    await withTempPaperclipHome(async (home) => {
+      const previousInstance = process.env.PAPERCLIP_INSTANCE_ID;
+      try {
+        process.env.PAPERCLIP_INSTANCE_ID = "blue";
+        const { runId: blueRunId } = await seedRunFixture({ includeIssue: false });
+        // A supervisor PID need not be this worker's PID. The instance-scoped
+        // intent still records the drain; it must not authorize another instance.
+        await writeHotRestartIntent({
+          previousServerPid: process.pid + 1,
+          previousServerStartedAt: "2026-08-04T00:00:00.000Z",
+          drainRequired: true,
+          requestedAt: new Date("2026-08-04T00:05:00.000Z"),
+        });
+        const blueHeartbeat = heartbeatService(db);
+        const bluePreparation = await blueHeartbeat.prepareHotRestartShutdown("SIGTERM");
+        const blueDrain = await blueHeartbeat.drainRunningRunsForShutdown("SIGTERM");
+        expect(bluePreparation).toMatchObject({
+          mode: "drain_required", skipDrain: false, activeRunIds: [blueRunId],
+        });
+        expect(blueDrain.interruptedRunIds).toEqual([blueRunId]);
+        const blueIntentPath = resolveHotRestartIntentPath(home);
+        const legacyPath = resolveLegacyHotRestartIntentPath(home);
+        const blueBefore = await fs.readFile(blueIntentPath, "utf8");
+        const legacyBefore = await fs.readFile(legacyPath, "utf8");
+
+        await seedRunFixture({ includeIssue: false });
+        process.env.PAPERCLIP_INSTANCE_ID = "default";
+        const defaultIntentPath = resolveHotRestartIntentPath(home);
+        const defaultPreparation = await heartbeatService(db).prepareHotRestartShutdown("SIGTERM");
+        const defaultIntentExists = await fs.stat(defaultIntentPath)
+          .then(() => true, (error: NodeJS.ErrnoException) => {
+            if (error.code === "ENOENT") return false;
+            throw error;
+          });
+        const legacyAfter = await fs.readFile(legacyPath, "utf8");
+        process.env.PAPERCLIP_INSTANCE_ID = "blue";
+        const blueAfter = await readHotRestartIntent();
+        const blueRawAfter = await fs.readFile(blueIntentPath, "utf8");
+        await blueHeartbeat.reconcileHotRestartAdoption();
+        const report = JSON.parse(
+          await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
+        ) as HotRestartReport;
+
+        expect(defaultIntentExists).toBe(false);
+        expect(legacyAfter).toBe(legacyBefore);
+        expect(blueRawAfter).toBe(blueBefore);
+        expect(defaultPreparation).toEqual({
+          mode: "drain_required", skipDrain: false, activeRunIds: [],
+        });
+        expect(blueAfter?.shutdownSnapshot?.activeRuns.map((run) => run.runId))
+          .toEqual([blueRunId]);
+        expect(report.runs.map((run) => run.runId)).toEqual([blueRunId]);
+        expect(report.finalizedWhileDownRunIds).toEqual([blueRunId]);
+      } finally {
+        if (previousInstance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+        else process.env.PAPERCLIP_INSTANCE_ID = previousInstance;
+      }
+    });
+  });
+
   it("snapshots and drains a server-stdio ACP run before embedded database shutdown", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);

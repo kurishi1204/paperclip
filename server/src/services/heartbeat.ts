@@ -637,6 +637,7 @@ import {
 import {
   findMissingHotRestartSnapshotRunIds,
   readHotRestartIntent,
+  readHotRestartIntentWithSource,
   readProcessStartedAt,
   removeHotRestartIntent,
   shouldHonorHotRestartIntentForProcess,
@@ -14708,9 +14709,9 @@ export function heartbeatService(
     if (idleSessions.failed > 0) {
       logger.warn({ idleSessions }, "idle native sessions could not checkpoint before controller shutdown");
     }
-    let intent: Awaited<ReturnType<typeof readHotRestartIntent>>;
+    let request: Awaited<ReturnType<typeof readHotRestartIntentWithSource>>;
     try {
-      intent = await readHotRestartIntent();
+      request = await readHotRestartIntentWithSource();
     } catch (err) {
       logger.warn(
         { err },
@@ -14723,12 +14724,22 @@ export function heartbeatService(
       };
     }
 
+    const intent = request?.intent;
     if (!intent)
       return {
         mode: "not_requested" as const,
         skipDrain: false as const,
         activeRunIds: [] as string[],
       };
+    if (intent.drainRequired && request?.source !== "instance") {
+      // A legacy-only marker can belong to another instance. Keep its old
+      // drain behavior without writing this server's runs into that request.
+      return {
+        mode: "drain_required" as const,
+        skipDrain: false as const,
+        activeRunIds: [] as string[],
+      };
+    }
     if (!intent.drainRequired && !shouldHonorHotRestartIntentForProcess(intent)) {
       logger.warn(
         { expectedPid: intent.previousServerPid, currentPid: process.pid },

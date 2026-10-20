@@ -375,8 +375,8 @@ Use `--drain-required` only when the deploy intentionally requires the old termi
 The service CLI follows the same interrupt-and-retry behavior when you use
 `paperclipai service restart --wait`. This flag disables adoption and interrupts
 active runs at shutdown. It does not wait for their work to finish. Explicit
-drains also save the running set before shutdown, so the startup report can
-identify interrupted runs as `finalized_while_down` with reason
+drains with an instance-scoped intent also save the running set before shutdown,
+so the startup report can identify interrupted runs as `finalized_while_down` with reason
 `run_status_interrupted`.
 
 When Paperclip manages embedded PostgreSQL, it suppresses that dependency's eager

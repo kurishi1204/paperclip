@@ -461,31 +461,40 @@ async function readHotRestartIntentAtPath(filePath: string) {
   }
 }
 
-export async function readHotRestartIntent(homeDir?: string) {
+export async function readHotRestartIntentWithSource(homeDir?: string) {
   const instanceIntent = await readHotRestartIntentAtPath(resolveHotRestartIntentPath(homeDir));
   let legacyIntent: HotRestartIntent | null;
   try {
     legacyIntent = await readHotRestartIntentAtPath(resolveLegacyHotRestartIntentPath(homeDir));
   } catch (error) {
-    if (instanceIntent) return instanceIntent;
+    if (instanceIntent) return { intent: instanceIntent, source: "instance" as const };
     throw error;
   }
 
   if (!instanceIntent) {
     // The home-root marker predates instances. Only the default instance may
     // consume it without an instance-root request to correlate against.
-    return resolvePaperclipInstanceId() === "default" ? legacyIntent : null;
+    return resolvePaperclipInstanceId() === "default" && legacyIntent
+      ? { intent: legacyIntent, source: "legacy" as const }
+      : null;
   }
   if (!legacyIntent || !isSameHotRestartRequest(instanceIntent, legacyIntent)) {
-    return instanceIntent;
+    return { intent: instanceIntent, source: "instance" as const };
   }
 
   // A pre-instance server rewrites only the legacy marker when it captures
   // its shutdown snapshot. Preserve the instance-scoped request fields while
   // importing that snapshot only after the immutable request identity matches.
-  return legacyIntent.shutdownSnapshot
-    ? { ...instanceIntent, shutdownSnapshot: legacyIntent.shutdownSnapshot }
-    : instanceIntent;
+  return {
+    intent: legacyIntent.shutdownSnapshot
+      ? { ...instanceIntent, shutdownSnapshot: legacyIntent.shutdownSnapshot }
+      : instanceIntent,
+    source: "instance" as const,
+  };
+}
+
+export async function readHotRestartIntent(homeDir?: string) {
+  return (await readHotRestartIntentWithSource(homeDir))?.intent ?? null;
 }
 
 export function findMissingHotRestartSnapshotRunIds(intent: HotRestartIntent) {

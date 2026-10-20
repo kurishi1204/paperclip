@@ -7,6 +7,7 @@ import {
   isObservedHotRestartTargetAlive,
   parseHotRestartIntent,
   readHotRestartIntent,
+  readHotRestartIntentWithSource,
   readProcessStartedAt,
   removeHotRestartIntent,
   resolveHotRestartIntentPath,
@@ -58,6 +59,11 @@ describe("hot-restart path compatibility", () => {
         drainRequired: true, drainReason: null, preflightActiveRunIds: [],
         shutdownSnapshot: { activeRuns },
       });
+      expect(await readHotRestartIntentWithSource(homeDir)).toMatchObject({
+        source: "instance", intent: { shutdownSnapshot: { activeRuns } },
+      });
+      expect(JSON.parse(await fs.readFile(resolveHotRestartIntentPath(homeDir), "utf8")))
+        .not.toHaveProperty("source");
     });
   });
 
