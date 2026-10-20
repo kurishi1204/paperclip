@@ -115,6 +115,7 @@ import {
   lte,
   ne,
   notInArray,
+  notExists,
   or,
   sql,
 } from "drizzle-orm";
@@ -8208,6 +8209,25 @@ export async function buildPaperclipWakePayload(input: {
   const executionAlreadyReconciled =
     recoveryAction?.status === "resolved" &&
     Boolean(recoveryEvidence.executionReconciliation);
+  const recoveryAgentId = readNonEmptyString(input.agentId);
+  let settledForCurrentOwner = false;
+  if (
+    !executionAlreadyReconciled && recoveryAction &&
+    ["resolved", "cancelled"].includes(recoveryAction.status) &&
+    recoveryAction.sourceIssueId === issueId && recoveryAgentId && isUuidLike(recoveryAgentId) &&
+    readNonEmptyString(input.contextSnapshot.wakeReason) !== "source_scoped_recovery_action"
+  ) {
+    // Settled recovery is provenance, not another repair assignment. Confirm
+    // the current source owner and absence of live recovery in one snapshot.
+    const [currentOwner] = await input.db.select({ id: issues.id }).from(issues).where(and(
+      eq(issues.id, issueId), eq(issues.companyId, input.companyId), eq(issues.assigneeAgentId, recoveryAgentId),
+      notExists(input.db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      ))),
+    )).limit(1);
+    settledForCurrentOwner = Boolean(currentOwner);
+  }
   const originalAssigneeId =
     recoveryAction?.returnOwnerAgentId ??
     recoveryAction?.previousOwnerAgentId ??
@@ -8251,7 +8271,7 @@ export async function buildPaperclipWakePayload(input: {
     attachmentOmissions,
     externalChatProvider,
     recovery:
-      !executionAlreadyReconciled && (recoveryAction || recoveryCause)
+      !executionAlreadyReconciled && !settledForCurrentOwner && (recoveryAction || recoveryCause)
         ? {
             cause: recoveryAction?.cause ?? recoveryCause,
             failureSummary: readNonEmptyString(recoveryEvidence.failureSummary),

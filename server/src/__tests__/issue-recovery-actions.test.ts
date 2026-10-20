@@ -37,6 +37,8 @@ import { deliverReconciledExecutions } from "../services/execution-recovery-reso
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { isPaperclipRecoveryWakePayload, renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -2200,6 +2202,164 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]).toMatchObject({ status: "todo", assigneeAgentId: coderId });
   });
 
+  async function expectOrdinaryRestoredWake(companyId: string, agentId: string, contextSnapshot: Record<string, unknown>, runId?: string) {
+    const wake = await buildPaperclipWakePayload({ db, companyId, agentId, runId, contextSnapshot });
+    const prompt = renderPaperclipWakePrompt(wake);
+    expect(wake?.reason).toBe("issue_recovery_action_restored");
+    expect(wake?.recovery).toBeNull();
+    expect(isPaperclipRecoveryWakePayload(wake)).toBe(false);
+    expect(prompt).toContain("lead with the work");
+    expect(prompt).not.toContain("Recovery contract:");
+    expect(prompt).not.toContain("Do not do the deliverable work");
+    return { wake, prompt };
+  }
+
+  async function queueRestoredWake(companyId: string, agentId: string, opts: Record<string, any>) {
+    const responsibleUserId = randomUUID();
+    await db.insert(authUsers).values({ id: responsibleUserId, name: "Fixture operator", email: `${responsibleUserId}@example.test`,
+      emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
+    await db.update(companies).set({ defaultResponsibleUserId: responsibleUserId }).where(eq(companies.id, companyId));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, agentId));
+    // This existing harness pattern occupies the only provider slot. The real
+    // public wake persists its context without invoking any adapter or provider.
+    await seedHeartbeatRun({ companyId, agentId, runId: randomUUID(), status: "running" });
+    const queued = await heartbeatService(db, { runtimeEnv: {} }).wakeup(agentId, opts);
+    expect(queued).not.toBeNull(); expect(queued!.status).toBe("queued");
+    const [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id));
+    expect(persisted.contextSnapshot).toMatchObject(opts.contextSnapshot);
+    const [wakeReceipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.runId, queued!.id));
+    expect(wakeReceipt.status).toBe("queued");
+    return persisted;
+  }
+
+  async function projectionFixture(status: "active" | "escalated" | "resolved" | "cancelled" = "resolved") {
+    const f = await seedCompany();
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.sourceIssueId));
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({ companyId: f.companyId, sourceIssueId: f.sourceIssueId,
+      kind: "workspace_validation", ownerType: "agent", ownerAgentId: f.managerId,
+      previousOwnerAgentId: f.coderId, returnOwnerAgentId: f.coderId, cause: "workspace_validation_failed",
+      fingerprint: "projection-fixture", nextAction: "Repair the workspace and return the source." });
+    if (status === "resolved" || status === "cancelled") await issueRecoveryActionService(db).resolveActiveForIssue({
+      companyId: f.companyId, sourceIssueId: f.sourceIssueId, actionId: action.id, status,
+      outcome: status === "cancelled" ? "cancelled" : "restored" });
+    if (status === "escalated") await db.update(issueRecoveryActions).set({ status }).where(eq(issueRecoveryActions.id, action.id));
+    const context = { issueId: f.sourceIssueId, taskId: f.sourceIssueId,
+      wakeReason: "issue_recovery_action_restored", source: "issue.recovery_action_resolution", recoveryActionId: action.id };
+    return { ...f, action, context };
+  }
+
+  it.each(["reassigned", "disposition"])("projects real %s resolution wakes as ordinary current-owner work", async kind => {
+    const f = await seedCompany(), currentOwner = kind === "reassigned" ? f.managerId : f.coderId;
+    await db.update(issues).set({ status: "blocked", assigneeAgentId: currentOwner }).where(eq(issues.id, f.sourceIssueId));
+    const disposition = kind === "disposition";
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({ companyId: f.companyId, sourceIssueId: f.sourceIssueId,
+      kind: disposition ? "deliberate_wait_without_target" : "workspace_validation",
+      ownerType: "board", returnOwnerAgentId: f.coderId, previousOwnerAgentId: f.coderId,
+      cause: disposition ? "deliberate_wait_without_target" : "workspace_validation_failed",
+      fingerprint: "producer-resolution", nextAction: "Inspect and restore the source.",
+      wakePolicy: disposition ? { type: "board_escalation" } : null,
+      evidence: disposition ? { terminalReason: "unchanged_source_state_exhausted", sourceAttemptCount: 2, sourceMaxAttempts: 2 } : {} });
+    const wake = vi.fn(async (_agentId: string, _opts: Record<string, any>) => null);
+    const app = createApp(undefined, { recoveryActionEnqueueWakeup: wake });
+    const response = await request(app).post(`/api/issues/${f.sourceIssueId}/recovery-actions/resolve`)
+      .send({ actionId: action.id, outcome: "restored", sourceIssueStatus: "todo" }).expect(200);
+    expect(response.body.recoveryAction).toMatchObject({ id: action.id,
+      status: "resolved",
+      outcome: kind === "reassigned" ? "restored" : "handed_back" });
+    expect(wake).toHaveBeenCalledTimes(1);
+    const [agentId, opts] = wake.mock.calls[0]; expect(agentId).toBe(currentOwner);
+    expect(opts.contextSnapshot).toMatchObject({ issueId: f.sourceIssueId, recoveryActionId: action.id });
+    const queued = await queueRestoredWake(f.companyId, agentId, opts);
+    await expectOrdinaryRestoredWake(queued.companyId, queued.agentId, queued.contextSnapshot!, queued.id);
+  });
+
+  it("does not allow a cancelled recovery outcome to reopen todo or emit a wake", async () => {
+    const f = await projectionFixture("active"), wake = vi.fn(async () => null);
+    const response = await request(createApp(undefined, { recoveryActionEnqueueWakeup: wake }))
+      .post(`/api/issues/${f.sourceIssueId}/recovery-actions/resolve`)
+      .send({ actionId: f.action.id, outcome: "cancelled", sourceIssueStatus: "todo" });
+    expect(response.status).toBe(400); expect(wake).not.toHaveBeenCalled();
+    expect(await issueRecoveryActionService(db).getActiveForIssue(f.companyId, f.sourceIssueId)).toMatchObject({ id: f.action.id });
+  });
+
+  it("treats settled cancelled provenance as ordinary only for its current owner", async () => {
+    const f = await projectionFixture("cancelled");
+    // Backcompat projection coverage, not a claim that cancelled+todo is
+    // accepted by the resolve route (the separate rejection test pins that).
+    await expectOrdinaryRestoredWake(f.companyId, f.coderId, f.context);
+  });
+
+  it("keeps status-only document and approval permissions when recovery projection is settled", async () => {
+    const f = await projectionFixture(), runId = randomUUID();
+    const context = { ...f.context, recoveryIntent: "status_only", allowDeliverableWork: false,
+      allowDocumentUpdates: false, resumeRequiresNormalModel: true };
+    const paperclipWake = await buildPaperclipWakePayload({ db, companyId: f.companyId, agentId: f.coderId, contextSnapshot: context });
+    await seedHeartbeatRun({ companyId: f.companyId, agentId: f.coderId, issueId: f.sourceIssueId, runId, status: "running" });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...context, paperclipWake } }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ checkoutRunId: runId, executionRunId: runId }).where(eq(issues.id, f.sourceIssueId));
+    const app = createApp({ type: "agent", source: "agent_api_key", agentId: f.coderId, companyId: f.companyId, runId });
+    const doc = await request(app).put(`/api/issues/${f.sourceIssueId}/documents/report`)
+      .send({ format: "markdown", title: "Blocked mutation", body: "This must not be saved." });
+    expect(doc.status, JSON.stringify(doc.body)).toBe(403);
+    expect(doc.body.error).toContain("Status-only recovery runs cannot update issue documents");
+    const approval = await request(app).post(`/api/issues/${f.sourceIssueId}/approvals`).send({ approvalId: randomUUID() });
+    expect(approval.status, JSON.stringify(approval.body)).toBe(403);
+    expect(approval.body.error).toContain("Status-only recovery runs cannot create or modify approvals");
+  });
+
+  it("keeps a settled no-replay execution blocker independent of recovery prompt projection", async () => {
+    const f = await projectionFixture(), runId = randomUUID();
+    await seedHeartbeatRun({ companyId: f.companyId, agentId: f.coderId, issueId: f.sourceIssueId, runId, status: "failed" });
+    const [action] = await db.update(issueRecoveryActions).set({ kind: "active_run_watchdog",
+      cause: "legacy_execution_requires_reconciliation", evidence: { runId, automaticRecovery: { replay: "blocked" } },
+    }).where(eq(issueRecoveryActions.id, f.action.id)).returning();
+    await buildPaperclipWakePayload({ db, companyId: f.companyId, agentId: f.coderId, contextSnapshot: f.context });
+    expect(await getExecutionBlocker(db, f.companyId, f.sourceIssueId)).toMatchObject({ recoveryActionId: action.id,
+      runId, cause: "legacy_execution_requires_reconciliation" });
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)))[0]).toEqual(action);
+  });
+
+  it("projects the settled quarantine-restore wake shape as ordinary work", async () => {
+    const f = await projectionFixture();
+    // The workspace service uses the same real action resolver. Its route
+    // supplies this context; this test does not claim to run the Git rescue.
+    await expectOrdinaryRestoredWake(f.companyId, f.coderId, { ...f.context,
+      source: "execution_workspace.quarantine_restore", executionWorkspaceId: randomUUID(), rescueRef: "rescue/fixture" });
+  });
+
+  it.each(["active", "escalated", "foreign-issue", "foreign-owner", "missing-agent", "invalid-agent", "new-active", "source-scoped"])(
+    "retains recovery framing when restored ownership is not established: %s", async kind => {
+      const f = await projectionFixture(kind === "active" || kind === "escalated" ? kind : "resolved");
+      const context: Record<string, unknown> = { ...f.context }; let agentId: string | undefined = f.coderId;
+      if (kind === "foreign-issue") {
+        const [other] = await db.insert(issues).values({ companyId: f.companyId, title: "Other source", status: "todo", assigneeAgentId: f.coderId }).returning();
+        context.issueId = other.id; context.taskId = other.id;
+      }
+      if (kind === "foreign-owner") agentId = f.managerId;
+      if (kind === "missing-agent") agentId = undefined;
+      if (kind === "invalid-agent") agentId = "not-an-agent-id";
+      if (kind === "source-scoped") context.wakeReason = "source_scoped_recovery_action";
+      if (kind === "new-active") await issueRecoveryActionService(db).upsertSourceScoped({ companyId: f.companyId,
+        sourceIssueId: f.sourceIssueId, kind: "configuration_validation", ownerType: "board", cause: "configuration_incomplete",
+        fingerprint: "new-owner-contract", nextAction: "Inspect the new hold." });
+      const wake = await buildPaperclipWakePayload({ db, companyId: f.companyId, agentId, contextSnapshot: context });
+      expect(wake?.recovery).toMatchObject({ cause: "workspace_validation_failed" });
+      expect(isPaperclipRecoveryWakePayload(wake)).toBe(true);
+      expect(renderPaperclipWakePrompt(wake)).toContain("Recovery contract:");
+    });
+
+  it.each(["unknown", "foreign-company"])("preserves unknown action lookup behavior for %s provenance", async kind => {
+    const f = await projectionFixture();
+    const actionId = kind === "unknown" ? randomUUID() : (await projectionFixture()).action.id;
+    const context = { ...f.context, recoveryActionId: actionId };
+    const wake = await buildPaperclipWakePayload({ db, companyId: f.companyId, agentId: f.coderId, contextSnapshot: context });
+    expect(wake?.recovery).toBeNull();
+    const fallback = await buildPaperclipWakePayload({ db, companyId: f.companyId, agentId: f.coderId,
+      contextSnapshot: { ...context, recoveryCause: "workspace_validation_failed" } });
+    expect(fallback?.recovery).toMatchObject({ cause: "workspace_validation_failed" });
+    expect(renderPaperclipWakePrompt(fallback)).toContain("Recovery contract:");
+  });
+
   it("hands restored work back to the recorded return owner and records the outcome", async () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     await db
@@ -2222,7 +2382,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       wakePolicy: { type: "wake_owner" },
     });
 
-    const enqueueRecoveryActionWakeup = vi.fn(async () => null);
+    const enqueueRecoveryActionWakeup = vi.fn(async (_agentId: string, _opts: Record<string, any>) => null);
     const resolved = await request(createApp(undefined, {
       recoveryActionEnqueueWakeup: enqueueRecoveryActionWakeup,
     }))
@@ -2253,6 +2413,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         payload: expect.objectContaining({ issueId: sourceIssueId, recoveryActionId: action.id }),
       }),
     );
+    const [target, opts] = enqueueRecoveryActionWakeup.mock.calls[0];
+    const persisted = await queueRestoredWake(companyId, target, opts);
+    expect(persisted.contextSnapshot).toMatchObject({ issueId: sourceIssueId, taskId: sourceIssueId,
+      recoveryActionId: action.id, wakeReason: "issue_recovery_action_restored", source: "issue.recovery_action_resolution" });
+    await expectOrdinaryRestoredWake(persisted.companyId, persisted.agentId, persisted.contextSnapshot!, persisted.id);
   });
 
   it("does not enqueue a restored wake when todo status and assignee are unchanged", async () => {
