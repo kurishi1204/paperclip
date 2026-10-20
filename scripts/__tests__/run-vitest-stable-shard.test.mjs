@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 import {
@@ -73,7 +73,7 @@ test("unavailable ownership lookup stops the common entry before any Vitest job"
 
 test("the real host lookup identifies the probe's own ephemeral listener", () => {
   const result = spawnSync(process.execPath, [
-    "--import", path.join(repoRoot, "cli/node_modules/tsx/dist/loader.mjs"),
+    "--import", pathToFileURL(path.join(repoRoot, "cli/node_modules/tsx/dist/loader.mjs")).href,
     path.join(repoRoot, "scripts/check-vitest-test-host.mjs"),
   ], { cwd: repoRoot, encoding: "utf8", env: workflowEnv(), timeout: 20_000 });
   assert.equal(result.status, 0, result.stderr);

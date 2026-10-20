@@ -14,7 +14,7 @@ try {
   if (owner !== process.pid) {
     throw new Error(
       `Port-owner lookup returned ${owner ?? "no owner"} for probe PID ${process.pid}. `
-      + "Preserve the host PATH and its ownership tools; macOS normally needs /usr/sbin for lsof.",
+      + "Preserve the host PATH and install missing ownership tools; macOS normally needs /usr/sbin for lsof.",
     );
   }
   console.log(`[test:host] Local listener belongs to probe PID ${process.pid}.`);

@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadShardDurations, selectGeneralServerShard } from "./general-server-shard.mjs";
 
 import { assertSelectedTests, partitionTestLines } from "./test-line-shard.mjs";
@@ -613,7 +613,7 @@ if (options.dryRun) {
 // Use the production lookup before any expensive suite starts. The child owns
 // the listener and is bounded even if the host's lookup command does not return.
 const testHost = spawnSync(process.execPath, [
-  "--import", path.join(repoRoot, "cli/node_modules/tsx/dist/loader.mjs"),
+  "--import", pathToFileURL(path.join(repoRoot, "cli/node_modules/tsx/dist/loader.mjs")).href,
   path.join(scriptsDir, "check-vitest-test-host.mjs"),
 ], {
   cwd: repoRoot,

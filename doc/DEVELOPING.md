@@ -28,10 +28,11 @@ GitHub Actions owns `pnpm-lock.yaml`.
 
 ## Test host check
 
-The standard `pnpm test:run` checks the test host before it starts Vitest. A short
+The standard Vitest runner (`pnpm test:run` and its grouped entries) checks the
+test host before it starts Vitest. A short
 probe opens its own ephemeral loopback listener and uses the production port-owner
-lookup to verify its PID. If this fails, keep the original host `PATH` when adding
-toolchain directories. On macOS, this normally includes `/usr/sbin` for `lsof`.
+lookup to verify its PID. If this fails, install missing ownership tools and keep
+the original host `PATH` when adding toolchain directories. On macOS, this normally includes `/usr/sbin` for `lsof`.
 The probe cannot change managed services and has a 15-second process limit.
 `--dry-run` only prints the existing plan and does not run the probe.
 
