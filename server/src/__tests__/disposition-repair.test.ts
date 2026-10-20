@@ -5,6 +5,7 @@ import {
   DISPOSITION_REPAIR_BASE_DELAYS_MS,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
   dispositionRepairDelayMs,
+  collectDispositionRepairSourceState,
 } from "../services/recovery/disposition-repair.ts";
 
 const deliberateWaitRun = {
@@ -20,6 +21,25 @@ const deliberateWaitRun = {
 };
 
 describe("owner-sticky disposition repair", () => {
+  it("keeps the original null-descriptor fingerprint byte-identical", async () => {
+    const emptyQuery = () => {
+      const query = {
+        from: () => query,
+        innerJoin: () => query,
+        where: async () => [],
+      };
+      return query;
+    };
+    const db = { select: emptyQuery } as unknown as Parameters<typeof collectDispositionRepairSourceState>[0];
+    const state = await collectDispositionRepairSourceState(db, { issue: {
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "22222222-2222-4222-8222-222222222222",
+      status: "blocked", assigneeAgentId: null, assigneeUserId: null,
+      executionPolicy: null, executionState: null, monitorNextCheckAt: null, unblockDescriptor: null,
+    } });
+    expect(state.fingerprint).toBe("disposition_repair:v1:8e17260cb097569afdde5f9ccd0591446506aeaf7e30eb1979bb31a2e5d666c1");
+    expect(state.hasDurableWaitingPath).toBe(false);
+  });
   it("classifies a deliberate wait without a target into its dedicated bounded lane", () => {
     expect(ISSUE_RECOVERY_ACTION_KINDS).toContain("deliberate_wait_without_target");
     expect(classifyContinuationFailure(deliberateWaitRun)).toEqual({
