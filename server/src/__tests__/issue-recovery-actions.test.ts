@@ -2294,6 +2294,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const context = { ...f.context, recoveryIntent: "status_only", allowDeliverableWork: false,
       allowDocumentUpdates: false, resumeRequiresNormalModel: true };
     const paperclipWake = await buildPaperclipWakePayload({ db, companyId: f.companyId, agentId: f.coderId, contextSnapshot: context });
+    expect(isPaperclipRecoveryWakePayload(paperclipWake)).toBe(true);
+    expect(renderPaperclipWakePrompt(paperclipWake)).toContain("Recovery contract:");
+    expect(renderPaperclipWakePrompt(paperclipWake)).toContain("Do not produce the deliverable yourself.");
     await seedHeartbeatRun({ companyId: f.companyId, agentId: f.coderId, issueId: f.sourceIssueId, runId, status: "running" });
     await db.update(heartbeatRuns).set({ contextSnapshot: { ...context, paperclipWake } }).where(eq(heartbeatRuns.id, runId));
     await db.update(issues).set({ checkoutRunId: runId, executionRunId: runId }).where(eq(issues.id, f.sourceIssueId));

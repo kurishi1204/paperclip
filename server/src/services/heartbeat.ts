@@ -8215,7 +8215,8 @@ export async function buildPaperclipWakePayload(input: {
     !executionAlreadyReconciled && recoveryAction &&
     ["resolved", "cancelled"].includes(recoveryAction.status) &&
     recoveryAction.sourceIssueId === issueId && recoveryAgentId && isUuidLike(recoveryAgentId) &&
-    readNonEmptyString(input.contextSnapshot.wakeReason) !== "source_scoped_recovery_action"
+    readNonEmptyString(input.contextSnapshot.wakeReason) !== "source_scoped_recovery_action" &&
+    input.contextSnapshot.recoveryIntent !== "status_only"
   ) {
     // Settled recovery is provenance, not another repair assignment. Confirm
     // the current source owner and absence of live recovery in one snapshot.
