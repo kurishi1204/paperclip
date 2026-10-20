@@ -372,6 +372,17 @@ recycled process when identity cannot be established.
 
 Use `--drain-required` only when the deploy intentionally requires the old terminate-and-retry behavior. Without that flag, the old server verifies that the marker targets its own PID, stops new scheduler work, waits for any queue-claim callback already in flight, snapshots currently running heartbeat run IDs and child PIDs, and skips the shutdown drain so eligible detached local-agent processes can keep running. ACP-backed local runs use server-owned stdio and cannot survive their parent server, so the old server instead persists their complete snapshot, changes the marker to `drainRequired` with `drainReason: "active_acp_run"`, and drains only those runs to bounded conversation retries. These retries resume the prior session when compatible, otherwise carry the full task conversation into a fresh session. They do not automatically replay tool calls or require receipts for every prior action. Detached CLI runs remain eligible for adoption during the same mixed restart. If an ACP process terminates but its terminal run update does not persist, startup classifies it as lost with reason `selective_drain_not_finalized` rather than treating the drain as successful. On startup the new server writes `$PAPERCLIP_HOME/instances/${PAPERCLIP_INSTANCE_ID:-default}/hot-restart-report.json` with `previousServerPid`, `newServerPid`, `previousServerVersion`, `newServerVersion`, `drainReason`, `adoptedRunIds`, `finalizedWhileDownRunIds`, `lostRunIds`, and per-run classifications before the normal orphan reaper runs.
 
+The service CLI follows the same interrupt-and-retry behavior when you use
+`paperclipai service restart --wait`. This flag disables adoption and interrupts
+active runs at shutdown. It does not wait for their work to finish. Explicit
+drains with an instance-scoped intent also save the running set before shutdown,
+so the startup report can identify interrupted runs as `finalized_while_down` with reason
+`run_status_interrupted`. The receipt also records which runs the existing
+ownership checks select for interruption. If one is still running at startup,
+the report marks it lost with reason `drain_not_finalized`. Native suspended
+runs and runs owned by other controllers keep their ownership; the receipt does
+not turn a full drain into a selective drain.
+
 When Paperclip manages embedded PostgreSQL, it suppresses that dependency's eager
 `SIGINT`/`SIGTERM` cleanup hooks. Paperclip owns signal ordering so the heartbeat
 snapshot and any required drain complete while the database is still available;
