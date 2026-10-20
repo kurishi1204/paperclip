@@ -11713,7 +11713,10 @@ export function issueService(db: Db) {
         assigneeAgentId: current.assigneeAgentId,
         checkoutRunId: current.checkoutRunId,
         executionRunId: current.executionRunId,
-        ...(current.status === "blocked" && current.unblockDescriptor != null
+        ...(current.status === "blocked" && current.unblockDescriptor != null &&
+          expectedStatuses.includes("blocked") &&
+          (current.assigneeAgentId == null || current.assigneeAgentId === agentId) &&
+          (current.checkoutRunId == null || current.checkoutRunId === checkoutRunId)
           ? { reason: "typed_blocked_wait", unblockDescriptor: current.unblockDescriptor }
           : {}),
       });

@@ -219,8 +219,9 @@ export async function collectDispositionRepairSourceState(
       executionPolicy: issue.executionPolicy,
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt?.toISOString() ?? null,
-      // Missing/null descriptors keep the exact pre-existing repair fingerprint.
-      ...(issue.unblockDescriptor != null ? { unblockDescriptor: issue.unblockDescriptor } : {}),
+      // Null and historical non-blocked descriptors preserve the old retry budget.
+      ...(issue.status === "blocked" && issue.unblockDescriptor != null
+        ? { unblockDescriptor: issue.unblockDescriptor } : {}),
     },
     blockers: blockers.sort((a, b) => a.id.localeCompare(b.id)),
     children: children.sort((a, b) => a.id.localeCompare(b.id)),

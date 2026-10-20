@@ -297,6 +297,53 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
   }
 
   it.each([
+    { lane: "legacy", status: "in_progress", parkAtDispatch: false },
+    { lane: "v1", status: "in_progress", parkAtDispatch: false },
+    { lane: "v1", status: "in_review", parkAtDispatch: false },
+    { lane: "legacy", status: "in_progress", parkAtDispatch: true },
+    { lane: "v1", status: "in_progress", parkAtDispatch: true },
+  ])("revalidates actual $lane repair dispatch from $status (late wait=$parkAtDispatch)", async ({ lane, status, parkAtDispatch }) => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID(), sourceId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Normal repair dispatch", status, assigneeAgentId: agentId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: sourceId, companyId, agentId, invocationSource: "assignment", triggerDetail: "system",
+      status: "succeeded", contextSnapshot: { issueId }, finishedAt: new Date(),
+    });
+    const { runId } = await seedQueuedRun({
+      companyId, agentId, issueId, wakeReason: "issue_disposition_repair",
+      scheduledRetryReason: "issue_disposition_repair", invocationSource: "automation",
+      contextExtras: {
+        retryReason: "issue_disposition_repair", dispositionRepairSourceRunId: sourceId,
+        ...(lane === "legacy" ? { legacyDispositionEpisode: { id: sourceId, attempt: 1, maxAttempts: 2 } } : {}),
+      },
+    });
+    if (parkAtDispatch) beforeContinuationDispatchCheck = async input => {
+      if (input.runId !== runId) return;
+      await db.update(issues).set({
+        status: "blocked", unblockDescriptor: { owner: "board", action: "Verify the new receipt" },
+      }).where(eq(issues.id, issueId));
+    };
+    mockAdapterExecute.mockImplementation(async () => {
+      expect(parkAtDispatch).toBe(false);
+      const [claimed] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(claimed.executionRunId).toBe(runId);
+      expect(claimed.status).toBe(status);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Completed the isolated normal repair fixture.", provider: "test", model: "test-model" };
+    });
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    expect((await heartbeat.getRun(runId))?.status).toBe(parkAtDispatch ? "cancelled" : "succeeded");
+    expect(countExecuteCallsForRun(runId)).toBe(parkAtDispatch ? 0 : 1);
+    if (parkAtDispatch) expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0])
+      .toMatchObject({ status: "blocked", unblockDescriptor: { owner: "board", action: "Verify the new receipt" } });
+  });
+
+  it.each([
     { name: "assignments", sameIssue: true, first: "assignment", second: "assignment" },
     { name: "unrelated tasks", sameIssue: false, first: "assignment", second: "assignment" },
     { name: "assignment then direct comment", sameIssue: true, first: "assignment", second: "direct" },

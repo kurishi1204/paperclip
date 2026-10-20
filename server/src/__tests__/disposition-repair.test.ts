@@ -21,6 +21,27 @@ const deliberateWaitRun = {
 };
 
 describe("owner-sticky disposition repair", () => {
+  it.each(["todo", "in_progress", "in_review", "done"])(
+    "keeps stale nonblocked descriptors outside the %s upgrade fingerprint", async status => {
+      const emptyQuery = () => {
+        const query = { from: () => query, innerJoin: () => query, where: async () => [] };
+        return query;
+      };
+      const db = { select: emptyQuery } as unknown as Parameters<typeof collectDispositionRepairSourceState>[0];
+      const issue = {
+        id: "11111111-1111-4111-8111-111111111111",
+        companyId: "22222222-2222-4222-8222-222222222222",
+        status, assigneeAgentId: null, assigneeUserId: null,
+        executionPolicy: null, executionState: null, monitorNextCheckAt: null, unblockDescriptor: null,
+      };
+      const legacy = await collectDispositionRepairSourceState(db, { issue });
+      const stale = await collectDispositionRepairSourceState(db, { issue: {
+        ...issue, unblockDescriptor: { owner: "board", action: "Historical receipt wait" },
+      } });
+      expect(stale.fingerprint).toBe(legacy.fingerprint);
+      expect(stale.hasDurableWaitingPath).toBe(false);
+    },
+  );
   it("keeps the original null-descriptor fingerprint byte-identical", async () => {
     const emptyQuery = () => {
       const query = {

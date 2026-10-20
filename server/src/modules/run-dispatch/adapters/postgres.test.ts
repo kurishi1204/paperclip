@@ -382,6 +382,61 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   }
 
   describe("evaluateScheduledRetryGate", () => {
+    it("keeps a pre-upgrade v1 repair eligible when only a stale nonblocked descriptor differs", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const issue = (await db.select().from(issues).where(eq(issues.id, issueId)))[0]!;
+      const original = await collectDispositionRepairSourceState(db, { issue });
+      const runId = await seedRun({
+        companyId, agentId, status: "scheduled_retry", scheduledRetryReason: "issue_disposition_repair",
+        contextSnapshot: { issueId, retryReason: "issue_disposition_repair",
+          dispositionRepairFingerprint: original.fingerprint, dispositionRepairAttempt: 4 },
+      });
+      await db.update(issues).set({
+        unblockDescriptor: { owner: "board", action: "Historical receipt wait" },
+      }).where(eq(issues.id, issueId));
+      const adapter = createPostgresRunDispatchAdapter(db);
+      expect(await adapter.evaluateScheduledRetryGate({
+        runId, companyId, retryReasonOverride: "issue_disposition_repair", now: new Date(),
+      })).toEqual({ allowed: true });
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.contextSnapshot)
+        .toMatchObject({ dispositionRepairFingerprint: original.fingerprint, dispositionRepairAttempt: 4 });
+    });
+
+    it("keeps a mixed typed wait after its first-class blockers resolve", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID(), blockerId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "blocked", assigneeAgentId: agentId });
+      await seedIssue({ companyId, issueId: blockerId, status: "done" });
+      await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" });
+      const descriptor = { owner: "board", action: "Verify the external receipt as well" } as const;
+      await db.update(issues).set({ unblockDescriptor: descriptor }).where(eq(issues.id, issueId));
+      const svc = issueService(db);
+      expect(await svc.getDependencyReadiness(issueId)).toMatchObject({ isDependencyReady: true });
+      expect(await collectDispositionRepairSourceState(db, {
+        issue: (await db.select().from(issues).where(eq(issues.id, issueId)))[0]!,
+      })).toMatchObject({ hasDurableWaitingPath: true, durablePathReason: "unblock_descriptor" });
+      await expect(svc.checkout(issueId, agentId, ["blocked"], null))
+        .rejects.toMatchObject({ status: 409, details: { reason: "typed_blocked_wait" } });
+      await svc.update(issueId, { status: "todo" });
+      await expect(svc.checkout(issueId, agentId, ["todo"], null))
+        .resolves.toMatchObject({ status: "in_progress", unblockDescriptor: null });
+    });
+
+    it.each(["unexpected_status", "other_owner"])("does not label %s as a typed-wait checkout refusal", async cause => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const peerId = randomUUID(), issueId = randomUUID();
+      await seedAgent({ companyId, id: peerId, name: "Other agent" });
+      await seedIssue({ companyId, issueId, status: "blocked", assigneeAgentId: agentId });
+      await db.update(issues).set({ unblockDescriptor: { owner: "board", action: "Verify the receipt" } }).where(eq(issues.id, issueId));
+      const checkout = issueService(db).checkout(issueId,
+        cause === "other_owner" ? peerId : agentId,
+        cause === "unexpected_status" ? ["todo"] : ["blocked"], null);
+      await expect(checkout).rejects.toMatchObject({ status: 409 });
+      await checkout.catch(error => expect(error.details).not.toHaveProperty("reason"));
+    });
+
     it("preserves a typed blocked transition committed while checkout is waiting", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();
       const issueId = randomUUID();
