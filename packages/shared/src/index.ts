@@ -1974,6 +1974,7 @@ export {
   issueBlockedInboxReasonSchema,
   issueBlockedInboxSeveritySchema,
   issueBlockedInboxStateSchema,
+  issueUnblockDescriptorSchema,
   updateIssueSchema,
   stalledReviewDecisionSchema,
   issueExecutionPolicySchema,

@@ -117,7 +117,7 @@ Overrides and special cases:
 - **Blocked-task dedup:** before touching a `blocked` task, check the thread. If your most recent comment was a blocked-status update and no one has replied since, skip entirely — do not checkout, do not re-comment. Only re-engage on new context (comment, status change, event wake).
 - Nothing assigned → exit the heartbeat.
 
-**Step 5 — Checkout.** You MUST checkout before doing any work. Include the run ID header:
+**Step 5 — Checkout.** Checkout is required before deliverable work. A `blocked` issue with an `unblockDescriptor` stays blocked until its named action is fulfilled: comments, owner notifications and repair wakes do not resolve that condition. Read/triage the wait without checkout. If you are the named unblock owner, perform only the already-authorized unblock action, then record its evidence and PATCH the issue to `todo`; checkout afterward. Do not clear the wait merely to acquire execution. Include the run ID header:
 
 ```
 POST /api/issues/{issueId}/checkout
@@ -125,7 +125,7 @@ Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLI
 { "agentId": "{your-agent-id}", "expectedStatuses": ["todo", "backlog", "blocked", "in_review"] }
 ```
 
-If already checked out by you, returns normally. If owned by another agent: `409 Conflict` — stop, pick a different task. **Never retry a 409.**
+If already checked out by you, returns normally. A `409` with `details.reason: "typed_blocked_wait"` preserves the named wait; follow the unblock procedure above without retrying checkout while the wait is unresolved. If owned by another agent: `409 Conflict` — stop, pick a different task. **Never retry an unchanged 409.**
 
 **Name provisional tasks early.** When the task has `titleNeedsGeneration: true`, use `set_task_title` with a concise outcome-focused title and `onlyIfProvisional: true` as one of your first calls after checkout. If the tool is unavailable, use `PUT /api/issues/{issueId}/title` with `{ "title": "Concise task title", "onlyIfProvisional": true }` and the normal authentication/run headers. This metadata update is allowed in Ask and Plan modes. Keep explicit titles and the full description intact, then continue the task.
 
@@ -586,7 +586,7 @@ Exact response fields are documented in `skills/paperclip/references/api-referen
 
 ## Critical Rules
 
-- **Never retry a 409.** The task belongs to someone else.
+- **Never retry an unchanged 409.** Ownership conflicts require another task. A `typed_blocked_wait` conflict requires fulfilling the named action and an authorized status update before a new checkout.
 - **Never look for unassigned work.** No assignments = exit.
 - **Never self-assign from a mention.** A mention identifies relevant context; task work requires explicit assignment.
 - **Honor "send it back to me" requests from board users.** If a board/user asks for review handoff (e.g. "let me review it", "assign it back to me"), reassign to them with `assigneeAgentId: null` and `assigneeUserId: "<requesting-user-id>"`, typically setting status to `in_review` instead of `done`. Resolve the user id from the triggering comment's `authorUserId` when available, else the issue's `createdByUserId` if it matches the requester context.

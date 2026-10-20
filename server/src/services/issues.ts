@@ -11534,6 +11534,13 @@ export function issueService(db: Db) {
             eq(issues.executionRunId, checkoutRunId),
           )
         : isNull(issues.executionRunId);
+      // Checkout is execution acquisition, not proof that a named unblock
+      // action was fulfilled. Keep this in every status-writing checkout SQL
+      // predicate so a concurrent blocked transition cannot be overwritten.
+      const noTypedBlockedWait = or(
+        ne(issues.status, "blocked"),
+        sql`coalesce(jsonb_typeof(${issues.unblockDescriptor}), 'null') = 'null'`,
+      );
       const updated = await db
         .update(issues)
         .set({
@@ -11549,6 +11556,7 @@ export function issueService(db: Db) {
           and(
             eq(issues.id, id),
             inArray(issues.status, expectedStatuses),
+            noTypedBlockedWait,
             or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
             executionLockCondition,
           ),
@@ -11568,6 +11576,7 @@ export function issueService(db: Db) {
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
+          unblockDescriptor: issues.unblockDescriptor,
         })
         .from(issues)
         .where(eq(issues.id, id))
@@ -11665,6 +11674,7 @@ export function issueService(db: Db) {
               and(
                 eq(issues.id, id),
                 inArray(issues.status, expectedStatuses),
+                noTypedBlockedWait,
                 eq(issues.executionRunId, current.executionRunId),
                 or(
                   isNull(issues.assigneeAgentId),
@@ -11703,6 +11713,9 @@ export function issueService(db: Db) {
         assigneeAgentId: current.assigneeAgentId,
         checkoutRunId: current.checkoutRunId,
         executionRunId: current.executionRunId,
+        ...(current.status === "blocked" && current.unblockDescriptor != null
+          ? { reason: "typed_blocked_wait", unblockDescriptor: current.unblockDescriptor }
+          : {}),
       });
     },
 

@@ -7117,6 +7117,7 @@ export function shouldAutoCheckoutIssueForWake(input: {
   issueStatus: string | null;
   issueAssigneeAgentId: string | null;
   issueExecutionState?: unknown;
+  issueUnblockDescriptor?: unknown;
   isDependencyReady: boolean;
   agentId: string;
 }) {
@@ -7126,6 +7127,9 @@ export function shouldAutoCheckoutIssueForWake(input: {
   if (executionState?.status === "pending") return false;
 
   const issueStatus = readNonEmptyString(input.issueStatus);
+  // A wake delivers context; the named unblock action still needs an explicit
+  // authorized status update before this issue is executable again.
+  if (issueStatus === "blocked" && input.issueUnblockDescriptor != null) return false;
   if (
     issueStatus !== "todo" &&
     issueStatus !== "backlog" &&
@@ -10916,6 +10920,7 @@ export function heartbeatService(
         assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
+        unblockDescriptor: issues.unblockDescriptor,
         executionWorkspaceSettings: issues.executionWorkspaceSettings,
         parentId: issues.parentId,
         createdByUserId: issues.createdByUserId,
@@ -20805,6 +20810,7 @@ export function heartbeatService(
           issueStatus: issueContext.status,
           issueAssigneeAgentId: issueContext.assigneeAgentId,
           issueExecutionState: issueContext.executionState,
+          issueUnblockDescriptor: issueContext.unblockDescriptor,
           isDependencyReady:
             issueDependencyReadiness?.isDependencyReady ?? true,
           agentId: agent.id,
@@ -23020,6 +23026,8 @@ export function heartbeatService(
         if (
           !issueId ||
           (!isResolvedInteractionContinuationWakeContext(context) &&
+            readNonEmptyString(context.retryReason) !== ISSUE_DISPOSITION_REPAIR_RETRY_REASON &&
+            run.scheduledRetryReason !== ISSUE_DISPOSITION_REPAIR_RETRY_REASON &&
             !["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? ""))
         ) {
           return { dispatched: true, resultPromise: dispatch(() => {}) };

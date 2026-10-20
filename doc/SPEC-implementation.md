@@ -1217,6 +1217,17 @@ Server behavior:
 2. if updated row count is 0, return `409` with current owner/status
 3. successful checkout sets `assignee_agent_id`, `status = in_progress`, and `started_at`
 
+A blocked issue with a non-null `unblockDescriptor` cannot be checked out. Both
+the direct update and stale-lock adoption enforce this predicate atomically and
+return the ordinary checkout `409` with `details.reason: "typed_blocked_wait"`.
+Wakes and comments deliver context without proving the named action is complete.
+The named owner can inspect and fulfill the already-authorized action without
+checkout, then use the existing authorized status-update/resume path to leave
+`blocked`; that path clears the descriptor before normal checkout. Blocked issues
+without a descriptor retain the existing dependency-readiness behavior. Valid
+descriptors count as durable waits for disposition repair; malformed persisted
+descriptors preserve the checkout guard but do not establish a healthy wait.
+
 `POST /issues/:issueId/release` clears checkout and execution locks. For terminal
 issues (`done` or `cancelled`), it preserves the assignee, status, and disposition
 timestamps, including on repeated release. For unfinished issues it clears the
