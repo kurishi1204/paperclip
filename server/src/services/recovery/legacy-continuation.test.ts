@@ -49,4 +49,39 @@ describe("legacy continuation authority", () => {
   it("leaves native finalization to its own authority", () => {
     expect(decideLegacyContinuation({ ...input, run: { ...input.run, runtimeMode: "native" } }).kind).toBe("skip");
   });
+  describe("exhausted bound failed repairs", () => {
+    const failed: LegacyContinuationInput & { boundFailedRepairEpisodeId?: string | null } = {
+      ...input, run: { ...input.run, status: "failed" },
+      agent: { ...input.agent!, status: "error" },
+      episode: { ...input.episode, attempt: 2 }, boundFailedRepairEpisodeId: input.episode.id,
+    };
+    it("reports exhaustion without allocating another failed-run repair slot", () => {
+      expect(decideLegacyContinuation(failed)).toEqual({ kind: "exhausted", attempt: 2, maxAttempts: 2 });
+      expect(decideLegacyContinuation({ ...failed, episode: { ...failed.episode, attempt: 1 } })).toMatchObject({ kind: "skip" });
+    });
+    it.each([undefined, null, "other-episode"])("requires verified repair lineage (%s)", boundFailedRepairEpisodeId => {
+      expect(decideLegacyContinuation({ ...failed, boundFailedRepairEpisodeId }).kind).toBe("skip");
+    });
+    it.each(["cancelled", "timed_out", "interrupted", "running", "queued"])("does not reinterpret %s as failed exhaustion", status => {
+      expect(decideLegacyContinuation({ ...failed, run: { ...failed.run, status } }).kind).toBe("skip");
+    });
+    it.each(["stopped", "paused", "budgetBlocked", "pendingWait", "activeExecution", "ownedLifecycle", "conversation"] as const)("keeps the failed repair behind %s", gate => {
+      expect(decideLegacyContinuation({ ...failed, gates: { ...failed.gates, [gate]: true } }).kind).toBe("skip");
+    });
+    it("keeps native, owner, company, disposition and eligibility boundaries", () => {
+      const denied: LegacyContinuationInput[] = [
+        { ...failed, run: { ...failed.run, runtimeMode: "native" } },
+        { ...failed, issue: null }, { ...failed, agent: null },
+        { ...failed, issue: { ...failed.issue!, companyId: "foreign" } },
+        { ...failed, agent: { ...failed.agent!, companyId: "foreign" } },
+        { ...failed, agent: { ...failed.agent!, id: "other" } },
+        { ...failed, issue: { ...failed.issue!, assigneeAgentId: "other" } },
+        { ...failed, issue: { ...failed.issue!, assigneeUserId: "user" } },
+        { ...failed, gates: { ...failed.gates, agentInvokable: false } },
+        ...["done", "cancelled", "blocked", "in_review"].map(status => ({ ...failed, issue: { ...failed.issue!, status } })),
+        ...["paused", "terminated", "pending_approval"].map(status => ({ ...failed, agent: { ...failed.agent!, status } })),
+      ];
+      for (const value of denied) expect(decideLegacyContinuation(value).kind).toBe("skip");
+    });
+  });
 });

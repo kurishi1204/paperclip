@@ -127,6 +127,47 @@ describe("issueRecoveryActionService", () => {
     expect(fakeDb.update).toHaveBeenCalledTimes(1);
     expect(fakeDb.insert).toHaveBeenCalledTimes(1);
   });
+
+  const retryInput = { companyId: "company-1", sourceIssueId: "source-1", kind: "missing_disposition" as const,
+    ownerType: "agent" as const, ownerAgentId: "agent-1", cause: "successful_run_missing_issue_disposition" as const,
+    fingerprint: "missing-disposition:fingerprint", nextAction: "Choose a disposition.", attemptCount: 1 };
+  function conflictDb(error: unknown, recover: boolean) {
+    const row = makeRecoveryActionRow(); let reads = 0;
+    const fakeDb = {
+      select: vi.fn(() => ({ from() { return this; }, where() { return this; }, orderBy() { return this; },
+        limit: async () => recover && reads++ > 0 ? [row] : [] })),
+      insert: vi.fn(() => ({ values: () => ({ returning: async () => { throw error; } }) })),
+      update: vi.fn(() => ({ set: () => ({ where: () => ({ returning: async () => [row] }) }) })),
+    };
+    return { fakeDb, service: issueRecoveryActionService(fakeDb as never) };
+  }
+  it.each([
+    { code: "23505", constraint: "issue_recovery_actions_active_fingerprint_uq" },
+    new Error("Failed query", { cause: { code: "23505", constraint_name: "issue_recovery_actions_active_source_uq" } }),
+    new Error("Failed query", { cause: new Error("Driver wrapper", { cause: { code: "23505", constraint_name: "issue_recovery_actions_active_fingerprint_uq" } }) }),
+    { code: "23505", message: 'duplicate key violates "issue_recovery_actions_active_source_uq"' },
+  ])("reuses the same persisted action after a scoped unique conflict %#", async error => {
+    const { fakeDb, service } = conflictDb(error, true);
+    expect(await service.upsertSourceScoped(retryInput)).toMatchObject({ id: expect.any(String), attemptCount: 1 });
+    expect(fakeDb.insert).toHaveBeenCalledTimes(1); expect(fakeDb.select).toHaveBeenCalledTimes(2);
+  });
+  it.each([
+    { code: "23505", constraint_name: "issue_recovery_actions_pkey", message: "issue_recovery_actions_active_source_uq" },
+    { code: "23503", message: "issue_recovery_actions_active_source_uq" },
+    new Error("issue_recovery_actions_active_source_uq", { cause: { code: "23505", constraint_name: "unrelated_unique" } }),
+    new Error("issue_recovery_actions_active_source_uq", { cause: { code: "23503" } }),
+    { message: "Failed query" },
+  ])("does not retry an unrelated driver or wrapper failure %#", async error => {
+    const { fakeDb, service } = conflictDb(error, false);
+    await expect(service.upsertSourceScoped(retryInput)).rejects.toBe(error);
+    expect(fakeDb.insert).toHaveBeenCalledTimes(1); expect(fakeDb.select).toHaveBeenCalledTimes(1);
+  });
+  it("preserves the original error for a circular cause", async () => {
+    const error: { cause?: unknown } = {}; error.cause = error;
+    const { service, fakeDb } = conflictDb(error, false);
+    await expect(service.upsertSourceScoped(retryInput)).rejects.toBe(error);
+    expect(fakeDb.insert).toHaveBeenCalledTimes(1);
+  });
 });
 
 if (!embeddedPostgresSupport.supported) {
@@ -224,6 +265,76 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     return { companyId, managerId, coderId, sourceIssueId, prefix, sourceIssue: sourceIssue! };
   }
+
+  it("preserves unrelated real driver errors without retry", async () => {
+    const f = await seedCompany();
+    const base = { companyId: f.companyId, sourceIssueId: f.sourceIssueId, kind: "missing_disposition" as const,
+      ownerType: "agent" as const, ownerAgentId: f.coderId, cause: "successful_run_missing_issue_disposition" as const,
+      fingerprint: "driver-error-control", nextAction: "Choose a disposition.", attemptCount: 1 };
+    const action = await issueRecoveryActionService(db).upsertSourceScoped(base);
+    const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    for (const code of ["23505", "23503"]) {
+      let failure: unknown;
+      try { await db.insert(issueRecoveryActions).values({ ...row,
+        ...(code === "23503" ? { id: randomUUID(), companyId: randomUUID() } : {}),
+      }); } catch (error) { failure = error; }
+      expect(failure).toMatchObject({ cause: { code,
+        ...(code === "23505" ? { constraint_name: "issue_recovery_actions_pkey" } : {}),
+      } });
+      const sourceIssueId = randomUUID();
+      await db.insert(issues).values({ id: sourceIssueId, companyId: f.companyId, title: "Driver control", status: "in_progress", assigneeAgentId: f.coderId });
+      const insert = vi.fn(() => ({ values: () => ({ returning: async () => { throw failure; } }) }));
+      const proxy = new Proxy(db, { get(target, key) { const value = key === "insert" ? insert : Reflect.get(target, key); return typeof value === "function" ? value.bind(target) : value; } });
+      await expect(issueRecoveryActionService(proxy).upsertSourceScoped({ ...base, sourceIssueId })).rejects.toBe(failure);
+      expect(insert).toHaveBeenCalledTimes(1);
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId))).toHaveLength(0);
+    }
+  });
+
+  it("reuses one action across two real upserts that both read no active action", async () => {
+    const f = await seedCompany(); let arrived = 0; let release!: () => void;
+    const ready = new Promise<void>(resolve => { release = resolve; }); const conflicts: unknown[] = [];
+    function racingDb() {
+      let firstRead = true;
+      function wrap(query: any, mode: "read" | "insert"): any {
+        return new Proxy(query, { get(target, key) {
+          const value = Reflect.get(target, key);
+          if (typeof value !== "function") return value;
+          return (...args: unknown[]) => {
+            const next = value.apply(target, args);
+            if (mode === "read" && key === "limit") return Promise.resolve(next).then(async rows => {
+              if (firstRead) { firstRead = false; expect(rows).toEqual([]); if (++arrived === 2) release(); await ready; }
+              return rows;
+            });
+            if (mode === "insert" && key === "returning") return Promise.resolve(next).catch(error => { conflicts.push(error); throw error; });
+            return ["from", "where", "orderBy", "values"].includes(String(key)) ? wrap(next, mode) : next;
+          };
+        } });
+      }
+      return new Proxy(db, { get(target, key) {
+        if (key === "select") return (...args: unknown[]) => wrap((target.select as any)(...args), "read");
+        if (key === "insert") return (...args: unknown[]) => wrap((target.insert as any)(...args), "insert");
+        const value = Reflect.get(target, key); return typeof value === "function" ? value.bind(target) : value;
+      } });
+    }
+    const input = { companyId: f.companyId, sourceIssueId: f.sourceIssueId, kind: "deliberate_wait_without_target" as const,
+      ownerType: "agent" as const, ownerAgentId: f.coderId, cause: "deliberate_wait_without_target" as const,
+      fingerprint: "bounded-race", nextAction: "Choose a disposition.", attemptCount: 2, maxAttempts: 2 };
+    const settled = await Promise.allSettled([issueRecoveryActionService(racingDb()).upsertSourceScoped(input), issueRecoveryActionService(racingDb()).upsertSourceScoped(input)]);
+    expect(settled.map(row => row.status)).toEqual(["fulfilled", "fulfilled"]);
+    const values = settled.map(row => (row as PromiseFulfilledResult<Awaited<ReturnType<ReturnType<typeof issueRecoveryActionService>["upsertSourceScoped"]>>>).value);
+    expect(values[0].id).toBe(values[1].id);
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]).toMatchObject({ cause: { code: "23505", constraint_name: "issue_recovery_actions_active_source_uq" } });
+    const rows = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.sourceIssueId));
+    expect(rows).toHaveLength(1);
+    const secondIssueId = randomUUID();
+    await db.insert(issues).values({ id: secondIssueId, companyId: f.companyId, title: "Sequential control", status: "in_progress", assigneeAgentId: f.coderId, issueNumber: 2 });
+    const sequential = issueRecoveryActionService(db);
+    await sequential.upsertSourceScoped({ ...input, sourceIssueId: secondIssueId });
+    const control = await sequential.upsertSourceScoped({ ...input, sourceIssueId: secondIssueId });
+    expect(rows[0]).toMatchObject({ status: control.status, ownerType: control.ownerType, attemptCount: control.attemptCount, maxAttempts: control.maxAttempts });
+  });
 
   async function seedHeartbeatRun(input: {
     companyId: string;

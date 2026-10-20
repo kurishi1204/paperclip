@@ -109,20 +109,30 @@ function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
   };
 }
 
+const RECOVERY_ACTION_UNIQUE_CONSTRAINTS = [
+  "issue_recovery_actions_active_source_uq",
+  "issue_recovery_actions_active_fingerprint_uq",
+] as const;
+const MAX_ERROR_CAUSE_DEPTH = 8;
+
 function isUniqueRecoveryActionConflict(error: unknown) {
-  const maybe = error as { code?: string; constraint?: string; message?: string } | null;
-  return Boolean(
-    maybe &&
-      maybe.code === "23505" &&
-      (
-        maybe.constraint === "issue_recovery_actions_active_source_uq" ||
-        maybe.constraint === "issue_recovery_actions_active_fingerprint_uq" ||
-        typeof maybe.message === "string" && (
-          maybe.message.includes("issue_recovery_actions_active_source_uq") ||
-          maybe.message.includes("issue_recovery_actions_active_fingerprint_uq")
-        )
-      ),
-  );
+  const seen = new Set<object>();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current) && seen.size < MAX_ERROR_CAUSE_DEPTH) {
+    seen.add(current);
+    const node = current as { code?: unknown; constraint?: unknown; constraint_name?: unknown; message?: unknown; cause?: unknown };
+    // Drizzle wraps the driver error. Pair SQLSTATE and constraint at the same
+    // node so query text in an outer wrapper cannot authorize a retry.
+    if (node.code === "23505") {
+      const constraint = typeof node.constraint_name === "string" ? node.constraint_name
+        : typeof node.constraint === "string" ? node.constraint : null;
+      if (constraint !== null) return RECOVERY_ACTION_UNIQUE_CONSTRAINTS.some(name => name === constraint);
+      const message = node.message;
+      return typeof message === "string" && RECOVERY_ACTION_UNIQUE_CONSTRAINTS.some(name => message.includes(name));
+    }
+    current = node.cause;
+  }
+  return false;
 }
 
 export function issueRecoveryActionService(db: Db) {

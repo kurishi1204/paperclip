@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { legacyExecutionNeedsReconciliationWithEvidence, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 describe("legacy continuation persisted authority", () => {
@@ -88,6 +89,16 @@ describe("legacy continuation persisted authority", () => {
     expect((await f.actions()).find(a => a.status === "active")).toMatchObject({ ownerType: "board", attemptCount: 2 });
   });
 
+  it("preserves the pre-episode repair path rather than granting new failed-lineage authority", async () => {
+    const f = await finalRepair(); const context = { ...f.failed.contextSnapshot };
+    delete context.legacyDispositionEpisode;
+    await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, f.failed.id));
+    await f.createRecovery().reconcileStrandedAssignedIssues();
+    const state = await snapshot(f);
+    expect(escalationRows(state).comments).toHaveLength(0);
+    expect(state.runs).toHaveLength(4);
+    expect(state.actions.find(row => row.status === "active")).toMatchObject({ ownerType: "agent", maxAttempts: 5, attemptCount: 1 });
+  });
   it.each(["approval", "budget", "pause", "reassigned"])("ACCT-03 %s introduced during second repair delay survives restart without another debit", async gate => {
     const f = await fixture();
     await f.createRecovery().reconcileLegacyContinuation(f.runId);
@@ -246,9 +257,242 @@ describe("legacy continuation persisted authority", () => {
   });
   it("the delayed sweep ignores old diagnostic labels and uses the same repair path", async () => {
     const f = await fixture();
-    await f.createRecovery().reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    await f.createRecovery().reconcileStrandedAssignedIssues();
     expect(await f.runs()).toHaveLength(2);
     const repair = (await f.runs()).find(r => r.id !== f.runId)!;
     expect(repair.contextSnapshot).toMatchObject({ legacyDispositionEpisode: { id: f.runId, attempt: 1 } });
+  });
+
+  async function finalRepair(attempt = 2, activeAction = false) {
+    const f = await fixture({ executionRetryAccounting: { version: 1, failureRetries: 0, maxTurnContinuations: 0 } });
+    await f.createRecovery().reconcileLegacyContinuation(f.runId);
+    let repair = (await f.runs()).find(row => row.id !== f.runId)!;
+    if (attempt === 2) {
+      await f.finish(repair);
+      await f.createRecovery().reconcileLegacyContinuation(repair.id);
+      repair = (await f.runs()).find(row => row.status === "scheduled_retry")!;
+    }
+    // Match setRunStatus's direct persistence branch: policy-v1 is not an
+    // action-outcome reconciliation hold. Forcing the terminalizer here would
+    // create a watchdog that the real producer never creates for this shape.
+    await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, repair.id));
+    const [failed] = await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), executionStatusDeliveryId: randomUUID(), updatedAt: new Date(),
+      errorCode: "adapter_failed", error: "exceeded retry limit, last status: 429 Too Many Requests", exitCode: 1,
+      resultJson: { conversationContinuation: "continue_conversation_v1", timeoutFired: false },
+      issueCommentStatus: "not_applicable",
+    }).where(eq(heartbeatRuns.id, repair.id)).returning();
+    expect(await legacyExecutionNeedsReconciliationWithEvidence(db, failed)).toBe(false);
+    if (repair.wakeupRequestId) await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, repair.wakeupRequestId));
+    await db.update(agents).set({ status: "error" }).where(eq(agents.id, f.agentId));
+    await db.update(issueRecoveryActions).set(activeAction
+      ? { timeoutAt: new Date(0) }
+      : { status: "cancelled", outcome: "cancelled", resolvedAt: new Date() }
+    ).where(eq(issueRecoveryActions.companyId, f.companyId));
+    return { ...f, failed };
+  }
+
+  async function snapshot(f: { companyId: string; issueId: string }) {
+    const [runs, actions, issue, comments, activity, wakes] = await Promise.all([
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)).orderBy(heartbeatRuns.id),
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId)).orderBy(issueRecoveryActions.id),
+      db.select().from(issues).where(eq(issues.id, f.issueId)),
+      db.select().from(issueComments).where(eq(issueComments.companyId, f.companyId)).orderBy(issueComments.id),
+      db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId)).orderBy(activityLog.id),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)).orderBy(agentWakeupRequests.id),
+    ]);
+    return { runs, actions, issue, comments, activity, wakes };
+  }
+  function escalationRows(state: Awaited<ReturnType<typeof snapshot>>) {
+    return {
+      actions: state.actions.filter(row => ["active", "escalated"].includes(row.status) && row.kind === "deliberate_wait_without_target"),
+      comments: state.comments.filter(row => (row.metadata?.recovery as Record<string, unknown> | undefined)?.kind === "disposition_repair_escalated"),
+      activity: state.activity.filter(row => row.action === "issue.disposition_repair_escalated"),
+    };
+  }
+  it.each([false, true])("escalates an exhausted failed repair once without another run (active action: %s)", async activeAction => {
+    const f = await finalRepair(2, activeAction), recovery = f.createRecovery();
+    const before = await snapshot(f);
+    // A future candidate cutoff enters the real public sweep but isolates its
+    // existing active-action tail from the assigned-issue branch.
+    const outcome = await recovery.reconcileStrandedAssignedIssues(activeAction
+      ? { issueCreatedAtGte: new Date(Date.now() + 60_000) } : undefined);
+    expect(outcome.escalated).toBe(1);
+    const state = await snapshot(f), rows = escalationRows(state);
+    expect(state.issue[0]).toMatchObject({ status: "blocked", assigneeAgentId: f.agentId, assigneeUserId: null });
+    expect(rows.actions).toHaveLength(1);
+    expect(rows.actions[0]).toMatchObject({ ownerType: "board", attemptCount: 2, wakePolicy: { type: "board_escalation" },
+      evidence: { latestRunId: f.failed.id, latestRunStatus: "failed", latestRunErrorCode: "adapter_failed", sourceAttemptCount: 2, sourceMaxAttempts: 2 } });
+    expect(state.runs).toEqual(before.runs);
+    expect(state.wakes).toEqual(before.wakes);
+    expect(rows.comments).toHaveLength(1); expect(rows.activity).toHaveLength(1);
+    for (let i = 0; i < 2; i++) {
+      await recovery.reconcileStrandedAssignedIssues();
+
+      expect(await snapshot(f)).toEqual(state);
+    }
+    expect(await recovery.reconcileLegacyContinuation(f.failed.id)).toBe("skipped");
+  });
+  it("keeps an under-cap failed repair and both independent counters unchanged", async () => {
+    const f = await finalRepair(1), before = await snapshot(f);
+    await f.createRecovery().reconcileStrandedAssignedIssues();
+    expect(await snapshot(f)).toEqual(before);
+  });
+  it.each(["missing-source", "foreign-company", "other-agent", "wrong-issue", "failed-source", "changed-episode"])("does not escalate an invalid failed repair lineage: %s", async mutation => {
+    const f = await finalRepair(); const context = structuredClone(f.failed.contextSnapshot!) as Record<string, any>;
+    if (mutation === "missing-source") delete context.dispositionRepairSourceRunId;
+    if (mutation === "foreign-company") {
+      const other = await fixture();
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, other.issueId));
+      context.dispositionRepairSourceRunId = other.runId;
+    }
+    if (mutation === "other-agent" || mutation === "wrong-issue" || mutation === "failed-source") {
+      const [source] = (await f.runs()).filter(row => row.id === context.dispositionRepairSourceRunId);
+      const other = await fixture();
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, other.issueId));
+      const [replacement] = await db.insert(heartbeatRuns).values({ companyId: f.companyId,
+        agentId: mutation === "other-agent" ? (await db.insert(agents).values({ companyId: f.companyId, name: "Other worker", role: "engineer", adapterType: "codex_local", status: "idle" }).returning())[0].id : f.agentId,
+        status: mutation === "failed-source" ? "failed" : "succeeded", runtimeMode: "legacy",
+        contextSnapshot: { ...source.contextSnapshot, issueId: mutation === "wrong-issue" ? other.issueId : f.issueId },
+        createdAt: new Date(0),
+      }).returning();
+      // Preserve the source episode identity explicitly; only its binding differs.
+      await db.update(heartbeatRuns).set({ contextSnapshot: { ...replacement.contextSnapshot,
+        legacyDispositionEpisode: { id: context.legacyDispositionEpisode.id, attempt: 0, maxAttempts: 2 } } }).where(eq(heartbeatRuns.id, replacement.id));
+      context.dispositionRepairSourceRunId = replacement.id;
+    }
+    if (mutation === "changed-episode") context.legacyDispositionEpisode.id = randomUUID();
+    await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, f.failed.id));
+    const before = await snapshot(f);
+    await f.createRecovery().reconcileStrandedAssignedIssues();
+    expect(await snapshot(f)).toEqual(before);
+  });
+  it("preserves the pre-episode repair path rather than granting new failed-lineage authority", async () => {
+    const f = await finalRepair(); const context = { ...f.failed.contextSnapshot };
+    delete context.legacyDispositionEpisode;
+    await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, f.failed.id));
+    await f.createRecovery().reconcileStrandedAssignedIssues();
+    const state = await snapshot(f);
+    expect(escalationRows(state).comments).toHaveLength(0);
+    expect(state.runs).toHaveLength(4);
+    expect(state.actions.find(row => row.status === "active")).toMatchObject({ ownerType: "agent", maxAttempts: 5, attemptCount: 1 });
+  });
+  it.each(["approval", "budget", "paused", "reassigned", "goal", "monitor", "wake", "operator-cancel"])("preserves a real failed-repair admission gate: %s", async gate => {
+    const f = await finalRepair();
+    if (gate === "approval") await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: "request_confirmation", status: "pending", payload: { version: 1, prompt: "Continue?" } });
+    if (gate === "budget") await db.update(companies).set({ status: "paused", pauseReason: "budget" }).where(eq(companies.id, f.companyId));
+    if (gate === "paused") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
+    if (gate === "reassigned") await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, f.issueId));
+    if (gate === "goal") await db.update(heartbeatRuns).set({ contextSnapshot: { ...f.failed.contextSnapshot, goalControlRequestId: randomUUID() } }).where(eq(heartbeatRuns.id, f.failed.id));
+    if (gate === "monitor") await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 60_000) }).where(eq(issues.id, f.issueId));
+    if (gate === "wake") await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand", status: "queued", payload: { issueId: f.issueId } });
+    if (gate === "operator-cancel") await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "operator_interrupted" }).where(eq(heartbeatRuns.id, f.failed.id));
+    const before = await snapshot(f);
+    await f.createRecovery().reconcileStrandedAssignedIssues();
+    expect(await snapshot(f)).toEqual(before);
+    if (gate === "approval" || gate === "paused") {
+      if (gate === "approval") await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.companyId, f.companyId));
+      else await db.update(agents).set({ status: "error" }).where(eq(agents.id, f.agentId));
+      expect((await f.createRecovery().reconcileStrandedAssignedIssues()).escalated).toBe(1);
+    }
+  });
+  it.each(["no-policy", "unsafe-workspace"])("retains the real reconciliation hold for %s", async kind => {
+    const f = await finalRepair();
+    const resultJson = kind === "no-policy" ? {} : { ...f.failed.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" };
+    const [run] = await db.update(heartbeatRuns).set({ resultJson }).where(eq(heartbeatRuns.id, f.failed.id)).returning();
+    expect(await legacyExecutionNeedsReconciliationWithEvidence(db, run)).toBe(true);
+    await terminalizeLegacyExecution({ db, run, status: "failed", fromStatuses: ["failed"] });
+    await f.createRecovery().reconcileStrandedAssignedIssues();
+    const state = await snapshot(f);
+    expect(state.actions.find(row => ["active", "escalated"].includes(row.status))).toMatchObject({ kind: "active_run_watchdog", ownerType: "board" });
+    expect(escalationRows(state).comments).toHaveLength(0);
+    expect(state.runs).toHaveLength(3);
+  });
+  async function holdIssueLock(issueId: string) {
+    let acquired!: (tx: any) => void, release!: () => void;
+    const locked = new Promise<any>(resolve => { acquired = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const pending = db.transaction(async tx => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+      acquired(tx); await gate;
+    });
+    const tx = await locked;
+    return { tx, release: async () => { release(); await pending; } };
+  }
+  async function waitForIssueLockWaiters(expected: number) {
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      const rows = await db.execute(sql`select pid from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock' and pid <> pg_backend_pid()`);
+      if (rows.length >= expected) return;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    throw new Error("Expected fixture backends did not reach the issue lock");
+  }
+  it.each([false, true])("does not allocate a new repair when concurrent exhaustion meets failed=%s", async failed => {
+    const f = await finalRepair();
+    if (!failed) await db.update(heartbeatRuns).set({ status: "succeeded", errorCode: null, error: null, exitCode: 0 }).where(eq(heartbeatRuns.id, f.failed.id));
+    const r1 = f.createRecovery(), r2 = f.createRecovery();
+    const held = await holdIssueLock(f.issueId);
+    const pending = Promise.all([r1.reconcileStrandedAssignedIssues(), failed
+      ? r2.reconcileStrandedAssignedIssues() : r2.reconcileLegacyContinuation(f.failed.id)]);
+    try { await waitForIssueLockWaiters(2); } finally { await held.release(); }
+    await pending;
+    const state = await snapshot(f), rows = escalationRows(state);
+    expect(rows.actions).toHaveLength(1); expect(rows.actions[0].ownerType).toBe("board");
+    expect(state.issue[0]).toMatchObject({ status: "blocked", assigneeAgentId: f.agentId });
+    expect(state.runs).toHaveLength(3);
+    expect(state.wakes.filter(row => ["queued", "deferred_issue_execution"].includes(row.status))).toHaveLength(0);
+    expect(rows.comments).toHaveLength(1); expect(rows.activity).toHaveLength(1);
+    // This writer records the transition in disposition_repair_escalated;
+    // issueService.update does not add a separate generic activity row.
+    expect(state.activity.filter(row => row.action === "issue.updated" && row.details?.status === "blocked")).toHaveLength(0);
+  });
+  it.each(["owner", "user", "done", "title"])("rechecks the source after another writer changes %s", async change => {
+    const f = await finalRepair(), before = await snapshot(f), held = await holdIssueLock(f.issueId);
+    const pending = f.createRecovery().reconcileStrandedAssignedIssues();
+    let expectedIssue: typeof issues.$inferSelect;
+    try {
+      await waitForIssueLockWaiters(1);
+      const [other] = change === "owner" ? await held.tx.insert(agents).values({ companyId: f.companyId, name: "Other owner", role: "engineer", status: "idle", adapterType: "codex_local" }).returning() : [];
+      [expectedIssue] = await held.tx.update(issues).set({
+        ...(change === "owner" ? { assigneeAgentId: other.id } : {}),
+        ...(change === "user" ? { assigneeAgentId: null, assigneeUserId: "fixture-owner" } : {}),
+        ...(change === "done" ? { status: "done" } : {}),
+        ...(change === "title" ? { title: "An unrelated edit" } : {}),
+        revision: sql`${issues.revision} + 1`, updatedAt: new Date(),
+      }).where(eq(issues.id, f.issueId)).returning();
+    } finally { await held.release(); }
+    await pending;
+    const state = await snapshot(f), rows = escalationRows(state);
+    if (change === "title") {
+      expect(state.issue[0]).toMatchObject({ status: "blocked", title: "An unrelated edit", assigneeAgentId: f.agentId });
+      expect(rows.actions).toHaveLength(1); expect(rows.comments).toHaveLength(1); expect(rows.activity).toHaveLength(1);
+    } else {
+      expect(state.issue[0]).toEqual(expectedIssue!);
+      expect(state.actions).toEqual(before.actions);
+      expect(state.comments).toEqual(before.comments); expect(state.activity).toEqual(before.activity);
+    }
+    expect(state.runs).toEqual(before.runs); expect(state.wakes).toEqual(before.wakes);
+  });
+  it("rolls back the blocker, action and debit when the notice insert fails", async () => {
+    const f = await finalRepair(), before = await snapshot(f);
+    const suffix = randomUUID().replaceAll("-", "");
+    const functionName = `reject_exhaustion_${suffix}`, triggerName = `reject_notice_${suffix}`;
+    expect(f.issueId).toMatch(/^[a-f0-9-]{36}$/);
+    await db.execute(sql.raw(`CREATE FUNCTION ${functionName}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.issue_id = '${f.issueId}'::uuid THEN RAISE EXCEPTION 'fixture notice failure'; END IF; RETURN NEW; END $$`));
+    try {
+      await db.execute(sql.raw(`CREATE TRIGGER ${triggerName} BEFORE INSERT ON issue_comments FOR EACH ROW EXECUTE FUNCTION ${functionName}()`));
+      const result = await Promise.allSettled([f.createRecovery().reconcileStrandedAssignedIssues()]);
+      expect(result[0].status).toBe("rejected");
+      expect(await snapshot(f)).toEqual(before);
+    } finally {
+      await db.execute(sql.raw(`DROP TRIGGER IF EXISTS ${triggerName} ON issue_comments`));
+      await db.execute(sql.raw(`DROP FUNCTION ${functionName}()`));
+    }
+    await f.createRecovery().reconcileStrandedAssignedIssues();
+    const state = await snapshot(f), rows = escalationRows(state);
+    expect(state.issue[0]).toMatchObject({ status: "blocked", assigneeAgentId: f.agentId });
+    expect(rows.actions).toHaveLength(1); expect(rows.actions[0].attemptCount).toBe(2);
+    expect(rows.comments).toHaveLength(1); expect(rows.activity).toHaveLength(1);
+    expect(state.runs).toEqual(before.runs); expect(state.wakes).toEqual(before.wakes);
   });
 });
