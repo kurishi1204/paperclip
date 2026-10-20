@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { issueUnblockDescriptorSchema } from "@paperclipai/shared";
 import {
   agentWakeupRequests,
   approvals,
@@ -28,6 +29,7 @@ type DispositionRepairIssue = Pick<
   | "executionPolicy"
   | "executionState"
   | "monitorNextCheckAt"
+  | "unblockDescriptor"
 >;
 
 export type DispositionRepairSourceState = {
@@ -205,7 +207,9 @@ export async function collectDispositionRepairSourceState(
             ? "interaction"
             : pendingApproval
               ? "approval"
-              : null;
+              : issue.status === "blocked" && issueUnblockDescriptorSchema.safeParse(issue.unblockDescriptor).success
+                ? "unblock_descriptor"
+                : null;
 
   const durableState = {
     source: {
@@ -215,6 +219,9 @@ export async function collectDispositionRepairSourceState(
       executionPolicy: issue.executionPolicy,
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt?.toISOString() ?? null,
+      // Null and historical non-blocked descriptors preserve the old retry budget.
+      ...(issue.status === "blocked" && issue.unblockDescriptor != null
+        ? { unblockDescriptor: issue.unblockDescriptor } : {}),
     },
     blockers: blockers.sort((a, b) => a.id.localeCompare(b.id)),
     children: children.sort((a, b) => a.id.localeCompare(b.id)),

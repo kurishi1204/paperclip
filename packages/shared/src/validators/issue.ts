@@ -685,24 +685,22 @@ function withCreateIssueStatusDefault<T extends z.ZodRawShape>(
   }, schema);
 }
 
+export const issueUnblockDescriptorSchema = z.object({
+  owner: z.union([
+    z.object({ agentId: z.string().guid() }).strict(),
+    z.object({ userId: z.string().trim().min(1) }).strict(),
+    z.literal("board"),
+  ]),
+  action: multilineTextSchema.pipe(z.string().trim().min(1).max(2_000)),
+}).strict();
+
 const createIssueBaseSchema = z.object({
   projectId: z.string().guid().optional().nullable(),
   projectWorkspaceId: z.string().guid().optional().nullable(),
   goalId: z.string().guid().optional().nullable(),
   parentId: z.string().guid().optional().nullable(),
   blockedByIssueIds: z.array(z.string().guid()).optional(),
-  unblockDescriptor: z
-    .object({
-      owner: z.union([
-        z.object({ agentId: z.string().guid() }).strict(),
-        z.object({ userId: z.string().trim().min(1) }).strict(),
-        z.literal("board"),
-      ]),
-      action: multilineTextSchema.pipe(z.string().trim().min(1).max(2_000)),
-    })
-    .strict()
-    .optional()
-    .nullable(),
+  unblockDescriptor: issueUnblockDescriptorSchema.optional().nullable(),
   inheritExecutionWorkspaceFromIssueId: z.string().guid().optional().nullable(),
   title: z.string().min(1),
   description: multilineTextSchema.optional().nullable(),

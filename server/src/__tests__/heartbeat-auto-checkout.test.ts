@@ -4,6 +4,31 @@ import {
 } from "../services/heartbeat.ts";
 
 describe("shouldAutoCheckoutIssueForWake", () => {
+  it.each(["issue_commented", "issue_unblock_requested", "issue_disposition_repair"])(
+    "preserves a typed blocked wait during %s instead of claiming execution",
+    (wakeReason) => {
+      const wait = { owner: "board", action: "Confirm the missing external receipt" };
+      expect(shouldAutoCheckoutIssueForWake({
+        contextSnapshot: { wakeReason },
+        issueStatus: "blocked",
+        issueAssigneeAgentId: "agent-1",
+        issueUnblockDescriptor: wait,
+        isDependencyReady: true,
+        agentId: "agent-1",
+      })).toBe(false);
+    },
+  );
+
+  it("keeps dependency-resolved checkout for blocked rows without a typed wait", () => {
+    expect(shouldAutoCheckoutIssueForWake({
+      contextSnapshot: { wakeReason: "issue_blockers_resolved" },
+      issueStatus: "blocked",
+      issueAssigneeAgentId: "agent-1",
+      isDependencyReady: true,
+      agentId: "agent-1",
+    })).toBe(true);
+  });
+
   it("auto-checks out an assigned todo issue for an actionable wake", () => {
     expect(shouldAutoCheckoutIssueForWake({
       contextSnapshot: { wakeReason: "issue_assigned" },
