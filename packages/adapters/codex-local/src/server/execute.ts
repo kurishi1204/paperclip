@@ -769,10 +769,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     let allowReadOnlyAutoApproval = false;
     if (runtimeMcpGateways.some((gateway) => gateway.readOnlyAutoApproveTools?.length)) {
       if (!executionTargetIsRemote && isRunScopedManagedCodexHome(config, effectiveCodexHome)) {
-        const version = await runAdapterExecutionTargetProcess(runId, null, command, ["--version"], {
-          cwd, env: envConfigStrings, timeoutSec: 10, graceSec: 1, onLog,
-        });
-        allowReadOnlyAutoApproval = version.exitCode === 0 && !version.timedOut && supportsCodexMcpReadApproval(version.stdout);
+        try {
+          const version = await runAdapterExecutionTargetProcess(runId, null, command, ["--version"], {
+            cwd, env: envConfigStrings, timeoutSec: 10, graceSec: 1, onLog,
+          });
+          allowReadOnlyAutoApproval = version.exitCode === 0 && !version.timedOut && supportsCodexMcpReadApproval(version.stdout);
+        } catch {
+          // Capability is unknown; keep existing client approval behavior. The
+          // normal command-readiness check still reports any launch failure.
+        }
       }
       if (!allowReadOnlyAutoApproval) await onLog("stderr", "[paperclip] Runtime read approvals require a disposable local managed Codex home and codex-cli >= 0.154.0; approvals were not projected.\n");
     }

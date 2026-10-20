@@ -80,11 +80,28 @@ describe("codex managed home", () => {
   it("quotes exact tool names without creating other TOML tables", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-read-approval-"));
     try {
-      const tool = 'read\"]\n[mcp_servers.evil]\nurl="unexpected';
+      const tool = 'read\u007f\"]\n[mcp_servers.evil]\nurl="unexpected';
       await writeManagedCodexMcpConfig({ codexHome: root, apiBaseUrl: "https://paperclip.example", gateways: [{ name: "runtime", endpointPath: "/mcp", bearerToken: "token", readOnlyAutoApproveTools: [tool] }], allowReadOnlyAutoApproval: true });
       const parsed = parseToml(await fs.readFile(path.join(root, "config.toml"), "utf8")) as { mcp_servers: Record<string, { tools: Record<string, unknown> }> };
       expect(Object.keys(parsed.mcp_servers)).toEqual(["runtime"]);
       expect(Object.keys(parsed.mcp_servers.runtime!.tools)).toEqual([tool]);
+      expect(await fs.readFile(path.join(root, "config.toml"), "utf8")).not.toContain("\u007f");
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    { gateways: [], allowReadOnlyAutoApproval: false },
+    { gateways: [], allowReadOnlyAutoApproval: true },
+    { gateways: [{ name: "runtime", endpointPath: "/mcp", bearerToken: "token", readOnlyAutoApproveTools: ["read"] }], allowReadOnlyAutoApproval: false },
+  ])("preserves tolerant config handling outside active read-approval projection: %j", async (options) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-read-approval-"));
+    try {
+      const original = '[mcp_servers."unfinished"';
+      await fs.writeFile(path.join(root, "config.toml"), original);
+      await expect(writeManagedCodexMcpConfig({ codexHome: root, apiBaseUrl: "https://paperclip.example", ...options })).resolves.toBeDefined();
+      const result = await fs.readFile(path.join(root, "config.toml"), "utf8");
+      expect(result).toContain(original);
+      expect(result).not.toContain("approval_mode");
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
 
@@ -106,6 +123,7 @@ describe("codex managed home", () => {
     expect(isRunScopedManagedCodexHome({ env }, env.CODEX_HOME)).toBe(false);
     expect(supportsCodexMcpReadApproval("codex-cli 0.154.0\n")).toBe(true);
     expect(supportsCodexMcpReadApproval("codex-cli 0.153.9")).toBe(false);
+    expect(supportsCodexMcpReadApproval("codex-cli 0.154.0-alpha.1")).toBe(false);
     expect(supportsCodexMcpReadApproval("unknown")).toBe(false);
   });
 

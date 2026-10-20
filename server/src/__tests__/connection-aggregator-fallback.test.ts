@@ -17,6 +17,7 @@ import {
   connectionGrants,
   toolCatalogEntries,
   toolProfiles,
+  toolProfileEntries,
   toolProfileBindings,
   toolConnectionInstalls,
 } from "@paperclipai/db";
@@ -441,6 +442,18 @@ const support = await getEmbeddedPostgresTestSupport();
     it("remembers None and refuses setup after reloading the service", async () => {
       await resetQuestions();
       const answer = await selectProvider("none");
+      // Discovery may reconcile acknowledged runtime identity and initialize
+      // settings bookkeeping. It must not change business access or choices.
+      const businessState = async () => Promise.all([
+        db.select().from(connectionGrants).where(eq(connectionGrants.companyId, claims.company_id)),
+        db.select().from(toolConnections).where(eq(toolConnections.companyId, claims.company_id)),
+        db.select().from(toolProfiles).where(eq(toolProfiles.companyId, claims.company_id)),
+        db.select().from(toolProfileEntries).where(eq(toolProfileEntries.companyId, claims.company_id)),
+        db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, claims.company_id)),
+        db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, claims.company_id)),
+        db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.companyId, claims.company_id)),
+      ]);
+      const beforeSearch = await businessState();
       const result = await connectionIntentService(db).search(
         claims,
         "hubspot",
@@ -448,6 +461,7 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(result.results).toEqual([]);
       expect(result.providerQuestion).toBeUndefined();
       expect(result.instruction).toContain("declined");
+      expect(await businessState()).toEqual(beforeSearch);
       const retry = await connectionIntentService(db).search(
         claims,
         "hubspot",
@@ -455,6 +469,7 @@ const support = await getEmbeddedPostgresTestSupport();
       );
       expect(retry.providerQuestion).toBeDefined();
       expect(retry.selectionInteractionId).toBeUndefined();
+      expect(await businessState()).toEqual(beforeSearch);
       await expect(
         connectionIntentService(db).request(claims, "via:arcade:hubspot", {
           selectionInteractionId: answer.id,

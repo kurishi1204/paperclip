@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { parse as parseToml } from "smol-toml";
+import { parse as parseToml, TomlError } from "smol-toml";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 import { isCodexAuthCachePath, readSubscriptionAccountId } from "./codex-auth-cache.js";
@@ -259,7 +259,7 @@ async function ensureCopiedFile(target: string, source: string): Promise<void> {
 }
 
 function tomlString(value: string): string {
-  return JSON.stringify(value);
+  return JSON.stringify(value).replace(/\u007f/g, "\\u007f");
 }
 
 function sanitizeMcpServerName(value: string, fallback: string): string {
@@ -279,7 +279,16 @@ function stripManagedMcpBlock(config: string): string {
   return `${config.slice(0, start)}${config.slice(end + MANAGED_MCP_BLOCK_END.length)}`.trimEnd();
 }
 
-function readCodexMcpServerNames(config: string): Set<string> {
+function readCodexMcpServerNames(config: string, strict: boolean): Set<string> {
+  if (!strict) {
+    // Preserve the pre-feature tolerant scan for runs outside this projection.
+    const names = new Set<string>();
+    for (const match of config.matchAll(/^\s*\[\s*mcp_servers\s*\.\s*(?:"([^"]+)"|'([^']+)'|([^\]\s#]+))\s*\]/gm)) {
+      const name = match[1] ?? match[2] ?? match[3];
+      if (name) names.add(name.trim());
+    }
+    return names;
+  }
   const servers = parseToml(config).mcp_servers;
   if (servers === undefined) return new Set();
   if (!servers || typeof servers !== "object" || Array.isArray(servers) || servers instanceof Date) {
@@ -353,10 +362,15 @@ export async function writeManagedCodexMcpConfig(input: {
     throw error;
   });
   const unmanagedConfig = stripManagedMcpBlock(existing);
+  const strictApprovalConfig = input.allowReadOnlyAutoApproval === true &&
+    input.gateways.some((gateway) => Array.isArray(gateway.readOnlyAutoApproveTools) && gateway.readOnlyAutoApproveTools.length > 0);
   let existingNames: Set<string>;
-  try { existingNames = readCodexMcpServerNames(unmanagedConfig); }
-  catch {
-    throw new Error("Unmanaged Codex config could not be parsed; managed MCP config was not changed.");
+  try { existingNames = readCodexMcpServerNames(unmanagedConfig, strictApprovalConfig); }
+  catch (error) {
+    // Parser codeblocks can contain credentials. Keep reason and location only.
+    const detail = error instanceof Error ? error.message.split("\n")[0] : "Unknown parser error";
+    const location = error instanceof TomlError ? ` (line ${error.line}, column ${error.column})` : "";
+    throw new Error(`Unmanaged Codex config could not be parsed; managed MCP config was not changed. ${detail}${location}`);
   }
   const { block, warnings } = buildManagedMcpBlock({
     gateways: input.gateways,
@@ -373,11 +387,13 @@ export async function writeManagedCodexMcpConfig(input: {
 }
 
 export function supportsCodexMcpReadApproval(version: string): boolean {
-  const match = /^codex-cli (\d+)\.(\d+)\.(\d+)(?:[-+][\w.-]+)?$/.exec(version.trim());
+  const match = /^codex-cli (\d+)\.(\d+)\.(\d+)$/.exec(version.trim());
   return Boolean(match && (Number(match[1]) > 0 || Number(match[2]) >= 154));
 }
 
 export function isRunScopedManagedCodexHome(config: Record<string, unknown>, codexHome: string): boolean {
+  // Produced by server/services/ai-connection-runtime.ts prepareManagedAiRuntime:
+  // mkdtemp per run, with provider/config/data children; connector homes differ.
   const env = config.env as Record<string, unknown> | undefined;
   const managed = config.managedAiConnection as Record<string, unknown> | undefined;
   const home = typeof env?.HOME === "string" ? env.HOME : "";

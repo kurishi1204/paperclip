@@ -4,12 +4,15 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parse as parseToml } from "smol-toml";
 
-const state = vi.hoisted(() => ({ version: "codex-cli 0.154.0\n", launches: [] as Array<{ env: Record<string, string>; config: string }> }));
+const state = vi.hoisted(() => ({ version: "codex-cli 0.154.0\n", rejectVersion: false, launches: [] as Array<{ env: Record<string, string>; config: string }> }));
 vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   ensureCommandResolvable: vi.fn(async () => {}),
   resolveCommandForLogs: vi.fn(async () => "/fixture/codex"),
   runChildProcess: vi.fn(async (_runId, _command, args: string[], options: { env: Record<string, string> }) => {
+    if (args.includes("--version")) {
+      if (state.rejectVersion) throw new Error("simulated version spawn failure");
+    }
     if (!args.includes("--version")) state.launches.push({ env: options.env, config: await fs.readFile(path.join(options.env.CODEX_HOME!, "config.toml"), "utf8") });
     return { exitCode: 0, signal: null, timedOut: false, stdout: args.includes("--version") ? state.version : '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}\n', stderr: "", pid: 123, startedAt: new Date().toISOString() };
   }),
@@ -19,7 +22,7 @@ import { execute } from "./execute.js";
 describe("Codex runtime read approval wiring", () => {
   const roots: string[] = [];
   afterEach(async () => {
-    vi.unstubAllEnvs(); state.launches = []; state.version = "codex-cli 0.154.0\n";
+    vi.unstubAllEnvs(); state.launches = []; state.rejectVersion = false; state.version = "codex-cli 0.154.0\n";
     await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
   });
 
@@ -62,6 +65,14 @@ describe("Codex runtime read approval wiring", () => {
   it("checks the actual CLI version and keeps unsupported binaries unapproved", async () => {
     state.version = "codex-cli 0.153.9\n";
     const { logs } = await run("old-cli");
+    expect(state.launches[0]!.config).not.toContain("approval_mode");
+    expect(logs.join("")).toContain("approvals were not projected");
+  });
+
+  it("keeps the normal launch path and a visible warning when the version probe rejects", async () => {
+    state.rejectVersion = true;
+    const { logs } = await run("probe-failed");
+    expect(state.launches).toHaveLength(1);
     expect(state.launches[0]!.config).not.toContain("approval_mode");
     expect(logs.join("")).toContain("approvals were not projected");
   });

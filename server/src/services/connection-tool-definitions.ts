@@ -1,9 +1,9 @@
 import { CONNECTION_REQUEST_TOOL_DESCRIPTION, CONNECTIONS_SEARCH_TOOL_DESCRIPTION } from "@paperclipai/shared";
 
-export const RUNTIME_CONNECTION_TOOL_DEFINITIONS = [
+const INTERNAL_RUNTIME_CONNECTION_TOOLS = [
   {
     name: "connections_search",
-    annotations: { readOnlyHint: true },
+    clientApprovalRisk: "read",
     description: CONNECTIONS_SEARCH_TOOL_DESCRIPTION,
     inputSchema: {
       type: "object",
@@ -13,7 +13,7 @@ export const RUNTIME_CONNECTION_TOOL_DEFINITIONS = [
   },
   {
     name: "connection_request",
-    annotations: { readOnlyHint: false },
+    clientApprovalRisk: "write",
     description: CONNECTION_REQUEST_TOOL_DESCRIPTION,
     inputSchema: {
       type: "object",
@@ -24,8 +24,10 @@ export const RUNTIME_CONNECTION_TOOL_DEFINITIONS = [
   },
 ] as const;
 
-// These are Paperclip-owned definitions, not upstream MCP risk hints. Never
-// derive client approvals from catalog names, provider hints or default risks.
-export const RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES = RUNTIME_CONNECTION_TOOL_DEFINITIONS
-  .filter((tool) => tool.annotations.readOnlyHint === true)
-  .map((tool) => tool.name);
+// Preserve the existing wire contract for every MCP client. Classification is
+// Paperclip-owned and internal; no upstream hints or name inference is used.
+export const RUNTIME_CONNECTION_TOOL_DEFINITIONS = INTERNAL_RUNTIME_CONNECTION_TOOLS
+  .map(({ clientApprovalRisk: _risk, ...tool }) => tool);
+export const RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES = Object.freeze(INTERNAL_RUNTIME_CONNECTION_TOOLS
+  .filter((tool) => tool.clientApprovalRisk === "read")
+  .map((tool) => tool.name));

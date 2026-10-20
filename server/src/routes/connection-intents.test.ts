@@ -13,7 +13,8 @@ import { RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES } from "../services/connection-
 describe("runtime connection MCP contract", () => {
   it("derives client read approvals only from the first-party advertised read tool", () => {
     expect(RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES).toEqual(["connections_search"]);
-    expect(RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES.every((name) => RUNTIME_CONNECTION_TOOL_DEFINITIONS.some((tool) => tool.name === name && tool.annotations.readOnlyHint))).toBe(true);
+    expect(Object.isFrozen(RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES)).toBe(true);
+    expect(RUNTIME_CONNECTION_TOOL_DEFINITIONS.every((tool) => !("annotations" in tool) && !("clientApprovalRisk" in tool))).toBe(true);
   });
   it("advertises both canonical tools with the shared descriptions and narrow schemas", () => {
     expect(
@@ -22,7 +23,6 @@ describe("runtime connection MCP contract", () => {
     expect(RUNTIME_CONNECTION_TOOL_DEFINITIONS).toEqual([
       {
         name: "connections_search",
-        annotations: { readOnlyHint: true },
         description: CONNECTIONS_SEARCH_TOOL_DESCRIPTION,
         inputSchema: {
           type: "object",
@@ -38,7 +38,6 @@ describe("runtime connection MCP contract", () => {
       },
       {
         name: "connection_request",
-        annotations: { readOnlyHint: false },
         description: CONNECTION_REQUEST_TOOL_DESCRIPTION,
         inputSchema: {
           type: "object",
