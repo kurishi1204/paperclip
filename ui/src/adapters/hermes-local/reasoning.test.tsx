@@ -22,7 +22,7 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-async function selectHigh(overrides: Partial<AdapterConfigFieldsProps> = {}) {
+async function selectHigh(overrides: Partial<AdapterConfigFieldsProps> = {}, viaRegistry = false) {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => getConfigSchema() })));
   const mark = vi.fn();
@@ -35,7 +35,8 @@ async function selectHigh(overrides: Partial<AdapterConfigFieldsProps> = {}) {
   const container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
-  await act(async () => root?.render(<TooltipProvider><SchemaConfigFields {...props} /></TooltipProvider>));
+  const ConfigFields = viaRegistry ? getUIAdapter("hermes_local").ConfigFields : SchemaConfigFields;
+  await act(async () => root?.render(<TooltipProvider><ConfigFields {...props} /></TooltipProvider>));
   expect(container.textContent).toContain("Reasoning effort");
   const trigger = [...container.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Hermes default");
   expect(trigger).toBeTruthy();
@@ -50,6 +51,12 @@ it("retains the Hermes builder through the registry and external parser override
   expect(getUIAdapter("hermes_local").buildAdapterConfig).toBe(buildHermesConfig);
   syncExternalAdapters([{ type: "hermes_local", label: "Synthetic parser override" }]);
   expect(getUIAdapter("hermes_local").buildAdapterConfig).toBe(buildHermesConfig);
+});
+
+it("renders canonical reasoning through the actual Hermes registry ConfigFields", async () => {
+  const { mark } = await selectHigh({}, true);
+  expect(mark).toHaveBeenCalledWith("adapterConfig", "reasoningEffort", "high");
+  expect(mark.mock.calls.every(([, field]) => field !== "effort")).toBe(true);
 });
 
 it("selects canonical high in edit mode and preserves it in the save patch", async () => {

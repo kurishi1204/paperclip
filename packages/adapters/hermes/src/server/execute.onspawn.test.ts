@@ -116,6 +116,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
       String(call[1]).startsWith("[hermes] Starting Hermes Agent") || String(call[1]).startsWith("[hermes] Exit code:"));
     expect(diagnostics).toHaveLength(2);
     expect(diagnostics.every((call: unknown[]) => call[0] === "stderr")).toBe(true);
+    expect(ctx.onLog).toHaveBeenCalledWith("stderr", expect.stringContaining("requested_reasoning=default"));
   });
   it("keeps bounded live Run stdout strictly reparseable including provider stderr and session diagnostic", async () => {
     const events=[{type:"system",subtype:"init",session_id:"fixture-session"},
@@ -155,6 +156,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
       "--ignore-user-config", "--ignore-rules", "--format", "stream-json",
       "-m", "gpt-6.1-sol", "--provider", "openai-codex",
       "--reasoning", "high", "-t", "search", "--max-turns", "2", "--source", "tool"]);
+    expect(ctx.onLog).toHaveBeenCalledWith("stderr", expect.stringContaining("requested_reasoning=high"));
     expect(result.clearSession).toBe(true);
   });
 
