@@ -63,6 +63,7 @@ import {
   validateBoundedRuntimeOptions,
   validateBoundedToolsets,
   validateHermesExtraArgs,
+  validateHermesReasoningEffort,
 } from "./safe-runtime.js";
 
 // ---------------------------------------------------------------------------
@@ -378,6 +379,7 @@ export async function execute(
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
   const extraArgs = validateHermesExtraArgs(config.extraArgs, bounded);
+  const reasoningEffort = validateHermesReasoningEffort(config.reasoningEffort, extraArgs);
   const inheritHostEnv = !bounded && config.managedAiRouting !== true;
   const env: Record<string, string> = {
     ...buildHermesChildEnv(config.env, bounded, process.env, process.platform, inheritHostEnv),
@@ -510,6 +512,8 @@ export async function execute(
   if (resolvedProvider !== "auto") {
     args.push("--provider", resolvedProvider);
   }
+
+  if (reasoningEffort) args.push("--reasoning", reasoningEffort);
 
   if (toolsets) {
     args.push("-t", toolsets);

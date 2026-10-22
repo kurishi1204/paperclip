@@ -1108,6 +1108,16 @@ describe("AgentConfigForm environment selector", () => {
     expect(selector?.textContent).not.toContain("· sandbox");
   });
 
+  it("leaves Hermes effort to its canonical schema instead of the inert generic effort field", async () => {
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { adapterType: "hermes_local", adapterConfig: { model: "gpt-6.1-sol", reasoningEffort: "high" } },
+    );
+    roots.push(result.root);
+    expect(result.container.querySelector('[data-testid="adapter-config-fields"]')).toBeTruthy();
+    expect(result.container.textContent).not.toContain("Thinking effort");
+  });
+
   it("renders non-local adapter config fields in the Adapter card", async () => {
     const result = await renderForm(
       [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],

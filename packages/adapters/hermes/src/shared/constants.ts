@@ -27,6 +27,22 @@ export const DEFAULT_GRACE_SEC = 10;
  */
 export const DEFAULT_MODEL = "auto";
 
+/** Hermes 0.21.6 --reasoning vocabulary; model/provider clamping stays in Hermes. */
+export const HERMES_REASONING_EFFORTS = [
+  "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+] as const;
+
+export type HermesReasoningEffort = typeof HERMES_REASONING_EFFORTS[number];
+
+/** An omitted setting preserves Hermes's configured/default behavior. */
+export function normalizeHermesReasoningEffort(raw: unknown): HermesReasoningEffort | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  if (typeof raw !== "string" || !HERMES_REASONING_EFFORTS.includes(raw as HermesReasoningEffort)) {
+    throw new Error("Hermes reasoningEffort must be a supported lowercase --reasoning level");
+  }
+  return raw as HermesReasoningEffort;
+}
+
 /**
  * Valid --provider choices for the hermes CLI.
  * Must stay in sync with `hermes chat --help`.

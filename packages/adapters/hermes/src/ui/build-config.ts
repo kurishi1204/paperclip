@@ -14,6 +14,7 @@ import type { CreateConfigValues } from "@paperclipai/adapter-utils";
 
 import {
   DEFAULT_TIMEOUT_SEC,
+  normalizeHermesReasoningEffort,
 } from "../shared/constants.js";
 
 /**
@@ -70,11 +71,13 @@ export function buildHermesConfig(
   }
 
   // Thinking/reasoning effort
-  if (v.thinkingEffort) {
-    const existing = (ac.extraArgs as string[]) || [];
-    existing.push("--reasoning-effort", String(v.thinkingEffort));
-    ac.extraArgs = existing;
+  const thinkingEffort = normalizeHermesReasoningEffort(v.thinkingEffort);
+  const schemaEffort = normalizeHermesReasoningEffort(v.adapterSchemaValues?.reasoningEffort);
+  if (thinkingEffort && schemaEffort && thinkingEffort !== schemaEffort) {
+    throw new Error("Hermes reasoningEffort conflicts with thinkingEffort");
   }
+  const reasoningEffort = schemaEffort ?? thinkingEffort;
+  if (reasoningEffort) ac.reasoningEffort = reasoningEffort;
 
   // Prompt template
   if (v.promptTemplate) {

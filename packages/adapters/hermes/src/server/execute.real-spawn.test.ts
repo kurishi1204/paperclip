@@ -20,6 +20,7 @@ describe("bounded Hermes real child boundary", () => {
         "const keys = ['ANTHROPIC_API_KEY', 'PAPERCLIP_API_KEY', 'PAPERCLIP_RUNTIME_TOOLS_TOKEN', 'PAPERCLIP_HERMES_BOUNDED_AGENT_ID', 'PAPERCLIP_HERMES_BOUNDED_HOME', 'PAPERCLIP_HERMES_TRUSTED_COMMAND', 'HERMES_YOLO_MODE', 'PAPERCLIP_RUN_SCRATCH_DIR', 'GH_TOKEN'];",
         "const seen = Object.fromEntries(keys.map(key => [key, process.env[key] ?? null]));",
         "seen.HERMES_HOME = process.env.HERMES_HOME; seen.HOME = process.env.HOME;",
+        "seen.argv = process.argv.slice(2);",
         "const events = [",
         "  {type:'system',subtype:'init',session_id:'actual-cli-session'},",
         "  {type:'tool_use',name:'web_search',input:{query:'public source'}},",
@@ -38,7 +39,7 @@ describe("bounded Hermes real child boundary", () => {
       const result = await execute({
         runId: "bounded-real-child-fixture",
         agent: { id: "bounded-fixture-agent", companyId: "fixture-company", name: "Research", adapterType: "hermes_local", adapterConfig: {} },
-        config: { boundedExecution: true, provider: "openai-codex", model: "fixture-model", toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: home, PAPERCLIP_RUN_SCRATCH_DIR: stage, GH_TOKEN: "synthetic-git-key" } },
+        config: { boundedExecution: true, provider: "openai-codex", model: "gpt-6.1-sol", reasoningEffort: "high", toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: home, PAPERCLIP_RUN_SCRATCH_DIR: stage, GH_TOKEN: "synthetic-git-key" } },
         context: { issueId: "fixture-issue", paperclipWorkspace: { cwd: stage } },
         runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
         authToken: "synthetic-paperclip-token",
@@ -56,6 +57,10 @@ describe("bounded Hermes real child boundary", () => {
         expect(seen[name]).toBeNull();
       }
       expect(seen.HERMES_HOME).toBe(home);
+      expect(seen.argv).toEqual(["chat", "-q", expect.any(String), "-Q",
+        "--ignore-user-config", "--ignore-rules", "--format", "stream-json",
+        "-m", "gpt-6.1-sol", "--provider", "openai-codex", "--reasoning", "high",
+        "-t", "search", "--max-turns", "2", "--source", "tool"]);
       expect(seen.HOME).not.toBe(process.env.HOME);
       expect(seen.HOME).not.toBe(stage);
       expect(result.sessionParams).toBeUndefined();
