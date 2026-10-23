@@ -302,8 +302,8 @@ test("the trusted PR workflow passes the shard's spec filter to Playwright witho
 });
 
 test("the trusted PR workflow regenerates stale stacked lockfiles", () => {
-  // Validate the proposed workflow here. The caller executes the merged master
-  // workflow; edits to this workflow take effect after code-owner review and merge.
+  // Validate the proposed local workflow here. The caller executes the adopted
+  // immutable callee; changing execution requires a reviewed pin update.
   const workflow = readFileSync(trustedPrWorkflow, "utf8");
   assert.match(
     workflow,
