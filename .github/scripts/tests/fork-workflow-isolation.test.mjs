@@ -16,7 +16,7 @@ const sourcePins = {
   'docker.yml': '27988c53e451e602a5e35fdf857aca98aac48fa120d2d94f3457467311808ca3',
   'e2e.yml': 'd8a00ab355a4e9304a9a8a28d6aa1fdb816f9130bff244c91d4d59a5453fde85',
   'pr-trusted.yml': '4591cb206275d8ffa8420045b028719e6bf066fc1f262cdde3c578b063150f27',
-  'pr.yml': ['2025e2b8fefb37dd515aef7d671ba725f74ffa3b86e5177ddfae7c3ad21e7163', '72faa9ad764b798a73e89684317f3bc9a73d3ba009a9343e621801e2ba4c6bfe'],
+  'pr.yml': 'afcf8ec9905611b23244390c1bd11533b17d40c2fe11a67f259c972c1991b50f',
   'refresh-lockfile.yml': 'c092cf9bf08d548157a84dc9d28ab0ec44ca14969b12315c10db4a2ce5cde20f',
   'release-smoke.yml': 'c3a05e16db09958896388d2bd2c61a9928c69fd0c33563d81854ac9637944ae3',
   'release-verify.yml': '0edca442132245dd04aa18be9cc80165f923f9c6a502227008b9afbdc4e8f5fd',
@@ -89,6 +89,14 @@ test('the pinned reusable PR workflow is the adopted 489b blob', () => {
   assert.equal(blob, '78911c1deca6832502cd2127798812071415205c');
 });
 
+test('the PR caller uses the fork-owned immutable adopted workflow', () => {
+  const body = jobBody('pr.yml', 'ci');
+  assert.deepEqual(body.filter((line) => /^    uses: /.test(line)), [
+    '    uses: kurishi1204/paperclip/.github/workflows/pr-trusted.yml@489b95bbf7b616a012464709da5dded3772f49b7',
+  ]);
+  assert.deepEqual(body.filter((line) => /^    secrets: /.test(line)), []);
+});
+
 for (const [file, jobs] of Object.entries(guardedRoots)) {
   for (const [name, original] of Object.entries(jobs)) {
     test(`${file}:${name} preserves its original condition behind the canonical guard`, () => {
@@ -103,14 +111,8 @@ for (const [file, jobs] of Object.entries(guardedRoots)) {
 test('every reviewed workflow retains its exact source bytes', () => {
   assert.deepEqual(Object.keys(sourcePins).sort(), reviewedFiles.toSorted());
   for (const file of reviewedFiles) {
+    assert.equal(typeof sourcePins[file], 'string', `${file}: source pin must be singular`);
     const actual = createHash('sha256').update(source(file)).digest('hex');
-    const expected = sourcePins[file];
-    if (file === 'pr.yml') {
-      // The second byte pin is the proposed later immutable-caller change. It
-      // does not apply that change or authorize its deployment.
-      assert.ok(Array.isArray(expected) && expected.includes(actual), `${file}: unreviewed source`);
-    } else {
-      assert.equal(actual, expected, `${file}: unreviewed source`);
-    }
+    assert.equal(actual, sourcePins[file], `${file}: unreviewed source`);
   }
 });

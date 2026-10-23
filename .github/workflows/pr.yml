@@ -10,6 +10,5 @@ permissions:
 
 jobs:
   ci:
-    # Master requires CODEOWNERS review for .github/**, including this workflow.
-    # The AWS runner group permits pr-trusted.yml@refs/heads/master.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+    # Call the reviewed workflow from this fork at the adopted immutable commit.
+    uses: kurishi1204/paperclip/.github/workflows/pr-trusted.yml@489b95bbf7b616a012464709da5dded3772f49b7
