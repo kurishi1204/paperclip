@@ -28187,6 +28187,7 @@ export function heartbeatService(
           }
 
           let reconciledSourceRunId: string | null = null;
+          let pendingReconciliationActionId: string | null = null;
           let reconciledRestoreRetryCount: number | null = null;
           if (executionReconciliationWake) {
             const actionId = readNonEmptyString(
@@ -28301,6 +28302,7 @@ export function heartbeatService(
               reconciledRestoreRetryCount = executionFailureRetryCount(reconciledRun!);
             }
             reconciledSourceRunId = sourceRunId;
+            pendingReconciliationActionId = action.id;
           }
 
           // This issue row is locked, and the saved execution-wait receipt (if
@@ -28313,6 +28315,25 @@ export function heartbeatService(
             .from(agents).where(and(eq(agents.id, agentId), eq(agents.companyId, issue.companyId))).limit(1);
           const taskError = freshRunnerTaskIneligibility(currentRunnerAgent ? currentRunnerAgent.adapterType : agent.adapterType, issue);
           if (taskError) {
+            if (pendingReconciliationActionId) {
+              // A new continuation is now impossible under the current Task
+              // mode. Close the pending delivery while its action row remains
+              // locked, so the recovery producer does not resend each tick.
+              const [invalidated] = await tx.update(issueRecoveryActions).set({
+                evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+                  continuationDelivery: "invalidated",
+                  continuationDeliveryReason: taskError.code,
+                })}::jsonb`,
+                updatedAt: new Date(),
+              }).where(and(
+                eq(issueRecoveryActions.companyId, issue.companyId),
+                eq(issueRecoveryActions.sourceIssueId, issue.id),
+                eq(issueRecoveryActions.id, pendingReconciliationActionId),
+                eq(issueRecoveryActions.status, "resolved"),
+                sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+              )).returning({ id: issueRecoveryActions.id });
+              if (!invalidated) return { kind: "deferred" as const };
+            }
             if (executionWaitRequestId) {
               const [retired] = await tx.update(agentWakeupRequests).set({
                 status: "skipped", reason: taskError.code, error: taskError.message,

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agentWakeupRequests, agents, companies, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+import { agentWakeupRequests, agents, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService, startTaskDrain, stopTaskDrain } from "../services/heartbeat.js";
 import { createDurableChatWakeupRequest } from "../services/durable-chat-wakeup.js";
@@ -250,6 +250,68 @@ describeEmbedded("fresh Paperclip Runner task preflight", () => {
       requestedByActorId: "fixture-user", payload: { issueId: task.issueId } });
     expect(replayed?.id).toBe(successor!.id);
     expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)).toHaveLength(2);
+  }, 60_000);
+
+  it("terminalizes only the bound pending reconciliation when its Task mode becomes ineligible", async () => {
+    async function arrange(workMode: "standard" | "skill_test") {
+      const task = await seed(workMode);
+      const [sourceRun] = await db.insert(heartbeatRuns).values({ companyId: task.companyId,
+        agentId: task.agentId, invocationSource: "on_demand", triggerDetail: "manual",
+        status: "failed", responsibleUserId: "fixture-user", runtimeMode: "legacy",
+        contextSnapshot: { issueId: task.issueId }, finishedAt: new Date(Date.now() - 60_000),
+        resultJson: { startupCancellation: { beforeNativeSelection: true } },
+      }).returning();
+      const decision = { runId: sourceRun!.id, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "Synthetic source run completed before this local admission test." };
+      const [action] = await db.insert(issueRecoveryActions).values({ companyId: task.companyId,
+        sourceIssueId: task.issueId!, kind: "active_run_watchdog", status: "resolved",
+        ownerType: "board", returnOwnerAgentId: task.agentId,
+        cause: "synthetic_source_failure", fingerprint: sourceRun!.id,
+        nextAction: "Synthetic local reconciliation", evidence: {
+          executionReconciliation: decision, continuationDelivery: "pending" },
+      }).returning();
+      const wake = () => heartbeat.wakeup(task.agentId, { source: "automation", triggerDetail: "system",
+        reason: "issue_recovery_action_restored", idempotencyKey: `execution-reconciliation:${action!.id}`,
+        payload: { issueId: task.issueId, recoveryActionId: action!.id },
+        requestedByActorType: "system", requestedByActorId: "execution-recovery",
+        contextSnapshot: { issueId: task.issueId, taskId: task.issueId, recoveryActionId: action!.id,
+          previousRunId: sourceRun!.id, retryOfRunId: sourceRun!.id, forceFreshSession: true,
+          wakeReason: "issue_recovery_action_restored", source: "execution.reconciled" },
+      });
+      return { task, sourceRun, action, wake };
+    }
+
+    const normal = await arrange("standard");
+    const accepted = await normal.wake();
+    expect(accepted).toMatchObject({ status: "queued" });
+    const [normalAction] = await db.select({ evidence: issueRecoveryActions.evidence })
+      .from(issueRecoveryActions).where(eq(issueRecoveryActions.id, normal.action!.id));
+    expect(normalAction?.evidence.continuationDelivery).toBe("pending");
+
+    const fault = await arrange("skill_test");
+    const [unrelated] = await db.insert(issueRecoveryActions).values({ companyId: fault.task.companyId,
+      sourceIssueId: fault.task.issueId!, kind: "active_run_watchdog", status: "resolved",
+      ownerType: "board", returnOwnerAgentId: fault.task.agentId,
+      cause: "unrelated_synthetic_failure", fingerprint: randomUUID(),
+      nextAction: "Unrelated synthetic action", evidence: { continuationDelivery: "pending" },
+    }).returning();
+    expect(await fault.wake()).toBeNull();
+    const actions = await db.select({ id: issueRecoveryActions.id, evidence: issueRecoveryActions.evidence })
+      .from(issueRecoveryActions);
+    expect(actions.find((entry) => entry.id === fault.action!.id)?.evidence).toMatchObject({
+      continuationDelivery: "invalidated", continuationDeliveryReason: "paperclip_runner_issue_ineligible",
+    });
+    expect(actions.find((entry) => entry.id === unrelated!.id)?.evidence.continuationDelivery).toBe("pending");
+    expect(actions.find((entry) => entry.id === normal.action!.id)?.evidence.continuationDelivery).toBe("pending");
+    const runIds = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+    expect(runIds).toHaveLength(3); // Both source Runs plus only the eligible successor.
+    expect(await db.select({ reason: agentWakeupRequests.reason }).from(agentWakeupRequests))
+      .toEqual(expect.arrayContaining([{ reason: "paperclip_runner_issue_ineligible" }]));
+
+    await db.update(issues).set({ workMode: "skill_test" }).where(eq(issues.id, normal.task.issueId!));
+    const replayed = await normal.wake();
+    expect(replayed?.id).toBe(accepted?.id);
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)).toHaveLength(3);
   }, 60_000);
 
   it("preserves the direct adapter's unscoped wake", async () => {
