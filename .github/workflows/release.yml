@@ -93,7 +93,7 @@ jobs:
     # Only the current master commit can use AWS. A preview or older source
     # falls back to GitHub-hosted runners, including raced merge dispatches.
     name: Check preview artifacts
-    if: github.ref == 'refs/heads/master' && github.event_name == 'workflow_dispatch' && (inputs.channel == 'preview' || inputs.channel == 'cloud-migrator') && !inputs.dry_run
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && (github.ref == 'refs/heads/master' && github.event_name == 'workflow_dispatch' && (inputs.channel == 'preview' || inputs.channel == 'cloud-migrator') && !inputs.dry_run)
     runs-on: ${{ vars.AWS_POST_MERGE_CI_ENABLED == 'true' && github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event_name == 'workflow_dispatch' && inputs.channel == 'cloud-migrator' && github.sha != '' && inputs.source_ref == github.sha && 'runs-on/fleet=paperclip-post-merge-x64/env=public-ci' || 'ubuntu-latest' }}
     permissions:
       contents: read
@@ -489,7 +489,7 @@ jobs:
   # canary publish, so the nightly publish skips re-verification.
 
   select_nightly:
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.channel == 'nightly')
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.channel == 'nightly'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -718,7 +718,7 @@ jobs:
   # are the approval gate.
 
   select_beta:
-    if: github.event_name == 'workflow_dispatch' && inputs.channel == 'beta'
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && (github.event_name == 'workflow_dispatch' && inputs.channel == 'beta')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -1076,7 +1076,7 @@ jobs:
   # advances mid-run could be soak-checked at one commit and verified or
   # published at another.
   preflight_stable:
-    if: github.event_name == 'workflow_dispatch' && inputs.channel == 'stable'
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && (github.event_name == 'workflow_dispatch' && inputs.channel == 'stable')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

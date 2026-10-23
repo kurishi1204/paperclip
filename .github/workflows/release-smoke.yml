@@ -45,6 +45,7 @@ jobs:
   # on the runner VM's systemd and require the installed service to end up
   # serving.
   smoke_service:
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -98,6 +99,7 @@ jobs:
           retention-days: 14
 
   smoke:
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
