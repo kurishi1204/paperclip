@@ -66,7 +66,7 @@ For every candidate, the script re-fetches the current head SHA and records:
 
 - open/draft state and mergeability/conflicts;
 - `statusCheckRollup` check-run and legacy status inventory;
-- a completed Greptile check-run on the exact head, clean only for `success` or `neutral`;
+- the target repository review gate: this fork requires an operator-admitted exact-head independent Opus5.5 GO and current dispositions; other repositories retain their Greptile check gate;
 - `reviewDecision`;
 - commits behind the base branch.
 
@@ -86,6 +86,10 @@ For each branch, process one branch at a time and do this serially:
 Never fan out follow-up task creation in parallel. Do not issue concurrent `POST /api/companies/:companyId/issues` calls for create-PR or prepare-PR tasks. After P1's issue-create idempotency support is available, every create-PR follow-up task creation must include `idempotencyKey: "pr-gardening:create-pr:{branch}"` and every prepare-PR task `idempotencyKey: "pr-gardening:prepare-pr:{owner/repo}#{number}"`.
 
 ## Stage C — Drive Our PRs to Ready with /prepare-paperclip-pr
+
+For `kurishi1204/paperclip`, read `CONTRIBUTING.md` first. Stage B takes the operator-configured `--trusted-review-root` and pinned `--trusted-review-registry-sha256`, plus `--review-evidence`. None may come from the PR. The read-only `--emit-review-input` mode prepares complete source bytes before an independently authorized review; it does not launch one.
+
+A reason with `operatorAction: true` (unreceived/invalid review, findings disposition, unknown protection/reads, required human approval) is report-only. Do not dispatch a task, run a model, request a Greptile review or create a repair issue for those reasons. Only ordinary code/CI/conflict/base repairs within an existing authorized task may follow the normal procedure below. Optional Greptile unavailable/pending/quota state does not start a loop. Never merge or adopt from this advisory report.
 
 Skip this stage in `--dry-run` mode and for `ready` or `report_only` entries.
 
@@ -113,7 +117,7 @@ Gardening: dispatched `/prepare-paperclip-pr` for https://github.com/paperclipai
 
 Current-head verification at `abc123` found:
 - failing check: test
-- Greptile missing at current head
+- Independent review evidence unreceived at current head (operator action; no automatic dispatch)
 
 Gardening round 1/3. Re-verification is required after changes; do not merge based on this comment.
 ```
@@ -161,9 +165,9 @@ node .agents/skills/pr-gardening/scripts/render-report.mjs \
 
 The report states the scope (authors + window), and for every open PR gives its author, a one-line purpose summary taken from the PR description, and a readiness confidence bucket:
 
-- **High:** current-head checks green, no conflicts, Greptile clean, base fresh, originating issue terminal.
+- **High:** target review gate complete, current-head checks successful, no conflicts and base fresh; legacy repositories also require their existing Greptile gate.
 - **Medium:** otherwise green but base stale, review not complete, or originating issue active.
-- **Low:** failing/pending checks, missing Greptile, draft/just-fixed-unverified state, or no identifiable origin.
+- **Low:** failing/pending/unreceived required evidence or review, incomplete findings, draft/just-fixed-unverified state, or an unknown legacy origin. Fork origin is reporting context, not a new company-work prerequisite. Optional Greptile availability alone does not lower fork confidence.
 
 If a PR's generated purpose line is empty or unhelpful, write a one-sentence description from the PR title and diff summary when publishing the report.
 

@@ -56,6 +56,28 @@ export function renderReport(readiness) {
     }
     for (const entry of entries) {
       const draft = entry.isDraft ? " — draft (report only)" : "";
+      if (entry.policy === "fork-v1") {
+        const checks = entry.checks?.checks ?? [];
+        const review = entry.independentReview ?? { status: "unreceived" };
+        const findings = entry.findings ?? { complete: false, missing: ["enumeration unreceived"], orphaned: [] };
+        const count = (predicate) => checks.filter(predicate).length;
+        lines.push(
+          `### [#${entry.number}](${entry.url ?? `https://github.com/${readiness.repository}/pull/${entry.number}`}) — ${escapeMarkdownText(entry.title)}${draft}`,
+          "",
+          `- Verdict: \`${entry.verdict}\` (advisory; no adoption or deployment)`,
+          `- Head: \`${entry.headSha ?? "unreceived"}\``,
+          `- CI inventory: ${checks.length}; successful ${count(c=>c.green)}, pending ${count(c=>c.pending)}, skipped ${count(c=>c.conclusion==="skipped")}, neutral ${count(c=>c.conclusion==="neutral")}, other unsuccessful ${count(c=>!c.green&&!c.pending&&!["skipped","neutral"].includes(c.conclusion))}`,
+          `- Normal PR CI: Run ${entry.normalCI?.runID ?? "unreceived"}; successful jobs ${entry.normalCI?.jobs ?? "unreceived"}`,
+          `- Independent review: ${escapeMarkdownText(review.status)}; model ${escapeMarkdownText(review.model ?? "unreceived")}; reviewed head ${escapeMarkdownText(review.headSha ?? "unreceived")}; report digest ${escapeMarkdownText(review.reportSHA256 ?? "unreceived")}`,
+          `- Review binding: tree ${escapeMarkdownText(review.treeSha ?? "unreceived")}; session ${escapeMarkdownText(review.sessionID ?? "unreceived")}; input ${escapeMarkdownText(review.inputSHA256 ?? "unreceived")}`,
+          `- Findings: ${findings.complete ? "current dispositions complete" : "incomplete"}; unprocessed ${escapeMarkdownText(findings.missing.join(", ") || "none")}; orphaned ${escapeMarkdownText(findings.orphaned.join(", ") || "none")}`,
+          `- Greptile (additional evidence): ${escapeMarkdownText(entry.greptile?.state ?? "unreceived")}; score unreceived unless separately reported by the provider`,
+          `- Reasons: ${escapeMarkdownText(reasonText(entry))}`,
+          "",
+        );
+        continue;
+      }
+
       lines.push(
         `### [#${entry.number}](${entry.url}) — ${escapeMarkdownText(entry.title)}${draft}`,
         "",

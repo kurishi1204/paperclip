@@ -47,8 +47,7 @@ each one).
 * **Migrations**: numbered incrementally with no conflicts against master. If
   master moved and took your number, renumber on top. Make migrations
   **idempotent** so users who already applied the old number are safe.
-* **Greptile file limit**: keep each PR under **100 changed files**; if a PR
-  exceeds that, split it into two.
+* Keep PRs focused and reviewable. For `kurishi1204/paperclip`, the Greptile-specific 100-file limit is advisory; split by coherent changes. Other target repositories retain their existing under-100-file Greptile limit.
 
 ## 4. Open the PR
 
@@ -59,6 +58,10 @@ each one).
 * Record the PR URL immediately — every report must include URLs to every PR.
 
 ## 5. Review loops
+
+For `kurishi1204/paperclip`, load the target fork's `CONTRIBUTING.md`, not the upstream URL in section 4. Apply its Review Gate using trusted adopted reader code. Run relevant CI, then an independently authorized fresh-session Opus5.5 review of the actual final source block and relevant dependencies. Use operator-admitted CLI journal evidence outside the PR checkout. Readiness never certifies itself from a PR-body claim or a model name. Unknown evidence remains unknown. Report only public-safe head/model/verdict/report-digest fields and the actual optional Greptile state.
+
+Do not automatically request Greptile, pay for a review loop, create company work or launch a model because a score is absent. Process all actually received findings. Model calls and adoption retain their own existing authorization; this skill adds none. The legacy steps below apply only to other target repositories.
 
 * Run the **/greploop** company skill: trigger Greptile review, address its
   comments, push, and repeat until Greptile gives **5/5 with zero unresolved

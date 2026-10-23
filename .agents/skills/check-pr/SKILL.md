@@ -124,7 +124,15 @@ Pipeline statuses: `running`, `pending`, `success`, `failed`, `canceled`, `skipp
 
 **Perforce:** Perforce doesn't have built-in CI checks natively. If the team uses a review tool (Swarm, etc.) or an external CI triggered by shelve events, check the relevant system. Otherwise, proceed to analysis immediately.
 
-### 4. Require a fresh Greptile review for the current head
+### 4. Apply the target repository review gate
+
+For `kurishi1204/paperclip`, use the canonical Review Gate in the target's `CONTRIBUTING.md`. Run `check-readiness.mjs` from trusted adopted code, with the operator's separately configured/pinned review root and the untrusted evidence pointer. Require same-head successful CI, a real independent fresh-session Opus5.5 GO joined to the admitted CLI journal, and current dispositions for every actual review source. Unsupported/missing evidence is unreceived, not approval. Do not execute PR-controlled review-admission code or settings.
+
+Greptile is advisory here. Preserve its actual findings and availability; do not run the legacy score gate or post a review trigger for this fork. No model launch, company Task/Run, purchase, permission change or merge is implied. Existing GitHub required checks/approvals/security remain required.
+
+The remaining GitHub commands in this section are **legacy rules for other target repositories only**. GitLab and Perforce installations retain their own rules.
+
+#### Legacy current-head Greptile gate (other GitHub repositories)
 
 For GitHub PRs, do not treat an existing Greptile review, comment, or summary as current unless it is tied to the PR's exact current `headRefOid`. This is especially important after pushing a new commit to an existing PR: a Greptile review on an older commit is stale, even if the PR still has a Greptile comment or prior review.
 
@@ -291,6 +299,8 @@ p4 shelve -f -c <CL_NUMBER>
 ```
 
 ### 9. Resolve review threads
+
+For this fork, thread resolution does not replace a source/version/body-bound disposition with a reason and evidence. Read every received source, including edited summaries and the independent report. Report unknown/incomplete enumeration. Include independent review status/head and truthful Greptile availability in the final report; a model GO does not adopt code.
 
 After addressing comments, resolve the corresponding review threads.
 
