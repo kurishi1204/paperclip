@@ -19,6 +19,7 @@ permissions:
 
 jobs:
   authorize:
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064'
     name: Authorize Storybook publisher
     runs-on: ubuntu-latest
     timeout-minutes: 5

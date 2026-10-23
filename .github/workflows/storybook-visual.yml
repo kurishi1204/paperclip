@@ -113,7 +113,7 @@ jobs:
 
   preview:
     name: Deploy selected branch Storybook
-    if: github.event_name == 'workflow_dispatch' && inputs.deploy_preview
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && (github.event_name == 'workflow_dispatch' && inputs.deploy_preview)
     permissions:
       contents: read
       id-token: write
