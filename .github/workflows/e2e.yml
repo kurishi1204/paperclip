@@ -10,6 +10,7 @@ on:
 
 jobs:
   authorize:
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064'
     name: Authorize optional paid E2E
     runs-on: ubuntu-latest
     timeout-minutes: 5

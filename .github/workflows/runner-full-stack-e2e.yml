@@ -55,7 +55,7 @@ concurrency:
 jobs:
   authorize:
     name: Authorize paid campaign
-    if: github.event_name != 'schedule' || vars.RUNNER_FULL_STACK_E2E_NIGHTLY_ENABLED == 'true'
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && (github.event_name != 'schedule' || vars.RUNNER_FULL_STACK_E2E_NIGHTLY_ENABLED == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
