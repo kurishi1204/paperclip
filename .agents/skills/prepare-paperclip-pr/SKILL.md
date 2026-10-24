@@ -47,18 +47,19 @@ each one).
 * **Migrations**: numbered incrementally with no conflicts against master. If
   master moved and took your number, renumber on top. Make migrations
   **idempotent** so users who already applied the old number are safe.
-* **Greptile file limit**: keep each PR under **100 changed files**; if a PR
-  exceeds that, split it into two.
+* Keep PRs focused and reviewable. For `kurishi1204/paperclip`, the Greptile-specific 100-file limit is advisory; split by coherent changes. Other target repositories retain their existing under-100-file Greptile limit.
 
 ## 4. Open the PR
 
-* Follow `CONTRIBUTING.md` (repo root,
-  https://github.com/paperclipai/paperclip/blob/master/CONTRIBUTING.md) for
-  the PR title, message format, and issue description.
+* Follow the target repository root `CONTRIBUTING.md` for the PR title, message format, and issue description. For `kurishi1204/paperclip`, use that fork's adopted contract. The upstream reference https://github.com/paperclipai/paperclip/blob/master/CONTRIBUTING.md applies to upstream targets, not as an override of the fork contract.
 * Push the branch and open the PR with `gh`.
 * Record the PR URL immediately — every report must include URLs to every PR.
 
 ## 5. Review loops
+
+For `kurishi1204/paperclip`, load the target fork's `CONTRIBUTING.md`, not the upstream URL in section 4. Apply its Review Gate using trusted adopted reader code. Run relevant CI, then an independently authorized fresh-session Opus5.5 review of the actual final source block and relevant dependencies. Use operator-admitted CLI journal evidence outside the PR checkout. Readiness never certifies itself from a PR-body claim or a model name. Unknown evidence remains unknown. The trusted registry must bind a non-empty actual `implementationSessionID`, and the reader must verify that it differs from the launched review session; operator admission remains responsible for that implementation record’s provenance. Report only public-safe head/model/verdict/report-digest fields and the actual optional Greptile state.
+
+Do not automatically request Greptile, pay for a review loop, create company work or launch a model because a score is absent. Process all actually received findings. Model calls and adoption retain their own existing authorization; this skill adds none. The legacy steps below apply only to other target repositories.
 
 * Run the **/greploop** company skill: trigger Greptile review, address its
   comments, push, and repeat until Greptile gives **5/5 with zero unresolved
@@ -71,7 +72,7 @@ each one).
 ## 6. Report back and hand off
 
 * Comment on the driving task: what you did, the PR URL(s), the worktree path
-  (use `~` for home), Greptile score, and check status.
+  (use `~` for home), and check status. For this fork, report actual Greptile availability and findings; include a score only if the provider actually returned one. Other repositories retain their existing score-report rule.
 * Create a `pull_request` work product for each opened PR (plus `branch` /
   `commit` work products where the branch or a commit is itself the handoff).
 * If the task requires follow-up per PR (e.g. sub-issues per PR), create them

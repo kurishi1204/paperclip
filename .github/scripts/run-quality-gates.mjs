@@ -23,7 +23,7 @@ const COMMENT_SIGNATURE = '— commitperclip';
 
 function buildComment(author, failures, informational) {
   if (failures.length === 0 && informational.length === 0) {
-    return `✅ All checks passing — ready for Greptile review and maintainer approval.\n\n${COMMENT_SIGNATURE}`;
+    return `✅ Template checks pass; exact-head CI, independent review and maintainer decision remain required.\n\n${COMMENT_SIGNATURE}`;
   }
 
   const lines = [

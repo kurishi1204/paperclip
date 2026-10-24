@@ -55,7 +55,10 @@ The script calls `GET /api/companies/:companyId/search/extract` with `kind=url`,
 
 ## Stage B — Verify Current-Head Readiness
 
+Run Stage B from an operator-controlled trusted adopted checkout, never from a PR checkout or a prepare worktree. Set `TRUSTED_ADOPTED_CHECKOUT` from trusted operator configuration, not PR data. Use an absolute run-owned `RUN_DIR` so input and output stay outside candidate checkouts. The candidate head is read through GitHub; it cannot choose or execute the reader.
+
 ```bash
+cd "$TRUSTED_ADOPTED_CHECKOUT"
 node .agents/skills/pr-gardening/scripts/check-readiness.mjs \
   --input "$RUN_DIR/candidates.json" \
   --output "$RUN_DIR/readiness.json" \
@@ -66,7 +69,7 @@ For every candidate, the script re-fetches the current head SHA and records:
 
 - open/draft state and mergeability/conflicts;
 - `statusCheckRollup` check-run and legacy status inventory;
-- a completed Greptile check-run on the exact head, clean only for `success` or `neutral`;
+- the target repository review gate: this fork requires an operator-admitted exact-head independent Opus5.5 GO and current dispositions; other repositories retain their Greptile check gate;
 - `reviewDecision`;
 - commits behind the base branch.
 
@@ -87,6 +90,10 @@ Never fan out follow-up task creation in parallel. Do not issue concurrent `POST
 
 ## Stage C — Drive Our PRs to Ready with /prepare-paperclip-pr
 
+For `kurishi1204/paperclip`, read `CONTRIBUTING.md` first. Stage B takes the operator-configured `--trusted-review-root` and pinned `--trusted-review-registry-sha256`, plus `--review-evidence`. None may come from the PR. The admitted registry must include the actual non-empty `implementationSessionID`; verify its execution provenance and require it to differ from the review START session ID. Both IDs are shown in the private readiness report. Missing/invalid pointer files keep every candidate visible as unknown; output must stay outside the trusted reader checkout. The read-only `--emit-review-input` mode prepares complete source bytes before an independently authorized review; it does not launch one.
+
+A reason with `operatorAction: true` (unreceived/invalid review, findings disposition, unknown protection/reads, required human approval) is report-only. Do not dispatch a task, run a model, request a Greptile review or create a repair issue for those reasons. Only ordinary code/CI/conflict/base repairs within an existing authorized task may follow the normal procedure below. Optional Greptile unavailable/pending/quota state does not start a loop. Never merge or adopt from this advisory report.
+
 Skip this stage in `--dry-run` mode and for `ready` or `report_only` entries.
 
 Every `needs_gardening` PR here was opened by this instance (Stage A guarantees it), so do not just report — actively get it merge-ready by running the `/prepare-paperclip-pr` skill against it. Process PRs one at a time:
@@ -101,7 +108,7 @@ Every `needs_gardening` PR here was opened by this instance (Stage A guarantees 
 
 2. **Deduplicate.** Search open Paperclip issues for the PR number/branch. If an equivalent open prepare-PR task already exists, reuse it with a concise status comment instead of creating another (see the deduplication section above).
 
-3. **Run the prepare skill.** Create one focused child task per PR assigned to a coder agent (prefer CodexCoder) instructing it to run `/prepare-paperclip-pr` for that PR — include the PR URL, branch, current head SHA, and the exact machine-detected `reasons[]` from `readiness.json`. If you are the gardener and already have the PR's branch checked out in a worktree, you may run `/prepare-paperclip-pr` directly instead of delegating. Either way, the prepare work must never merge, approve, or close the PR.
+3. **Run the prepare skill.** For this fork, continue only within the existing authorized task; do not create a child task or dispatch from this report. For other repositories, create one focused child task per PR assigned to a coder agent (prefer CodexCoder) instructing it to run `/prepare-paperclip-pr` for that PR — include the PR URL, branch, current head SHA, and the exact machine-detected `reasons[]` from `readiness.json`. If you are the gardener and already have the PR's branch checked out in a worktree, you may run `/prepare-paperclip-pr` directly instead of delegating. Either way, the prepare work must never merge, approve, or close the PR.
 
 4. **Leave the marker comment.** Comment on the originating issue with the marker above, the current head SHA, the copied `reasons[]`, the round counter, and a link to the prepare task. Use `POST /api/issues/:issueId/comments` with `X-Paperclip-Run-Id`. Include `resume: true` when the issue is terminal so the comment creates a live continuation.
 
@@ -113,7 +120,7 @@ Gardening: dispatched `/prepare-paperclip-pr` for https://github.com/paperclipai
 
 Current-head verification at `abc123` found:
 - failing check: test
-- Greptile missing at current head
+- Independent review evidence unreceived at current head (operator action; no automatic dispatch)
 
 Gardening round 1/3. Re-verification is required after changes; do not merge based on this comment.
 ```
@@ -161,9 +168,9 @@ node .agents/skills/pr-gardening/scripts/render-report.mjs \
 
 The report states the scope (authors + window), and for every open PR gives its author, a one-line purpose summary taken from the PR description, and a readiness confidence bucket:
 
-- **High:** current-head checks green, no conflicts, Greptile clean, base fresh, originating issue terminal.
-- **Medium:** otherwise green but base stale, review not complete, or originating issue active.
-- **Low:** failing/pending checks, missing Greptile, draft/just-fixed-unverified state, or no identifiable origin.
+- **High:** target review gate complete, current-head checks successful, no conflicts and base fresh; legacy repositories additionally require their existing Greptile gate and a terminal originating issue.
+- **Medium (legacy repositories only):** otherwise green but base stale, review not complete, or originating issue active. Fork entries are high only when ready; every other fork verdict is low.
+- **Low:** failing/pending/unreceived required evidence or review, incomplete findings, draft/just-fixed-unverified state, or an unknown legacy origin. Fork origin is reporting context, not a new company-work prerequisite. Optional Greptile availability alone does not lower fork confidence.
 
 If a PR's generated purpose line is empty or unhelpful, write a one-sentence description from the PR title and diff summary when publishing the report.
 

@@ -29,10 +29,10 @@ function readTrustedPrWorkflow() {
   const caller = readFileSync(prCallerWorkflow, "utf8");
   assert.match(
     caller,
-    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
-    "pr.yml must call the trusted workflow from CODEOWNERS-protected master",
+    /^\s+uses: kurishi1204\/paperclip\/\.github\/workflows\/pr-trusted\.yml@489b95bbf7b616a012464709da5dded3772f49b7\s*$/m,
+    "pr.yml must call this fork's trusted workflow at the adopted immutable commit 489b95bbf7b616a012464709da5dded3772f49b7",
   );
-  // Validate proposed workflow changes locally; CI executes the merged master version.
+  // Validate the local workflow contract; CI executes this fork's adopted immutable callee.
   return readFileSync(trustedPrWorkflow, "utf8");
 }
 
@@ -157,7 +157,7 @@ test("shard arguments are validated", () => {
   }
 });
 
-test("pr.yml calls the trusted PR workflow from master", () => {
+test("pr.yml calls this fork's trusted PR workflow at the adopted immutable commit", () => {
   assert.ok(readTrustedPrWorkflow().length > 0);
 });
 
@@ -302,8 +302,8 @@ test("the trusted PR workflow passes the shard's spec filter to Playwright witho
 });
 
 test("the trusted PR workflow regenerates stale stacked lockfiles", () => {
-  // Validate the proposed workflow here. The caller executes the merged master
-  // workflow; edits to this workflow take effect after code-owner review and merge.
+  // Validate the proposed local workflow here. The caller executes the adopted
+  // immutable callee; changing execution requires a reviewed pin update.
   const workflow = readFileSync(trustedPrWorkflow, "utf8");
   assert.match(
     workflow,
