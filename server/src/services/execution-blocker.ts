@@ -18,6 +18,17 @@ export function executionBlockerPredicate() {
   );
 }
 
+/** This existing outbox owns an explicit continuation that has not completed
+ * delivery. Generic recovery must wait; this is not a dispatch authorization.
+ * Keep it separate from getExecutionBlocker so the authorized delivery itself
+ * can use its existing admission contract. Caller supplies company/issue scope. */
+export function executionContinuationDeliveryPredicate() {
+  return and(
+    eq(issueRecoveryActions.status, "resolved"),
+    inArray(sql`${issueRecoveryActions.evidence}->>'continuationDelivery'`, ["pending", "delegated"]),
+  );
+}
+
 export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: { conversationResetCommentId?: string | null }): Promise<ExecutionBlocker | null> {
   const [conversation] = await db.select({ agentId: issues.conversationAgentId,
     boundaryId: issues.conversationBoundaryCommentId, status: issues.status,

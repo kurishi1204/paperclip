@@ -5,6 +5,7 @@ import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
 import { executionRetryAccounting } from "../execution-recovery-attempt.js";
 import { isExplicitContinuationRetryClaim } from "../explicit-continuation-retry-claim.js";
+import { isNativeContinuationHeld, nativeContinuationHoldSql, readNativeContinuationRecoveryPath } from "../native-runtime/native-continuation-hold.js";
 import {
   decideLegacyContinuation, legacyDispositionEpisode, legacyDispositionFingerprint,
   LEGACY_DISPOSITION_REPAIR_INSTRUCTION, type LegacyDispositionEpisode,
@@ -145,6 +146,7 @@ import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
   collectDispositionRepairSourceState,
+  hasNativeRecoveryExecutionPath,
   dispositionRepairDelayMs,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
 } from "./disposition-repair.js";
@@ -950,7 +952,7 @@ export function recoveryService(
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
   },
 ) {
-  const issuesSvc = issueService(db);
+  const issuesSvc = issueService(db, { preserveHeldNativeContinuation: true });
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
@@ -1124,35 +1126,69 @@ export function recoveryService(
         )
         .limit(1)
         .then((rows) => rows[0] ?? null),
-      db
-        .select({ id: nativeRunFinalizations.runId })
-        .from(nativeRunFinalizations)
-        .innerJoin(
-          heartbeatRuns,
-          eq(heartbeatRuns.id, nativeRunFinalizations.runId),
-        )
-        .where(
-          and(
-            eq(nativeRunFinalizations.companyId, companyId),
-            eq(nativeRunFinalizations.issueId, issueId),
-            isNull(nativeRunFinalizations.resultId),
-            agentId ? eq(heartbeatRuns.agentId, agentId) : sql`true`,
-            or(
-              inArray(nativeRunFinalizations.recoveryState, [
-                "awaiting_evidence",
-                "awaiting_runner_reattach",
-                "resuming_session",
-                "bootstrap_incomplete",
-              ]),
-              eq(nativeRunFinalizations.phase, "retryable_failure"),
-            ),
-          ),
-        )
-        .limit(1)
-        .then((rows) => rows[0] ?? null),
+      hasNativeRecoveryExecutionPath(db, { companyId, issueId, agentId }),
     ]);
 
     return Boolean(run || deferredWake || nativeRecovery);
+  }
+
+  async function recordOrphanedNativeRecoveryAttention(issue: typeof issues.$inferSelect) {
+    const publications: ActivityPublication[] = [];
+    await db.transaction(async (tx) => {
+      const [current] = await tx.select().from(issues).where(and(
+        eq(issues.companyId, issue.companyId), eq(issues.id, issue.id),
+      )).for("update").limit(1);
+      if (!current || ["done", "cancelled"].includes(current.status)) return;
+      const recovery = await readNativeContinuationRecoveryPath(tx, {
+        companyId: current.companyId, issueId: current.id,
+      });
+      const runIds = [...new Set(recovery.orphanedRunIds)].sort();
+      if (runIds.length === 0) return;
+      const activePredicate = and(
+        eq(issueRecoveryActions.companyId, current.companyId),
+        eq(issueRecoveryActions.sourceIssueId, current.id),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      );
+      let action: typeof issueRecoveryActions.$inferSelect | null = await tx.select().from(issueRecoveryActions).where(activePredicate)
+        .for("update").limit(1).then(rows => rows[0] ?? null);
+      let created = false;
+      if (!action) {
+        action = await tx.insert(issueRecoveryActions).values({
+          companyId: current.companyId, sourceIssueId: current.id,
+          kind: "active_run_watchdog", ownerType: "board",
+          previousOwnerAgentId: current.assigneeAgentId, returnOwnerAgentId: current.assigneeAgentId,
+          cause: "native_continuation_requires_reconciliation",
+          fingerprint: `native-continuation:${runIds[0]}`,
+          evidence: { runId: runIds[0], nativeOrphanedRunIds: runIds },
+          nextAction: "Inspect every recorded native continuation and reconcile its evidence before allowing another provider session. No action outcome has been inferred.",
+          wakePolicy: null, maxAttempts: null,
+        }).onConflictDoNothing().returning().then(rows => rows[0] ?? null);
+        created = action !== null;
+        // Another action writer need not take the issue lock. Preserve its
+        // identity and execution evidence if it won the source-scoped slot.
+        if (!action) action = await tx.select().from(issueRecoveryActions).where(activePredicate)
+          .for("update").limit(1).then(rows => rows[0] ?? null);
+      }
+      if (!action) throw new Error("Native recovery attention lost its source-scoped action");
+      const previousIds = Array.isArray(action.evidence.nativeOrphanedRunIds)
+        ? action.evidence.nativeOrphanedRunIds.filter((id): id is string => typeof id === "string") : [];
+      const recordedIds = [...new Set([...previousIds, ...runIds])].sort();
+      if (!created && runIds.every(id => previousIds.includes(id))) return;
+      await tx.update(issueRecoveryActions).set({
+        evidence: { ...action.evidence, nativeOrphanedRunIds: recordedIds }, updatedAt: new Date(),
+      }).where(and(activePredicate, eq(issueRecoveryActions.id, action.id)));
+      // addComment would touch Issue.updatedAt. Use the existing activity and
+      // publication path so the entire Issue, F and R remain unchanged.
+      await logActivity(tx as unknown as Db, {
+        companyId: current.companyId, actorType: "system", actorId: "recovery",
+        action: "issue.native_continuation_attention_required",
+        entityType: "issue_recovery_action", entityId: action.id,
+        details: { sourceIssueId: current.id, orphanedRunIds: recordedIds,
+          existingRecoveryOwnerPreserved: !created,
+          nextAction: "Reconcile every recorded native execution; do not infer that an unbound run stopped or did no work." },
+      }, publications);
+    });
+    for (const publication of publications) publishActivity(publication);
   }
 
   async function hasPendingWakeInteraction(companyId: string, issueId: string) {
@@ -2924,6 +2960,7 @@ export function recoveryService(
       const childState = await collectDispositionRepairSourceState(db, {
         issue: child,
       });
+      if (childState.hasRecoveryWaitingPath) continue;
       if (
         childState.hasActiveExecutionPath ||
         (!sameWorkspaceOnly && childState.hasDurableWaitingPath)
@@ -3075,8 +3112,9 @@ export function recoveryService(
     fingerprint: string;
     attemptCount: number;
     legacyEpisode?: LegacyDispositionEpisode;
-  }) {
-    let active = await recoveryActionsSvc.getActiveForIssue(
+  }, database: Db = db, publications?: ActivityPublication[]) {
+    const actionsSvc = database === db ? recoveryActionsSvc : issueRecoveryActionService(database);
+    let active = await actionsSvc.getActiveForIssue(
       input.issue.companyId,
       input.issue.id,
     );
@@ -3085,7 +3123,7 @@ export function recoveryService(
       (active.kind !== "deliberate_wait_without_target" ||
         active.fingerprint !== input.fingerprint)
     ) {
-      await recoveryActionsSvc.resolveActiveForIssue({
+      await actionsSvc.resolveActiveForIssue({
         companyId: input.issue.companyId,
         sourceIssueId: input.issue.id,
         actionId: active.id,
@@ -3093,7 +3131,7 @@ export function recoveryService(
         outcome: "cancelled",
         resolutionNote: "source_state_changed",
       });
-      await logActivity(db, {
+      await logActivity(database, {
         companyId: input.issue.companyId,
         actorType: "system",
         actorId: "recovery",
@@ -3108,13 +3146,13 @@ export function recoveryService(
           nextFingerprint: input.fingerprint,
           terminalReason: "source_state_changed",
         },
-      });
+      }, publications);
       active = null;
     }
 
     if (active && active.attemptCount >= input.attemptCount) return active;
 
-    return recoveryActionsSvc.upsertSourceScoped({
+    return actionsSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
       kind: "deliberate_wait_without_target",
@@ -3156,7 +3194,7 @@ export function recoveryService(
     legacyEpisode?: LegacyDispositionEpisode;
   }) {
     const agentId = input.issue.assigneeAgentId;
-    if (!agentId) return null;
+    if (!agentId) return { kind: "rejected" as const };
     // Preserve the initiating identity on the durable row, including while a
     // delayed repair is waiting to dispatch. Never substitute the issue owner.
     const sourceRun = input.latestRun?.id ? await db.select()
@@ -3208,8 +3246,9 @@ export function recoveryService(
         .limit(1)
         .then((rows) => rows[0]?.run ?? null);
 
-    let scheduledRun = await findScheduledRun();
+    let scheduledRun: typeof heartbeatRuns.$inferSelect | null = await findScheduledRun();
     let created = false;
+    let coveredByExecutionPath = false;
     if (!scheduledRun) {
       try {
         if (timing.delayMs === 0) {
@@ -3238,6 +3277,18 @@ export function recoveryService(
           created = Boolean(enqueuedRun);
         } else {
           scheduledRun = await db.transaction(async (tx) => {
+            const [current] = await tx.select().from(issues).where(and(
+              eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id),
+            )).for("update").limit(1);
+            if (!current || current.status === "done" || current.status === "cancelled"
+              || current.assigneeAgentId !== agentId || current.assigneeUserId !== input.issue.assigneeUserId) return null;
+            // Delayed reservations bypass enqueueWakeup. Revalidate their
+            // source under the same issue lock before creating either row.
+            const state = await collectDispositionRepairSourceState(tx as unknown as Db, { issue: current });
+            if (state.hasActiveExecutionPath || state.hasDurableWaitingPath) {
+              coveredByExecutionPath = true;
+              return null;
+            }
             const wakeup = await tx
               .insert(agentWakeupRequests)
               .values({
@@ -3290,7 +3341,7 @@ export function recoveryService(
               .where(eq(agentWakeupRequests.id, wakeup.id));
             return run;
           });
-          created = true;
+          created = Boolean(scheduledRun);
         }
       } catch (error) {
         if (!isUniqueViolation(error, DISPOSITION_REPAIR_IDEMPOTENCY_INDEX))
@@ -3301,7 +3352,14 @@ export function recoveryService(
       }
     }
 
-    if (!scheduledRun) return null;
+    if (!scheduledRun) {
+      // A retained native path is not a rejected empty legacy reservation.
+      // Keep its existing action available for the native recovery to settle.
+      if (coveredByExecutionPath || await hasNativeRecoveryExecutionPath(db, {
+        companyId: input.issue.companyId, issueId: input.issue.id,
+      })) return { kind: "covered" as const };
+      return { kind: "rejected" as const };
+    }
 
     await db
       .update(issueRecoveryActions)
@@ -3359,7 +3417,7 @@ export function recoveryService(
       });
     }
 
-    return scheduledRun;
+    return { kind: "scheduled" as const, run: scheduledRun };
   }
 
   async function latestRecoveryActionRun(
@@ -3466,6 +3524,13 @@ export function recoveryService(
         continue;
       }
 
+      const sourceState = await collectDispositionRepairSourceState(db, { issue });
+      if (sourceState.nativeOrphanedRunIds.length > 0) await recordOrphanedNativeRecoveryAttention(issue);
+      if (sourceState.hasRecoveryWaitingPath) {
+        result.skipped += 1;
+        continue;
+      }
+
       // A queued comment or healthy child cannot establish what the stopped
       // provider already did. Only execution reconciliation can clear this hold.
       if (requiresExecutionReconciliation(action.cause)
@@ -3477,9 +3542,8 @@ export function recoveryService(
         continue;
       }
 
-      const [sourceState, healthyChildren, hasNewSourcePath] =
+      const [healthyChildren, hasNewSourcePath] =
         await Promise.all([
-          collectDispositionRepairSourceState(db, { issue }),
           healthyOpenChildIssues(issue),
           sourceHasNewPathOutsideRecoveryAction(action),
         ]);
@@ -3495,7 +3559,7 @@ export function recoveryService(
             issue.companyId,
             issue.id,
           );
-          await issuesSvc.update(issue.id, {
+          const updated = await issuesSvc.update(issue.id, {
             status: "blocked",
             blockedByIssueIds: [
               ...new Set([
@@ -3504,6 +3568,10 @@ export function recoveryService(
               ]),
             ],
           });
+          if (!updated) {
+            result.skipped += 1;
+            continue;
+          }
         }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
           companyId: action.companyId,
@@ -3577,141 +3645,169 @@ export function recoveryService(
     terminalReason: string;
     legacyEpisode?: LegacyDispositionEpisode;
   }) {
-    const action = await ensureDispositionRepairAction({
-      issue: input.issue,
-      latestRun: input.latestRun,
-      fingerprint: input.fingerprint,
-      attemptCount: input.attemptCount,
-      legacyEpisode: input.legacyEpisode,
-    });
-    const now = new Date();
-    await db
-      .update(issueRecoveryActions)
-      .set({
-        status: "active",
-        ownerType: "board",
-        ownerAgentId: null,
-        ownerUserId: null,
-        maxAttempts: null,
-        evidence: {
-          ...action.evidence,
-          latestRunId: input.latestRun?.id ?? null,
-          latestRunStatus: input.latestRun?.status ?? null,
-          latestRunErrorCode: input.latestRun?.errorCode ?? null,
-          terminalReason: input.terminalReason,
-          sourceAttemptCount: input.attemptCount,
-          sourceMaxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
-          routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
-        },
-        nextAction:
-          "Inspect the evidence and choose whether to repair, retry the original owner, explicitly reassign, or resolve the source issue.",
-        wakePolicy: {
-          type: "board_escalation",
-          reason: input.terminalReason,
-          preservesSourceAssignee: true,
-        },
-        timeoutAt: null,
-        resolutionNote: input.terminalReason,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issueRecoveryActions.id, action.id),
-          eq(issueRecoveryActions.companyId, input.issue.companyId),
-        ),
-      );
+    const publications: ActivityPublication[] = [];
+    const postCommitActions: IssuePostCommitAction[] = [];
+    let updatedIssue: typeof issues.$inferSelect | null;
+    try {
+      updatedIssue = await db.transaction(async (tx) => {
+        const [current] = await tx.select().from(issues).where(and(
+          eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id),
+        )).for("update").limit(1);
+        if (!current || ["done", "cancelled"].includes(current.status) || current.hiddenAt
+          || current.assigneeAgentId !== input.issue.assigneeAgentId
+          || current.assigneeUserId !== input.issue.assigneeUserId) return null;
+        const updated = await issuesSvc.update(current.id, {
+          status: "blocked", companyGuard: current.companyId, expectedRevision: current.revision,
+        }, tx, publications, postCommitActions);
+        if (!updated) return null;
+        // The guarded source transition owns this escalation. No action,
+        // notice or audit is written if native recovery made it a no-op.
+        const action = await ensureDispositionRepairAction({
+          issue: current, latestRun: input.latestRun, fingerprint: input.fingerprint,
+          attemptCount: input.attemptCount, legacyEpisode: input.legacyEpisode,
+        }, tx as unknown as Db, publications);
 
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-    });
-    if (!updated) return null;
-    const sourceAssigneePreserved =
-      updated.assigneeAgentId === input.issue.assigneeAgentId &&
-      updated.assigneeUserId === input.issue.assigneeUserId;
+        const now = new Date();
+        await tx
+          .update(issueRecoveryActions)
+          .set({
+            status: "active",
+            ownerType: "board",
+            ownerAgentId: null,
+            ownerUserId: null,
+            maxAttempts: null,
+            evidence: {
+              ...action.evidence,
+              latestRunId: input.latestRun?.id ?? null,
+              latestRunStatus: input.latestRun?.status ?? null,
+              latestRunErrorCode: input.latestRun?.errorCode ?? null,
+              terminalReason: input.terminalReason,
+              sourceAttemptCount: input.attemptCount,
+              sourceMaxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
+              routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
+            },
+            nextAction:
+              "Inspect the evidence and choose whether to repair, retry the original owner, explicitly reassign, or resolve the source issue.",
+            wakePolicy: {
+              type: "board_escalation",
+              reason: input.terminalReason,
+              preservesSourceAssignee: true,
+            },
+            timeoutAt: null,
+            resolutionNote: input.terminalReason,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issueRecoveryActions.id, action.id),
+              eq(issueRecoveryActions.companyId, input.issue.companyId),
+            ),
+          );
 
-    await issuesSvc.addComment(
-      input.issue.id,
-      [
-        "Paperclip exhausted the bounded original-owner disposition repair without a durable source-state change.",
-        "",
-        `- Attempts: ${input.attemptCount}/${input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS}`,
-        `- Terminal reason: \`${input.terminalReason}\``,
-        "- Recovery owner: board",
-        "- Source ownership: unchanged; reassignment requires an explicit decision or a policy-defined serious failure.",
-        "",
-        "Next action: repair the liveness disposition or request an explicit source-owner decision.",
-      ].join("\n"),
-      {},
-      {
-        authorType: "system",
-        presentation: compactRecoveryPresentation(
-          "Agent needs attention",
-        ),
-        metadata: {
-          ...recoveryNoticeMetadata({
-            cause: "deliberate_wait_without_target",
-            latestRun: input.latestRun,
-            recoveryActionId: action.id,
+        const sourceAssigneePreserved =
+          updated.assigneeAgentId === input.issue.assigneeAgentId &&
+          updated.assigneeUserId === input.issue.assigneeUserId;
+
+        await issuesSvc.addComment(
+          input.issue.id,
+          [
+            "Paperclip exhausted the bounded original-owner disposition repair without a durable source-state change.",
+            "",
+            `- Attempts: ${input.attemptCount}/${input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS}`,
+            `- Terminal reason: \`${input.terminalReason}\``,
+            "- Recovery owner: board",
+            "- Source ownership: unchanged; reassignment requires an explicit decision or a policy-defined serious failure.",
+            "",
+            "Next action: repair the liveness disposition or request an explicit source-owner decision.",
+          ].join("\n"),
+          {},
+          {
+            authorType: "system",
+            presentation: compactRecoveryPresentation(
+              "Agent needs attention",
+            ),
+            metadata: {
+              ...recoveryNoticeMetadata({
+                cause: "deliberate_wait_without_target",
+                latestRun: input.latestRun,
+                recoveryActionId: action.id,
+                previousStatus: input.issue.status,
+                recoveryOwner: null,
+              }),
+              recovery: {
+                kind: "disposition_repair_escalated",
+                actionId: action.id,
+                attemptCount: input.attemptCount,
+                maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
+                reason: input.terminalReason,
+                assigneeAgentId: input.issue.assigneeAgentId,
+              },
+            },
+          },
+          tx,
+        );
+
+        await logActivity(tx as unknown as Db, {
+          companyId: input.issue.companyId,
+          actorType: "system",
+          actorId: "recovery",
+          agentId: null,
+          runId: input.latestRun?.id ?? null,
+          action: "issue.disposition_repair_escalated",
+          entityType: "issue",
+          entityId: input.issue.id,
+          details: {
+            identifier: input.issue.identifier,
+            status: "blocked",
             previousStatus: input.issue.status,
-            recoveryOwner: null,
-          }),
-          recovery: {
-            kind: "disposition_repair_escalated",
-            actionId: action.id,
+            sourceStateFingerprint: input.fingerprint,
             attemptCount: input.attemptCount,
             maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
-            reason: input.terminalReason,
-            assigneeAgentId: input.issue.assigneeAgentId,
+            terminalReason: input.terminalReason,
+            recoveryActionId: action.id,
+            recoveryOwnerAgentId: null,
+            recoveryOwnerType: "board",
+            routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
+            sourceAssigneeBefore: {
+              agentId: input.issue.assigneeAgentId,
+              userId: input.issue.assigneeUserId,
+            },
+            sourceAssigneeAfter: {
+              agentId: updated.assigneeAgentId,
+              userId: updated.assigneeUserId,
+            },
+            sourceAssigneePreserved,
           },
-        },
-      },
-    );
-
-    await logActivity(db, {
-      companyId: input.issue.companyId,
-      actorType: "system",
-      actorId: "recovery",
-      agentId: null,
-      runId: input.latestRun?.id ?? null,
-      action: "issue.disposition_repair_escalated",
-      entityType: "issue",
-      entityId: input.issue.id,
-      details: {
-        identifier: input.issue.identifier,
-        status: "blocked",
-        previousStatus: input.issue.status,
-        sourceStateFingerprint: input.fingerprint,
-        attemptCount: input.attemptCount,
-        maxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
-        terminalReason: input.terminalReason,
-        recoveryActionId: action.id,
-        recoveryOwnerAgentId: null,
-        recoveryOwnerType: "board",
-        routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
-        sourceAssigneeBefore: {
-          agentId: input.issue.assigneeAgentId,
-          userId: input.issue.assigneeUserId,
-        },
-        sourceAssigneeAfter: {
-          agentId: updated.assigneeAgentId,
-          userId: updated.assigneeUserId,
-        },
-        sourceAssigneePreserved,
-      },
-    });
-    if (!sourceAssigneePreserved) {
-      logger.error(
-        {
-          issueId: input.issue.id,
-          beforeAssigneeAgentId: input.issue.assigneeAgentId,
-          afterAssigneeAgentId: updated.assigneeAgentId,
-          beforeAssigneeUserId: input.issue.assigneeUserId,
-          afterAssigneeUserId: updated.assigneeUserId,
-        },
-        "automatic disposition recovery observed a concurrent source-owner change",
-      );
+        }, publications);
+        if (!sourceAssigneePreserved) {
+          logger.error(
+            {
+              issueId: input.issue.id,
+              beforeAssigneeAgentId: input.issue.assigneeAgentId,
+              afterAssigneeAgentId: updated.assigneeAgentId,
+              beforeAssigneeUserId: input.issue.assigneeUserId,
+              afterAssigneeUserId: updated.assigneeUserId,
+            },
+            "automatic disposition recovery observed a concurrent source-owner change",
+          );
+        }
+        return updated;
+      });
+    } catch (error) {
+      logger.warn({ err: error, issueId: input.issue.id, runId: input.latestRun?.id },
+        "Disposition escalation rolled back; no partial board action was committed");
+      return null;
     }
-    return updated;
+    if (updatedIssue) {
+      try {
+        for (const publication of publications) publishActivity(publication);
+        await executeIssuePostCommitActions(db, postCommitActions);
+      } catch (error) {
+        logger.warn({ err: error, issueId: input.issue.id, runId: input.latestRun?.id },
+          "Disposition escalation committed; postcommit delivery is unconfirmed");
+      }
+    }
+    return updatedIssue;
   }
 
   async function decidePersistedLegacyContinuation(
@@ -3825,6 +3921,8 @@ export function recoveryService(
     const state = await collectDispositionRepairSourceState(db, {
       issue: current,
     });
+    if (state.nativeOrphanedRunIds.length > 0) await recordOrphanedNativeRecoveryAttention(current);
+    if (state.hasRecoveryWaitingPath) return "skipped";
     if (episode) {
       if (!latestRun) return "skipped";
       const decision = await decidePersistedLegacyContinuation(current, latestRun.id, state, episode);
@@ -3922,7 +4020,7 @@ export function recoveryService(
       attempt: nextAttempt,
       legacyEpisode: episode,
     });
-    if (!scheduled && episode) {
+    if (scheduled.kind === "rejected" && episode) {
       // Admission can reject a stale snapshot under the issue lock. An empty
       // repair action must not subsequently cause escalation.
       await recoveryActionsSvc.resolveActiveForIssue({
@@ -3930,7 +4028,7 @@ export function recoveryService(
         status: "cancelled", outcome: "cancelled", resolutionNote: "repair_admission_rejected",
       });
     }
-    return scheduled ? "queued" : "skipped";
+    return scheduled.kind === "scheduled" ? "queued" : "skipped";
   }
 
   async function escalateQaPagingHold(issue: typeof issues.$inferSelect, latestRun: LatestIssueRun) {
@@ -4529,6 +4627,16 @@ export function recoveryService(
     }
 
     for (const issue of candidates) {
+      // A native coordinator, including one whose binding was lost, must be
+      // settled by its existing owner. Missing binding is not a replay grant.
+      const nativeRecovery = await readNativeContinuationRecoveryPath(db, {
+        companyId: issue.companyId, issueId: issue.id,
+      });
+      if (nativeRecovery.orphaned) await recordOrphanedNativeRecoveryAttention(issue);
+      if (nativeRecovery.pending) {
+        result.skipped += 1;
+        continue;
+      }
       if (issue.originKind === "chat_channel") {
         await settleSlackConversation(db, issue.companyId, issue.id);
         const [current] = await db.select({ externalConversationState: externalConversationStateSql() })
@@ -6229,6 +6337,8 @@ export function recoveryService(
         id: issues.id,
         companyId: issues.companyId,
         status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
         checkoutRunId: issues.checkoutRunId,
         executionRunId: issues.executionRunId,
       })
@@ -6254,6 +6364,10 @@ export function recoveryService(
     const runStatusById = new Map<string, string>();
     for (const row of runRows) runStatusById.set(row.id, row.status);
     const runById = new Map(runRows.map(row => [row.id, row]));
+    const finalizationRows = referencedRunIds.length > 0
+      ? await db.select().from(nativeRunFinalizations).where(inArray(nativeRunFinalizations.runId, referencedRunIds))
+      : [];
+    const finalizationByRunId = new Map(finalizationRows.map(row => [row.runId, row]));
 
     // Collect the runs that a non-terminal issue still references. Such a run is
     // the live run of an active issue. A different, terminal issue can also hold
@@ -6327,6 +6441,9 @@ export function recoveryService(
         await deps.settleExplicitContinuationRetry?.(owner);
         continue;
       }
+      if (owner && isNativeContinuationHeld({
+        issue, run: owner, finalization: finalizationByRunId.get(owner.id) ?? null,
+      })) continue;
       if (
         !isCleanable(issue.checkoutRunId) ||
         !isCleanable(issue.executionRunId)
@@ -6346,6 +6463,13 @@ export function recoveryService(
         .where(
           and(
             eq(issues.id, issue.id),
+            sql`not (${nativeContinuationHoldSql()})`,
+            // R and F can have been read in different snapshots. A same-run
+            // claim that has already returned R to running is not cleanable.
+            notExists(db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              or(eq(heartbeatRuns.id, issues.checkoutRunId), eq(heartbeatRuns.id, issues.executionRunId)),
+              notInArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+            ))),
             issue.checkoutRunId
               ? eq(issues.checkoutRunId, issue.checkoutRunId)
               : isNull(issues.checkoutRunId),
