@@ -142,8 +142,11 @@ open a second PR for the same connection accidentally.
    package and any tightly coupled content-playbook correction, but no
    Paperclip App implementation.
 6. Run focused validation and the required PR workflow. Do not present the gate
-   until checks are green, Greptile is 5/5, all actionable review comments are
-   resolved, and the recorded PR head still matches the reviewed head.
+   until all required checks succeed, the target repository review gate is
+   complete, all actionable findings have reasoned dispositions, and the recorded
+   PR head still matches the reviewed head. For `kurishi1204/paperclip`, apply its
+   `CONTRIBUTING.md` quality gate; report optional Greptile availability honestly.
+   Other repositories retain their own review requirements.
 
 ## Gate Research Before Building
 
@@ -196,7 +199,10 @@ its commit before writing code. For each accepted connection:
    evidence.
 7. Run the standard PR-preparation workflow for this connector PR. Do not hand
    it back for merge until focused verification passes, all required checks are
-   green, Greptile is 5/5, and every actionable comment is resolved.
+   green, the target repository review gate is complete, and every actionable
+   comment has a reasoned disposition. For `kurishi1204/paperclip`, use its
+   `CONTRIBUTING.md` quality gate and report actual optional Greptile state;
+   other target repositories retain their own review requirements.
 
 Complete and report each connection independently. Failure or review delay on
 one connection must not cause another connection to be bundled into its PR.

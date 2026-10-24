@@ -24,7 +24,7 @@ Affirm that you did this search by checking the dedup-search box in the PR templ
 - Touch the **smallest possible number of files**
 - Make sure the change is very targeted and easy to review
 - All tests pass and CI is green
-- Greptile score is 5/5 with all comments addressed
+- Satisfy the [target repository review gate](#review-gate-kurishi1204paperclip) at the current head
 - Use the [PR template](.github/PULL_REQUEST_TEMPLATE.md)
 
 These almost always get merged quickly when they're clean.
@@ -39,7 +39,7 @@ These almost always get merged quickly when they're clean.
   - Clear description of what & why
   - Proof it works (manual testing notes)
   - All tests passing and CI green
-  - Greptile score 5/5 with all comments addressed
+  - Satisfy the [target repository review gate](#review-gate-kurishi1204paperclip) at the current head
   - [PR template](.github/PULL_REQUEST_TEMPLATE.md) fully filled out
 
 PRs that follow this path are **much** more likely to be accepted, even when they're large.
@@ -112,15 +112,32 @@ If your change adds, removes, or modifies emitted telemetry events, update the [
 
 All Paperclip CI gates (lint, typecheck, tests, build, and any other required checks) must be satisfied before a PR can be merged. Don't ask for a merge while gates are red — fix them first.
 
-### Greptile Review
+### Review Gate (kurishi1204/paperclip)
 
-We use [Greptile](https://greptile.com) for automated code review. Your PR must achieve a **5/5 Greptile score** before it can be merged, with:
+For pull requests targeting **kurishi1204/paperclip**, adoption requires all of the following at the exact current head:
 
-- **No open P2 (or higher) comments**
-- **No open recommendations**
-- **No open follow-ups**
+- CI and repository-required status checks have actually completed successfully. Missing, pending, failing, skipped or neutral checks are not successful execution evidence.
+- An independent, fresh-session Claude Opus 5.5 review reports actual model `claude-opus-5-5`, known successful native/provider completion and one exact final `判定: GO` line. Bind the full launched input, full before/after changed sources and relevant dependencies, head/tree, executor, session and actual result bytes. Configured model names and PR-body claims are insufficient.
+- Every received review source has a current disposition: resolved, rejected with concrete evidence, or explicitly not a finding. Include inline threads, reviews, edited general summaries, check outputs, every check annotation and the independent report. Record the source version/body hash, reason and supporting evidence. Classification correctness remains the operator's responsibility; a complete table alone does not prove a fix.
+- All existing required approvals, CODEOWNERS decisions, conversation requirements, branch protections and security checks remain satisfied. Maintainers retain the adoption decision. A model GO or a readiness report does not merge or deploy code.
 
-We hold the bar high here on purpose — we want code quality to be as high as possible. If Greptile leaves comments, fix them (or, if a comment is wrong, reply explaining why) and request a re-review.
+[Greptile](https://greptile.com) is additional review evidence in this fork. Report its actual status, findings and score when received. Unavailable, pending or quota-limited is not 5/5, approval, or a code-quality result. Address actual findings regardless of vendor. Do not run a paid review loop merely to obtain a score. A Greptile check explicitly required by repository protection remains required; this policy does not change settings or bypass it. Other target repositories follow their own contribution rules.
+
+Use the fork path in `.agents/skills/pr-gardening/scripts/check-readiness.mjs` from trusted adopted code. It reads GitHub checks, protections, source and review comments. It supports only an **operator-admitted CLI journal**; missing or unsupported evidence is unreceived/invalid, never a fallback success. It does not require a Paperclip company Task/Run or launch a model. The candidate reader cannot certify its own initial installation. Maintainers must decide that first policy adoption from separately trusted operator execution, independent review and normal CI evidence; a candidate readiness verdict is not that decision.
+
+The operator must be able to read the applicable branch rules and protection. For a protected base, GitHub requires **Administration repository permissions (read)** for a fine-grained token on [Get branch protection](https://docs.github.com/en/rest/branches/branch-protection#get-branch-protection). Confirm that prerequisite for the actual operator. An unreadable protection response remains unknown; do not remove protection or substitute model approval.
+
+The trusted operator configures a private `--trusted-review-root` outside PR checkouts and pins `registry.json` with `--trusted-review-registry-sha256`. Do not derive either value from the PR. A `--review-evidence` pointer has no authority; its inline `approved`, model and verdict claims are ignored. Registry schema `paperclip.operator-review-registry/v1` admits one `trusted-cli-journal/v1` entry per repository/PR/head and an actual executor. Each entry binds `key`, `purpose: independent_implementation_review`, a required non-empty `implementationSessionID` from the actual implementation execution, `sourceInputSHA256`, `cliInvocationPath`, `cliSHA256` and artifact paths/hashes for `start`, `claim`, `process`, `terminal`, `raw`, `report`, `system`, `material`, `launcher` and the actual `cli` snapshot. These artifacts must remain within the private admitted root. The reader joins the actual START/CLAIM/PROCESS/native terminal record, raw first-party provider response, actual model/session, input bytes, admitted launcher/CLI hashes and exact final report. Only the admitted one-shot high-effort, tools-disabled CLI argument shape is supported; different or resumed launch shapes remain invalid. The reader requires the operator-bound implementation session ID and checks that it differs from the actual launched review session ID, comparing case-insensitively; absent or invalid IDs remain `implementation_session_unreceived`, and reuse remains `review_not_independent`. The trusted operator must verify the implementation ID against its real execution record before admitting it. The reader does not independently authenticate that implementation record or prove independence from different strings alone. A derived `RESULT.json` success flag alone cannot pass.
+
+For an existing PR, emit the complete source block before review with `--emit-review-input <PR> --repo kurishi1204/paperclip --review-dependencies <comma-separated relevant paths> --output <outside-checkout-file>`. Include that block byte-for-byte once in the launched material. Review input binds the repository, head/tree and complete source bytes; it need not have a PR number at review time. This command requires an existing PR; it is not a local-tree emitter. For a pre-PR source review, a trusted operator must prepare the same complete source contract from pinned Git blobs, and the later GitHub reconstruction must match it exactly. The operator later admits that exact reviewed head to one PR in the pinned registry, and the reader checks actual GitHub sources against the launched block. It contains GitHub-verified full before/after file bytes and dependency blobs, not just an asserted head. Select all relevant dependencies; ask the reviewer to identify omissions. The pointer schema is `paperclip.review-pointer/v1`, with `repository` and `entries` containing `pullRequest`, `headSha`, `admissionKey`, the same `dependencies`, and `dispositions`. Each disposition binds `sourceID`, `sourceVersion`, `bodySHA256`, `disposition`, `reason` and `evidence`. An initial report exposes unprocessed sources so they can be assessed without requesting another model call. A missing, malformed or unsupported pointer produces a visible `readiness_unknown` entry for every input candidate with a specific pointer subcode; it does not discard candidates or launch another review. Readiness output, like emitted source input, must be outside the trusted reader checkout (or stdout via `--output -`).
+
+Both output writers compare the device/inode of existing destination ancestors with the trusted checkout, so case aliases and symlinks cannot bypass the outside-checkout check. Existing output targets must resolve to single-link regular files; multi-link files are rejected even outside the checkout. New output files are allowed under an existing external parent, and `--output -` writes to stdout. Writers do not create missing parents. The operator must keep the filesystem stable between validation and writing; the check is not protection against a same-user filesystem race.
+
+The operator/executor and filesystem are the trust boundary, as an instance administrator would be for server run records. An administrator or same-user process able to alter that boundary can fabricate evidence. Hashes do not authenticate a provider or prove isolation. This reader neither creates an authenticator nor claims cryptographic attestation. Run it from trusted adopted code, never let a PR execute or configure its own review admission.
+
+The initial and final evidence snapshots compare the complete typed GraphQL status rollup, including legacy `StatusContext` rows and duplicate names. Check annotations are read from the same repository/check-run route at both snapshots, with every page and the declared count verified. GitHub's annotation response has no native annotation ID: the inventory uses the owning check-run ID, complete body digest and identical-body occurrence, preserving duplicates and all annotation levels for operator disposition. The private readiness report includes every received annotation body and its head/source/version binding. Missing, unreadable, incomplete or changing annotation evidence cannot establish readiness; notices are not automatically classified as harmless.
+
+Keep public PR evidence to the reviewed head, actual model, verdict and report digest. Do not publish private journal paths, instance IDs, credentials or internal logs.
 
 ## Helping Other Contributors
 

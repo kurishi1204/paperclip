@@ -124,7 +124,15 @@ Pipeline statuses: `running`, `pending`, `success`, `failed`, `canceled`, `skipp
 
 **Perforce:** Perforce doesn't have built-in CI checks natively. If the team uses a review tool (Swarm, etc.) or an external CI triggered by shelve events, check the relevant system. Otherwise, proceed to analysis immediately.
 
-### 4. Require a fresh Greptile review for the current head
+### 4. Apply the target repository review gate
+
+For `kurishi1204/paperclip`, use the canonical Review Gate in the target's `CONTRIBUTING.md`. Run `check-readiness.mjs` from trusted adopted code, with the operator's separately configured/pinned review root and the untrusted evidence pointer. Require same-head successful CI, a real independent fresh-session Opus5.5 GO joined to the admitted CLI journal, and current dispositions for every actual review source. Unsupported/missing evidence is unreceived, not approval. The trusted registry must bind a non-empty actual `implementationSessionID`, and the reader must verify that it differs from the launched review session; operator admission remains responsible for that implementation record’s provenance. Do not execute PR-controlled review-admission code or settings.
+
+Greptile is advisory here. Preserve its actual findings and availability; do not run the legacy score gate or post a review trigger for this fork. No model launch, company Task/Run, purchase, permission change or merge is implied. Existing GitHub required checks/approvals/security remain required.
+
+The remaining GitHub commands in this section are **legacy rules for other target repositories only**. GitLab and Perforce installations retain their own rules.
+
+#### Legacy current-head Greptile gate (other GitHub repositories)
 
 For GitHub PRs, do not treat an existing Greptile review, comment, or summary as current unless it is tied to the PR's exact current `headRefOid`. This is especially important after pushing a new commit to an existing PR: a Greptile review on an older commit is stale, even if the PR still has a Greptile comment or prior review.
 
@@ -168,6 +176,8 @@ fi
 ```
 
 If a Greptile check exists for the current head but is still pending or in progress, wait for it with the same polling pattern used by `greploop` rather than proceeding from older review material. If no Greptile check appears for the current head after a reasonable wait, report the PR as blocked on a fresh Greptile review for `HEAD_SHA` and stop. Do not mark the check complete from PR comments, PR reviews, or Greptile summaries that cannot be associated with the current head SHA.
+
+#### GitLab integration rules
 
 For GitLab installations with Greptile integration, apply the same freshness rule against the MR's current head SHA:
 
@@ -215,6 +225,8 @@ fi
 ```
 
 Block completion if, for `MR_SHA`, there is (a) no Greptile job or note at all (missing), (b) the newest Greptile job/note is tied to a different sha (stale), or (c) the Greptile job status is not `success`. A completed Greptile result for a different SHA is stale and must block completion.
+
+#### Perforce integration rules
 
 For Perforce installations with Greptile integration, apply the same rule using the CL's current shelved-revision identity and the Greptile webhook/review artifact tied to it; a Greptile result for an earlier shelf is stale and must block completion.
 
@@ -291,6 +303,8 @@ p4 shelve -f -c <CL_NUMBER>
 ```
 
 ### 9. Resolve review threads
+
+For this fork, thread resolution does not replace a source/version/body-bound disposition with a reason and evidence. Read every received source, including edited summaries and the independent report. Report unknown/incomplete enumeration. Include independent review status/head and truthful Greptile availability in the final report; a model GO does not adopt code.
 
 After addressing comments, resolve the corresponding review threads.
 
