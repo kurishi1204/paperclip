@@ -129,6 +129,8 @@ export type StalenessDecision =
     };
 
 export type QueuedRunFacts = {
+  /** Current persisted wait, rechecked even after a repair was promoted. */
+  issueHasTypedBlockedWait: boolean;
   /** Rechecked for automatic native replacements immediately before dispatch. */
   dependenciesBlocked?: DependencyBlockFacts | null;
   runId: string;
@@ -504,6 +506,15 @@ export function decideQueuedRunStaleness(
       errorCode: "issue_not_found",
       reason: "Cancelled because the target issue no longer exists",
       details: { issueId: facts.issueId },
+    };
+  }
+
+  if (facts.retryReasonKind === "disposition_repair" && facts.issueHasTypedBlockedWait) {
+    return {
+      stale: true,
+      errorCode: "issue_blocked",
+      reason: "Cancelled disposition repair because the task has a persisted unblock owner and action",
+      details: { issueId: facts.issueId, reason: "typed_blocked_wait" },
     };
   }
 

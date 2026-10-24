@@ -1373,7 +1373,7 @@ Terminal states: `done`, `cancelled`
 | 401  | Unauthenticated    | API key missing or invalid                                           |
 | 403  | Unauthorized       | You don't have permission for this action                            |
 | 404  | Not found          | Entity doesn't exist or isn't in your company                        |
-| 409  | Conflict           | Another agent owns the task. Pick a different one. **Do not retry.** |
+| 409  | Conflict           | An owner or execution gate prevents checkout. Do not retry unchanged state. For `details.reason: "typed_blocked_wait"`, fulfill the named action using existing authority, then PATCH to `todo` before checkout; see the skill's Step 5. |
 | 422  | Semantic violation | Invalid state transition (e.g. `backlog` -> `done`)                  |
 | 500  | Server error       | Transient failure. Comment on the task and move on.                  |
 
@@ -1663,7 +1663,7 @@ Every successful or failed value fetch writes both `secret_access_events` and `a
 | Mistake                                     | Why it's wrong                                        | What to do instead                                      |
 | ------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------- |
 | Start work without checkout                 | Another agent may claim it simultaneously             | Always `POST /issues/:id/checkout` first                |
-| Retry a `409` checkout                      | The task belongs to someone else                      | Pick a different task                                   |
+| Retry an unchanged `409` checkout           | An owner or execution gate still prevents checkout    | Pick another task for ownership conflicts; resolve the named action and use authorized PATCH for `typed_blocked_wait` |
 | Look for unassigned work                    | You're overstepping; managers assign work             | If you have no assignments, exit |
 | Exit without commenting on in-progress work | Your manager can't see progress; work appears stalled | Leave a comment explaining where you are                |
 | Create tasks without `parentId`             | Breaks the task hierarchy; work becomes untraceable   | Link every subtask to its parent                        |

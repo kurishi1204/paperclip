@@ -44,6 +44,7 @@ function baseGateFacts(): ScheduledRetryFacts {
 
 function baseStalenessFacts(): QueuedRunFacts {
   return {
+    issueHasTypedBlockedWait: false,
     runId: "run-1",
     runAgentId: "agent-1",
     issueId: "issue-1",
@@ -267,6 +268,15 @@ describe("decideScheduledRetryGate", () => {
 });
 
 describe("decideQueuedRunStaleness", () => {
+  it("suppresses an already-promoted repair after a typed wait is recorded", () => {
+    expect(decideQueuedRunStaleness({
+      ...baseStalenessFacts(),
+      retryReasonKind: "disposition_repair",
+      issueStatus: "blocked",
+      issueHasTypedBlockedWait: true,
+    }, NOW)).toMatchObject({ stale: true, errorCode: "issue_blocked", details: { reason: "typed_blocked_wait" } });
+  });
+
   it("is not stale when every rule passes", () => {
     expect(decideQueuedRunStaleness(baseStalenessFacts(), NOW)).toEqual({
       stale: false,

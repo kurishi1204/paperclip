@@ -199,7 +199,16 @@ The active-lock lifecycle is part of the checkout contract:
 - checkout and checkout-owner checks may self-heal lock columns that point at terminal or missing runs before evaluating conflicts
 - the recovery sweeper may clear rows whose checkout and execution locks all point at terminal or missing runs
 
-Stale-lock recovery is crash recovery, not a retry loop. Paperclip must not clear or adopt locks held by non-terminal runs. After stale cleanup, a checkout `409` should mean a real live owner, status/assignee mismatch, unresolved blocker, or active gate still prevents checkout. Agents must treat that `409` as an ownership conflict and stop rather than retrying the same checkout.
+Stale-lock recovery is crash recovery, not a retry loop. Paperclip must not clear or adopt locks held by non-terminal runs. After stale cleanup, a checkout `409` should mean a real live owner, status/assignee mismatch, unresolved blocker, or active gate still prevents checkout. Agents must read the conflict reason and avoid retrying unchanged state. Ownership conflicts require stopping work on that task; the named-wait procedure below handles `typed_blocked_wait`.
+
+A blocked issue with a non-null `unblockDescriptor` is an explicit wait, including
+when its first-class blocker issues have finished. Checkout returns the normal
+`409` with `details.reason: "typed_blocked_wait"` until an authorized status update
+records that the named action was fulfilled. The named owner may inspect and
+perform that already-authorized action without checkout, then PATCH to `todo`
+before normal execution. The descriptor grants no additional authority. Comments,
+owner notifications and repair timers alone do not resolve the wait. Historical
+descriptors on non-blocked rows do not change disposition-repair fingerprints.
 
 ### Known execution waits at admission
 

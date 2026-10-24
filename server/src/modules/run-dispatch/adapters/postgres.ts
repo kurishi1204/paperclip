@@ -14,7 +14,7 @@ import {
   issueComments,
   issues,
 } from "@paperclipai/db";
-import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
+import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON, issueUnblockDescriptorSchema } from "@paperclipai/shared";
 import { parseObject } from "../../../adapters/utils.js";
 import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokability.js";
 import { budgetService } from "../../../services/budgets.js";
@@ -341,6 +341,7 @@ export function createPostgresRunDispatchAdapter(
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
         monitorNextCheckAt: issues.monitorNextCheckAt,
+        unblockDescriptor: issues.unblockDescriptor,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)));
@@ -520,6 +521,7 @@ export function createPostgresRunDispatchAdapter(
         executionRunId: issues.executionRunId,
         checkoutRunId: issues.checkoutRunId,
         executionState: issues.executionState,
+        unblockDescriptor: issues.unblockDescriptor,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)));
@@ -598,6 +600,8 @@ export function createPostgresRunDispatchAdapter(
       } : null,
       issueFound: issue !== null,
       issueStatus: issue?.status ?? null,
+      issueHasTypedBlockedWait: issue?.status === "blocked"
+        && issueUnblockDescriptorSchema.safeParse(issue.unblockDescriptor).success,
       issueAssigneeAgentId: issue?.assigneeAgentId ?? null,
       issueExecutionRunId: issue?.executionRunId ?? null,
       issueCheckoutRunId: issue?.checkoutRunId ?? null,

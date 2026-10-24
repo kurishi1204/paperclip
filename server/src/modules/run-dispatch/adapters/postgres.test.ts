@@ -24,6 +24,9 @@ import {
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { collectDispositionRepairSourceState } from "../../../services/recovery/disposition-repair.js";
+import { issueService } from "../../../services/issues.js";
+import { legacyDispositionFingerprint } from "../../../services/recovery/legacy-continuation.js";
 
 // Proves the DB-to-facts mapping this adapter owns for each state the two
 // run-dispatch gates decide on. `application/use-cases.test.ts` and
@@ -379,6 +382,254 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   }
 
   describe("evaluateScheduledRetryGate", () => {
+    it("preserves a new standing wait committed after the initial transition read", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID(), blockerId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      await seedIssue({ companyId, issueId: blockerId, status: "todo" });
+      await db.update(issues).set({ unblockDescriptor: { owner: "board", action: "Historical wait" } }).where(eq(issues.id, issueId));
+      const current = { owner: "board", action: "New committed receipt wait" } as const;
+      const transact = db.transaction.bind(db);
+      let intervened = false;
+      const spy = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
+        if (!intervened) {
+          intervened = true;
+          // The update request already read in_progress; another writer now
+          // commits a current blocked wait before its locked receipt baseline.
+          await db.update(issues).set({ status: "blocked", unblockDescriptor: current }).where(eq(issues.id, issueId));
+        }
+        return transact(callback, config);
+      });
+      try {
+        const updated = await issueService(db).update(issueId, { status: "blocked", blockedByIssueIds: [blockerId] });
+        expect(intervened).toBe(true);
+        expect(updated?.unblockDescriptor).toEqual(current);
+      } finally { spy.mockRestore(); }
+    });
+
+    it.each(["omitted", "explicit", "already_blocked"])("does not reactivate a historical wait when entering blocked (%s)", async descriptorMode => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID(), blockerId = randomUUID();
+      const previous = { owner: "board", action: "Historical receipt wait" } as const;
+      const current = { owner: "board", action: "Current receipt wait" } as const;
+      await seedIssue({ companyId, issueId,
+        status: descriptorMode === "already_blocked" ? "blocked" : "in_progress", assigneeAgentId: agentId });
+      await seedIssue({ companyId, issueId: blockerId, status: "todo" });
+      await db.update(issues).set({ unblockDescriptor: previous }).where(eq(issues.id, issueId));
+      const svc = issueService(db);
+      const updated = await svc.update(issueId, {
+        status: "blocked", blockedByIssueIds: [blockerId],
+        ...(descriptorMode === "explicit" ? { unblockDescriptor: current } : {}),
+      });
+      expect(updated?.unblockDescriptor).toEqual(descriptorMode === "omitted" ? null
+        : descriptorMode === "explicit" ? current : previous);
+      await svc.update(blockerId, { status: "done" });
+      expect(await svc.getDependencyReadiness(issueId)).toMatchObject({ isDependencyReady: true });
+      const checkout = svc.checkout(issueId, agentId, ["blocked"], null);
+      if (descriptorMode === "omitted") {
+        await expect(checkout).resolves.toMatchObject({ status: "in_progress", unblockDescriptor: null });
+      } else {
+        await expect(checkout).rejects.toMatchObject({ status: 409, details: { reason: "typed_blocked_wait" } });
+      }
+    });
+
+    it("keeps a pre-upgrade v1 repair eligible when only a stale nonblocked descriptor differs", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const issue = (await db.select().from(issues).where(eq(issues.id, issueId)))[0]!;
+      const original = await collectDispositionRepairSourceState(db, { issue });
+      const runId = await seedRun({
+        companyId, agentId, status: "scheduled_retry", scheduledRetryReason: "issue_disposition_repair",
+        contextSnapshot: { issueId, retryReason: "issue_disposition_repair",
+          dispositionRepairFingerprint: original.fingerprint, dispositionRepairAttempt: 4 },
+      });
+      await db.update(issues).set({
+        unblockDescriptor: { owner: "board", action: "Historical receipt wait" },
+      }).where(eq(issues.id, issueId));
+      const adapter = createPostgresRunDispatchAdapter(db);
+      expect(await adapter.evaluateScheduledRetryGate({
+        runId, companyId, retryReasonOverride: "issue_disposition_repair", now: new Date(),
+      })).toEqual({ allowed: true });
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.contextSnapshot)
+        .toMatchObject({ dispositionRepairFingerprint: original.fingerprint, dispositionRepairAttempt: 4 });
+    });
+
+    it("keeps a mixed typed wait after its first-class blockers resolve", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID(), blockerId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "blocked", assigneeAgentId: agentId });
+      await seedIssue({ companyId, issueId: blockerId, status: "done" });
+      await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" });
+      const descriptor = { owner: "board", action: "Verify the external receipt as well" } as const;
+      await db.update(issues).set({ unblockDescriptor: descriptor }).where(eq(issues.id, issueId));
+      const svc = issueService(db);
+      expect(await svc.getDependencyReadiness(issueId)).toMatchObject({ isDependencyReady: true });
+      expect(await collectDispositionRepairSourceState(db, {
+        issue: (await db.select().from(issues).where(eq(issues.id, issueId)))[0]!,
+      })).toMatchObject({ hasDurableWaitingPath: true, durablePathReason: "unblock_descriptor" });
+      await expect(svc.checkout(issueId, agentId, ["blocked"], null))
+        .rejects.toMatchObject({ status: 409, details: { reason: "typed_blocked_wait" } });
+      await svc.update(issueId, { status: "todo" });
+      await expect(svc.checkout(issueId, agentId, ["todo"], null))
+        .resolves.toMatchObject({ status: "in_progress", unblockDescriptor: null });
+    });
+
+    it.each(["unexpected_status", "other_owner"])("does not label %s as a typed-wait checkout refusal", async cause => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const peerId = randomUUID(), issueId = randomUUID();
+      await seedAgent({ companyId, id: peerId, name: "Other agent" });
+      await seedIssue({ companyId, issueId, status: "blocked", assigneeAgentId: agentId });
+      await db.update(issues).set({ unblockDescriptor: { owner: "board", action: "Verify the receipt" } }).where(eq(issues.id, issueId));
+      const checkout = issueService(db).checkout(issueId,
+        cause === "other_owner" ? peerId : agentId,
+        cause === "unexpected_status" ? ["todo"] : ["blocked"], null);
+      await expect(checkout).rejects.toMatchObject({ status: 409 });
+      await checkout.catch(error => expect(error.details).not.toHaveProperty("reason"));
+    });
+
+    it("preserves a typed blocked transition committed while checkout is waiting", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "todo", assigneeAgentId: agentId });
+      const descriptor = { owner: "board", action: "Verify the newly missing receipt" } as const;
+      let signalLocked!: () => void;
+      const locked = new Promise<void>(resolve => { signalLocked = resolve; });
+      const transition = db.transaction(async tx => {
+        await tx.update(issues).set({ status: "blocked", unblockDescriptor: descriptor }).where(eq(issues.id, issueId));
+        signalLocked();
+        expect(await waitForBlockedForUpdate("issues")).toBe(true);
+      });
+      await Promise.race([locked, transition]);
+      const checkout = expect(issueService(db).checkout(issueId, agentId, ["todo", "blocked"], null))
+        .rejects.toMatchObject({ status: 409, details: { reason: "typed_blocked_wait" } });
+      await Promise.all([transition, checkout]);
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0])
+        .toMatchObject({ status: "blocked", unblockDescriptor: descriptor });
+    });
+
+    it.each([true, false])("preserves a typed wait in late stale-lock adoption (assigned=%s)", async assigned => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "blocked", assigneeAgentId: assigned ? agentId : null });
+      const descriptor = { owner: "board", action: "Verify the missing receipt" } as const;
+      await db.update(issues).set({ unblockDescriptor: descriptor }).where(eq(issues.id, issueId));
+      const staleId = await seedRun({ companyId, agentId, contextSnapshot: { issueId } });
+      await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, staleId));
+      const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId } });
+      const transact = db.transaction.bind(db);
+      let cleanups = 0;
+      const spy = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
+        const result = await transact(callback, config);
+        if (++cleanups === 2) {
+          // Another writer installs a terminal execution lock after both
+          // cleanup transactions, forcing checkout's stale-adoption branch.
+          await db.update(issues).set({ executionRunId: staleId }).where(eq(issues.id, issueId));
+        }
+        return result;
+      });
+      try {
+        await expect(issueService(db).checkout(issueId, agentId, ["blocked"], runId))
+          .rejects.toMatchObject({ status: 409, details: { reason: "typed_blocked_wait" } });
+        expect(cleanups).toBe(2);
+        expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0])
+          .toMatchObject({ status: "blocked", assigneeAgentId: assigned ? agentId : null,
+            executionRunId: staleId, unblockDescriptor: descriptor });
+      } finally { spy.mockRestore(); }
+    });
+
+    it("retains checkout behavior for JSON-null descriptors", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "blocked", assigneeAgentId: agentId });
+      await db.update(issues).set({ unblockDescriptor: sql`'null'::jsonb` }).where(eq(issues.id, issueId));
+      await expect(issueService(db).checkout(issueId, agentId, ["blocked"], null))
+        .resolves.toMatchObject({ status: "in_progress", unblockDescriptor: null });
+    });
+
+    it("preserves a malformed typed wait without treating it as healthy", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "blocked", assigneeAgentId: agentId });
+      await db.update(issues).set({ unblockDescriptor: { owner: "board", action: "" } }).where(eq(issues.id, issueId));
+      const issue = (await db.select().from(issues).where(eq(issues.id, issueId)))[0]!;
+      expect(await collectDispositionRepairSourceState(db, { issue }))
+        .toMatchObject({ hasDurableWaitingPath: false, durablePathReason: null });
+      await expect(issueService(db).checkout(issueId, agentId, ["blocked"], null))
+        .rejects.toMatchObject({ status: 409, details: { reason: "typed_blocked_wait" } });
+    });
+
+    it.each(["legacy", "v1"])("suppresses %s disposition repair after a typed wait, including an already-promoted run", async lane => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+      const sourceId = await seedRun({ companyId, agentId, contextSnapshot: { issueId } });
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, sourceId));
+      const before = await db.select().from(issues).where(eq(issues.id, issueId)).then(rows => rows[0]!);
+      const sourceState = await collectDispositionRepairSourceState(db, { issue: before });
+      const runId = await seedRun({
+        companyId, agentId, status: "scheduled_retry", scheduledRetryReason: "issue_disposition_repair",
+        contextSnapshot: {
+          issueId, retryReason: "issue_disposition_repair", wakeReason: "issue_disposition_repair",
+          dispositionRepairSourceRunId: sourceId,
+          dispositionRepairFingerprint: lane === "legacy"
+            ? legacyDispositionFingerprint(companyId, issueId, agentId, sourceId) : sourceState.fingerprint,
+          ...(lane === "legacy" ? { legacyDispositionEpisode: { id: sourceId, attempt: 1, maxAttempts: 2 } } : {}),
+        },
+      });
+      await db.update(issues).set({
+        status: "blocked", unblockDescriptor: { owner: { agentId }, action: "Verify the restored external receipt" },
+      }).where(eq(issues.id, issueId));
+      const adapter = createPostgresRunDispatchAdapter(db);
+      expect(await adapter.evaluateScheduledRetryGate({
+        runId, companyId, retryReasonOverride: "issue_disposition_repair", now: new Date(),
+      })).toMatchObject({ allowed: false, errorCode: "issue_disposition_repair_superseded" });
+      await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, runId));
+      expect(await adapter.cancelStaleQueuedRun({
+        runId, companyId, expectedStatus: "queued", now: new Date(),
+      })).toMatchObject({ outcome: "cancelled", errorCode: "issue_blocked" });
+      await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, runId));
+      const dispatch = vi.fn(async () => undefined);
+      expect(await adapter.dispatchResolvedInteractionIfCurrent({
+        runId, companyId, expectedStatus: "running", now: new Date(), dispatch,
+      })).toMatchObject({ dispatched: false, cancellation: { outcome: "cancelled", errorCode: "issue_blocked" } });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0])
+        .toMatchObject({ status: "blocked", assigneeAgentId: agentId, unblockDescriptor: { owner: { agentId } } });
+    });
+
+    it("recognizes the persisted unblock owner as a durable path without refreshing legacy fingerprints", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "blocked", assigneeAgentId: agentId });
+      const readIssue = () => db.select().from(issues).where(eq(issues.id, issueId)).then(rows => rows[0]!);
+      const legacy = await collectDispositionRepairSourceState(db, { issue: await readIssue() });
+      const descriptor = { owner: { agentId }, action: "Read the external receipt once access is restored" };
+      await db.update(issues).set({ unblockDescriptor: descriptor }).where(eq(issues.id, issueId));
+      const waiting = await collectDispositionRepairSourceState(db, { issue: await readIssue() });
+      expect(waiting).toMatchObject({ hasDurableWaitingPath: true, durablePathReason: "unblock_descriptor" });
+      expect(waiting.fingerprint).not.toBe(legacy.fingerprint);
+      await db.update(issues).set({ unblockDescriptor: null }).where(eq(issues.id, issueId));
+      expect((await collectDispositionRepairSourceState(db, { issue: await readIssue() })).fingerprint)
+        .toBe(legacy.fingerprint);
+    });
+
+    it("preserves a typed wait on direct checkout until a normal authorized status update resumes it", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "blocked", assigneeAgentId: agentId });
+      const descriptor = { owner: "board", action: "Confirm the missing receipt" } as const;
+      await db.update(issues).set({ unblockDescriptor: descriptor }).where(eq(issues.id, issueId));
+      const svc = issueService(db);
+      await expect(svc.checkout(issueId, agentId, ["todo", "backlog", "blocked"], null))
+        .rejects.toMatchObject({ status: 409, details: { reason: "typed_blocked_wait", unblockDescriptor: descriptor } });
+      expect(await db.select().from(issues).where(eq(issues.id, issueId)).then(rows => rows[0]))
+        .toMatchObject({ status: "blocked", assigneeAgentId: agentId, unblockDescriptor: descriptor });
+      await svc.update(issueId, { status: "todo" });
+      await expect(svc.checkout(issueId, agentId, ["todo", "backlog", "blocked"], null))
+        .resolves.toMatchObject({ status: "in_progress", unblockDescriptor: null });
+    });
+
     it("maps a disabled on-demand wake into a blocked scheduled-retry gate decision", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();
       await db

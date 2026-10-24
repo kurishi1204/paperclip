@@ -1758,6 +1758,57 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  it("lets the self-owned unblock agent resume through PATCH before checkout", async () => {
+    const waiting = makeIssue({
+      status: "blocked",
+      unblockDescriptor: { owner: { agentId: ownerAgentId }, action: "Verify the restored receipt" },
+    });
+    mockIssueService.getById.mockResolvedValue(waiting);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...waiting,
+      ...patch,
+      unblockDescriptor: null,
+    }));
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo", comment: "Verified the restored receipt; ready to resume." });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    expect(mockIssueService.update).toHaveBeenCalledWith(issueId, expect.objectContaining({ status: "todo" }));
+  });
+
+  it.each(["management", "visible", "denied"])("keeps separate unblock-owner resume behind existing authority (%s)", async authority => {
+    const authorized = authority !== "denied";
+    const waiting = makeIssue({
+      status: "blocked", assigneeAgentId: ownerAgentId,
+      unblockDescriptor: { owner: { agentId: peerAgentId }, action: "Verify the external receipt" },
+    });
+    mockIssueService.getById.mockResolvedValue(waiting);
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read" || input.action === "issue:mutate"
+        || (authority === "management" && input.action === "tasks:manage_active_checkouts"),
+      action: input.action,
+      reason: authority === "visible" && input.action === "issue:mutate"
+        ? "allow_visible_issue_write" : "allow_explicit_grant",
+      explanation: "Existing permission fixture; the descriptor grants no authority.",
+    }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...waiting, ...patch, unblockDescriptor: null,
+    }));
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo" });
+    expect(res.status, JSON.stringify(res.body)).toBe(authorized ? 200 : 403);
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    if (authorized) {
+      expect(res.body.assigneeAgentId).toBe(ownerAgentId);
+      expect(mockIssueService.update).toHaveBeenCalledWith(issueId, expect.objectContaining({ status: "todo" }));
+    } else {
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(res.body.error).toBe("Agent cannot request follow-up for another agent's issue");
+    }
+  });
+
   it("rejects peer-agent status updates that would clear a recovery action they do not own", async () => {
     mockIssueService.getById.mockResolvedValue(
       makeIssue({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" }),
