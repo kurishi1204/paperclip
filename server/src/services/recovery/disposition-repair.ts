@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
+import { and, eq, inArray, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -39,6 +39,7 @@ export type DispositionRepairSourceState = {
   hasActiveExecutionPath: boolean;
   hasNativeRecoveryPath: boolean;
   hasRecoveryWaitingPath: boolean;
+  hasUnresolvedRecoveryWait: boolean;
   nativeOrphanedRunIds: string[];
   hasDurableWaitingPath: boolean;
   durablePathReason: string | null;
@@ -184,7 +185,8 @@ export async function collectDispositionRepairSourceState(
           and(
             eq(heartbeatRuns.companyId, issue.companyId),
             inArray(heartbeatRuns.status, [...ACTIVE_RUN_STATUSES]),
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+            or(eq(heartbeatRuns.nativeIssueId, issue.id),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`),
             input.excludeRunId ? ne(heartbeatRuns.id, input.excludeRunId) : sql`true`,
           ),
         ),
@@ -223,21 +225,23 @@ export async function collectDispositionRepairSourceState(
     ? "execution_reconciliation"
     : delivery.length > 0
       ? "execution_continuation_delivery"
-      : nativeRecovery.orphaned
-        ? "native_continuation_reconciliation"
-        : issue.assigneeUserId
-          ? "user_owner"
-          : blockers.length > 0
-            ? "blocker"
-            : issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now()
-              ? "monitor"
-              : pendingExecutionState?.status === "pending"
-                ? "execution_stage"
-                : pendingInteraction
-                  ? "interaction"
-                  : pendingApproval
-                    ? "approval"
-                    : null;
+      : nativeRecovery.boardEvidenceWaiting
+        ? "native_execution_evidence"
+        : nativeRecovery.orphaned
+          ? "native_continuation_reconciliation"
+          : issue.assigneeUserId
+            ? "user_owner"
+            : blockers.length > 0
+              ? "blocker"
+              : issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now()
+                ? "monitor"
+                : pendingExecutionState?.status === "pending"
+                  ? "execution_stage"
+                  : pendingInteraction
+                    ? "interaction"
+                    : pendingApproval
+                      ? "approval"
+                      : null;
 
   const durableState = {
     source: {
@@ -265,9 +269,10 @@ export async function collectDispositionRepairSourceState(
   return {
     fingerprint: `disposition_repair:v1:${digest}`,
     dependencyIssueIds: [...new Set([...blockers.map((row) => row.id), ...children.map((row) => row.id)])],
-    hasActiveExecutionPath: activeRuns.length > 0 || queuedWakes.length > 0 || (nativeRecovery.pending && !nativeRecovery.orphaned),
-    hasNativeRecoveryPath: nativeRecovery.pending && !nativeRecovery.orphaned,
+    hasActiveExecutionPath: activeRuns.length > 0 || queuedWakes.length > 0 || (nativeRecovery.pending && !nativeRecovery.orphaned && !nativeRecovery.boardEvidenceWaiting),
+    hasNativeRecoveryPath: nativeRecovery.pending && !nativeRecovery.orphaned && !nativeRecovery.boardEvidenceWaiting,
     hasRecoveryWaitingPath: nativeRecovery.pending || reconciliation.length > 0 || delivery.length > 0,
+    hasUnresolvedRecoveryWait: nativeRecovery.orphaned || nativeRecovery.boardEvidenceWaiting || reconciliation.length > 0 || delivery.length > 0,
     nativeOrphanedRunIds: nativeRecovery.orphanedRunIds,
     hasDurableWaitingPath: durablePathReason !== null,
     durablePathReason,

@@ -142,6 +142,12 @@ function recoveryColumn(relation: SQLWrapper, name: string): SQL {
   return sql`${relation}.${sql.identifier(name)}`;
 }
 
+function nativeBoardEvidenceWaitingSql(finalization: SQLWrapper): SQL<boolean> {
+  const f = (name: string) => recoveryColumn(finalization, name);
+  return sql<boolean>`coalesce((${f("phase")} = 'terminal_failure'
+    and ${f("failure_detail")}->'recoveryOwner'->>'kind' = 'board'), false)`;
+}
+
 /** This is an unresolved native settlement/evidence path, not permission to
  * resume a provider or replay an old effect. A terminal coordinator can still
  * explicitly retain board-owned ambiguous evidence. The original failure's
@@ -185,8 +191,7 @@ function nativeContinuationRecoveryRowSql(run: SQLWrapper, finalization: SQLWrap
     and ${f("result_id")} is null
     and (
       ${f("phase")} not in ('committed', 'applied', 'terminal_failure')
-      or (${f("phase")} = 'terminal_failure'
-        and ${f("failure_detail")}->'recoveryOwner'->>'kind' = 'board')
+      or ${nativeBoardEvidenceWaitingSql(finalization)}
     )
     and not (${authorizedHandoff})`;
 }
@@ -226,10 +231,11 @@ export function nativeContinuationRecoveryPathSql(
 export async function readNativeContinuationRecoveryPath(
   db: NativeContinuationReader,
   input: { companyId: string; issueId: string; agentId?: string | null },
-): Promise<{ pending: boolean; orphaned: boolean; orphanedRunIds: string[] }> {
+): Promise<{ pending: boolean; orphaned: boolean; orphanedRunIds: string[]; boardEvidenceWaiting: boolean }> {
   const rows = await db.select({
     runId: heartbeatRuns.id,
     orphaned: nativeContinuationOrphanSql(sql`${heartbeatRuns}`),
+    boardEvidenceWaiting: nativeBoardEvidenceWaitingSql(sql`${nativeRunFinalizations}`),
   }).from(issues)
     .innerJoin(heartbeatRuns, and(
       eq(heartbeatRuns.companyId, issues.companyId),
@@ -247,5 +253,6 @@ export async function readNativeContinuationRecoveryPath(
       nativeContinuationRecoveryRowSql(sql`${heartbeatRuns}`, sql`${nativeRunFinalizations}`),
     ));
   const orphanedRunIds = rows.filter(row => row.orphaned).map(row => row.runId).sort();
-  return { pending: rows.length > 0, orphaned: orphanedRunIds.length > 0, orphanedRunIds };
+  return { pending: rows.length > 0, orphaned: orphanedRunIds.length > 0, orphanedRunIds,
+    boardEvidenceWaiting: rows.some(row => row.boardEvidenceWaiting) };
 }

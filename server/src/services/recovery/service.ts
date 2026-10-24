@@ -1174,8 +1174,15 @@ export function recoveryService(
         ? action.evidence.nativeOrphanedRunIds.filter((id): id is string => typeof id === "string") : [];
       const recordedIds = [...new Set([...previousIds, ...runIds])].sort();
       if (!created && runIds.every(id => previousIds.includes(id))) return;
+      const newlyRecordedIds = runIds.filter(id => !previousIds.includes(id));
       await tx.update(issueRecoveryActions).set({
         evidence: { ...action.evidence, nativeOrphanedRunIds: recordedIds }, updatedAt: new Date(),
+        // The existing card renders nextAction. Keep its original decision and
+        // owner intact while making newly recorded evidence visible there;
+        // activity persistence alone is not an owner-facing recovery message.
+        ...(!created && action.ownerType === "agent" ? {
+          nextAction: `${action.nextAction}\n\nHandle the existing recovery decision first; also reconcile these unresolved native executions: ${newlyRecordedIds.join(", ")}. Their action outcomes remain unverified.`,
+        } : {}),
       }).where(and(activePredicate, eq(issueRecoveryActions.id, action.id)));
       // addComment would touch Issue.updatedAt. Use the existing activity and
       // publication path so the entire Issue, F and R remain unchanged.
@@ -2960,7 +2967,7 @@ export function recoveryService(
       const childState = await collectDispositionRepairSourceState(db, {
         issue: child,
       });
-      if (childState.hasRecoveryWaitingPath) continue;
+      if (childState.hasUnresolvedRecoveryWait) continue;
       if (
         childState.hasActiveExecutionPath ||
         (!sameWorkspaceOnly && childState.hasDurableWaitingPath)

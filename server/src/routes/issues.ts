@@ -9373,6 +9373,7 @@ export function issueRoutes(
               activeRecoveryAction.evidence.runId ??
               activeRecoveryAction.evidence.sourceRunId,
             decision: executionReconciliation,
+            recoveryAction: activeRecoveryAction,
           });
         } else if (executionReconciliation) {
           throw conflict(

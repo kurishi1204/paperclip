@@ -22,6 +22,10 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
+import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
+import { collectDispositionRepairSourceState } from "./recovery/disposition-repair.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -31,6 +35,10 @@ export async function validateExecutionReconciliation(input: {
   agentId: string | null;
   sourceRunId: unknown;
   decision: ExecutionReconciliation | undefined;
+  /** Server-owned current action, supplied only after the route's BOARD gate.
+   * The caller must retain the issue lock through validation and recording. */
+  recoveryAction?: Pick<typeof issueRecoveryActions.$inferSelect,
+    "id" | "companyId" | "sourceIssueId" | "status" | "returnOwnerAgentId" | "evidence">;
 }) {
   const { db, companyId, issueId, agentId, decision } = input;
   if (!decision || decision.runId !== input.sourceRunId || !agentId) {
@@ -38,6 +46,21 @@ export async function validateExecutionReconciliation(input: {
       "Reconcile the recorded execution and its action outcomes before continuing this task.",
     );
   }
+  // The production caller already owns I. Keep the common I -> F -> R order
+  // while verifying stop proof, so a coordinator claim cannot race the receipt.
+  const [task] = await db
+    .select()
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
+    .for("update");
+  const [coordinator] = await db
+    .select()
+    .from(nativeRunFinalizations)
+    .where(and(
+      eq(nativeRunFinalizations.companyId, companyId),
+      eq(nativeRunFinalizations.runId, decision.runId),
+    ))
+    .for("update");
   const [run] = await db
     .select()
     .from(heartbeatRuns)
@@ -46,11 +69,8 @@ export async function validateExecutionReconciliation(input: {
         eq(heartbeatRuns.companyId, companyId),
         eq(heartbeatRuns.id, decision.runId),
       ),
-    );
-  const [task] = await db
-    .select()
-    .from(issues)
-    .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+    )
+    .for("update");
   const review =
     task?.status === "in_review"
       ? parseIssueExecutionState(task.executionState)
@@ -63,13 +83,52 @@ export async function validateExecutionReconciliation(input: {
     !run ||
     !task ||
     task.assigneeAgentId !== agentId ||
-    (run.agentId !== agentId && !isCurrentReviewer) ||
     (run.nativeIssueId ?? run.contextSnapshot?.issueId) !== issueId ||
     !["failed", "interrupted", "timed_out", "cancelled"].includes(run.status)
   ) {
     throw conflict(
       "The recovery source or task owner changed. Inspect the current execution before continuing.",
     );
+  }
+  if (run.agentId !== agentId && !isCurrentReviewer) {
+    const action = input.recoveryAction;
+    const activeAction = action && action.companyId === companyId && action.sourceIssueId === issueId
+      ? await issueRecoveryActionService(db).getActiveForIssue(companyId, issueId)
+      : null;
+    const [currentAction] = activeAction && action && activeAction.id === action.id
+      ? await db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.id, activeAction.id),
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.sourceIssueId, issueId),
+        eq(issueRecoveryActions.status, activeAction.status),
+      )).for("update")
+      : [];
+    const actionSourceRunId = currentAction?.evidence.runId ?? currentAction?.evidence.sourceRunId;
+    const sourceCanBeReconciled = coordinator?.phase === "terminal_failure" ||
+      (coordinator != null && await isCancelledNativeStartup(db, run, coordinator));
+    if (!currentAction || currentAction.returnOwnerAgentId !== agentId ||
+      currentAction.returnOwnerAgentId !== action?.returnOwnerAgentId || actionSourceRunId !== run.id ||
+      run.runtimeMode !== "native" || !coordinator || coordinator.issueId !== issueId ||
+      coordinator.resultId !== null || !sourceCanBeReconciled ||
+      task.executionRunId !== null || task.checkoutRunId !== null) {
+      throw conflict("The recovery source or task owner changed. Inspect the current execution before continuing.");
+    }
+    const sourceLeases = await db.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run.id),
+    ));
+    if (sourceLeases.some(lease => !lease.releasedAt ||
+      (lease.provider === "local"
+        ? lease.status === "pending_cleanup" || lease.cleanupStatus === "failed"
+        : !hasRemoteTerminationReceipt(lease)))) {
+      throw conflict("Verify the previous execution environment's cleanup and remote termination receipt before handing it back.");
+    }
+    const sourceState = await collectDispositionRepairSourceState(db, { issue: task, excludeRunId: run.id });
+    if (sourceState.hasActiveExecutionPath)
+      throw conflict("Another execution already owns this task. Inspect it before handing back the old execution.");
+    const otherOrphans = sourceState.nativeOrphanedRunIds.filter(id => id !== run.id);
+    if (otherOrphans.length) {
+      throw conflict(`Other native executions still need separate outcome evidence: ${otherOrphans.join(", ")}.`);
+    }
   }
   if (hasWorkspaceRestoreFailure(run.resultJson) &&
       (!decision.workspaceRepairEvidence || decision.workspaceRepairEvidence.trim().length < 20)) {
@@ -92,15 +151,6 @@ export async function validateExecutionReconciliation(input: {
       "The previous provider is still running. Stop it before continuing.",
     );
   }
-  const [coordinator] = await db
-    .select()
-    .from(nativeRunFinalizations)
-    .where(
-      and(
-        eq(nativeRunFinalizations.companyId, companyId),
-        eq(nativeRunFinalizations.runId, run.id),
-      ),
-    );
   if (coordinator?.leaseOwner || coordinator?.failureDetail?.successorRunId)
     throw conflict(
       "This execution still has a coordinator or a linked continuation. Inspect that run first.",
