@@ -198,6 +198,133 @@ export function canonical(value) {
   return JSON.stringify(value);
 }
 const sourceBlock = (value) => `${SOURCE_BEGIN}${canonical(value)}${SOURCE_END}`;
+// Lossless v2 source codec. Journal admission requires an explicit v2 registry entry.
+export const REVIEW_SOURCE_V2 = "paperclip.fork-review-source/v2";
+const REVERSE_DIFF_V1 = "paperclip.exact-reverse-line-diff/v1";
+const sourceKeys = ["schema", "repository", "headSha", "treeSha", "baseSha", "mergeBaseSha", "changedFiles", "dependencyFiles"];
+function exactKeys(value, keys, code = "source_v2_shape") {
+  ensure(value && typeof value === "object" && !Array.isArray(value) && canonical(Object.keys(value).sort()) === canonical([...keys].sort()), code);
+}
+function sourceText(value) {
+  ensure(typeof value === "string" && !value.includes("\0") && Buffer.from(value, "utf8").toString("utf8") === value, "source_v2_utf8");
+  return value;
+}
+function sourceBlob(value, withContent = true) {
+  exactKeys(value, withContent ? ["path", "blobSha", "content"] : ["path", "blobSha"]);
+  ensure(typeof value.path === "string" && value.path.length > 0 && !value.path.includes("\0") && hex(value.blobSha, 40), "source_v2_blob_identity");
+  if (withContent) {
+    const bytes = Buffer.from(sourceText(value.content), "utf8");
+    ensure(createHash("sha1").update(Buffer.concat([Buffer.from(`blob ${bytes.length}\0`), bytes])).digest("hex") === value.blobSha, "source_v2_blob_mismatch");
+  }
+}
+const sourceLines = (text) => text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+function sourceV1Shape(source) {
+  exactKeys(source, sourceKeys);
+  ensure(source.schema === SOURCE_SCHEMA, "source_schema_unsupported");
+  ensure(typeof source.repository === "string" && source.repository.length > 0 && [source.headSha, source.treeSha, source.baseSha, source.mergeBaseSha].every(v => hex(v, 40)), "source_v2_identity");
+  ensure(Array.isArray(source.changedFiles) && Array.isArray(source.dependencyFiles), "source_v2_shape");
+  const paths = new Set();
+  for (const file of source.changedFiles) {
+    exactKeys(file, ["path", "status", "before", "after"]);
+    ensure(typeof file.path === "string" && file.path && !paths.has(file.path), "source_v2_file_identity"); paths.add(file.path);
+    ensure(["added", "removed", "modified", "renamed", "copied"].includes(file.status), "source_status_unsupported");
+    ensure(file.status === "added" ? file.before === null : file.before !== null, "source_before_missing");
+    ensure(file.status === "removed" ? file.after === null : file.after !== null, "source_after_missing");
+    if (file.before) sourceBlob(file.before);
+    if (file.after) { sourceBlob(file.after); ensure(file.after.path === file.path, "source_v2_file_identity"); }
+    if (["modified", "removed"].includes(file.status)) ensure(file.before.path === file.path, "source_v2_file_identity");
+  }
+  const dependencies = new Set();
+  for (const file of source.dependencyFiles) { sourceBlob(file); ensure(!dependencies.has(file.path), "source_dependencies"); dependencies.add(file.path); }
+}
+// Patience anchors make a deterministic exact diff without a candidate-supplied
+// command or an external patch process. Repeated/unanchored regions remain whole.
+function exactReverseDiff(afterText, beforeText) {
+  const after = sourceLines(afterText), before = sourceLines(beforeText), edits = [];
+  const emit = (start, end, b0, b1) => {
+    const insert = before.slice(b0, b1).join("");
+    if (start === end && !insert) return;
+    const last = edits.at(-1);
+    if (last && last.afterStartLine + last.deleteLineCount === start) { last.deleteLineCount += end - start; last.beforeText += insert; }
+    else edits.push({ afterStartLine: start, deleteLineCount: end - start, beforeText: insert });
+  };
+  function walk(a0, a1, b0, b1) {
+    while (a0 < a1 && b0 < b1 && after[a0] === before[b0]) { a0++; b0++; }
+    while (a0 < a1 && b0 < b1 && after[a1 - 1] === before[b1 - 1]) { a1--; b1--; }
+    if (a0 === a1 || b0 === b1) { emit(a0, a1, b0, b1); return; }
+    const unique = (lines, lo, hi) => { const map = new Map(); for (let i = lo; i < hi; i++) map.set(lines[i], map.has(lines[i]) ? -1 : i); return map; };
+    const a = unique(after, a0, a1), b = unique(before, b0, b1), pairs = [];
+    for (let i = a0; i < a1; i++) if (a.get(after[i]) === i && b.has(after[i]) && b.get(after[i]) >= 0) pairs.push([i, b.get(after[i])]);
+    const tails = [], previous = [];
+    for (let i = 0; i < pairs.length; i++) {
+      let lo = 0, hi = tails.length;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (pairs[tails[mid]][1] < pairs[i][1]) lo = mid + 1; else hi = mid; }
+      previous[i] = lo ? tails[lo - 1] : -1; tails[lo] = i;
+    }
+    if (!tails.length) { emit(a0, a1, b0, b1); return; }
+    const anchors = []; for (let i = tails.at(-1); i >= 0; i = previous[i]) anchors.push(pairs[i]); anchors.reverse();
+    for (const [ai, bi] of anchors) { walk(a0, ai, b0, bi); a0 = ai + 1; b0 = bi + 1; }
+    walk(a0, a1, b0, b1);
+  }
+  walk(0, after.length, 0, before.length);
+  return { schema: REVERSE_DIFF_V1, afterLineCount: after.length, edits };
+}
+function restoreBefore(afterText, delta) {
+  exactKeys(delta, ["schema", "afterLineCount", "edits"]);
+  const lines = sourceLines(afterText);
+  ensure(delta.schema === REVERSE_DIFF_V1 && delta.afterLineCount === lines.length && Array.isArray(delta.edits), "source_v2_diff_shape");
+  const output = []; let cursor = 0, priorEnd = -1;
+  for (const edit of delta.edits) {
+    exactKeys(edit, ["afterStartLine", "deleteLineCount", "beforeText"]);
+    ensure(Number.isSafeInteger(edit.afterStartLine) && Number.isSafeInteger(edit.deleteLineCount) && edit.afterStartLine >= cursor && edit.afterStartLine > priorEnd && edit.deleteLineCount >= 0 && edit.afterStartLine <= lines.length && edit.deleteLineCount <= lines.length - edit.afterStartLine, "source_v2_diff_range");
+    sourceText(edit.beforeText); ensure(edit.deleteLineCount > 0 || edit.beforeText.length > 0, "source_v2_diff_empty");
+    output.push(lines.slice(cursor, edit.afterStartLine).join(""), edit.beforeText); cursor = edit.afterStartLine + edit.deleteLineCount; priorEnd = cursor;
+  }
+  output.push(lines.slice(cursor).join(""));
+  const before = output.join("");
+  ensure(canonical(exactReverseDiff(afterText, before)) === canonical(delta), "source_v2_diff_noncanonical");
+  return before;
+}
+export function reviewSourceV2(source) {
+  sourceV1Shape(source);
+  const result = { ...source, schema: REVIEW_SOURCE_V2, logicalSourceSHA256: digest(canonical(source)), changedFiles: source.changedFiles.map(file => ({ path: file.path, status: file.status,
+    before: file.before ? (file.after ? { path: file.before.path, blobSha: file.before.blobSha } : { ...file.before }) : null,
+    after: file.after ? { ...file.after } : null,
+    reverseDiff: file.before && file.after ? exactReverseDiff(file.after.content, file.before.content) : null })), dependencyFiles: source.dependencyFiles.map(file => ({ ...file })) };
+  ensure(canonical(restoreReviewSourceV2(result)) === canonical(source), "source_v2_roundtrip");
+  return result;
+}
+export function restoreReviewSourceV2(source) {
+  exactKeys(source, [...sourceKeys, "logicalSourceSHA256"]);
+  ensure(source.schema === REVIEW_SOURCE_V2, "source_schema_unsupported");
+  ensure(hex(source.logicalSourceSHA256, 64) && Array.isArray(source.changedFiles) && Array.isArray(source.dependencyFiles), "source_v2_shape");
+  const changedFiles = source.changedFiles.map(file => {
+    exactKeys(file, ["path", "status", "before", "after", "reverseDiff"]);
+    let before = file.before;
+    if (file.before && file.after) {
+      sourceBlob(file.before, false); sourceBlob(file.after);
+      before = { ...file.before, content: restoreBefore(file.after.content, file.reverseDiff) };
+    } else ensure(file.reverseDiff === null, "source_v2_mixed_representation");
+    return { path: file.path, status: file.status, before: before ? { ...before } : null, after: file.after ? { ...file.after } : null };
+  });
+  const result = { schema: SOURCE_SCHEMA, repository: source.repository, headSha: source.headSha, treeSha: source.treeSha, baseSha: source.baseSha, mergeBaseSha: source.mergeBaseSha, changedFiles, dependencyFiles: source.dependencyFiles.map(file => ({ ...file })) };
+  sourceV1Shape(result);
+  ensure(digest(canonical(result)) === source.logicalSourceSHA256, "source_v2_logical_mismatch");
+  return result;
+}
+export function reviewSourceV2Block(source) { return sourceBlock(reviewSourceV2(source)); }
+export function parseReviewSourceV2Block(block, expectedSource) {
+  ensure(typeof block === "string" && block.startsWith(SOURCE_BEGIN), "source_v2_block_invalid");
+  const text = block.endsWith("\n") ? block.slice(0, -1) : block;
+  ensure(text.endsWith(SOURCE_END), "source_v2_block_invalid");
+  const body = text.slice(SOURCE_BEGIN.length, -SOURCE_END.length);
+  let encoded; try { encoded = JSON.parse(body); } catch { throw new Error("source_v2_block_invalid"); }
+  ensure(body === canonical(encoded), "source_v2_block_noncanonical");
+  const restored = restoreReviewSourceV2(encoded);
+  if (expectedSource !== undefined) ensure(canonical(restored) === canonical(expectedSource), "source_v2_expected_mismatch");
+  return restored;
+}
+
 function ensure(condition, code) { if (!condition) throw new Error(code); }
 function inside(root, target) { return target === root || target.startsWith(`${root}${path.sep}`); }
 function outsideCheckoutOutput(checkout, output, code) {
@@ -258,7 +385,9 @@ export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, p
     const entries = registry.entries.filter((entry) => entry.key === pointer.admissionKey && entry.repository === repository && entry.pullRequest === pullRequest && entry.headSha === headSha);
     ensure(entries.length === 1, "review_not_admitted");
     const entry = entries[0];
-    ensure(entry.kind === "trusted-cli-journal/v1" && entry.purpose === "independent_implementation_review", "unsupported_review_source");
+    const v1 = entry.kind === "trusted-cli-journal/v1" && entry.sourceSchema === undefined;
+    const v2 = entry.kind === "trusted-cli-journal/v2" && entry.sourceSchema === REVIEW_SOURCE_V2;
+    ensure((v1 || v2) && entry.purpose === "independent_implementation_review", "unsupported_review_source");
     const bytes = (name) => {
       const artifact = entry.artifacts?.[name];
       ensure(artifact && hex(artifact.sha256, 64) && typeof artifact.path === "string", "admission_artifact");
@@ -284,8 +413,17 @@ export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, p
     ensure(start.argv?.[0] === entry.cliInvocationPath, "executor_path");
     ensure(start.combinedSHA256 === digest(combined) && start.combinedBytes === combined.length, "launch_input");
     ensure(entry.sourceInputSHA256 === digest(Buffer.from(canonical(source))), "review_source_binding");
-    const block = sourceBlock(source);
-    ensure(material.toString("utf8").split(block).length === 2, "source_not_in_launch_input");
+    const materialText = material.toString("utf8");
+    ensure(Buffer.from(materialText, "utf8").equals(material), "source_not_in_launch_input");
+    // One complete source block is the only admitted representation. A second
+    // block (including the other schema) cannot supply contradictory context.
+    ensure(materialText.split(SOURCE_BEGIN).length === 2 && materialText.split(SOURCE_END).length === 2, "source_not_in_launch_input");
+    const blockStart = materialText.indexOf(SOURCE_BEGIN);
+    const blockEnd = materialText.indexOf(SOURCE_END, blockStart) + SOURCE_END.length;
+    const actualBlock = materialText.slice(blockStart, blockEnd);
+    const block = v2 ? reviewSourceV2Block(source) : sourceBlock(source);
+    if (v2) parseReviewSourceV2Block(actualBlock, source);
+    ensure(actualBlock === block, "source_not_in_launch_input");
     ensure(start.sessionID === processRecord.sessionID && start.sessionID === claim.sessionID && claim.singleAttempt === true && claim.noRetry === true && Number.isInteger(processRecord.pid) && processRecord.pid > 0, "journal_execution");
     const expectedArgv = [entry.cliInvocationPath, "--print", "--session-id", start.sessionID,
       "--max-turns", "1", "--model", "claude-opus-5-5", "--effort", "high", "--output-format", "json",
@@ -305,7 +443,7 @@ export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, p
     ensure(typeof raw.result === "string" && Buffer.from(raw.result).equals(report), "actual_report");
     const lines = raw.result.replace(/\n+$/, "").split("\n");
     ensure(lines.at(-1) === "判定: GO" && lines.filter((line) => line.startsWith("判定: ")).length === 1, "review_not_go");
-    return { status: "valid", model: "claude-opus-5-5", provider: "firstParty", implementationSessionID: entry.implementationSessionID, sessionID: raw.session_id, headSha, treeSha: source.treeSha, inputSHA256: digest(combined), reportSHA256: digest(report), report: raw.result, verdict: "判定: GO", trustBoundary: "operator-admitted executor and journal, not signed provider attestation" };
+    return { status: "valid", model: "claude-opus-5-5", provider: "firstParty", implementationSessionID: entry.implementationSessionID, sessionID: raw.session_id, headSha, treeSha: source.treeSha, sourceSchema: v2 ? REVIEW_SOURCE_V2 : SOURCE_SCHEMA, evidenceKind: v2 ? "lossless-v2-reconstructed-source" : "inline-v1-whole-source", inputSHA256: digest(combined), reportSHA256: digest(report), report: raw.result, verdict: "判定: GO", trustBoundary: "operator-admitted executor and journal, not signed provider attestation" };
   } catch (error) {
     return { status: "invalid", code: "independent_review_invalid", subcode: /^[a-z][a-z0-9_]+$/.test(error.message) ? error.message : "journal_read_unavailable" };
   }
@@ -324,7 +462,8 @@ function getPages(get, route, field = null) {
   throw new Error("pagination_incomplete");
 }
 
-export function buildReviewSource(get, repository, pr, files, treeSha, baseSha, mergeBaseSha, dependencyPaths = []) {
+export function buildReviewSource(get, repository, pr, files, treeSha, baseSha, mergeBaseSha, dependencyPaths = [], sourceSchema = SOURCE_SCHEMA) {
+  ensure([SOURCE_SCHEMA, REVIEW_SOURCE_V2].includes(sourceSchema), "source_schema_unsupported");
   ensure([pr.head.sha, treeSha, baseSha, mergeBaseSha].every(v=>hex(v,40)), "source_identity");
   const prefix = `repos/${repository}`;
   const headTree = get(`${prefix}/git/trees/${treeSha}?recursive=1`);
@@ -339,7 +478,7 @@ export function buildReviewSource(get, repository, pr, files, treeSha, baseSha, 
     ensure(data.encoding === "base64" && data.sha === entry.sha, "source_blob_encoding");
     const bytes = Buffer.from(data.content.replace(/\s/g,""),"base64");
     ensure(bytes.length === data.size && createHash("sha1").update(Buffer.concat([Buffer.from(`blob ${bytes.length}\0`),bytes])).digest("hex") === entry.sha, "source_blob_mismatch");
-    const text = new TextDecoder("utf-8",{fatal:true}).decode(bytes);
+    const text = new TextDecoder("utf-8",{fatal:true,ignoreBOM:sourceSchema===REVIEW_SOURCE_V2}).decode(bytes);
     ensure(!text.includes("\0"),"source_binary_unsupported");
     return { path:entry.path,blobSha:entry.sha,content:text };
   };
@@ -567,11 +706,14 @@ async function main() {
     const files = getPages(get,`repos/${repo}/pulls/${number}/files`);
     ensure(files.length === pr.changed_files,"changed_files_incomplete");
     const commit = get(`repos/${repo}/git/commits/${pr.head.sha}`);
-    const source = buildReviewSource(get,repo,pr,files,commit.tree.sha,branch.commit.sha,comparison.merge_base_commit.sha,options.review_dependencies ? options.review_dependencies.split(",").map(p=>p.trim()) : []);
+    const schema = options.source_schema ?? "v1";
+    ensure(["v1", "v2"].includes(schema), "source_schema_unsupported");
+    const source = buildReviewSource(get,repo,pr,files,commit.tree.sha,branch.commit.sha,comparison.merge_base_commit.sha,options.review_dependencies ? options.review_dependencies.split(",").map(p=>p.trim()) : [], schema === "v2" ? REVIEW_SOURCE_V2 : SOURCE_SCHEMA);
     const final = get(`repos/${repo}/pulls/${number}`);
     const finalBranch = get(`repos/${repo}/branches/${encodeURIComponent(pr.base.ref)}`);
     ensure(final.head.sha===pr.head.sha && finalBranch.commit.sha===branch.commit.sha,"head_changed");
-    const body = sourceBlock(source);
+    // The default remains v1; v2 requires an explicit operator schema selection.
+    const body = schema === "v2" ? reviewSourceV2Block(source) : sourceBlock(source);
     if (options.output === "-") process.stdout.write(body+"\n");
     else fs.writeFileSync(options.output,body+"\n");
     return;

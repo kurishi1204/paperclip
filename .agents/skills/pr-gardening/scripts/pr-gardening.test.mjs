@@ -648,3 +648,176 @@ test("unknown check-output fields remain received sources rather than silent omi
 test("same-name CheckRun occurrences are retained in both status inventories",async()=>{
  const f=forkFixture();try{const page=f.routes[`repos/${FORK}/commits/${HEAD}/check-runs?filter=latest&per_page=100&page=1`];page.check_runs.push({...structuredClone(f.ci),id:2});page.total_count=2;f.view.statusCheckRollup.push(structuredClone(f.view.statusCheckRollup[0]));let r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,"ready");assert.equal(r.pullRequests[0].checks.checks.length,2);let calls=0;f.deps.viewPullRequest=()=>{const row=structuredClone(f.view);if(++calls===2)row.statusCheckRollup.pop();return row;};r=await checkReadiness(document,f.options(),f.deps);assert.deepEqual(r.pullRequests[0].reasons.map(x=>x.code),["evidence_changed"]);}finally{f.close();}
 });
+
+// Candidate v2 coverage; the adopted v1 fixture and launch contract remain valid.
+import * as sourceCodec from "./check-readiness.mjs";
+function sourceV2Fixture(before = "old source\n", after = "new source\n", status = "modified") {
+  const filePath = status === "renamed" || status === "copied" ? "new-name.mjs" : "sample.mjs";
+  const blob = (name, content) => ({ path: name, blobSha: hashBlob(content), content });
+  return { schema:"paperclip.fork-review-source/v1", repository:FORK, headSha:HEAD, treeSha:TREE, baseSha:BASE, mergeBaseSha:BASE,
+    changedFiles:[{ path:filePath,status,before:status === "added" ? null : blob(status === "renamed" || status === "copied" ? "old-name.mjs" : filePath,before),after:status === "removed" ? null : blob(filePath,after) }],
+    dependencyFiles:[blob("dependency.mjs","export const dependency = 'unchanged';\r\n")] };
+}
+const v2Cases = [
+ ["ordinary modified", "old source\n", "new source\n", "modified"],
+ ["UTF8 code points", "日本語🙂\nold\n", "日本語🚀\nnew\n", "modified"],
+ ["CRLF", "a\r\nold\r\nz\r\n", "a\r\nnew\r\nz\r\n", "modified"],
+ ["no final newline", "a\nold", "a\nnew", "modified"],
+ ["newline added", "same", "same\n", "modified"],
+ ["newline removed", "same\n", "same", "modified"],
+ ["BOM", "\ufeffold\n", "\ufeffnew\n", "modified"],
+ ["empty modified before", "", "new\n", "modified"],
+ ["empty modified after", "old\n", "", "modified"],
+ ["added empty", "", "", "added"],
+ ["added UTF8", "", "新規\r\n", "added"],
+ ["removed empty", "", "", "removed"],
+ ["removed UTF8", "削除\r\n", "", "removed"],
+ ["renamed with edits", "same\nold\n", "same\nnew\n", "renamed"],
+ ["renamed unchanged", "same\n", "same\n", "renamed"],
+ ["copied with edits", "same\nold\n", "same\nnew\n", "copied"],
+ ["repeated lines", "x\nx\nold\nx\nx\n", "x\nx\nnew\nx\nx\n", "modified"],
+];
+for (const [name,before,after,status] of v2Cases) test(`source v2 round-trip ${name}`,()=>{
+ const source=sourceV2Fixture(before,after,status), frozen=canonical(source);
+ assert.equal(typeof sourceCodec.reviewSourceV2,"function","adopted v1 has no v2 codec");
+ const compact=sourceCodec.reviewSourceV2(source), restored=sourceCodec.restoreReviewSourceV2(compact);
+ assert.equal(canonical(source),frozen);assert.deepEqual(restored,source);assert.equal(compact.logicalSourceSHA256,digest(frozen));
+ assert.equal(canonical(sourceCodec.reviewSourceV2(source)),canonical(compact));
+ for(const side of ["before","after"])if(source.changedFiles[0][side]){const actual=restored.changedFiles[0][side];assert.deepEqual(Buffer.from(actual.content),Buffer.from(source.changedFiles[0][side].content));assert.equal(hashBlob(actual.content),actual.blobSha);}
+ if(status !== "added" && status !== "removed")assert.equal(Object.hasOwn(compact.changedFiles[0].before,"content"),false);
+ assert.deepEqual(sourceCodec.parseReviewSourceV2Block(sourceCodec.reviewSourceV2Block(source)+"\n",source),source);
+});
+
+test("source v2 retains distant small edits without repeating a whole middle",()=>{
+ const lines=Array.from({length:400},(_,i)=>`unique source line ${i}\n`),before=lines.join(""),changed=[...lines];changed[4]="replacement first\n";changed[390]="replacement last\n";
+ const source=sourceV2Fixture(before,changed.join("")),compact=sourceCodec.reviewSourceV2(source),delta=compact.changedFiles[0].reverseDiff;
+ assert.equal(delta.edits.length,2);assert.equal(Buffer.byteLength(delta.edits.map(x=>x.beforeText).join("")),Buffer.byteLength(lines[4]+lines[390]));assert.deepEqual(sourceCodec.restoreReviewSourceV2(compact),source);
+ assert.ok(Buffer.byteLength(canonical(compact))<Buffer.byteLength(canonical(source)));
+});
+
+for(const [name,mutate,code] of [
+ ["unknown schema",x=>{x.schema="paperclip.fork-review-source/v999";},"source_schema_unsupported"],
+ ["extra top field",x=>{x.unknown=true;},"source_v2_shape"],
+ ["legacy before mixed into v2",x=>{x.changedFiles[0].before.content="old source\n";},"source_v2_shape"],
+ ["unknown diff schema",x=>{x.changedFiles[0].reverseDiff.schema="unknown";},"source_v2_diff_shape"],
+ ["wrong after line count",x=>{x.changedFiles[0].reverseDiff.afterLineCount++;},"source_v2_diff_shape"],
+ ["negative start",x=>{x.changedFiles[0].reverseDiff.edits[0].afterStartLine=-1;},"source_v2_diff_range"],
+ ["fractional delete",x=>{x.changedFiles[0].reverseDiff.edits[0].deleteLineCount=0.5;},"source_v2_diff_range"],
+ ["out of range",x=>{x.changedFiles[0].reverseDiff.edits[0].deleteLineCount=9;},"source_v2_diff_range"],
+ ["duplicate edit",x=>{x.changedFiles[0].reverseDiff.edits.push({...x.changedFiles[0].reverseDiff.edits[0]});},"source_v2_diff_range"],
+ ["empty edit",x=>{x.changedFiles[0].reverseDiff.edits[0].deleteLineCount=0;x.changedFiles[0].reverseDiff.edits[0].beforeText="";},"source_v2_diff_empty"],
+ ["altered before literal",x=>{x.changedFiles[0].reverseDiff.edits[0].beforeText="not the old source\n";},"source_v2_blob_mismatch"],
+ ["altered before SHA",x=>{x.changedFiles[0].before.blobSha="0".repeat(40);},"source_v2_blob_mismatch"],
+ ["altered after content",x=>{x.changedFiles[0].after.content="different\n";},"source_v2_blob_mismatch"],
+ ["altered after SHA",x=>{x.changedFiles[0].after.blobSha="0".repeat(40);},"source_v2_blob_mismatch"],
+ ["altered logical source hash",x=>{x.logicalSourceSHA256="0".repeat(64);},"source_v2_logical_mismatch"],
+ ["altered dependency",x=>{x.dependencyFiles[0].content="other\n";},"source_v2_blob_mismatch"],
+ ["unknown file status",x=>{x.changedFiles[0].status="unknown";},"source_status_unsupported"],
+ ["duplicate file",x=>{x.changedFiles.push(structuredClone(x.changedFiles[0]));},"source_v2_file_identity"],
+ ["NUL before",x=>{x.changedFiles[0].reverseDiff.edits[0].beforeText="\0";},"source_v2_utf8"],
+ ["unpaired surrogate",x=>{x.changedFiles[0].reverseDiff.edits[0].beforeText="\ud800";},"source_v2_utf8"],
+])test(`source v2 rejects ${name}`,()=>{const value=sourceCodec.reviewSourceV2(sourceV2Fixture());mutate(value);assert.throws(()=>sourceCodec.restoreReviewSourceV2(value),e=>e.message===code);});
+
+test("source v2 rejects unknown v1 fields rather than silently dropping them",()=>{const source=sourceV2Fixture();source.unknown="not represented";assert.throws(()=>sourceCodec.reviewSourceV2(source),/source_v2_shape/);});
+test("source v2 rejects redundant identity edits",()=>{const source=sourceV2Fixture("anchor\nold\nend\n","anchor\nnew\nend\n"),compact=sourceCodec.reviewSourceV2(source);compact.changedFiles[0].reverseDiff.edits.unshift({afterStartLine:0,deleteLineCount:1,beforeText:"anchor\n"});assert.throws(()=>sourceCodec.restoreReviewSourceV2(compact),/source_v2_diff_range|source_v2_diff_noncanonical/);});
+test("source v2 block rejects v1, mixed forms, duplicate blocks and malformed JSON",()=>{
+ const source=sourceV2Fixture(),v1=`=== BEGIN PAPERCLIP REVIEW SOURCE ===\n${canonical(source)}\n=== END PAPERCLIP REVIEW SOURCE ===`,v2=sourceCodec.reviewSourceV2Block(source);
+ for(const value of [v1,v1+"\n"+v2,v2+"\n"+v1,v2+"\n"+v2,v2.replace('{','{bad'),v2.replace('"schema":"paperclip.fork-review-source/v2"','"schema":"paperclip.fork-review-source/v1","schema":"paperclip.fork-review-source/v2"')])assert.throws(()=>sourceCodec.parseReviewSourceV2Block(value),/source_v2_shape|source_v2_block_invalid|source_v2_block_noncanonical/);
+ const expected=structuredClone(source);expected.headSha=BASE;assert.throws(()=>sourceCodec.parseReviewSourceV2Block(v2,expected),/source_v2_expected_mismatch/);
+});
+test("source v2 prototype cannot self-admit through adopted v1 journal",()=>{
+ const f=forkFixture();try{const value=sourceCodec.reviewSourceV2(f.source);f.data.material=sourceCodec.reviewSourceV2Block(f.source);f.admission.sourceInputSHA256=digest(canonical(value));const combined=Buffer.concat([Buffer.from(f.data.system),Buffer.from([0]),Buffer.from(f.data.material)]);f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(combined);f.data.start.combinedBytes=combined.length;f.seal();assert.deepEqual(admitTrustedJournal(f.admissionArgs()),{status:"invalid",code:"independent_review_invalid",subcode:"review_source_binding"});}finally{f.close();}
+});
+
+function v2JournalFixture() {
+ const f=forkFixture();
+ f.admission.kind="trusted-cli-journal/v2";
+ f.admission.sourceSchema="paperclip.fork-review-source/v2";
+ f.data.material="Full reviewed source:\n"+sourceCodec.reviewSourceV2Block(f.source);
+ const input=Buffer.concat([Buffer.from(f.data.system),Buffer.from([0]),Buffer.from(f.data.material)]);
+ f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(input);
+ f.data.start.combinedBytes=input.length;
+ f.seal();
+ return f;
+}
+test("explicit v2 registry admits only a restored exact logical v1 source",()=>{
+ const f=v2JournalFixture();try{
+  const review=admitTrustedJournal(f.admissionArgs());
+  assert.equal(review.status,"valid",JSON.stringify(review));
+  assert.equal(review.evidenceKind,"lossless-v2-reconstructed-source");
+  assert.equal(review.sourceSchema,"paperclip.fork-review-source/v2");
+ }finally{f.close();}
+});
+test("v2 readiness and private report label reconstructed source without relaxing CI",async()=>{
+ const f=v2JournalFixture();try{
+  const accepted=await checkReadiness(document,f.options(),f.deps);
+  assert.equal(accepted.pullRequests[0].verdict,"ready");
+  assert.match(renderReport(accepted),/evidence kind lossless-v2-reconstructed-source/);
+  f.ci.conclusion="failure";
+  const failed=await checkReadiness(document,f.options(),f.deps);
+  assert.notEqual(failed.pullRequests[0].verdict,"ready");
+ }finally{f.close();}
+});
+test("v1 journal rejects a mixed source block while its ordinary fixture remains valid",()=>{
+ const f=forkFixture();try{
+  assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
+  f.data.material+=`\n${sourceCodec.reviewSourceV2Block(f.source)}`;
+  const input=Buffer.concat([Buffer.from(f.data.system),Buffer.from([0]),Buffer.from(f.data.material)]);
+  f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(input);
+  f.data.start.combinedBytes=input.length;f.seal();
+  assert.deepEqual(admitTrustedJournal(f.admissionArgs()),{status:"invalid",code:"independent_review_invalid",subcode:"source_not_in_launch_input"});
+ }finally{f.close();}
+});
+for(const [name,mutate,subcode] of [
+ ["missing registry schema",f=>{delete f.admission.sourceSchema;},"unsupported_review_source"],
+ ["unknown registry schema",f=>{f.admission.sourceSchema="future";},"unsupported_review_source"],
+ ["old kind with new schema",f=>{f.admission.kind="trusted-cli-journal/v1";},"unsupported_review_source"],
+ ["new kind with old v1 block",f=>{f.data.material=`Full reviewed source:\n=== BEGIN PAPERCLIP REVIEW SOURCE ===\n${canonical(f.source)}\n=== END PAPERCLIP REVIEW SOURCE ===`;},"source_v2_shape"],
+ ["mixed v1 and v2 blocks",f=>{f.data.material+=`\n=== BEGIN PAPERCLIP REVIEW SOURCE ===\n${canonical(f.source)}\n=== END PAPERCLIP REVIEW SOURCE ===`;},"source_not_in_launch_input"],
+ ["duplicate v2 blocks",f=>{f.data.material+=`\n${sourceCodec.reviewSourceV2Block(f.source)}`;},"source_not_in_launch_input"],
+ ["damaged reconstructed before",f=>{const begin="=== BEGIN PAPERCLIP REVIEW SOURCE ===\n",end="\n=== END PAPERCLIP REVIEW SOURCE ===",body=f.data.material.slice(f.data.material.indexOf(begin)+begin.length,f.data.material.lastIndexOf(end));const value=JSON.parse(body);value.changedFiles[0].reverseDiff.edits[0].beforeText="wrong\n";f.data.material="Full reviewed source:\n"+begin+canonical(value)+end;},"source_v2_blob_mismatch"],
+ ["tools enabled in launch",f=>{f.data.start.argv[f.data.start.argv.indexOf("--tools")+1]="Read";},"unsupported_launch_shape"],
+ ["conditional model verdict",f=>{f.data.raw.result=f.data.report="判定: CONDITIONAL GO\n";},"review_not_go"],
+])test(`v2 journal rejects ${name}`,()=>{const f=v2JournalFixture();try{mutate(f);const input=Buffer.concat([Buffer.from(f.data.system),Buffer.from([0]),Buffer.from(f.data.material)]);f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(input);f.data.start.combinedBytes=input.length;f.seal();assert.deepEqual(admitTrustedJournal(f.admissionArgs()),{status:"invalid",code:"independent_review_invalid",subcode});}finally{f.close();}});
+
+function invokeSourceSchema(f,schema,output="-") {
+ return spawnSync(process.execPath,[realpathSync(path.join(f.checkout,".agents/skills/pr-gardening/scripts/check-readiness.mjs")),"--emit-review-input","1","--repo",FORK,"--source-schema",schema,"--output",output],{env:{PATH:path.join(f.directory,"bin")+path.delimiter+path.dirname(process.execPath)},encoding:"utf8"});
+}
+test("source v2 explicit emitter writes lossless prototype without widening v1 default",()=>{
+ const f=outputFixture();try{const run=invokeSourceSchema(f,"v2");assert.equal(run.status,0,run.stderr);const text=run.stdout.trimEnd(),body=JSON.parse(text.slice(text.indexOf("\n")+1,text.lastIndexOf("\n")));assert.equal(body.schema,"paperclip.fork-review-source/v2");assert.deepEqual(sourceCodec.parseReviewSourceV2Block(run.stdout,f.source),f.source);assert.equal(Object.hasOwn(body.changedFiles[0].before,"content"),false);const old=f.invoke(true,"-");assert.equal(old.stdout,`=== BEGIN PAPERCLIP REVIEW SOURCE ===\n${canonical(f.source)}\n=== END PAPERCLIP REVIEW SOURCE ===\n`);assert.equal(invokeSourceSchema(f,"v1").stdout,old.stdout);assert.ok(readFileSync(f.calls,"utf8").trim().split("\n").map(JSON.parse).every(a=>a[0]==="api"&&a[1]==="--method"&&a[2]==="GET"));}finally{f.close();}
+});
+test("source v2 emitter preserves UTF8 BOM while default v1 behavior stays unchanged",()=>{
+ const f=outputFixture();try{
+ const source=sourceV2Fixture("\ufeffold\r\n","\ufeffnew\r\n");source.dependencyFiles=[];const file=source.changedFiles[0],prefix=`repos/${FORK}`;
+ f.routes[`${prefix}/pulls/1/files?per_page=100&page=1`][0].sha=file.after.blobSha;
+ f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree[0].sha=file.after.blobSha;f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree[0].sha=file.before.blobSha;
+ for(const blob of [file.before,file.after])f.routes[`${prefix}/git/blobs/${blob.blobSha}`]={sha:blob.blobSha,encoding:"base64",size:Buffer.byteLength(blob.content),content:Buffer.from(blob.content).toString("base64")};writeFileSync(path.join(f.directory,"routes.json"),JSON.stringify(f.routes));
+ const run=invokeSourceSchema(f,"v2");assert.equal(run.status,0,run.stderr);assert.deepEqual(sourceCodec.parseReviewSourceV2Block(run.stdout,source),source);
+ const old=invokeSourceSchema(f,"v1");assert.equal(old.status,0,old.stderr);const body=JSON.parse(old.stdout.trimEnd().split("\n")[1]);assert.equal(body.changedFiles[0].after.content,"new\r\n");
+ }finally{f.close();}
+});
+test("source v2 unknown emitter schema fails without writing an output",()=>{const f=outputFixture();try{const output=path.join(f.directory,"not-created.json"),run=invokeSourceSchema(f,"unknown",output);assert.equal(run.status,1);assert.match(run.stderr,/source_schema_unsupported/);assert.equal(existsSync(output),false);}finally{f.close();}});
+
+test("source v2 reconstructs real Git added removed renamed and exact text blobs",()=>{
+ const directory=mkdtempSync(path.join(os.tmpdir(),"source-v2-real-git-"));
+ try{
+ const env={PATH:process.env.PATH,GIT_CONFIG_NOSYSTEM:"1",GIT_CONFIG_GLOBAL:"/dev/null",LC_ALL:"C"};
+ const git=(args,input)=>{const run=spawnSync("git",["-c","user.name=Source Codec Fixture","-c","user.email=source-codec@example.invalid",...args],{cwd:directory,env,input});assert.equal(run.status,0,run.stderr?.toString());return run.stdout;};
+ git(["init","--quiet"]);
+ const originals={"utf8.txt":"日本語🙂\nold\n","crlf.txt":"a\r\nold\r\n","no-final-newline.txt":"old","bom.txt":"\ufeffold\n","empty.txt":"","removed.txt":"remove only\n","old-name.txt":"rename identical\n","unchanged.txt":"dependency\r\n"};
+ for(const [name,text] of Object.entries(originals))writeFileSync(path.join(directory,name),text);
+ git(["add","--all"]);git(["commit","--quiet","-m","before"]);const before=git(["rev-parse","HEAD"]).toString().trim();
+ for(const [name,text] of Object.entries({"utf8.txt":"日本語🚀\nnew\n","crlf.txt":"a\r\nnew\r\n","no-final-newline.txt":"new","bom.txt":"\ufeffnew\n","empty.txt":"now present\n","added.txt":"追加\n"}))writeFileSync(path.join(directory,name),text);
+ rmSync(path.join(directory,"removed.txt"));git(["mv","old-name.txt","new-name.txt"]);git(["add","--all"]);git(["commit","--quiet","-m","after"]);const after=git(["rev-parse","HEAD"]).toString().trim();
+ const fields=git(["diff","--name-status","-z","--find-renames=100%",before,after]).toString().split("\0");fields.pop();const changed=[];
+ const blob=(ref,name)=>({path:name,blobSha:git(["rev-parse",`${ref}:${name}`]).toString().trim(),content:new TextDecoder("utf-8",{fatal:true,ignoreBOM:true}).decode(git(["show",`${ref}:${name}`]))});
+ for(let i=0;i<fields.length;){const status=fields[i++],oldPath=fields[i++],newPath=status.startsWith("R")?fields[i++]:oldPath;const kind={A:"added",D:"removed",M:"modified",R:"renamed"}[status[0]];assert.ok(kind);changed.push({path:newPath,status:kind,before:kind==="added"?null:blob(before,oldPath),after:kind==="removed"?null:blob(after,newPath)});}
+ changed.sort((a,b)=>a.path.localeCompare(b.path));assert.deepEqual([...new Set(changed.map(x=>x.status))].sort(),["added","modified","removed","renamed"]);
+ const raw=git(["diff","--raw","-z","--no-abbrev","--find-renames=100%",before,after]).toString().split("\0");raw.pop();const independentPaths=[];for(let i=0;i<raw.length;){const header=raw[i++],name=raw[i++];independentPaths.push(header.split(" ").at(-1).startsWith("R")?raw[i++]:name);}assert.deepEqual(independentPaths.sort(),changed.map(x=>x.path).sort());assert.equal(changed.length,8);
+ const source={schema:"paperclip.fork-review-source/v1",repository:FORK,headSha:after,treeSha:git(["rev-parse",after+"^{tree}"]).toString().trim(),baseSha:before,mergeBaseSha:before,changedFiles:changed,dependencyFiles:[blob(after,"unchanged.txt")]};
+ const encoded=sourceCodec.reviewSourceV2(source),restored=sourceCodec.restoreReviewSourceV2(encoded);assert.deepEqual(restored,source);
+ const bodies=restored.changedFiles.flatMap(f=>[f.before,f.after].filter(Boolean)).concat(restored.dependencyFiles);assert.equal(bodies.length,15);
+ for(const body of bodies){assert.equal(hashBlob(body.content),body.blobSha);assert.equal(git(["hash-object","--stdin"],Buffer.from(body.content)).toString().trim(),body.blobSha);}
+ assert.deepEqual(sourceCodec.parseReviewSourceV2Block(sourceCodec.reviewSourceV2Block(source),source),source);
+ }finally{rmSync(directory,{recursive:true,force:true});}
+});
