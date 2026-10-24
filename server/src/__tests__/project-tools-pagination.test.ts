@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { callProjectTool, projectToolDefinitions } from "../services/project-tools.js";
+import { createHash, randomUUID } from "node:crypto";
 
 const input = {
   name: "list_projects", arguments: {}, apiUrl: "http://paperclip.test", token: "test-token",
@@ -9,6 +10,17 @@ const input = {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("project discovery result bounds", () => {
+  it("offers the two bounded self-task document tools only to a standard task run", () => {
+    const regular = projectToolDefinitions("standard", true).map(tool => tool.name);
+    expect(regular.filter(name => name.endsWith("_self_task_document"))).toEqual([
+      "read_self_task_document", "write_self_task_document",
+    ]);
+    // The dedicated document capability follows the canonical document catalog,
+    // independently of the generic project-creation work-mode gate.
+    expect(projectToolDefinitions("planning", true).map(tool => tool.name)).toContain("write_self_task_document");
+    expect(projectToolDefinitions("standard", false).map(tool => tool.name)).not.toContain("write_self_task_document");
+  });
+
   it("requests bounded summaries and normalizes continuation cursors", async () => {
     const page = { projects: [{ id: "abcdefab-0000-4000-8000-000000000001", name: "Project", status: "in_progress", description: "Summary", descriptionTruncated: true }], nextCursor: "abcdefab-0000-4000-8000-000000000001" };
     const fetch = vi.fn(async (_url: string, _options: RequestInit) => ({ ok: true, json: async () => page }));
@@ -26,5 +38,29 @@ describe("project discovery result bounds", () => {
     vi.stubGlobal("fetch", fetch);
     await expect(callProjectTool({ ...input, arguments: arguments_ })).rejects.toThrow();
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("records an unknown postcommit PUT response without replaying the write", async () => {
+    const companyId = randomUUID(), issueId = randomUUID(), documentId = randomUUID(), revisionId = randomUUID();
+    const body = "Synthetic fixed input";
+    let persistedWrites = 0;
+    const fetch = vi.fn(async (_url: string, options: RequestInit) => {
+      if (options.method === "GET") return { ok: true, redirected: false, status: 200,
+        json: async () => [{ id: revisionId, companyId, issueId, key: "notes", documentId,
+          body, revisionNumber: 1 }] };
+      persistedWrites++;
+      // The server commits, but the client loses the PUT acknowledgement.
+      throw new TypeError("synthetic response lost after commit");
+    });
+    vi.stubGlobal("fetch", fetch);
+    const saved = await callProjectTool({ ...input, companyId, issueId,
+      name: "write_self_task_document", arguments: { key: "result", title: "Result",
+        format: "markdown", body: "Synthetic result", documentId: null, baseRevisionId: null,
+        input: { key: "notes", documentId, revisionId,
+          bodySha256: createHash("sha256").update(body).digest("hex") } } });
+    expect(saved).toMatchObject({ outcome: "unknown", stage: "put",
+      requests: { reads: 1, puts: 1, readbacks: 0 }, reason: "synthetic response lost after commit" });
+    expect(persistedWrites).toBe(1);
+    expect(fetch.mock.calls.map(([, options]) => options.method)).toEqual(["GET", "PUT"]);
   });
 });

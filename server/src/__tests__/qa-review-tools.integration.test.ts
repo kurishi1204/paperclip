@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import http from "node:http";
 import { and, eq, sql } from "drizzle-orm";
-import { agentWakeupRequests, agents, assets, documentAnnotationComments, documentAnnotationThreads, documents, heartbeatRuns, issueAttachments, issueComments, issueExecutionDecisions, issueRelations, issues, issueWorkProducts } from "@paperclipai/db";
+import { agentWakeupRequests, agents, assets, documentAnnotationComments, documentAnnotationThreads, documentRevisions, documents, heartbeatRuns, issueAttachments, issueComments, issueExecutionDecisions, issueRelations, issues, issueWorkProducts } from "@paperclipai/db";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { documentService } from "../services/documents.js";
+import { callProjectTool } from "../services/project-tools.js";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
@@ -37,8 +38,9 @@ describe("run-bound QA review MCP", () => {
     await server?.close(); vi.unstubAllEnvs();
   });
 
-  async function reviewFixture(withResponsibleUser = false, claimedAdapter = "paperclip_runner") {
-    const fixture = await server.fixture(withResponsibleUser ? { connectionScenario: "fresh" } : {});
+  async function reviewFixture(withResponsibleUser = false, claimedAdapter = "paperclip_runner",
+    existingFixture?: Awaited<ReturnType<typeof server.fixture>>) {
+    const fixture = existingFixture ?? await server.fixture(withResponsibleUser ? { connectionScenario: "fresh" } : {});
     const stageId = randomUUID();
     const policy = normalizeIssueExecutionPolicy({
       stages: [{ id: stageId, type: "review", participants: [{ type: "agent", agentId: fixture.agentId }] }],
@@ -735,6 +737,78 @@ describe("run-bound QA review MCP", () => {
     expect(second.nextAfterCommentId).toBeNull();
   });
 
+  it("reads the bounded writer's exact saved document revision before one QA decision", async () => {
+    const fixture = await server.fixture({ disableWakeOnDemand: true });
+    await server.db.update(issues).set({ checkoutRunId: fixture.runId }).where(eq(issues.id, fixture.issueId));
+    // The seed input is older than this run's one permitted deliverable write.
+    await server.db.update(documentRevisions).set({ createdByRunId: null })
+      .where(eq(documentRevisions.createdByRunId, fixture.runId));
+    const token = createLocalAgentJwt(fixture.agentId, fixture.companyId, "paperclip_runner",
+      fixture.runId, fixture.responsibleUserId)!;
+    const base = { apiUrl: server.apiUrl, token, companyId: fixture.companyId,
+      issueId: fixture.issueId, agentId: fixture.agentId, conversation: false };
+    const input = await callProjectTool({ ...base, name: "read_self_task_document", arguments: { key: "notes" } });
+    expect(input.outcome).toBe("verified");
+    if (input.outcome !== "verified" || typeof input.documentId !== "string" ||
+        typeof input.revisionId !== "string" || typeof input.bodySha256 !== "string")
+      throw new Error("Fixed input receipt is unavailable");
+    const body = "# Synthetic accepted result\n\nOne bounded write for QA.";
+    const saved = await callProjectTool({ ...base, name: "write_self_task_document", arguments: {
+      key: "result", documentId: null, baseRevisionId: null,
+      title: "Result", format: "markdown", body,
+      input: { key: "notes", documentId: input.documentId,
+        revisionId: input.revisionId, bodySha256: input.bodySha256 },
+    } });
+    expect(saved.outcome).toBe("verified");
+    if (saved.outcome !== "verified" || typeof saved.revisionId !== "string")
+      throw new Error("Saved document revision receipt is unavailable");
+
+    const { stageId, tool, rows } = await reviewFixture(false, "claude_local", fixture);
+    const assigned = (await tool("read_assigned_issue")).body.result.structuredContent;
+    expect(assigned.documentSummaries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: "result", latestRevisionId: saved.revisionId }),
+    ]));
+    const page = (await tool("read_assigned_issue_document", {
+      key: "result", expectedRevision: assigned.revision,
+      expectedDocumentRevisionId: saved.revisionId, limit: 8_000,
+    })).body.result;
+    expect(page.isError).not.toBe(true);
+    expect(page.structuredContent).toMatchObject({
+      latestRevisionId: saved.revisionId, body, nextOffset: null,
+    });
+    const decision = (await tool("submit_review_decision", {
+      decision: "approve", summary: "Fixed document revision reviewed.",
+      expectedStageId: stageId, expectedStatusVersion: assigned.statusVersion,
+      expectedRevision: assigned.revision,
+      expectedLastDecisionId: assigned.reviewStage.lastDecisionId,
+    })).body.result;
+    expect(decision.isError).not.toBe(true);
+    expect((await rows())).toMatchObject([{ createdByRunId: fixture.runId, outcome: "approved" }]);
+  });
+
+  it("rejects a QA decision after the document revision changes without a second verdict", async () => {
+    const { fixture, stageId, tool, rows } = await reviewFixture();
+    const assigned = (await tool("read_assigned_issue")).body.result.structuredContent;
+    const fixedRevisionId = assigned.documentSummaries.find((item: { key: string }) => item.key === "notes")?.latestRevisionId;
+    expect(typeof fixedRevisionId).toBe("string");
+    const first = (await tool("read_assigned_issue_document", {
+      key: "notes", expectedRevision: assigned.revision,
+      expectedDocumentRevisionId: fixedRevisionId,
+    })).body.result;
+    expect(first.isError).not.toBe(true);
+    expect(first.structuredContent.latestRevisionId).toBe(fixedRevisionId);
+    await documentService(server.db).upsertIssueDocument({ issueId: fixture.issueId, key: "notes",
+      format: "markdown", body: "A changed synthetic requirement.", baseRevisionId: fixedRevisionId });
+    const oldDecision = (await tool("submit_review_decision", {
+      decision: "approve", summary: "Stale document must not be approved.",
+      expectedStageId: stageId, expectedStatusVersion: assigned.statusVersion,
+      expectedRevision: assigned.revision,
+      expectedLastDecisionId: assigned.reviewStage.lastDecisionId,
+    })).body.result;
+    expect(oldDecision.isError).toBe(true);
+    expect(await rows()).toHaveLength(0);
+  });
+
   it("reads bounded non-plan document pages only through the assigned issue", async () => {
     const { fixture, tool } = await reviewFixture();
     const issue = (await tool("read_assigned_issue")).body.result.structuredContent;
@@ -746,13 +820,19 @@ describe("run-bound QA review MCP", () => {
       key: "notes", expectedRevision, offset: first.nextOffset, limit: 12,
     })).body.result.structuredContent;
     expect(second.body).toBe("ification co");
+    const fixedRevisionId = issue.documentSummaries.find((item: { key: string }) => item.key === "notes")?.latestRevisionId;
+    expect((await tool("read_assigned_issue_document", { key: "notes", expectedRevision,
+      expectedDocumentRevisionId: fixedRevisionId, limit: 12 })).body.result.structuredContent)
+      .toMatchObject({ latestRevisionId: fixedRevisionId, body: "Document ver" });
     expect((await tool("read_assigned_issue_document", { key: "../secrets", expectedRevision })).body.result.isError).toBe(true);
     expect((await tool("read_assigned_issue_document", { key: "notes", issueId: fixture.blockerId, expectedRevision })).body.result.isError).toBe(true);
     expect((await tool("read_assigned_issue_document", { key: "other-issue-only", expectedRevision })).body.result.isError).toBe(true);
     expect((await tool("read_assigned_issue_document", { key: "notes", expectedRevision, limit: 16_001 })).body.result.isError).toBe(true);
     const noteId = issue.documentSummaries.find((item: { key: string }) => item.key === "notes")?.id;
-    await server.db.update(documents).set({ latestBody: "Updated acceptance evidence." }).where(eq(documents.id, noteId));
-    expect((await tool("read_assigned_issue_document", { key: "notes", expectedRevision })).body.result.isError).toBe(true);
+    await documentService(server.db).upsertIssueDocument({ issueId: fixture.issueId, key: "notes", format: "markdown",
+      body: "Updated acceptance evidence.", baseRevisionId: fixedRevisionId });
+    expect((await tool("read_assigned_issue_document", { key: "notes", expectedRevision,
+      expectedDocumentRevisionId: fixedRevisionId })).body.result.isError).toBe(true);
   });
 
   it("reads assigned-document annotations and rejects a stale annotation revision", async () => {
