@@ -370,7 +370,7 @@ function secureRead(file, root) {
 
 // The pointer contains no authority. Only a separately operator-configured,
 // pinned registry outside this checkout may admit a real launcher and artifacts.
-export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, pullRequest, headSha, source, pointer, checkoutRoot = process.cwd() }) {
+export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, pullRequest, headSha, source, sourceFactory, pointer, checkoutRoot = process.cwd() }) {
   if (!trustedRoot || !registrySHA256 || !pointer) return { status: "unreceived", code: "independent_review_unreceived" };
   try {
     const root = fs.realpathSync(trustedRoot);
@@ -388,6 +388,12 @@ export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, p
     const v1 = entry.kind === "trusted-cli-journal/v1" && entry.sourceSchema === undefined;
     const v2 = entry.kind === "trusted-cli-journal/v2" && entry.sourceSchema === REVIEW_SOURCE_V2;
     ensure((v1 || v2) && entry.purpose === "independent_implementation_review", "unsupported_review_source");
+    // Select the decoder only after the operator-pinned entry validates. A PR
+    // pointer cannot choose it. Keep direct-source callers compatible.
+    if (sourceFactory !== undefined) {
+      ensure(source === undefined && typeof sourceFactory === "function", "review_source_factory");
+      source = sourceFactory(v2 ? REVIEW_SOURCE_V2 : SOURCE_SCHEMA);
+    }
     const bytes = (name) => {
       const artifact = entry.artifacts?.[name];
       ensure(artifact && hex(artifact.sha256, 64) && typeof artifact.path === "string", "admission_artifact");
@@ -653,8 +659,15 @@ async function checkForkReadiness(document, options, dependencies) {
       const pointers = pointerFile?.schema === "paperclip.review-pointer/v1" && pointerFile.repository === repository ? pointerFile.entries?.filter(e=>e.pullRequest===candidate.number&&e.headSha===head) ?? [] : [];
       ensure(pointers.length <= 1, "duplicate_review_pointer");
       const pointer = pointers[0];
-      const source = buildReviewSource(get, repository, pr, files, commit.tree.sha, branch.commit.sha, comparison.merge_base_commit.sha, pointer?.dependencies ?? []);
-      const review = admitTrustedJournal({ trustedRoot: options.trusted_review_root, registrySHA256: options.trusted_review_registry_sha256, repository, pullRequest: candidate.number, headSha: head, source, pointer, checkoutRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..") });
+      let source;
+      const sourceFactory = (schema) => {
+        source = buildReviewSource(get, repository, pr, files, commit.tree.sha, branch.commit.sha, comparison.merge_base_commit.sha, pointer?.dependencies ?? [], schema);
+        return source;
+      };
+      const review = admitTrustedJournal({ trustedRoot: options.trusted_review_root, registrySHA256: options.trusted_review_registry_sha256, repository, pullRequest: candidate.number, headSha: head, sourceFactory, pointer, checkoutRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..") });
+      // Without an admitted schema, retain the legacy v1 source in the report.
+      // This never retries admission or changes an invalid/unreceived result.
+      if (source === undefined) sourceFactory(SOURCE_SCHEMA);
       const comments = getPages(get, `repos/${repository}/issues/${candidate.number}/comments`);
       const inline = getPages(get, `repos/${repository}/pulls/${candidate.number}/comments`);
       const reviews = getPages(get, `repos/${repository}/pulls/${candidate.number}/reviews`);

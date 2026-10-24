@@ -821,3 +821,50 @@ test("source v2 reconstructs real Git added removed renamed and exact text blobs
  assert.deepEqual(sourceCodec.parseReviewSourceV2Block(sourceCodec.reviewSourceV2Block(source),source),source);
  }finally{rmSync(directory,{recursive:true,force:true});}
 });
+
+// Schema selection comes only from the pinned operator registry. The ordinary
+// readiness path must decode the same complete Git blobs as the v2 emitter.
+function bomReadinessFixture(location) {
+ const f=v2JournalFixture(),prefix=`repos/${FORK}`;
+ if(location==="changed")for(const side of ["before","after"]){const blob=f.source.changedFiles[0][side];blob.content="\ufeff"+blob.content;blob.blobSha=hashBlob(blob.content);}
+ if(location==="dependency")f.source.dependencyFiles=[{path:"dependency.mjs",content:"\ufeffdependency\r\n",blobSha:hashBlob("\ufeffdependency\r\n")}];
+ const file=f.source.changedFiles[0];
+ f.routes[`${prefix}/pulls/1/files?per_page=100&page=1`][0].sha=file.after.blobSha;
+ f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree=[file.after,...f.source.dependencyFiles].map(b=>({path:b.path,type:"blob",mode:"100644",sha:b.blobSha}));
+ f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree=[{path:file.before.path,type:"blob",mode:"100644",sha:file.before.blobSha}];
+ for(const b of [file.before,file.after,...f.source.dependencyFiles])f.routes[`${prefix}/git/blobs/${b.blobSha}`]={sha:b.blobSha,encoding:"base64",size:Buffer.byteLength(b.content),content:Buffer.from(b.content).toString("base64")};
+ f.pointer.dependencies=f.source.dependencyFiles.map(b=>b.path);
+ f.pointer.sourceSchema="paperclip.fork-review-source/v1"; // untrusted hint must not override registry v2
+ writeFileSync(f.evidence,JSON.stringify({schema:"paperclip.review-pointer/v1",repository:FORK,entries:[f.pointer]}));
+ f.admission.sourceInputSHA256=digest(canonical(f.source));
+ f.data.material="Full reviewed source:\n"+sourceCodec.reviewSourceV2Block(f.source);
+ const input=Buffer.concat([Buffer.from(f.data.system),Buffer.from([0]),Buffer.from(f.data.material)]);
+ f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(input);f.data.start.combinedBytes=input.length;f.seal();return f;
+}
+for(const location of ["changed","dependency"])test(`v2 readiness preserves BOM in ${location} Git blobs`,async()=>{
+ const f=bomReadinessFixture(location);try{
+  const result=await checkReadiness(document,f.options(),f.deps),r=result.pullRequests[0];
+  assert.equal(r.verdict,"ready",JSON.stringify(r));assert.equal(r.independentReview.status,"valid",JSON.stringify(r.independentReview));
+  assert.equal(r.independentReview.sourceSchema,"paperclip.fork-review-source/v2");assert.deepEqual(r.source,f.source);
+  const bodies=r.source.changedFiles.flatMap(x=>[x.before,x.after].filter(Boolean)).concat(r.source.dependencyFiles);
+  assert.ok(bodies.some(b=>b.content.startsWith("\ufeff")));for(const b of bodies)assert.equal(hashBlob(b.content),b.blobSha);
+ }finally{f.close();}
+});
+for(const version of ["v1","v2"])test(`admission selects ${version} source factory from trusted registry`,()=>{
+ const f=version==="v1"?forkFixture():v2JournalFixture();try{
+  const args=f.admissionArgs();delete args.source;const calls=[];args.sourceFactory=schema=>{calls.push(schema);return f.source;};
+  assert.equal(admitTrustedJournal(args).status,"valid");assert.deepEqual(calls,[`paperclip.fork-review-source/${version}`]);
+ }finally{f.close();}
+});
+test("untrusted pointer and unsupported registry cannot invoke a source factory",()=>{
+ const f=v2JournalFixture();try{
+  const args=f.admissionArgs();delete args.source;let calls=0;args.sourceFactory=()=>{calls++;throw Error("untrusted_schema_must_not_build");};
+  args.pointer={...args.pointer,sourceSchema:"paperclip.fork-review-source/v2"};
+  assert.equal(admitTrustedJournal({...args,registrySHA256:"0".repeat(64)}).subcode,"admission_pin");
+  f.admission.sourceSchema="unknown";f.seal();assert.equal(admitTrustedJournal({...args,registrySHA256:f.admissionArgs().registrySHA256}).subcode,"unsupported_review_source");
+  assert.deepEqual(admitTrustedJournal({...args,pointer:null}),{status:"unreceived",code:"independent_review_unreceived"});assert.equal(calls,0);
+ }finally{f.close();}
+});
+test("admission rejects ambiguous direct source plus factory without invoking it",()=>{
+ const f=v2JournalFixture();try{let calls=0;const r=admitTrustedJournal({...f.admissionArgs(),sourceFactory:()=>{calls++;return f.source;}});assert.equal(r.subcode,"review_source_factory");assert.equal(calls,0);}finally{f.close();}
+});
