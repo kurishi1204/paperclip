@@ -104,7 +104,11 @@ export async function validateExecutionReconciliation(input: {
       )).for("update")
       : [];
     const actionSourceRunId = currentAction?.evidence.runId ?? currentAction?.evidence.sourceRunId;
+    // Same-run resumptions must take I/F/R and recheck the current issue
+    // authority plus the marker recorded below. This admits an unbound old
+    // retryable source only with that reclaim fence in the same release.
     const sourceCanBeReconciled = coordinator?.phase === "terminal_failure" ||
+      (coordinator?.phase === "retryable_failure" && coordinator.recoveryState === "resuming_session") ||
       (coordinator != null && await isCancelledNativeStartup(db, run, coordinator));
     if (!currentAction || currentAction.returnOwnerAgentId !== agentId ||
       currentAction.returnOwnerAgentId !== action?.returnOwnerAgentId || actionSourceRunId !== run.id ||

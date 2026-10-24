@@ -3,7 +3,7 @@ import { realpathSync, writeFileSync } from "node:fs";
 import { basename, isAbsolute, relative } from "node:path";
 import express from "express";
 import request from "supertest";
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -26,6 +26,7 @@ import { recoveryService } from "../services/recovery/service.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { collectDispositionRepairSourceState } from "../services/recovery/disposition-repair.js";
 import { readNativeContinuationHold } from "../services/native-runtime/native-continuation-hold.js";
+import { claimNativeSessionResumptions } from "../services/native-runtime/native-finalization-reconciler.js";
 import { isCancelledNativeStartup } from "../services/cancelled-native-startup.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
@@ -932,15 +933,32 @@ describe("native continuation ownership: automatic clear and adoption", () => {
     return app;
   }
 
-  async function seedBoardNativeHandoff(kind: "terminal" | "never_claimed" = "terminal") {
-    const f = await seed({ checkout: true, status: "in_progress", phase: "terminal_failure" });
+  async function persistNativeResumeEvidence(f: Awaited<ReturnType<typeof seed>>) {
+    // Only the actual resumption claim is exercised: no backend/session is
+    // opened. A durable provider identity prevents an ambiguous-envelope
+    // terminalization from masquerading as a successful reclaim rejection.
+    await db.update(heartbeatRuns).set({ runnerProfileJson: {
+      nativeExecutionInput: { schema: "paperclip.native-execution-input.v1",
+        binding: { companyId: f.companyId, issueId: f.issueId, runId: f.runId, agentId: f.agentId } },
+      sessionCheckpoint: { backendKind: "codex_app_server", sessionId: "synthetic-native-session",
+        providerSessionId: "synthetic-provider-session", activeTurnId: "synthetic-existing-turn",
+        identity: { runId: f.runId } },
+    } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(nativeRunFinalizations).set({ nextAttemptAt: new Date(0) })
+      .where(eq(nativeRunFinalizations.runId, f.runId));
+  }
+
+  async function seedBoardNativeHandoff(kind: "terminal" | "never_claimed" | "retryable" = "terminal") {
+    const f = await seed({ checkout: true, status: "in_progress",
+      phase: kind === "retryable" ? "retryable_failure" : "terminal_failure" });
     await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, f.actorRunId));
     // This is the real ambiguous writer's board-owned evidence shape, not an
     // inference that terminal phase or an absent PID proves a provider stop.
-    await db.update(nativeRunFinalizations).set({ failureDetail: {
+    if (kind !== "retryable") await db.update(nativeRunFinalizations).set({ failureDetail: {
       recoveryMode: "ambiguous_state", recoveryOwner: { kind: "board" },
       originalFailureCode: "native_session_interrupted",
     } }).where(eq(nativeRunFinalizations.runId, f.runId));
+    if (kind === "retryable") await persistNativeResumeEvidence(f);
     if (kind === "never_claimed") {
       await db.update(heartbeatRuns).set({ status: "cancelled", nativePhase: "observed",
         finishedAt: new Date(), processPid: null, processGroupId: null,
@@ -1064,7 +1082,7 @@ describe("native continuation ownership: automatic clear and adoption", () => {
       ...delivery, qualification: "Complete existing JS never-claimed proof plus explicit BOARD decision; not automatic permission after Stop." });
   });
 
-  it.each(["stale_return_owner", "decision_other_run", "retryable", "cancelled_attempt_one",
+  it.each(["stale_return_owner", "decision_other_run", "retryable_without_resume_state", "cancelled_attempt_one",
     "coordinator_lease", "live_pid", "other_active_native_issue_only", "other_orphan",
     "legacy_other_owner", "remote_release_without_receipt"] as const)(
     "A6 BOARD refuses unsafe cross-owner reconciliation (%s)", async boundary => {
@@ -1072,8 +1090,12 @@ describe("native continuation ownership: automatic clear and adoption", () => {
       if (boundary === "stale_return_owner") await db.update(issueRecoveryActions)
         .set({ returnOwnerAgentId: f.agentId }).where(eq(issueRecoveryActions.id, f.action.id));
       if (boundary === "decision_other_run") f.body.executionReconciliation.runId = randomUUID();
-      if (boundary === "retryable") await db.update(nativeRunFinalizations)
-        .set({ phase: "retryable_failure" }).where(eq(nativeRunFinalizations.runId, f.runId));
+      if (boundary === "retryable_without_resume_state") {
+        await db.update(nativeRunFinalizations).set({ phase: "retryable_failure", recoveryState: null })
+          .where(eq(nativeRunFinalizations.runId, f.runId));
+        await db.update(heartbeatRuns).set({ nativePhase: "retryable_failure" })
+          .where(eq(heartbeatRuns.id, f.runId));
+      }
       if (boundary === "cancelled_attempt_one") await db.update(nativeRunFinalizations)
         .set({ attempt: 1 }).where(eq(nativeRunFinalizations.runId, f.runId));
       if (boundary === "coordinator_lease") await db.update(nativeRunFinalizations)
@@ -1131,6 +1153,161 @@ describe("native continuation ownership: automatic clear and adoption", () => {
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]).toEqual(sourceBefore);
     observations.push({ kind: "A6_BOARD_delivery_invalidated", requested,
       continuationDelivery: action.evidence.continuationDelivery, qualification: "Real default reassignment between receipt and synthetic outbox delivery; no new wake." });
+  });
+
+  it("A7 native resumption cannot reclaim a retryable old-owner orphan after reassignment", async () => {
+    const f = await seedBoardNativeHandoff("retryable");
+    const snapshot = async () => ({ issue: await f.readIssue(), action: await f.readAction(),
+      run: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]!,
+      finalization: (await db.select().from(nativeRunFinalizations)
+        .where(eq(nativeRunFinalizations.runId, f.runId)))[0]!,
+      wakes: await db.select().from(agentWakeupRequests) });
+    const before = await snapshot();
+    expect(before.issue).toMatchObject({ assigneeAgentId: f.newAgentId, executionRunId: null, checkoutRunId: null });
+    expect(before.run).toMatchObject({ status: "failed", agentId: f.agentId, runtimeMode: "native" });
+    expect(before.finalization).toMatchObject({ phase: "retryable_failure", recoveryState: "resuming_session",
+      resultId: null, leaseOwner: null });
+    const claims = await claimNativeSessionResumptions({ db, runnerInstanceId: "synthetic-old-owner-reaper",
+      runIds: [f.runId], now: new Date() });
+    const after = await snapshot();
+    observations.push({ kind: "A7_reassigned_reclaim", claimCount: claims.length,
+      oldRunClaimed: claims.some(claim => claim.runId === f.runId), runStatus: after.run.status,
+      phase: after.finalization.phase, leaseOwner: after.finalization.leaseOwner,
+      unchanged: JSON.stringify(after) === JSON.stringify(before),
+      qualification: "Actual claim function only, complete claim-required envelope/checkpoint identity; no provider open/recover, no external effects." });
+    expect(claims).toHaveLength(0);
+    expect(after).toEqual(before);
+  });
+
+  it("A7 bound same-owner resumption backs off on an issue lock then claims one lease and prevents BOARD takeover", async () => {
+    const f = await seed({ checkout: true, status: "in_progress" });
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, f.actorRunId));
+    await persistNativeResumeEvidence(f);
+    const snapshot = async () => ({ issue: await f.readIssue(),
+      run: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]!,
+      finalization: (await db.select().from(nativeRunFinalizations)
+        .where(eq(nativeRunFinalizations.runId, f.runId)))[0]! });
+    const before = await snapshot();
+    let announce!: () => void, release!: () => void;
+    const acquired = new Promise<void>(resolve => { announce = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const holder = db.transaction(async tx => {
+      await tx.select().from(issues).where(eq(issues.id, f.issueId)).for("update");
+      announce(); await released;
+    });
+    const transactionErrors: string[] = [];
+    const observedDb = new Proxy(db, { get(target, key, receiver) {
+      if (key !== "transaction") return Reflect.get(target, key, receiver);
+      return async (...args: any[]) => {
+        try { return await (target.transaction as any)(...args); }
+        catch (error) {
+          const detail = error as { code?: string; cause?: { code?: string } };
+          transactionErrors.push(detail.cause?.code ?? detail.code ?? "unknown");
+          throw error;
+        }
+      };
+    } });
+    await acquired;
+    try {
+      const blocked = await claimNativeSessionResumptions({ db: observedDb,
+        runnerInstanceId: "synthetic-lock-contender", runIds: [f.runId], now: new Date() });
+      expect(blocked).toHaveLength(0);
+      expect(transactionErrors).toEqual(["55P03"]);
+      expect(await snapshot()).toEqual(before);
+    } finally { release(); await holder; }
+    // All are real due rows, but none owns the current binding. Put them before
+    // the valid Run so an early candidate LIMIT cannot starve a legitimate
+    // resume forever. UUID subtraction is deterministic even for a low UUID.
+    const targetNumber = BigInt(`0x${f.runId.replaceAll("-", "")}`);
+    const rejectedIds = Array.from({ length: 26 }, (_, index) => {
+      const hex = (targetNumber - BigInt(index + 1)).toString(16).padStart(32, "0");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    });
+    expect(rejectedIds.every(id => id < f.runId)).toBe(true);
+    expect(new Set(rejectedIds).size).toBe(26);
+    const inserted = await db.insert(heartbeatRuns).values(rejectedIds.map(id => ({
+      id, companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      runtimeMode: "native", status: "failed", finishedAt: new Date(),
+      nativePhase: "retryable_failure", contextSnapshot: { issueId: f.issueId },
+      runnerProfileJson: { nativeExecutionInput: { schema: "paperclip.native-execution-input.v1",
+        binding: { companyId: f.companyId, issueId: f.issueId, runId: id, agentId: f.agentId } },
+        sessionCheckpoint: { providerSessionId: "synthetic-rejected-session", activeTurnId: "synthetic-turn" } },
+    }))).returning({ id: heartbeatRuns.id });
+    expect(inserted).toHaveLength(26);
+    await db.insert(nativeRunFinalizations).values(rejectedIds.map(id => ({ runId: id,
+      companyId: f.companyId, issueId: f.issueId, phase: "retryable_failure",
+      recoveryState: "resuming_session", resultId: null, nextAttemptAt: new Date(0) })));
+    const readRejected = async () => ({
+      runs: await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.id, rejectedIds)).orderBy(heartbeatRuns.id),
+      finalizations: await db.select().from(nativeRunFinalizations)
+        .where(inArray(nativeRunFinalizations.runId, rejectedIds)).orderBy(nativeRunFinalizations.runId),
+    });
+    const rejectedBefore = await readRejected();
+    expect(rejectedBefore.runs).toHaveLength(inserted.length);
+    expect(rejectedBefore.finalizations).toHaveLength(rejectedIds.length);
+    const claims = await claimNativeSessionResumptions({ db, runnerInstanceId: "synthetic-current-owner",
+      runIds: [...rejectedIds, f.runId], limit: 1, now: new Date() });
+    expect(claims).toHaveLength(1);
+    expect(claims[0]).toMatchObject({ runId: f.runId, leaseOwner: expect.stringContaining("synthetic-current-owner:resume:") });
+    const claimed = await snapshot();
+    expect(claimed.issue).toEqual(before.issue);
+    expect(claimed.run).toMatchObject({ id: f.runId, status: "running", finishedAt: null });
+    expect(claimed.finalization).toMatchObject({ phase: "observed", leaseOwner: claims[0]!.leaseOwner, resultId: null });
+    expect(claimed.finalization.leaseExpiresAt!.getTime()).toBeGreaterThan(Date.now());
+    expect(await readRejected()).toEqual(rejectedBefore);
+    // These deliberately unbound distractors are no longer needed for the
+    // separate first-claim-wins BOARD check below.
+    await db.delete(nativeRunFinalizations).where(inArray(nativeRunFinalizations.runId, rejectedIds));
+    await db.delete(heartbeatRuns).where(inArray(heartbeatRuns.id, rejectedIds));
+    const newAgentId = randomUUID();
+    await db.insert(agents).values({ id: newAgentId, companyId: f.companyId,
+      name: "Synthetic target after a resume claim", role: "engineer", status: "active",
+      adapterType: "paperclip_runner", adapterConfig: { provider: "codex" } });
+    await issueService(db).update(f.issueId, { assigneeAgentId: newAgentId });
+    await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(action).toMatchObject({ ownerType: "board", returnOwnerAgentId: newAgentId });
+    expect(action?.evidence.runId).toBe(f.runId);
+    const protectedBefore = { ...(await snapshot()), action };
+    const response = await request(createRecoveryApp()).post(`/api/issues/${f.issueId}/recovery-actions/resolve`).send({
+      actionId: action!.id, outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: { runId: f.runId, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "Synthetic lease precedence counterexample; this request must not override an already claimed native run." },
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.error).toContain("source or task owner changed");
+    expect({ ...(await snapshot()), action: (await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action!.id)))[0] }).toEqual(protectedBefore);
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    observations.push({ kind: "A7_bound_resume", nowaitErrors: transactionErrors, claimCount: claims.length,
+      sameRun: claims[0]!.runId === f.runId, issuedLease: claimed.finalization.leaseOwner,
+      earlierIneligibleCandidates: rejectedIds.length, rejectedCandidatesUnchanged: true, successLimit: 1,
+      claimedPhase: claimed.finalization.phase, boardHTTPStatus: response.status,
+      qualification: "Real I-lock NOWAIT backoff with a promise barrier, then a same-run lease; real reassignment/BOARD rejects the prior successful claim. No provider/session executed." });
+  });
+
+  it("A7 BOARD reconciles a resumable retryable orphan before one delivery and the old Run cannot be reclaimed", async () => {
+    const f = await seedBoardNativeHandoff("retryable");
+    const before = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]!;
+    const response = await f.resolve();
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const receipt = await f.readAction();
+    expect(receipt.evidence).toMatchObject({ continuationDelivery: "pending",
+      executionReconciliation: { runId: f.runId, providerStopped: true, actionOutcome: "not_performed" } });
+    const [recorded] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId));
+    expect(recorded).toMatchObject({ phase: "retryable_failure", recoveryState: "resuming_session",
+      resultId: null, leaseOwner: null, failureDetail: { replacementDenied: "operator_reconciled" } });
+    const claims = await claimNativeSessionResumptions({ db, runnerInstanceId: "synthetic-after-BOARD",
+      runIds: [f.runId], now: new Date() });
+    expect(claims).toHaveLength(0);
+    expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0])
+      .toEqual(recorded);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]).toEqual(before);
+    const delivery = await receiveSyntheticBoardDelivery(f);
+    observations.push({ kind: "A7_retryable_BOARD_handoff", boardHTTPStatus: response.status,
+      oldRunClaimsAfterReceipt: claims.length, ...delivery,
+      qualification: "Actual BOARD receipt and claim fence with both current-binding and marker protections; synthetic DB wake callback only, not a physical provider-stop or concurrent exactly-once proof." });
   });
 
   async function reassignNativeSource(input: { neverClaimed: boolean }) {

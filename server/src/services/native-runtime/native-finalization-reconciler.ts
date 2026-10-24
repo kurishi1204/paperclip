@@ -33,6 +33,7 @@ import {
 } from "./status-decision-committer.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueService } from "../issues.js";
+import { readNativeContinuationIssueAuthority } from "./native-continuation-hold.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { reportRunFailure } from "../run-failure-report.js";
 import { resumeNativeWorkspaceFinalization } from "./native-workspace-finalizer.js";
@@ -341,8 +342,13 @@ export async function claimNativeSessionResumptions(input: {
   limit?: number;
 }): Promise<NativeSessionResumeClaim[]> {
   const now = input.now ?? new Date();
+  const claimLimit = input.limit ?? 25;
+  if (!Number.isSafeInteger(claimLimit) || claimLimit < 0) {
+    throw new RangeError("Native session resume claim limit must be a non-negative safe integer.");
+  }
+  if (claimLimit === 0) return [];
   const candidates = await input.db
-    .select({ runId: heartbeatRuns.id })
+    .select({ runId: heartbeatRuns.id, companyId: heartbeatRuns.companyId, issueId: nativeRunFinalizations.issueId })
     .from(heartbeatRuns)
     .innerJoin(
       nativeRunFinalizations,
@@ -370,171 +376,197 @@ export async function claimNativeSessionResumptions(input: {
           : []),
       ),
     )
-    .limit(input.limit ?? 25);
+    // Inspect every durable candidate before classifying it. A bound/owner
+    // check after LIMIT lets rejected orphan rows occupy the same first page
+    // forever. These rows contain only identity/scope; bound the successful
+    // claims below rather than silently truncating the eligible population.
+    .orderBy(heartbeatRuns.id);
 
   const claims: NativeSessionResumeClaim[] = [];
   for (const candidate of candidates) {
+    if (claims.length >= claimLimit) break;
     const leaseOwner = `${input.runnerInstanceId}:resume:${randomUUID()}`;
     let terminalRunToEmit: typeof heartbeatRuns.$inferSelect | null = null;
-    const claimed = await input.db.transaction(async (tx) => {
-      const row = await tx.select({
-        run: heartbeatRuns,
-        coordinator: nativeRunFinalizations,
-      }).from(heartbeatRuns)
-        .innerJoin(nativeRunFinalizations, eq(nativeRunFinalizations.runId, heartbeatRuns.id))
-        .where(eq(heartbeatRuns.id, candidate.runId))
-        .for("update")
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      if (!row) return false;
-      if (
-        row.run.runtimeMode !== "native" ||
-        isNativeRunnerOwnershipHeld(row.run) ||
-        row.run.processPid !== null ||
-        row.run.processGroupId !== null ||
-        row.coordinator.resultId ||
-        row.coordinator.phase !== "retryable_failure" ||
-        (row.coordinator.nextAttemptAt &&
-          row.coordinator.nextAttemptAt > now) ||
-        (row.coordinator.leaseOwner &&
-          row.coordinator.leaseExpiresAt &&
-          row.coordinator.leaseExpiresAt > now) ||
-        !["running", "failed"].includes(row.run.status)
-      )
-        return false;
-
-      const profile = row.run.runnerProfileJson ?? {};
-      const persistedInput = profile.nativeExecutionInput;
-      const checkpoint = profile.sessionCheckpoint;
-      const failureDetail = record(row.coordinator.failureDetail);
-      const originalFailureCode =
-        typeof failureDetail.originalFailureCode === "string"
-          ? failureDetail.originalFailureCode
-          : row.run.errorCode ?? row.coordinator.failureCode
-            ?? "native_session_interrupted";
-      const providerEvent = await tx
-        .select({ id: heartbeatRunEvents.id })
-        .from(heartbeatRunEvents)
-        .where(
-          and(
-            eq(heartbeatRunEvents.runId, row.run.id),
-            inArray(heartbeatRunEvents.eventType, [
-              "harness.ready",
-              "session.started",
-              "session.resumed",
-              "session.updated",
-              "turn.started",
-              "provider.event",
-              "provider.rpc_result",
-            ]),
-          ),
+    let claimed = false;
+    try {
+      claimed = await input.db.transaction(async (tx) => {
+        // Explicit order; a joined FOR UPDATE does not guarantee I/F/R order.
+        // NOWAIT makes inverse legacy/finalizer locks a no-write backoff, never
+        // a new waiting edge. Catch 55P03 only after the transaction rolled back.
+        const issue = await tx.select().from(issues).where(and(
+          eq(issues.id, candidate.issueId), eq(issues.companyId, candidate.companyId),
+        )).for("update", { noWait: true }).limit(1).then(rows => rows[0] ?? null);
+        if (!issue) return false;
+        const coordinator = await tx.select().from(nativeRunFinalizations).where(and(
+          eq(nativeRunFinalizations.runId, candidate.runId),
+          eq(nativeRunFinalizations.companyId, candidate.companyId),
+          eq(nativeRunFinalizations.issueId, issue.id),
+        )).for("update", { noWait: true }).limit(1).then(rows => rows[0] ?? null);
+        if (!coordinator) return false;
+        const run = await tx.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, candidate.runId), eq(heartbeatRuns.companyId, candidate.companyId),
+        )).for("update", { noWait: true }).limit(1).then(rows => rows[0] ?? null);
+        if (!run) return false;
+        const row = { run, coordinator };
+        const continuationMarkers = record(coordinator.failureDetail);
+        const hasMarker = (value: unknown) => value !== undefined && value !== null && value !== "";
+        if (hasMarker(continuationMarkers.successorRunId) || hasMarker(continuationMarkers.replacementDenied)
+          || !(await readNativeContinuationIssueAuthority(tx as unknown as Db, { issue, run }))) return false;
+        if (
+          row.run.runtimeMode !== "native" ||
+          isNativeRunnerOwnershipHeld(row.run) ||
+          row.run.processPid !== null ||
+          row.run.processGroupId !== null ||
+          row.coordinator.resultId ||
+          row.coordinator.phase !== "retryable_failure" ||
+          (row.coordinator.nextAttemptAt &&
+            row.coordinator.nextAttemptAt > now) ||
+          (row.coordinator.leaseOwner &&
+            row.coordinator.leaseExpiresAt &&
+            row.coordinator.leaseExpiresAt > now) ||
+          !["running", "failed"].includes(row.run.status)
         )
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      const checkpointRecord = record(checkpoint);
-      const checkpointHasProviderIdentity =
-        (typeof checkpointRecord.providerSessionId === "string"
-          && checkpointRecord.providerSessionId.length > 0)
-        || Object.keys(record(checkpointRecord.providerIdentity)).length > 0;
-      const bootstrapRetry =
-        !!persistedInput
-        && !checkpoint
-        && !providerEvent
-        && failureDetail.recoveryMode === "bootstrap_retry"
-        && failureDetail.providerSessionEstablished === false;
-      if (
-        !persistedInput
-        || (!checkpoint && !bootstrapRetry)
-        || (!!checkpoint && !checkpointHasProviderIdentity)
-      ) {
-        const failureCode = originalFailureCode;
-        await tx.update(nativeRunFinalizations).set({
-          phase: "terminal_failure",
-          leaseOwner: null,
-          leaseExpiresAt: null,
-          failureCode,
-          failureDetail: {
-            ...failureDetail,
-            originalFailureCode,
-            recoveryMode: "ambiguous_state",
-            providerSessionEstablished:
-              checkpointHasProviderIdentity || providerEvent !== null,
-            recoveryOwner: { kind: "board" },
-            nextAction: "Inspect the original provider failure; durable state is missing or ambiguous and opening a replacement provider session is forbidden.",
-          },
+          return false;
+
+        const profile = row.run.runnerProfileJson ?? {};
+        const persistedInput = profile.nativeExecutionInput;
+        const checkpoint = profile.sessionCheckpoint;
+        const failureDetail = record(row.coordinator.failureDetail);
+        const originalFailureCode =
+          typeof failureDetail.originalFailureCode === "string"
+            ? failureDetail.originalFailureCode
+            : row.run.errorCode ?? row.coordinator.failureCode
+              ?? "native_session_interrupted";
+        const providerEvent = await tx
+          .select({ id: heartbeatRunEvents.id })
+          .from(heartbeatRunEvents)
+          .where(
+            and(
+              eq(heartbeatRunEvents.runId, row.run.id),
+              inArray(heartbeatRunEvents.eventType, [
+                "harness.ready",
+                "session.started",
+                "session.resumed",
+                "session.updated",
+                "turn.started",
+                "provider.event",
+                "provider.rpc_result",
+              ]),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        const checkpointRecord = record(checkpoint);
+        const checkpointHasProviderIdentity =
+          (typeof checkpointRecord.providerSessionId === "string"
+            && checkpointRecord.providerSessionId.length > 0)
+          || Object.keys(record(checkpointRecord.providerIdentity)).length > 0;
+        const bootstrapRetry =
+          !!persistedInput
+          && !checkpoint
+          && !providerEvent
+          && failureDetail.recoveryMode === "bootstrap_retry"
+          && failureDetail.providerSessionEstablished === false;
+        if (
+          !persistedInput
+          || (!checkpoint && !bootstrapRetry)
+          || (!!checkpoint && !checkpointHasProviderIdentity)
+        ) {
+          const failureCode = originalFailureCode;
+          await tx.update(nativeRunFinalizations).set({
+            phase: "terminal_failure",
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            failureCode,
+            failureDetail: {
+              ...failureDetail,
+              originalFailureCode,
+              recoveryMode: "ambiguous_state",
+              providerSessionEstablished:
+                checkpointHasProviderIdentity || providerEvent !== null,
+              recoveryOwner: { kind: "board" },
+              nextAction: "Inspect the original provider failure; durable state is missing or ambiguous and opening a replacement provider session is forbidden.",
+            },
+            nextAttemptAt: null,
+            updatedAt: now,
+          }).where(eq(nativeRunFinalizations.runId, row.run.id));
+          const [updatedRun] = await tx.update(heartbeatRuns).set({
+            status: "failed",
+            finishedAt: now,
+            nativePhase: "terminal_failure",
+            nativePhaseUpdatedAt: now,
+            errorCode: failureCode,
+            error: typeof failureDetail.message === "string"
+              ? failureDetail.message
+              : "Persisted native session state is ambiguous and cannot be resumed safely",
+            updatedAt: now,
+          }).where(eq(heartbeatRuns.id, row.run.id)).returning();
+          // Only a genuine transition into "failed" is a new terminal failure.
+          // A candidate that is already "failed" (the filter above admits
+          // both "running" and "failed") must not send a second Sentry event.
+          terminalRunToEmit =
+            updatedRun && updatedRun.status !== row.run.status ? updatedRun : null;
+          await issueService(tx as unknown as Db).update(
+            row.coordinator.issueId,
+            { status: "blocked" },
+            tx,
+          );
+          await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
+            companyId: row.run.companyId,
+            sourceIssueId: row.coordinator.issueId,
+            kind: "active_run_watchdog",
+            ownerType: "board",
+            ownerAgentId: null,
+            returnOwnerAgentId: row.run.agentId,
+            cause: failureCode,
+            fingerprint: createHash("sha256").update(`${row.run.id}:${failureCode}`).digest("hex"),
+            evidence: {
+              runId: row.run.id,
+              hasEnvelope: !!persistedInput,
+              hasCheckpoint: !!checkpoint,
+              providerEventsExist: providerEvent !== null,
+              originalFailureCode,
+            },
+            nextAction: "Inspect the original provider failure and explicitly resolve recovery; do not open a duplicate provider session.",
+            wakePolicy: null,
+            maxAttempts: 3,
+            supersedeOnIdentityChange: true,
+          });
+          return false;
+        }
+
+        const leaseExpiresAt = new Date(now.getTime() + 20 * 60_000);
+        const updated = await tx.update(nativeRunFinalizations).set({
+          phase: "observed",
+          leaseOwner,
+          leaseExpiresAt,
+          failureCode: null,
+          failureDetail: null,
           nextAttemptAt: null,
           updatedAt: now,
-        }).where(eq(nativeRunFinalizations.runId, row.run.id));
-        const [updatedRun] = await tx.update(heartbeatRuns).set({
-          status: "failed",
-          finishedAt: now,
-          nativePhase: "terminal_failure",
+        }).where(and(
+          eq(nativeRunFinalizations.runId, row.run.id),
+          eq(nativeRunFinalizations.phase, row.coordinator.phase),
+        )).returning({ runId: nativeRunFinalizations.runId }).then((rows) => rows[0] ?? null);
+        if (!updated) return false;
+        await tx.update(heartbeatRuns).set({
+          status: "running",
+          finishedAt: null,
+          error: null,
+          errorCode: null,
+          nativePhase: "observed",
           nativePhaseUpdatedAt: now,
-          errorCode: failureCode,
-          error: typeof failureDetail.message === "string"
-            ? failureDetail.message
-            : "Persisted native session state is ambiguous and cannot be resumed safely",
           updatedAt: now,
-        }).where(eq(heartbeatRuns.id, row.run.id)).returning();
-        // Only a genuine transition into "failed" is a new terminal failure.
-        // A candidate that is already "failed" (the filter above admits
-        // both "running" and "failed") must not send a second Sentry event.
-        terminalRunToEmit =
-          updatedRun && updatedRun.status !== row.run.status ? updatedRun : null;
-        await issueService(tx as unknown as Db).update(
-          row.coordinator.issueId,
-          { status: "blocked" },
-          tx,
-        );
-        await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
-          companyId: row.run.companyId,
-          sourceIssueId: row.coordinator.issueId,
-          kind: "active_run_watchdog",
-          ownerType: "board",
-          ownerAgentId: null,
-          returnOwnerAgentId: row.run.agentId,
-          cause: failureCode,
-          fingerprint: createHash("sha256").update(`${row.run.id}:${failureCode}`).digest("hex"),
-          evidence: {
-            runId: row.run.id,
-            hasEnvelope: !!persistedInput,
-            hasCheckpoint: !!checkpoint,
-            providerEventsExist: providerEvent !== null,
-            originalFailureCode,
-          },
-          nextAction: "Inspect the original provider failure and explicitly resolve recovery; do not open a duplicate provider session.",
-          wakePolicy: null,
-          maxAttempts: 3,
-          supersedeOnIdentityChange: true,
-        });
-        return false;
-      }
-
-      const leaseExpiresAt = new Date(now.getTime() + 20 * 60_000);
-      const updated = await tx.update(nativeRunFinalizations).set({
-        phase: "observed",
-        leaseOwner,
-        leaseExpiresAt,
-        failureCode: null,
-        failureDetail: null,
-        nextAttemptAt: null,
-        updatedAt: now,
-      }).where(and(
-        eq(nativeRunFinalizations.runId, row.run.id),
-        eq(nativeRunFinalizations.phase, row.coordinator.phase),
-      )).returning({ runId: nativeRunFinalizations.runId }).then((rows) => rows[0] ?? null);
-      if (!updated) return false;
-      await tx.update(heartbeatRuns).set({
-        status: "running",
-        finishedAt: null,
-        error: null,
-        errorCode: null,
-        nativePhase: "observed",
-        nativePhaseUpdatedAt: now,
-        updatedAt: now,
-      }).where(eq(heartbeatRuns.id, row.run.id));
-      return true;
-    });
+        }).where(eq(heartbeatRuns.id, row.run.id));
+        return true;
+      });
+    } catch (error) {
+      const detail = record(error);
+      if (detail.code !== "55P03" && record(detail.cause).code !== "55P03") throw error;
+      // A failed transaction must not publish even an earlier local terminal
+      // projection. The next natural claim may recheck the same fixed Run.
+      terminalRunToEmit = null;
+    }
     // Telemetry is best-effort background work; it must not delay claiming
     // the remaining candidates in this loop, so fire it and do not await it.
     if (terminalRunToEmit) {

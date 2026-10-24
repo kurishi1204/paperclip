@@ -33,6 +33,7 @@ import {
   type NativeSessionBackend,
   type PersistedNativeSession,
   type PrpEvent,
+  parseNativeExecutionInput,
 } from "@paperclipai/paperclip-runner";
 import {
   CONTROL_PLANE_CONFORMANCE_RESULT,
@@ -260,9 +261,25 @@ describe("P6-25 pre-result native session recovery", () => {
         leaseExpiresAt: new Date(0),
       })),
     ]);
+    await db.update(issues).set({ executionRunId: runId, checkoutRunId: null }).where(eq(issues.id, issueId));
   }, 30_000);
 
   afterAll(async () => temporary?.cleanup());
+
+  async function withResumeBinding<T>(targetRunId: string, work: () => Promise<T>): Promise<T> {
+    const [previous] = await db.select().from(issues).where(eq(issues.id, issueId));
+    if (!previous) throw new Error("resume_fixture_issue_missing");
+    await db.update(issues).set({ executionRunId: targetRunId, checkoutRunId: null })
+      .where(eq(issues.id, issueId));
+    try { return await work(); }
+    finally {
+      await db.update(issues).set({ executionRunId: previous.executionRunId, checkoutRunId: previous.checkoutRunId })
+        .where(eq(issues.id, issueId));
+      const [restored] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(restored).toMatchObject({ executionRunId: previous.executionRunId, checkoutRunId: previous.checkoutRunId,
+        assigneeAgentId: previous.assigneeAgentId, assigneeUserId: previous.assigneeUserId });
+    }
+  }
 
   it("filters durable ownership holds before the bounded resume candidate limit", async () => {
     const heldRunIds = Array.from(
@@ -313,6 +330,7 @@ describe("P6-25 pre-result native session recovery", () => {
       })),
     );
     try {
+      await withResumeBinding(eligibleRunId, async () => {
       expect(
         await claimNativeSessionResumptions({
           db,
@@ -336,6 +354,7 @@ describe("P6-25 pre-result native session recovery", () => {
           (row) => row.phase === "retryable_failure" && row.leaseOwner === null,
         ),
       ).toBe(true);
+      });
     } finally {
       await db
         .delete(nativeRunFinalizations)
@@ -381,6 +400,7 @@ describe("P6-25 pre-result native session recovery", () => {
   });
 
   it("uses provider-neutral checkpoint-free bootstrap retry only when durable evidence proves no session existed", async () => {
+    await withResumeBinding(bootstrapRetryRunId, async () => {
     await expect(claimNativeSessionResumptions({
       db,
       runnerInstanceId: "reaper",
@@ -388,6 +408,7 @@ describe("P6-25 pre-result native session recovery", () => {
     })).resolves.toEqual([
       { runId: bootstrapRetryRunId, leaseOwner: expect.stringContaining("reaper:resume:") },
     ]);
+    });
   });
 
   it("never claims an expired observed coordinator without explicit retryable failure", async () => {
@@ -509,6 +530,7 @@ describe("P6-25 pre-result native session recovery", () => {
   });
 
   it("does not resume cancelled or exhausted runs and fails closed without a checkpoint", async () => {
+    await withResumeBinding(missingCheckpointRunId, async () => {
     await expect(claimNativeSessionResumptions({
       db,
       runnerInstanceId: "reaper",
@@ -522,6 +544,7 @@ describe("P6-25 pre-result native session recovery", () => {
       .where(eq(issueRecoveryActions.sourceIssueId, issueId))).resolves.toEqual([
       expect.objectContaining({ cause: "native_session_interrupted", wakePolicy: null }),
     ]);
+    });
   });
 
   it("does not mistake the pre-first-attempt observed coordinator for an orphan", async () => {
@@ -561,6 +584,7 @@ describe("P6-25 pre-result native session recovery", () => {
       phase: "retryable_failure",
       attempt: 1,
     });
+    await withResumeBinding(freshRunId, async () => {
     const captureCallsBefore = mockCaptureRunFailure.mock.calls.length;
 
     await claimNativeSessionResumptions({ db, runnerInstanceId: "reaper", runIds: [freshRunId] });
@@ -570,6 +594,7 @@ describe("P6-25 pre-result native session recovery", () => {
     expect(mockCaptureRunFailure.mock.calls.slice(captureCallsBefore)).toHaveLength(1);
     const newCaptures = mockCaptureRunFailure.mock.calls.slice(captureCallsBefore);
     expect(newCaptures[0]?.[0]).toMatchObject({ runId: freshRunId, runStatus: "failed" });
+    });
   });
 
   it("sends no Sentry event when a sweep finds a run that is already failed", async () => {
@@ -597,12 +622,14 @@ describe("P6-25 pre-result native session recovery", () => {
       phase: "retryable_failure",
       attempt: 1,
     });
+    await withResumeBinding(freshRunId, async () => {
     const captureCallsBefore = mockCaptureRunFailure.mock.calls.length;
 
     await claimNativeSessionResumptions({ db, runnerInstanceId: "reaper", runIds: [freshRunId] });
     await waitForPendingRunFailureReports();
 
     expect(mockCaptureRunFailure.mock.calls.slice(captureCallsBefore)).toHaveLength(0);
+    });
   });
 });
 
@@ -660,6 +687,7 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
         identifier: "NRR-1",
         title: "Recover one native heartbeat",
         description: null,
+        prompt: "Recover one native heartbeat",
         workMode: "standard",
       },
       workspace: {
@@ -672,6 +700,7 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
         normalizedSessionId: sessionId,
         driverKind: "codex_app_server",
         protocolVersion: 1,
+        lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
       },
       provider: { kind: "codex", model: null },
       completionContract: {
@@ -683,6 +712,8 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
       interactionResponses: [],
       credentialBindings: [],
     };
+    // Validate the complete synthetic envelope at collection, before any DB/provider work.
+    parseNativeExecutionInput(execution);
     const checkpoint: PersistedNativeSession = {
       backendKind: "mock",
       sessionId: "driver-existing-session",
@@ -997,10 +1028,12 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
       ): NativeSessionBackend => {
         const freshRunId = executionInput.binding.runId;
         const freshTurnId = `new-direction:${freshRunId}`;
+        const freshSessionId = executionInput.session.normalizedSessionId;
+        if (!freshSessionId) throw new Error("synthetic_fresh_session_identity_required");
         const freshIdentity = {
           ...checkpoint.identity,
           runId: freshRunId,
-          sessionId: executionInput.session.normalizedSessionId,
+          sessionId: freshSessionId,
         };
         let releaseStart!: () => void;
         const started = new Promise<void>((resolve) => {
