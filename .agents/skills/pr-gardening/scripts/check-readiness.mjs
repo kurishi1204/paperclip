@@ -468,16 +468,103 @@ function getPages(get, route, field = null) {
   throw new Error("pagination_incomplete");
 }
 
-export function buildReviewSource(get, repository, pr, files, treeSha, baseSha, mergeBaseSha, dependencyPaths = [], sourceSchema = SOURCE_SCHEMA) {
+function verifiedTreeIndex(get, prefix, treeSha) {
+  const response = get(`${prefix}/git/trees/${treeSha}?recursive=1`);
+  ensure(response.sha === treeSha && response.truncated === false && Array.isArray(response.tree), "source_tree_incomplete");
+  const index = new Map(), children = new Map([["", []]]);
+  const modes = { blob: new Set(["100644", "100755", "120000"]), tree: new Set(["040000"]), commit: new Set(["160000"]) };
+  for (const row of response.tree) {
+    ensure(row && typeof row.path === "string" && row.path.length > 0 && !row.path.includes("\0") && Buffer.from(row.path).toString("utf8") === row.path && row.path.split("/").every(p => p && p !== "." && p !== "..") && Object.hasOwn(modes, row.type) && modes[row.type].has(row.mode) && hex(row.sha, 40), "source_tree_shape");
+    ensure(!index.has(row.path), "source_tree_duplicate_path");
+    index.set(row.path, row);
+    if (row.type === "tree") children.set(row.path, []);
+  }
+  for (const row of index.values()) {
+    const parent = row.path.includes("/") ? row.path.slice(0, row.path.lastIndexOf("/")) : "";
+    ensure(children.has(parent), "source_tree_hash_mismatch");
+    children.get(parent).push(row);
+  }
+  // Reconstruct each Git object, rather than trusting an asserted root SHA on
+  // an incomplete/corrupted array. This authenticates the equality exclusions.
+  for (const [directory, rows] of children) {
+    const name = row => row.path.slice(row.path.lastIndexOf("/") + 1);
+    rows.sort((a, b) => Buffer.compare(Buffer.from(name(a) + (a.type === "tree" ? "/" : "")), Buffer.from(name(b) + (b.type === "tree" ? "/" : ""))));
+    const body = Buffer.concat(rows.flatMap(row => [Buffer.from(`${row.mode === "040000" ? "40000" : row.mode} ${name(row)}\0`), Buffer.from(row.sha, "hex")]));
+    const actual = createHash("sha1").update(Buffer.concat([Buffer.from(`tree ${body.length}\0`), body])).digest("hex");
+    ensure(actual === (directory ? index.get(directory).sha : treeSha), "source_tree_hash_mismatch");
+  }
+  return index;
+}
+
+function relateReviewRows(files, base, head) {
+  ensure(Array.isArray(files) && files.every(f => f && typeof f.filename === "string" && f.filename.length > 0 && hex(f.sha, 40)), "source_files_shape");
+  ensure(new Set(files.map(f => f.filename)).size === files.length, "source_files_duplicate");
+  const equal = (a, b) => Boolean(a && b && a.mode === b.mode && a.type === b.type && a.sha === b.sha);
+  const delta = new Set();
+  for (const p of new Set([...base.keys(), ...head.keys()])) {
+    const b = base.get(p), a = head.get(p);
+    if ((b?.type === "tree") !== (a?.type === "tree") && b && a) throw new Error("source_type_change_unsupported");
+    if (b?.type !== "tree" && a?.type !== "tree" && !equal(b, a)) delta.add(p);
+  }
+  const covered = new Map(), real = [], rows = [];
+  const leaf = e => e ? { path: e.path, mode: e.mode, type: e.type, sha: e.sha } : null;
+  for (const f of files) {
+    ensure(["added", "modified", "removed", "renamed", "copied"].includes(f.status), "source_status_unsupported");
+    ensure(f.previous_filename === undefined || (["renamed", "copied"].includes(f.status) && typeof f.previous_filename === "string" && f.previous_filename.length > 0 && f.previous_filename !== f.filename), "source_pr_row_unexplained");
+    const oldPath = f.previous_filename ?? f.filename;
+    const before = base.get(oldPath), after = head.get(f.filename);
+    const same = equal(base.get(f.filename), after);
+    const stale = same && after.type === "blob" && ["100644", "100755"].includes(after.mode) && after.sha === f.sha &&
+      (["added", "modified", "copied"].includes(f.status) || (f.status === "renamed" && !base.has(oldPath) && !head.has(oldPath)));
+    if (stale) {
+      rows.push({ path: f.filename, status: f.status, rowSha: f.sha, classification: "already-adopted", before: leaf(base.get(f.filename)), after: leaf(after), proof: "identical-mode-type-blob-in-verified-trees" });
+      continue;
+    }
+    // An absent/absent removed row has no current leaf binding its row SHA.
+    // Keep it HOLD instead of inventing a historical deletion proof.
+    ensure(!(f.status === "removed" && !before && !after), "source_pr_row_unexplained");
+    ensure((f.status === "removed" ? before?.sha : after?.sha) === f.sha, "source_files_mismatch");
+    ensure(f.status === "added" ? !before : Boolean(before), "source_before_missing");
+    ensure(f.status === "removed" ? !after : Boolean(after), "source_after_missing");
+    if (["renamed", "copied"].includes(f.status)) {
+      ensure(f.previous_filename && !base.has(f.filename) && (f.status !== "renamed" || !head.has(oldPath)), "source_pr_row_unexplained");
+    }
+    for (const e of [before, after].filter(Boolean)) ensure(e.type === "blob" && ["100644", "100755"].includes(e.mode), "source_file_unsupported");
+    ensure(!before || !after || before.mode === after.mode, "source_mode_unrepresented");
+    const paths = f.status === "renamed" ? [oldPath, f.filename] : [f.filename];
+    for (const p of paths) {
+      ensure(delta.has(p), "source_pr_row_unexplained");
+      covered.set(p, (covered.get(p) ?? 0) + 1);
+      ensure(covered.get(p) === 1, "source_tree_change_coverage");
+    }
+    real.push(f);
+    rows.push({ path: f.filename, status: f.status, rowSha: f.sha, classification: "current-change", before: leaf(before), after: leaf(after) });
+  }
+  ensure([...delta].every(p => covered.get(p) === 1), "source_tree_change_unlisted");
+  return { files: real, summary: { totalRows: files.length, realRows: real.length, alreadyAdoptedRows: rows.length - real.length, unexplainedRows: 0, differentLeaves: delta.size, uncoveredLeaves: 0, rows } };
+}
+
+function pinnedComparison(get, prefix, baseSha, headSha) {
+  ensure(hex(baseSha, 40) && hex(headSha, 40), "base_comparison_unknown");
+  const comparison = get(`${prefix}/compare/${baseSha}...${headSha}`);
+  ensure(Number.isInteger(comparison.behind_by) && comparison.behind_by >= 0 && hex(comparison.merge_base_commit?.sha, 40) && (comparison.behind_by !== 0 || comparison.merge_base_commit.sha === baseSha), "base_comparison_unknown");
+  return comparison;
+}
+function reviewRowsSnapshot(files) {
+  ensure(Array.isArray(files) && files.every(f => f && typeof f.filename === "string" && typeof f.status === "string" && hex(f.sha, 40)), "source_files_shape");
+  ensure(new Set(files.map(f => f.filename)).size === files.length, "source_files_duplicate");
+  return canonical(files.map(f => ({ path: f.filename, status: f.status, sha: f.sha, previous: f.previous_filename ?? null })).sort((a,b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+
+export function buildReviewSource(get, repository, pr, files, treeSha, baseSha, mergeBaseSha, dependencyPaths = [], sourceSchema = SOURCE_SCHEMA, relationOutput) {
   ensure([SOURCE_SCHEMA, REVIEW_SOURCE_V2].includes(sourceSchema), "source_schema_unsupported");
   ensure([pr.head.sha, treeSha, baseSha, mergeBaseSha].every(v=>hex(v,40)), "source_identity");
   const prefix = `repos/${repository}`;
-  const headTree = get(`${prefix}/git/trees/${treeSha}?recursive=1`);
+  const head = verifiedTreeIndex(get, prefix, treeSha);
   const baseCommit = get(`${prefix}/git/commits/${mergeBaseSha}`);
-  const baseTree = get(`${prefix}/git/trees/${baseCommit.tree.sha}?recursive=1`);
-  ensure(headTree.sha === treeSha && baseTree.sha === baseCommit.tree.sha && !headTree.truncated && !baseTree.truncated && Array.isArray(headTree.tree) && Array.isArray(baseTree.tree), "source_tree_incomplete");
-  const head = new Map(headTree.tree.map(r=>[r.path,r]));
-  const base = new Map(baseTree.tree.map(r=>[r.path,r]));
+  ensure(baseCommit.sha === mergeBaseSha && hex(baseCommit.tree?.sha, 40), "source_tree_incomplete");
+  const base = verifiedTreeIndex(get, prefix, baseCommit.tree.sha);
+  const relation = relateReviewRows(files, base, head);
   const blob = (entry) => {
     ensure(entry?.type === "blob" && ["100644","100755"].includes(entry.mode), "source_file_unsupported");
     const data = get(`${prefix}/git/blobs/${entry.sha}`);
@@ -488,9 +575,7 @@ export function buildReviewSource(get, repository, pr, files, treeSha, baseSha, 
     ensure(!text.includes("\0"),"source_binary_unsupported");
     return { path:entry.path,blobSha:entry.sha,content:text };
   };
-  ensure(new Set(files.map(f=>f.filename)).size === files.length, "source_files_duplicate");
-  const changedFiles = files.map((f) => {
-    ensure(["added","modified","removed","renamed","copied"].includes(f.status), "source_status_unsupported");
+  const changedFiles = relation.files.map((f) => {
     const beforeEntry = base.get(f.previous_filename ?? f.filename);
     const afterEntry = head.get(f.filename);
     ensure((f.status === "removed" ? beforeEntry?.sha : afterEntry?.sha) === f.sha, "source_files_mismatch");
@@ -500,6 +585,7 @@ export function buildReviewSource(get, repository, pr, files, treeSha, baseSha, 
   }).sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0);
   ensure(Array.isArray(dependencyPaths) && dependencyPaths.every(p=>typeof p==="string") && new Set(dependencyPaths).size===dependencyPaths.length, "source_dependencies");
   const dependencyFiles = [...dependencyPaths].sort().map(p=>blob(head.get(p)));
+  if (relationOutput !== undefined) { ensure(relationOutput && typeof relationOutput === "object" && !Array.isArray(relationOutput), "source_relation_output"); Object.assign(relationOutput, relation.summary); }
   return { schema:SOURCE_SCHEMA,repository,headSha:pr.head.sha,treeSha,baseSha,mergeBaseSha,changedFiles,dependencyFiles };
 }
 
@@ -654,14 +740,15 @@ async function checkForkReadiness(document, options, dependencies) {
       const files = getPages(get, `repos/${repository}/pulls/${candidate.number}/files`);
       ensure(files.length === pr.changed_files, "changed_files_incomplete");
       const commit = get(`repos/${repository}/git/commits/${head}`);
-      const comparison = get(`repos/${repository}/compare/${encodeURIComponent(pr.base.ref)}...${head}`);
-      ensure(Number.isInteger(comparison.behind_by) && hex(comparison.merge_base_commit?.sha,40), "base_comparison_unknown");
+      ensure(commit.sha === head && hex(commit.tree?.sha, 40), "source_identity");
+      const comparison = pinnedComparison(get, `repos/${repository}`, branch.commit.sha, head);
       const pointers = pointerFile?.schema === "paperclip.review-pointer/v1" && pointerFile.repository === repository ? pointerFile.entries?.filter(e=>e.pullRequest===candidate.number&&e.headSha===head) ?? [] : [];
       ensure(pointers.length <= 1, "duplicate_review_pointer");
       const pointer = pointers[0];
       let source;
+      const sourceRelation = {};
       const sourceFactory = (schema) => {
-        source = buildReviewSource(get, repository, pr, files, commit.tree.sha, branch.commit.sha, comparison.merge_base_commit.sha, pointer?.dependencies ?? [], schema);
+        source = buildReviewSource(get, repository, pr, files, commit.tree.sha, branch.commit.sha, comparison.merge_base_commit.sha, pointer?.dependencies ?? [], schema, sourceRelation);
         return source;
       };
       const review = admitTrustedJournal({ trustedRoot: options.trusted_review_root, registrySHA256: options.trusted_review_registry_sha256, repository, pullRequest: candidate.number, headSha: head, sourceFactory, pointer, checkoutRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..") });
@@ -687,12 +774,18 @@ async function checkForkReadiness(document, options, dependencies) {
       });
       const final = get(`repos/${repository}/pulls/${candidate.number}`);
       const finalBranch = get(`repos/${repository}/branches/${encodeURIComponent(pr.base.ref)}`);
+      const sourceIdentityChanged = final.head.sha!==head || final.base.sha!==pr.base.sha || final.base.ref!==pr.base.ref || finalBranch.commit.sha!==branch.commit.sha;
+      const finalFiles = getPages(get, `repos/${repository}/pulls/${candidate.number}/files`);
+      ensure(finalFiles.length === final.changed_files, "changed_files_incomplete");
+      // A changed identity is already blocked; do not start observing a second
+      // source version as if it belonged to this completed evidence snapshot.
+      const finalComparison = sourceIdentityChanged ? comparison : pinnedComparison(get, `repos/${repository}`, finalBranch.commit.sha, final.head.sha);
       const finalMetadata = view(candidate.number);
       const changedEvidence = snapshot(runs,comments,inline,reviews,annotations,rollup) !== snapshot(finalRuns,finalComments,finalInline,finalReviews,finalAnnotations,rollupSnapshot(finalMetadata.statusCheckRollup));
-      const changedHead = final.head.sha!==head || final.base.sha!==pr.base.sha || finalBranch.commit.sha!==branch.commit.sha || final.comments!==pr.comments || final.review_comments!==pr.review_comments || final.state!==pr.state || final.draft!==pr.draft || finalMetadata.headRefOid!==head || finalMetadata.reviewDecision!==metadata.reviewDecision;
+      const changedHead = sourceIdentityChanged || final.comments!==pr.comments || final.review_comments!==pr.review_comments || final.state!==pr.state || final.draft!==pr.draft || finalMetadata.headRefOid!==head || finalMetadata.reviewDecision!==metadata.reviewDecision || reviewRowsSnapshot(finalFiles)!==reviewRowsSnapshot(files) || finalComparison.merge_base_commit.sha!==comparison.merge_base_commit.sha || finalComparison.behind_by!==comparison.behind_by;
       const reviewPolicies = [protection?.required_pull_request_reviews, ...rules.filter(r=>r.type==="pull_request").map(r=>r.parameters)].filter(Boolean);
       const requiredReview = reviewPolicies.some(p=>p.required_approving_review_count>0 || p.require_code_owner_reviews===true || p.require_code_owner_review===true || p.require_last_push_approval===true);
-      entry = { number: candidate.number, url: pr.html_url, title: pr.title, author: pr.user?.login, purpose: summarizePullRequestBody(pr.body), state: pr.state, isDraft: pr.draft, headSha: head, baseRefName: pr.base.ref, behindBy: comparison.behind_by, originatingIssue: candidate.originatingIssue, policy: "fork-v1", checks, normalCI:{runID:normalRun.id,jobs:jobs.length,conclusion:normalRun.conclusion}, independentReview: { ...review, report: undefined }, findings, greptile: { state: checks.advisory.length ? checks.advisory.map(r=>`${r.status}:${r.conclusion??"unreceived"}`).join(", ") : "unavailable/unreceived", score: null }, source, ...readinessVerdict({policy:"fork-v1",pullRequest:{...pr,reviewDecision:metadata.reviewDecision},checks,review,findings,behindBy:comparison.behind_by,changedHead,changedEvidence,requiredReview}) };
+      entry = { number: candidate.number, url: pr.html_url, title: pr.title, author: pr.user?.login, purpose: summarizePullRequestBody(pr.body), state: pr.state, isDraft: pr.draft, headSha: head, baseRefName: pr.base.ref, behindBy: comparison.behind_by, originatingIssue: candidate.originatingIssue, policy: "fork-v1", checks, normalCI:{runID:normalRun.id,jobs:jobs.length,conclusion:normalRun.conclusion}, independentReview: { ...review, report: undefined }, findings, greptile: { state: checks.advisory.length ? checks.advisory.map(r=>`${r.status}:${r.conclusion??"unreceived"}`).join(", ") : "unavailable/unreceived", score: null }, source, sourceRelation, ...readinessVerdict({policy:"fork-v1",pullRequest:{...pr,reviewDecision:metadata.reviewDecision},checks,review,findings,behindBy:comparison.behind_by,changedHead,changedEvidence,requiredReview}) };
     } catch (error) {
       entry = { number: candidate.number, url: pr?.html_url, title: pr?.title ?? candidate.title ?? "Unreceived", state: pr?.state ?? "unknown", isDraft: pr?.draft ?? false, policy: "fork-v1", headSha: pr?.head?.sha ?? null, verdict: pr?.draft ? "report_only" : "needs_gardening", reasons:[{...reason("readiness_unknown", "Required GitHub or trusted-review evidence could not be verified"),subcode:/^[a-z][a-z0-9_]+$/.test(error.message)?error.message:"read_dependency_unavailable",operatorAction:true}] };
     }
@@ -715,16 +808,21 @@ async function main() {
     const get = (route) => ghJson(["api","--method","GET",route]);
     const pr = get(`repos/${repo}/pulls/${number}`);
     const branch = get(`repos/${repo}/branches/${encodeURIComponent(pr.base.ref)}`);
-    const comparison = get(`repos/${repo}/compare/${encodeURIComponent(pr.base.ref)}...${pr.head.sha}`);
+    const comparison = pinnedComparison(get, `repos/${repo}`, branch.commit.sha, pr.head.sha);
     const files = getPages(get,`repos/${repo}/pulls/${number}/files`);
     ensure(files.length === pr.changed_files,"changed_files_incomplete");
     const commit = get(`repos/${repo}/git/commits/${pr.head.sha}`);
+    ensure(commit.sha === pr.head.sha && hex(commit.tree?.sha, 40), "source_identity");
     const schema = options.source_schema ?? "v1";
     ensure(["v1", "v2"].includes(schema), "source_schema_unsupported");
     const source = buildReviewSource(get,repo,pr,files,commit.tree.sha,branch.commit.sha,comparison.merge_base_commit.sha,options.review_dependencies ? options.review_dependencies.split(",").map(p=>p.trim()) : [], schema === "v2" ? REVIEW_SOURCE_V2 : SOURCE_SCHEMA);
     const final = get(`repos/${repo}/pulls/${number}`);
     const finalBranch = get(`repos/${repo}/branches/${encodeURIComponent(pr.base.ref)}`);
-    ensure(final.head.sha===pr.head.sha && finalBranch.commit.sha===branch.commit.sha,"head_changed");
+    ensure(final.head.sha===pr.head.sha && final.base.sha===pr.base.sha && final.base.ref===pr.base.ref && finalBranch.commit.sha===branch.commit.sha,"head_changed");
+    const finalFiles = getPages(get, `repos/${repo}/pulls/${number}/files`);
+    ensure(finalFiles.length === final.changed_files, "changed_files_incomplete");
+    const finalComparison = pinnedComparison(get, `repos/${repo}`, finalBranch.commit.sha, final.head.sha);
+    ensure(final.head.sha===pr.head.sha && final.base.sha===pr.base.sha && final.base.ref===pr.base.ref && finalBranch.commit.sha===branch.commit.sha && reviewRowsSnapshot(finalFiles)===reviewRowsSnapshot(files) && finalComparison.merge_base_commit.sha===comparison.merge_base_commit.sha && finalComparison.behind_by===comparison.behind_by,"head_changed");
     // The default remains v1; v2 requires an explicit operator schema selection.
     const body = schema === "v2" ? reviewSourceV2Block(source) : sourceBlock(source);
     if (options.output === "-") process.stdout.write(body+"\n");
