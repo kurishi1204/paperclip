@@ -200,6 +200,25 @@ export function canonical(value) {
 const sourceBlock = (value) => `${SOURCE_BEGIN}${canonical(value)}${SOURCE_END}`;
 function ensure(condition, code) { if (!condition) throw new Error(code); }
 function inside(root, target) { return target === root || target.startsWith(`${root}${path.sep}`); }
+function outsideCheckoutOutput(checkout, output, code) {
+  if (output === "-") return;
+  // Resolve the actual existing target/ancestor, including symlinks. Missing
+  // suffixes do not change which checkout owns the destination path.
+  let ancestor = path.resolve(output);
+  const suffix = [];
+  for (;;) {
+    try { fs.lstatSync(ancestor); break; }
+    catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      suffix.unshift(path.basename(ancestor));
+      const parent = path.dirname(ancestor);
+      ensure(parent !== ancestor, code);
+      ancestor = parent;
+    }
+  }
+  const destination = path.resolve(fs.realpathSync(ancestor), ...suffix);
+  ensure(!inside(fs.realpathSync(checkout), destination), code);
+}
 function secureRead(file, root) {
   const resolved = fs.realpathSync(file);
   ensure(inside(root, resolved) && resolved === path.resolve(file), "journal_path");
@@ -262,7 +281,9 @@ export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, p
       "--disable-slash-commands", "--no-chrome", "--permission-mode", "dontAsk", "--permission-prompts", "none",
       "--no-session-persistence", "--system-prompt", system.toString("utf8")];
     ensure(canonical(start.argv) === canonical(expectedArgv), "unsupported_launch_shape");
-    ensure(!entry.implementationSessionID || entry.implementationSessionID !== start.sessionID, "review_not_independent");
+    ensure(typeof entry.implementationSessionID === "string" && entry.implementationSessionID.trim() && entry.implementationSessionID === entry.implementationSessionID.trim(), "implementation_session_unreceived");
+    ensure(typeof start.sessionID === "string" && start.sessionID.trim() && start.sessionID === start.sessionID.trim(), "journal_execution");
+    ensure(entry.implementationSessionID.toLowerCase() !== start.sessionID.toLowerCase(), "review_not_independent");
     ensure(terminal.nativeExit === 0 && terminal.inputSHA256 === digest(combined) && terminal.rawSHA256 === digest(rawBytes), "native_terminal");
     ensure(raw.type === "result" && raw.subtype === "success" && raw.is_error === false && raw.terminal_reason === "completed" && raw.num_turns === 1 && raw.queued_turn_count === 0, "provider_terminal");
     ensure(raw.session_id === start.sessionID && terminal.sessionID === raw.session_id, "provider_session");
@@ -271,7 +292,7 @@ export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, p
     ensure(typeof raw.result === "string" && Buffer.from(raw.result).equals(report), "actual_report");
     const lines = raw.result.replace(/\n+$/, "").split("\n");
     ensure(lines.at(-1) === "判定: GO" && lines.filter((line) => line.startsWith("判定: ")).length === 1, "review_not_go");
-    return { status: "valid", model: "claude-opus-5-5", provider: "firstParty", sessionID: raw.session_id, headSha, treeSha: source.treeSha, inputSHA256: digest(combined), reportSHA256: digest(report), report: raw.result, verdict: "判定: GO", trustBoundary: "operator-admitted executor and journal, not signed provider attestation" };
+    return { status: "valid", model: "claude-opus-5-5", provider: "firstParty", implementationSessionID: entry.implementationSessionID, sessionID: raw.session_id, headSha, treeSha: source.treeSha, inputSHA256: digest(combined), reportSHA256: digest(report), report: raw.result, verdict: "判定: GO", trustBoundary: "operator-admitted executor and journal, not signed provider attestation" };
   } catch (error) {
     return { status: "invalid", code: "independent_review_invalid", subcode: /^[a-z][a-z0-9_]+$/.test(error.message) ? error.message : "journal_read_unavailable" };
   }
@@ -391,11 +412,25 @@ async function checkForkReadiness(document, options, dependencies) {
   const repository = FORK_REPOSITORY;
   const get = dependencies.getJson ?? ((route) => ghJson(["api", "--method", "GET", route]));
   const view = dependencies.viewPullRequest ?? ((number) => ghJson(["pr","view",String(number),"--repo",repository,"--json","headRefOid,reviewDecision,statusCheckRollup"]));
-  const pointerFile = options.review_evidence ? readJson(options.review_evidence) : null;
+  let pointerFile = null;
+  let pointerFailure = null;
+  if (options.review_evidence !== undefined) {
+    if (typeof options.review_evidence !== "string" || !options.review_evidence.trim()) {
+      pointerFailure = "review_evidence_path_invalid";
+    } else {
+      try {
+        pointerFile = readJson(options.review_evidence);
+        ensure(pointerFile?.schema === "paperclip.review-pointer/v1" && pointerFile.repository === repository && Array.isArray(pointerFile.entries) && pointerFile.entries.every(entry => entry && typeof entry === "object"), "review_evidence_shape_invalid");
+      } catch (error) {
+        pointerFailure = error instanceof SyntaxError ? "review_evidence_invalid_json" : error.message === "review_evidence_shape_invalid" ? error.message : "review_evidence_unreadable";
+      }
+    }
+  }
   const entries = [];
   for (const candidate of document.candidates) {
     let pr; let entry;
     try {
+      ensure(!pointerFailure, pointerFailure);
       pr = get(`repos/${repository}/pulls/${candidate.number}`);
       const head = pr.head.sha;
       const metadata = view(candidate.number);
@@ -463,7 +498,7 @@ async function main() {
   if (options.emit_review_input) {
     ensure(typeof options.output === "string" && options.output.trim(), "review_output_required");
     const checkout = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
-    ensure(options.output === "-" || !inside(checkout, path.resolve(options.output)), "review_output_inside_checkout");
+    outsideCheckoutOutput(checkout, options.output, "review_output_inside_checkout");
     const repo = normalizeRepository(options.repo).toLowerCase();
     ensure(repo === FORK_REPOSITORY, "fork_source_only");
     const number = Number(options.emit_review_input);
@@ -484,7 +519,14 @@ async function main() {
     else fs.writeFileSync(options.output,body+"\n");
     return;
   }
-  writeJson(options.output ?? "readiness.json", await checkReadiness(readJson(options.input), options));
+  const document = readJson(options.input);
+  const output = options.output ?? "readiness.json";
+  if (normalizeRepository(options.repo ?? document.repository).toLowerCase() === FORK_REPOSITORY) {
+    const checkout = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
+    ensure(typeof output === "string" && output.trim(), "readiness_output_required");
+    outsideCheckoutOutput(checkout, output, "readiness_output_inside_checkout");
+  }
+  writeJson(output, await checkReadiness(document, options));
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

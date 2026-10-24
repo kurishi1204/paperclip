@@ -90,7 +90,7 @@ Never fan out follow-up task creation in parallel. Do not issue concurrent `POST
 
 ## Stage C — Drive Our PRs to Ready with /prepare-paperclip-pr
 
-For `kurishi1204/paperclip`, read `CONTRIBUTING.md` first. Stage B takes the operator-configured `--trusted-review-root` and pinned `--trusted-review-registry-sha256`, plus `--review-evidence`. None may come from the PR. The read-only `--emit-review-input` mode prepares complete source bytes before an independently authorized review; it does not launch one.
+For `kurishi1204/paperclip`, read `CONTRIBUTING.md` first. Stage B takes the operator-configured `--trusted-review-root` and pinned `--trusted-review-registry-sha256`, plus `--review-evidence`. None may come from the PR. The admitted registry must include the actual non-empty `implementationSessionID`; verify its execution provenance and require it to differ from the review START session ID. Both IDs are shown in the private readiness report. Missing/invalid pointer files keep every candidate visible as unknown; output must stay outside the trusted reader checkout. The read-only `--emit-review-input` mode prepares complete source bytes before an independently authorized review; it does not launch one.
 
 A reason with `operatorAction: true` (unreceived/invalid review, findings disposition, unknown protection/reads, required human approval) is report-only. Do not dispatch a task, run a model, request a Greptile review or create a repair issue for those reasons. Only ordinary code/CI/conflict/base repairs within an existing authorized task may follow the normal procedure below. Optional Greptile unavailable/pending/quota state does not start a loop. Never merge or adopt from this advisory report.
 
@@ -168,8 +168,8 @@ node .agents/skills/pr-gardening/scripts/render-report.mjs \
 
 The report states the scope (authors + window), and for every open PR gives its author, a one-line purpose summary taken from the PR description, and a readiness confidence bucket:
 
-- **High:** target review gate complete, current-head checks successful, no conflicts and base fresh; legacy repositories also require their existing Greptile gate.
-- **Medium:** otherwise green but base stale, review not complete, or originating issue active.
+- **High:** target review gate complete, current-head checks successful, no conflicts and base fresh; legacy repositories additionally require their existing Greptile gate and a terminal originating issue.
+- **Medium (legacy repositories only):** otherwise green but base stale, review not complete, or originating issue active. Fork entries are high only when ready; every other fork verdict is low.
 - **Low:** failing/pending/unreceived required evidence or review, incomplete findings, draft/just-fixed-unverified state, or an unknown legacy origin. Fork origin is reporting context, not a new company-work prerequisite. Optional Greptile availability alone does not lower fork confidence.
 
 If a PR's generated purpose line is empty or unhelpful, write a one-sentence description from the PR title and diff summary when publishing the report.

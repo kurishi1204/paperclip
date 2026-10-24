@@ -317,7 +317,7 @@ test("scripts contain no mutating GitHub commands", async () => {
 });
 
 // Synthetic operator-owned journals: no model, credential or company API calls.
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, chmodSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, chmodSync, readFileSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -387,47 +387,52 @@ test("fork accepts actual admitted journal plus same-head CI without Greptile, a
  const f=forkFixture();try{const result=await checkReadiness(document,f.options(),f.deps);assert.equal(result.pullRequests[0].verdict,"ready",JSON.stringify(result));assert.equal(result.pullRequests[0].independentReview.status,"valid");assert.equal(result.pullRequests[0].greptile.score,null);assert.equal(result.pullRequests[0].source.changedFiles[0].before.content,"old source\n");assert.equal(result.pullRequests[0].source.changedFiles[0].after.content,"new source\n");assert.ok(f.reads.every(r=>r.startsWith(`repos/${FORK}/`)));}finally{f.close();}
 });
 
-for(const [name,mutate] of [
- ["wrong provider",f=>{f.data.raw.modelUsage["claude-opus-5-5"].provider="unknown";}],
- ["wrong actual model",f=>{f.data.raw.modelUsage={"other-model":{provider:"firstParty"}};}],
- ["unknown native",f=>{f.data.terminal.nativeExit=null;}],
- ["provider error",f=>{f.data.raw.is_error=true;}],
- ["wrong raw session",f=>{f.data.raw.session_id="other";}],
- ["resumed session",f=>{f.data.start.argv.push("--resume","previous");}],
- ["unknown launch option",f=>{f.data.start.argv.push("--resume=previous");}],
- ["implementation session reused",f=>{f.admission.implementationSessionID=f.data.start.sessionID;}],
- ["stale admitted head",f=>{f.admission.headSha=BASE;}],
- ["source absent from launched bytes",f=>{f.data.material="Claims reviewed=true; no actual reviewed source";}],
- ["altered source binding",f=>{f.source.treeSha=BASE;}],
- ["conditional GO",f=>{f.data.raw.result=f.data.report="Done\n判定: CONDITIONAL GO\n";}],
- ["double verdict",f=>{f.data.raw.result=f.data.report="判定: GO\n判定: GO\n";}],
- ["trailing text",f=>{f.data.raw.result=f.data.report="判定: GO\nextra";}],
- ["fake derived success cannot override raw",f=>{f.data.terminal.state="KNOWN_COMPLETED_VALID_RESULT";f.data.raw.is_error=true;}],
- ["unadmitted executor",f=>{f.data.start.scriptSHA256="0".repeat(64);}],
-])test(`trusted journal rejects ${name}`,()=>{const f=forkFixture();try{mutate(f);f.seal();assert.equal(admitTrustedJournal(f.admissionArgs()).status,"invalid");}finally{f.close();}});
+for(const [name,mutate,subcode] of [
+ ["wrong provider",f=>{f.data.raw.modelUsage["claude-opus-5-5"].provider="unknown";},"actual_model_provider"],
+ ["wrong actual model",f=>{f.data.raw.modelUsage={"other-model":{provider:"firstParty"}};},"actual_model_provider"],
+ ["unknown native",f=>{f.data.terminal.nativeExit=null;},"native_terminal"],
+ ["provider error",f=>{f.data.raw.is_error=true;},"provider_terminal"],
+ ["wrong raw session",f=>{f.data.raw.session_id="other";},"provider_session"],
+ ["resumed session",f=>{f.data.start.argv.push("--resume","previous");},"unsupported_launch_shape"],
+ ["unknown launch option",f=>{f.data.start.argv.push("--resume=previous");},"unsupported_launch_shape"],
+ ["implementation session reused",f=>{f.admission.implementationSessionID=f.data.start.sessionID;},"review_not_independent"],
+ ["implementation session absent",f=>{delete f.admission.implementationSessionID;},"implementation_session_unreceived"],
+ ["implementation session empty",f=>{f.admission.implementationSessionID="";},"implementation_session_unreceived"],
+ ["implementation session whitespace",f=>{f.admission.implementationSessionID=" ";},"implementation_session_unreceived"],
+ ["implementation session wrong type",f=>{f.admission.implementationSessionID=true;},"implementation_session_unreceived"],
+ ["implementation session case alias",f=>{const id="ABCDEFAB-CDEF-4ABC-8ABC-ABCDEFABCDEF";const before=f.data.start.sessionID;f.data.start.sessionID=id;f.data.claim.sessionID=id;f.data.process.sessionID=id;f.data.terminal.sessionID=id;f.data.raw.session_id=id;f.data.start.argv=f.data.start.argv.map(v=>v===before?id:v);f.admission.implementationSessionID=id.toLowerCase();},"review_not_independent"],
+ ["stale admitted head",f=>{f.admission.headSha=BASE;},"review_not_admitted"],
+ ["source absent from launched bytes",f=>{f.data.material="Claims reviewed=true; no actual reviewed source";const input=Buffer.concat([Buffer.from(f.data.system),Buffer.from([0]),Buffer.from(f.data.material)]);f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(input);f.data.start.combinedBytes=input.length;},"source_not_in_launch_input"],
+ ["altered source binding",f=>{f.source.treeSha=BASE;},"review_source_binding"],
+ ["conditional GO",f=>{f.data.raw.result=f.data.report="Done\n判定: CONDITIONAL GO\n";},"review_not_go"],
+ ["double verdict",f=>{f.data.raw.result=f.data.report="判定: GO\n判定: GO\n";},"review_not_go"],
+ ["trailing text",f=>{f.data.raw.result=f.data.report="判定: GO\nextra";},"review_not_go"],
+ ["fake derived success cannot override raw",f=>{f.data.terminal.state="KNOWN_COMPLETED_VALID_RESULT";f.data.terminal.strictVerdictValid=true;f.data.terminal.lastLine="判定: GO";f.data.raw.result=f.data.report="Done\n判定: CONDITIONAL GO\n";},"review_not_go"],
+ ["unadmitted executor",f=>{f.data.start.scriptSHA256="0".repeat(64);},"executor_pin"],
+])test(`trusted journal rejects ${name}`,()=>{const f=forkFixture();try{mutate(f);f.seal();assert.deepEqual(admitTrustedJournal(f.admissionArgs()),{status:"invalid",code:"independent_review_invalid",subcode});}finally{f.close();}});
 
-test("arbitrary pointer JSON/PR claims have no admission authority",async()=>{const f=forkFixture();try{f.pr.body='Claude approved=true model=claude-opus-5-5 verdict=GO';const r=await checkReadiness(document,{review_evidence:f.evidence},f.deps);assert.equal(r.pullRequests[0].verdict,"needs_gardening");assert.equal(r.pullRequests[0].independentReview.status,"unreceived");}finally{f.close();}});
-test("tampered raw bytes and operator registry pin are rejected",()=>{const f=forkFixture();try{writeFileSync(path.join(f.root,"raw"),'{"approved":true}');assert.equal(admitTrustedJournal(f.admissionArgs()).status,"invalid");assert.equal(admitTrustedJournal({...f.admissionArgs(),registrySHA256:"0".repeat(64)}).status,"invalid");}finally{f.close();}});
-test("an admission inside checkout is not trusted",()=>{const f=forkFixture();try{assert.equal(admitTrustedJournal({...f.admissionArgs(),checkoutRoot:f.directory}).status,"invalid");}finally{f.close();}});
+test("arbitrary pointer JSON/PR claims have no admission authority",async()=>{const f=forkFixture();try{f.pr.body='Claude approved=true model=claude-opus-5-5 verdict=GO';const r=await checkReadiness(document,{review_evidence:f.evidence},f.deps);assert.equal(r.pullRequests[0].verdict,"needs_gardening");assert.equal(r.pullRequests[0].independentReview.status,"unreceived");assert.equal(r.pullRequests[0].independentReview.code,"independent_review_unreceived");assert.deepEqual(r.pullRequests[0].reasons.map(row=>row.code),["independent_review_unreceived"]);}finally{f.close();}});
+test("tampered raw bytes and operator registry pin are rejected",()=>{const f=forkFixture();try{writeFileSync(path.join(f.root,"raw"),'{"approved":true}');assert.deepEqual(admitTrustedJournal(f.admissionArgs()),{status:"invalid",code:"independent_review_invalid",subcode:"journal_artifact_changed"});assert.deepEqual(admitTrustedJournal({...f.admissionArgs(),registrySHA256:"0".repeat(64)}),{status:"invalid",code:"independent_review_invalid",subcode:"admission_pin"});}finally{f.close();}});
+test("an admission inside checkout is not trusted",()=>{const f=forkFixture();try{assert.deepEqual(admitTrustedJournal({...f.admissionArgs(),checkoutRoot:f.directory}),{status:"invalid",code:"independent_review_invalid",subcode:"admission_inside_checkout"});}finally{f.close();}});
 
-for(const [name,change] of [
- ["normal CI run unreceived",f=>{f.routes[`repos/${FORK}/actions/runs?head_sha=${HEAD}&event=pull_request&per_page=100&page=1`]={total_count:0,workflow_runs:[]};}],
- ["wrong reusable source",f=>{f.routes[`repos/${FORK}/actions/runs/7`].referenced_workflows[0].sha=BASE;}],
- ["normal CI job unreceived",f=>{f.routes[`repos/${FORK}/actions/runs/7/jobs?filter=latest&per_page=100&page=1`]={total_count:0,jobs:[]};}],
- ["pending CI",f=>{f.ci.status="in_progress";}],
- ["failing CI",f=>{f.ci.conclusion="failure";}],
- ["skipped CI",f=>{f.ci.conclusion="skipped";}],
- ["wrong check head",f=>{f.ci.head_sha=BASE;}],
- ["incomplete check count",f=>{f.routes[`repos/${FORK}/commits/${HEAD}/check-runs?filter=latest&per_page=100&page=1`].total_count=2;}],
- ["rollup inventory mismatch",f=>{f.view.statusCheckRollup=[];}],
- ["required review",f=>{f.view.reviewDecision="REVIEW_REQUIRED";}],
- ["changes requested",f=>{f.view.reviewDecision="CHANGES_REQUESTED";}],
- ["blocked merge state",f=>{f.pr.mergeable_state="blocked";}],
- ["missing required check",f=>{f.routes[`repos/${FORK}/rules/branches/master?per_page=100&page=1`]=[{type:"required_status_checks",parameters:{required_status_checks:[{context:"security",integration_id:15368}]}}];}],
- ["undispositioned quota comment",f=>{f.pr.comments=1;f.routes[`repos/${FORK}/issues/1/comments?per_page=100&page=1`]=[{id:2,body:"Trial quota exhausted",updated_at:"now"}];}],
- ["comment count mismatch",f=>{f.pr.comments=1;}],
- ["changed file count mismatch",f=>{f.pr.changed_files=2;}],
-])test(`fork blocks ${name}`,async()=>{const f=forkFixture();try{change(f);const r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,"needs_gardening",JSON.stringify(r));}finally{f.close();}});
+for(const [name,change,code,subcode] of [
+ ["normal CI run unreceived",f=>{f.routes[`repos/${FORK}/actions/runs?head_sha=${HEAD}&event=pull_request&per_page=100&page=1`]={total_count:0,workflow_runs:[]};},"readiness_unknown","normal_ci_unreceived"],
+ ["wrong reusable source",f=>{f.routes[`repos/${FORK}/actions/runs/7`].referenced_workflows[0].sha=BASE;},"readiness_unknown","normal_ci_callee_mismatch"],
+ ["normal CI job unreceived",f=>{f.routes[`repos/${FORK}/actions/runs/7/jobs?filter=latest&per_page=100&page=1`]={total_count:0,jobs:[]};},"readiness_unknown","normal_ci_jobs_not_success"],
+ ["pending CI",f=>{f.ci.status="in_progress";},"checks_pending",null],
+ ["failing CI",f=>{f.ci.conclusion="failure";},"checks_failing",null],
+ ["skipped CI",f=>{f.ci.conclusion="skipped";},"checks_failing",null],
+ ["wrong check head",f=>{f.ci.head_sha=BASE;},"readiness_unknown","ci_head_mismatch"],
+ ["incomplete check count",f=>{f.routes[`repos/${FORK}/commits/${HEAD}/check-runs?filter=latest&per_page=100&page=1`].total_count=2;},"readiness_unknown","pagination_incomplete"],
+ ["rollup inventory mismatch",f=>{f.view.statusCheckRollup=[];},"readiness_unknown","ci_inventory_mismatch"],
+ ["required review",f=>{f.view.reviewDecision="REVIEW_REQUIRED";},"review_required",null],
+ ["changes requested",f=>{f.view.reviewDecision="CHANGES_REQUESTED";},"changes_requested",null],
+ ["blocked merge state",f=>{f.pr.mergeable_state="blocked";},"merge_state_blocked",null],
+ ["missing required check",f=>{f.routes[`repos/${FORK}/rules/branches/master?per_page=100&page=1`]=[{type:"required_status_checks",parameters:{required_status_checks:[{context:"security",integration_id:15368}]}}];},"required_checks_missing",null],
+ ["undispositioned quota comment",f=>{f.pr.comments=1;f.routes[`repos/${FORK}/issues/1/comments?per_page=100&page=1`]=[{id:2,body:"Trial quota exhausted",updated_at:"now"}];},"findings_undispositioned",null],
+ ["comment count mismatch",f=>{f.pr.comments=1;},"readiness_unknown","findings_enumeration_incomplete"],
+ ["changed file count mismatch",f=>{f.pr.changed_files=2;},"readiness_unknown","changed_files_incomplete"],
+])test(`fork blocks ${name}`,async()=>{const f=forkFixture();try{change(f);const r=await checkReadiness(document,f.options(),f.deps);const entry=r.pullRequests[0];assert.equal(entry.verdict,"needs_gardening",JSON.stringify(r));assert.deepEqual(entry.reasons.map(row=>({code:row.code,subcode:row.subcode??null})),[{code,subcode}],JSON.stringify(r));}finally{f.close();}});
 
 test("Greptile identity is advisory; a spoofed Actions name and an actually required Greptile stay blocking",()=>{
  const optional={id:2,name:"review",status:"in_progress",conclusion:null,app:GREPTILE_APP};
@@ -473,7 +478,7 @@ test("zero-review protection does not invent a required approval, positive requi
 });
 
 test("head changes and unavailable GitHub policy stay unknown or blocked",async()=>{
- const f=forkFixture();try{let reads=0;const original=f.deps.getJson;f.deps.getJson=route=>{const row=original(route);if(route===`repos/${FORK}/pulls/1`&&++reads===2)row.head.sha=BASE;return row;};let r=await checkReadiness(document,f.options(),f.deps);assert.ok(r.pullRequests[0].reasons.some(r=>r.code==="head_changed"));f.deps.getJson=route=>{if(route.includes("rules/branches"))throw new Error("unavailable");return original(route);};r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,"needs_gardening");assert.equal(r.pullRequests[0].reasons[0].code,"readiness_unknown");assert.match(renderReport(r),/could not be verified/);}finally{f.close();}
+ const f=forkFixture();try{let reads=0;const original=f.deps.getJson;f.deps.getJson=route=>{const row=original(route);if(route===`repos/${FORK}/pulls/1`&&++reads===2)row.head.sha=BASE;return row;};let r=await checkReadiness(document,f.options(),f.deps);assert.ok(r.pullRequests[0].reasons.some(r=>r.code==="head_changed"));f.deps.getJson=route=>{if(route.includes("rules/branches"))throw new Error("unavailable");return original(route);};r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,"needs_gardening");assert.equal(r.pullRequests[0].reasons[0].code,"readiness_unknown");assert.equal(r.pullRequests[0].reasons[0].subcode,"unavailable");assert.match(renderReport(r),/could not be verified/);}finally{f.close();}
 });
 
 test("fork command entry performs only GET/pr-view and emits exact full-source review input",()=>{
@@ -502,4 +507,38 @@ test("review source paths use deterministic code-unit ordering",()=>{
 
 test("a new review or changed check inventory during final reads blocks the snapshot",async()=>{
  for(const kind of ['review','check']){const f=forkFixture();try{let count=0;const original=f.deps.getJson;f.deps.getJson=route=>{const row=original(route);const chosen=kind==='review'?`repos/${FORK}/pulls/1/reviews?per_page=100&page=1`:`repos/${FORK}/commits/${HEAD}/check-runs?filter=latest&per_page=100&page=1`;if(route===chosen&&++count===2){if(kind==='review')return[{id:9,body:'New finding',state:'COMMENTED',submitted_at:'later'}];row.check_runs[0].conclusion='failure';}return row;};const r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,'needs_gardening',JSON.stringify(r));assert.ok(r.pullRequests[0].reasons.some(x=>x.code==='evidence_changed'));}finally{f.close();}}
+});
+
+for(const [name,prepare,subcode] of [
+ ["missing file",f=>path.join(f.directory,"absent.json"),"review_evidence_unreadable"],
+ ["malformed JSON",f=>{writeFileSync(f.evidence,"{");return f.evidence;},"review_evidence_invalid_json"],
+ ["bare flag",()=>true,"review_evidence_path_invalid"],
+ ["wrong schema",f=>{writeFileSync(f.evidence,JSON.stringify({schema:"other",entries:[]}));return f.evidence;},"review_evidence_shape_invalid"],
+ ["non-array entries",f=>{writeFileSync(f.evidence,JSON.stringify({schema:"paperclip.review-pointer/v1",repository:FORK,entries:{}}));return f.evidence;},"review_evidence_shape_invalid"],
+])test(`bad review pointer ${name} keeps every candidate visible`,async()=>{
+ const f=forkFixture();try{const candidates={repository:FORK,candidates:[{number:1,title:"First"},{number:2,title:"Second"}]};const r=await checkReadiness(candidates,{...f.options(),review_evidence:prepare(f)},f.deps);assert.deepEqual(r.pullRequests.map(row=>row.number),[1,2]);assert.deepEqual(r.summary,{total:2,ready:0,needsGardening:2,reportOnly:0});for(const row of r.pullRequests){assert.equal(row.state,"unknown");assert.deepEqual(row.reasons.map(r=>({code:r.code,subcode:r.subcode,operatorAction:r.operatorAction})),[{code:"readiness_unknown",subcode,operatorAction:true}]);}assert.equal(f.reads.length,0);const report=renderReport(r);assert.match(report,/\[#1\]/);assert.match(report,/\[#2\]/);}finally{f.close();}
+});
+
+test("bare review-evidence CLI flag still writes the complete unknown report",()=>{
+ const f=forkFixture();try{const input=path.join(f.directory,"candidates.json"),output=path.join(f.directory,"readiness.json");writeFileSync(input,JSON.stringify({repository:FORK,candidates:[{number:1},{number:2}]}));const script=fileURLToPath(new URL('./check-readiness.mjs',import.meta.url));const run=spawnSync(process.execPath,[script,"--input",input,"--output",output,"--review-evidence"],{encoding:"utf8",env:{PATH:path.dirname(process.execPath)}});assert.equal(run.status,0,run.stderr);const result=JSON.parse(readFileSync(output));assert.equal(result.pullRequests.length,2);assert.ok(result.pullRequests.every(r=>r.reasons[0].subcode==="review_evidence_path_invalid"));}finally{f.close();}
+});
+
+test("admitted review reports both operator-bound independent session IDs",async()=>{
+ const f=forkFixture();try{const r=await checkReadiness(document,f.options(),f.deps);const review=r.pullRequests[0].independentReview;assert.equal(review.status,"valid");assert.equal(review.implementationSessionID,f.admission.implementationSessionID);assert.notEqual(review.sessionID.toLowerCase(),review.implementationSessionID.toLowerCase());const report=renderReport(r);assert.match(report,/implementation session different-implementation-session/);assert.match(report,/review session 11111111-1111-4111-8111-111111111111/);}finally{f.close();}
+});
+
+test("fork readiness output cannot overwrite the trusted reader checkout",()=>{
+ const f=forkFixture();const script=fileURLToPath(new URL('./check-readiness.mjs',import.meta.url));const output=path.join(path.dirname(script),`guard-output-${process.pid}.json`);try{writeFileSync(output,"sentinel",{flag:"wx"});const input=path.join(f.directory,"empty.json");writeFileSync(input,JSON.stringify({repository:FORK,candidates:[]}));const run=spawnSync(process.execPath,[script,"--input",input,"--output",output],{encoding:"utf8"});assert.equal(run.status,1);assert.match(run.stderr,/readiness_output_inside_checkout/);assert.equal(readFileSync(output,"utf8"),"sentinel");}finally{rmSync(output,{force:true});f.close();}
+});
+
+test("both fork writers resolve external symlink aliases before writing",()=>{
+ const f=forkFixture();const script=fileURLToPath(new URL('./check-readiness.mjs',import.meta.url));const inside=path.join(path.dirname(script),`guard-alias-${process.pid}`);try{
+ mkdirSync(inside);const target=path.join(inside,"sentinel.json");writeFileSync(target,"sentinel");const directoryAlias=path.join(f.directory,"reader-directory-alias"),fileAlias=path.join(f.directory,"reader-file-alias.json");symlinkSync(inside,directoryAlias,"dir");symlinkSync(target,fileAlias,"file");
+ const bin=path.join(f.directory,"bin");mkdirSync(bin);const fixture=path.join(f.directory,"routes.json");writeFileSync(fixture,JSON.stringify(f.routes));const stub=path.join(bin,"gh");writeFileSync(stub,`#!${process.execPath}
+const fs=require('fs');const args=process.argv.slice(2),routes=JSON.parse(fs.readFileSync(${JSON.stringify(fixture)},'utf8'));if(args[0]==='api'&&args[1]==='--method'&&args[2]==='GET'&&Object.hasOwn(routes,args[3]))process.stdout.write(JSON.stringify(routes[args[3]]));else process.exit(8);
+`);chmodSync(stub,0o700);
+ const input=path.join(f.directory,"empty.json");writeFileSync(input,JSON.stringify({repository:FORK,candidates:[]}));const env={PATH:bin+path.delimiter+path.dirname(process.execPath)};const observed=[];
+ for(const emitter of [false,true])for(const output of [path.join(directoryAlias,"sentinel.json"),fileAlias,path.join(directoryAlias,"missing-parent","future.json")]){writeFileSync(target,"sentinel");const args=[script,"--input",input,"--output",output,...(emitter?["--emit-review-input","1","--repo",FORK]:[])];const run=spawnSync(process.execPath,args,{env,encoding:"utf8"});observed.push({emitter,output,nativeExit:run.status,stderr:run.stderr,contents:readFileSync(target,"utf8")});}
+ for(const row of observed){assert.equal(row.nativeExit,1,JSON.stringify(observed));assert.match(row.stderr,row.emitter?/review_output_inside_checkout/:/readiness_output_inside_checkout/);assert.equal(row.contents,"sentinel");}
+ }finally{rmSync(inside,{recursive:true,force:true});f.close();}
 });

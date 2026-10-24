@@ -57,7 +57,7 @@ each one).
 
 ## 5. Review loops
 
-For `kurishi1204/paperclip`, load the target fork's `CONTRIBUTING.md`, not the upstream URL in section 4. Apply its Review Gate using trusted adopted reader code. Run relevant CI, then an independently authorized fresh-session Opus5.5 review of the actual final source block and relevant dependencies. Use operator-admitted CLI journal evidence outside the PR checkout. Readiness never certifies itself from a PR-body claim or a model name. Unknown evidence remains unknown. Report only public-safe head/model/verdict/report-digest fields and the actual optional Greptile state.
+For `kurishi1204/paperclip`, load the target fork's `CONTRIBUTING.md`, not the upstream URL in section 4. Apply its Review Gate using trusted adopted reader code. Run relevant CI, then an independently authorized fresh-session Opus5.5 review of the actual final source block and relevant dependencies. Use operator-admitted CLI journal evidence outside the PR checkout. Readiness never certifies itself from a PR-body claim or a model name. Unknown evidence remains unknown. The trusted registry must bind a non-empty actual `implementationSessionID`, and the reader must verify that it differs from the launched review session; operator admission remains responsible for that implementation record’s provenance. Report only public-safe head/model/verdict/report-digest fields and the actual optional Greptile state.
 
 Do not automatically request Greptile, pay for a review loop, create company work or launch a model because a score is absent. Process all actually received findings. Model calls and adoption retain their own existing authorization; this skill adds none. The legacy steps below apply only to other target repositories.
 

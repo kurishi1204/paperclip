@@ -126,7 +126,7 @@ Pipeline statuses: `running`, `pending`, `success`, `failed`, `canceled`, `skipp
 
 ### 4. Apply the target repository review gate
 
-For `kurishi1204/paperclip`, use the canonical Review Gate in the target's `CONTRIBUTING.md`. Run `check-readiness.mjs` from trusted adopted code, with the operator's separately configured/pinned review root and the untrusted evidence pointer. Require same-head successful CI, a real independent fresh-session Opus5.5 GO joined to the admitted CLI journal, and current dispositions for every actual review source. Unsupported/missing evidence is unreceived, not approval. Do not execute PR-controlled review-admission code or settings.
+For `kurishi1204/paperclip`, use the canonical Review Gate in the target's `CONTRIBUTING.md`. Run `check-readiness.mjs` from trusted adopted code, with the operator's separately configured/pinned review root and the untrusted evidence pointer. Require same-head successful CI, a real independent fresh-session Opus5.5 GO joined to the admitted CLI journal, and current dispositions for every actual review source. Unsupported/missing evidence is unreceived, not approval. The trusted registry must bind a non-empty actual `implementationSessionID`, and the reader must verify that it differs from the launched review session; operator admission remains responsible for that implementation record’s provenance. Do not execute PR-controlled review-admission code or settings.
 
 Greptile is advisory here. Preserve its actual findings and availability; do not run the legacy score gate or post a review trigger for this fork. No model launch, company Task/Run, purchase, permission change or merge is implied. Existing GitHub required checks/approvals/security remain required.
 
