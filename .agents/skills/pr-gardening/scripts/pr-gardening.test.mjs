@@ -317,7 +317,7 @@ test("scripts contain no mutating GitHub commands", async () => {
 });
 
 // Synthetic operator-owned journals: no model, credential or company API calls.
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, chmodSync, readFileSync, symlinkSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, chmodSync, readFileSync, symlinkSync, copyFileSync, existsSync, linkSync, statSync, realpathSync } from "node:fs";
 import os from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -399,6 +399,9 @@ for(const [name,mutate,subcode] of [
  ["implementation session absent",f=>{delete f.admission.implementationSessionID;},"implementation_session_unreceived"],
  ["implementation session empty",f=>{f.admission.implementationSessionID="";},"implementation_session_unreceived"],
  ["implementation session whitespace",f=>{f.admission.implementationSessionID=" ";},"implementation_session_unreceived"],
+ ["implementation session leading padding",f=>{f.admission.implementationSessionID=" different-implementation-session";},"implementation_session_unreceived"],
+ ["implementation session trailing padding",f=>{f.admission.implementationSessionID="different-implementation-session ";},"implementation_session_unreceived"],
+ ["implementation session both padding",f=>{f.admission.implementationSessionID=" different-implementation-session ";},"implementation_session_unreceived"],
  ["implementation session wrong type",f=>{f.admission.implementationSessionID=true;},"implementation_session_unreceived"],
  ["implementation session case alias",f=>{const id="ABCDEFAB-CDEF-4ABC-8ABC-ABCDEFABCDEF";const before=f.data.start.sessionID;f.data.start.sessionID=id;f.data.claim.sessionID=id;f.data.process.sessionID=id;f.data.terminal.sessionID=id;f.data.raw.session_id=id;f.data.start.argv=f.data.start.argv.map(v=>v===before?id:v);f.admission.implementationSessionID=id.toLowerCase();},"review_not_independent"],
  ["stale admitted head",f=>{f.admission.headSha=BASE;},"review_not_admitted"],
@@ -541,4 +544,42 @@ const fs=require('fs');const args=process.argv.slice(2),routes=JSON.parse(fs.rea
  for(const emitter of [false,true])for(const output of [path.join(directoryAlias,"sentinel.json"),fileAlias,path.join(directoryAlias,"missing-parent","future.json")]){writeFileSync(target,"sentinel");const args=[script,"--input",input,"--output",output,...(emitter?["--emit-review-input","1","--repo",FORK]:[])];const run=spawnSync(process.execPath,args,{env,encoding:"utf8"});observed.push({emitter,output,nativeExit:run.status,stderr:run.stderr,contents:readFileSync(target,"utf8")});}
  for(const row of observed){assert.equal(row.nativeExit,1,JSON.stringify(observed));assert.match(row.stderr,row.emitter?/review_output_inside_checkout/:/readiness_output_inside_checkout/);assert.equal(row.contents,"sentinel");}
  }finally{rmSync(inside,{recursive:true,force:true});f.close();}
+});
+
+// Run the complete, byte-identical command from a disposable checkout. These
+// output-boundary controls must never write to the real source checkout.
+function outputFixture() {
+ const f=forkFixture();
+ const checkout=path.join(f.directory,"CheckoutReader"),scripts=path.join(checkout,".agents/skills/pr-gardening/scripts");mkdirSync(scripts,{recursive:true});
+ for(const name of ["check-readiness.mjs","lib.mjs"])copyFileSync(fileURLToPath(new URL(`./${name}`,import.meta.url)),path.join(scripts,name));
+ const input=path.join(f.directory,"empty.json");writeFileSync(input,JSON.stringify({repository:FORK,candidates:[]}));
+ const bin=path.join(f.directory,"bin");mkdirSync(bin);const fixture=path.join(f.directory,"routes.json"),calls=path.join(f.directory,"calls.jsonl");writeFileSync(fixture,JSON.stringify(f.routes));
+ const stub=path.join(bin,"gh");writeFileSync(stub,`#!${process.execPath}
+const fs=require('fs');const args=process.argv.slice(2),routes=JSON.parse(fs.readFileSync(${JSON.stringify(fixture)},'utf8'));fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='api'&&args[1]==='--method'&&args[2]==='GET'&&Object.hasOwn(routes,args[3]))process.stdout.write(JSON.stringify(routes[args[3]]));else process.exit(8);
+`);chmodSync(stub,0o700);
+ const invoke=(emitter,output)=>spawnSync(process.execPath,[realpathSync(path.join(scripts,"check-readiness.mjs")),"--input",input,"--output",output,...(emitter?["--emit-review-input","1","--repo",FORK]:[])],{env:{PATH:bin+path.delimiter+path.dirname(process.execPath)},encoding:"utf8"});
+ return {...f,checkout,calls,invoke};
+}
+
+for(const emitter of [false,true])for(const kind of ["case alias existing file","case alias missing suffix","outside hardlink"])test(`${emitter?"emitter":"readiness"} rejects ${kind} by file identity`,()=>{
+ const f=outputFixture();try{
+ const target=path.join(f.checkout,"sentinel.json");writeFileSync(target,"sentinel");let output;
+ if(kind==="outside hardlink"){output=path.join(f.directory,"outside-link.json");linkSync(target,output);assert.equal(statSync(target).nlink,2);}
+ else{const alias=path.join(f.directory,"cHECKOUTrEADER");if(!existsSync(alias))symlinkSync(f.checkout,alias,"dir");assert.equal(statSync(alias).dev,statSync(f.checkout).dev);assert.equal(statSync(alias).ino,statSync(f.checkout).ino);output=path.join(alias,...(kind.endsWith("missing suffix")?["missing-parent","future.json"]:["sentinel.json"]));}
+ const run=f.invoke(emitter,output);assert.equal(run.status,1,run.stderr);assert.match(run.stderr,emitter?/review_output_inside_checkout/:/readiness_output_inside_checkout/);assert.equal(readFileSync(target,"utf8"),"sentinel");assert.equal(existsSync(path.join(f.checkout,"missing-parent")),false);assert.equal(existsSync(f.calls),false,"unsafe output must stop before any GitHub read");
+ }finally{f.close();}
+});
+
+for(const emitter of [false,true])for(const kind of ["existing single-link file","new file","external symlink","stdout","missing external parent"])test(`${emitter?"emitter":"readiness"} preserves ${kind} output`,()=>{
+ const f=outputFixture();try{
+ let output=path.join(f.directory,"outside.json"),target=output;
+ if(kind==="existing single-link file")writeFileSync(output,"old");
+ if(kind==="external symlink"){target=path.join(f.directory,"outside-target.json");writeFileSync(target,"old");symlinkSync(target,output,"file");}
+ if(kind==="stdout")output="-";
+ if(kind==="missing external parent")output=path.join(f.directory,"uncreated-parent","future.json");
+ const run=f.invoke(emitter,output);
+ if(kind==="missing external parent"){assert.equal(run.status,1);assert.match(run.stderr,/ENOENT/);assert.doesNotMatch(run.stderr,/output_inside_checkout/);assert.equal(existsSync(path.dirname(output)),false);}
+ else{assert.equal(run.status,0,run.stderr);const body=output==="-"?run.stdout:readFileSync(target,"utf8");if(emitter)assert.equal(body,`=== BEGIN PAPERCLIP REVIEW SOURCE ===\n${canonical(f.source)}\n=== END PAPERCLIP REVIEW SOURCE ===\n`);else assert.deepEqual(JSON.parse(body).summary,{total:0,ready:0,needsGardening:0,reportOnly:0});}
+ if(existsSync(f.calls))assert.ok(readFileSync(f.calls,"utf8").trim().split("\n").map(JSON.parse).every(a=>a[0]==="api"&&a[1]==="--method"&&a[2]==="GET"));
+ }finally{f.close();}
 });

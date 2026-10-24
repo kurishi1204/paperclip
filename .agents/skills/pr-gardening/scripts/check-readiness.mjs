@@ -202,8 +202,10 @@ function ensure(condition, code) { if (!condition) throw new Error(code); }
 function inside(root, target) { return target === root || target.startsWith(`${root}${path.sep}`); }
 function outsideCheckoutOutput(checkout, output, code) {
   if (output === "-") return;
-  // Resolve the actual existing target/ancestor, including symlinks. Missing
-  // suffixes do not change which checkout owns the destination path.
+  // File identity, rather than path spelling, also covers case-insensitive
+  // aliases. The operator owns the filesystem and must keep it stable through
+  // the write; this check does not authenticate against a same-user race.
+  const checkoutInfo = fs.statSync(fs.realpathSync(checkout));
   let ancestor = path.resolve(output);
   const suffix = [];
   for (;;) {
@@ -216,8 +218,19 @@ function outsideCheckoutOutput(checkout, output, code) {
       ancestor = parent;
     }
   }
-  const destination = path.resolve(fs.realpathSync(ancestor), ...suffix);
-  ensure(!inside(fs.realpathSync(checkout), destination), code);
+  ancestor = fs.realpathSync(ancestor);
+  const targetInfo = fs.statSync(ancestor);
+  // Existing outputs must be single-link regular files. A hardlink outside the
+  // checkout can otherwise modify an inside file without any inside ancestor.
+  ensure(suffix.length ? targetInfo.isDirectory() : targetInfo.isFile() && targetInfo.nlink === 1, code);
+  let directory = targetInfo.isDirectory() ? ancestor : path.dirname(ancestor);
+  for (;;) {
+    const info = fs.statSync(directory);
+    ensure(info.dev !== checkoutInfo.dev || info.ino !== checkoutInfo.ino, code);
+    const parent = path.dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
 }
 function secureRead(file, root) {
   const resolved = fs.realpathSync(file);
