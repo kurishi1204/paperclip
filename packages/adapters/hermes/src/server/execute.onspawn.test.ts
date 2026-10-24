@@ -116,6 +116,7 @@ describe("hermes-local adapter onSpawn forwarding", () => {
       String(call[1]).startsWith("[hermes] Starting Hermes Agent") || String(call[1]).startsWith("[hermes] Exit code:"));
     expect(diagnostics).toHaveLength(2);
     expect(diagnostics.every((call: unknown[]) => call[0] === "stderr")).toBe(true);
+    expect(ctx.onLog).toHaveBeenCalledWith("stderr", expect.stringContaining("requested_reasoning=default"));
   });
   it("keeps bounded live Run stdout strictly reparseable including provider stderr and session diagnostic", async () => {
     const events=[{type:"system",subtype:"init",session_id:"fixture-session"},
@@ -143,6 +144,64 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     else process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID = previousBoundedAgent;
     if (previousTrustedCommand === undefined) delete process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND;
     else process.env.PAPERCLIP_HERMES_TRUSTED_COMMAND = previousTrustedCommand;
+  });
+
+  it("forwards a canonical high effort once without weakening bounded arguments", async () => {
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true,
+      provider: "openai-codex", model: "gpt-6.1-sol", reasoningEffort: "high",
+      toolsets: "search", maxTurnsPerRun: 2, env: { HERMES_HOME: "/private/qa/hermes" } });
+    const result = await execute(ctx as never);
+    const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+    expect(call[2]).toEqual(["chat", "-q", expect.any(String), "-Q",
+      "--ignore-user-config", "--ignore-rules", "--format", "stream-json",
+      "-m", "gpt-6.1-sol", "--provider", "openai-codex",
+      "--reasoning", "high", "-t", "search", "--max-turns", "2", "--source", "tool"]);
+    expect(ctx.onLog).toHaveBeenCalledWith("stderr", expect.stringContaining("requested_reasoning=high"));
+    expect(result.clearSession).toBe(true);
+  });
+
+  it("preserves the complete argument list when effort is omitted or empty", async () => {
+    const { ctx } = makeCtx({ provider: "openai-codex", model: "gpt-6.1-sol" });
+    await execute(ctx as never);
+    const before = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)![2];
+    await execute({ ...ctx, config: { ...ctx.config, reasoningEffort: "" } } as never);
+    expect(vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)![2]).toEqual(before);
+    expect(before).toEqual(["chat", "-q", expect.any(String), "--yolo", "-m", "gpt-6.1-sol",
+      "--provider", "openai-codex", "--source", "tool"]);
+  });
+
+  for (const bounded of [false, true]) {
+    it.each(["HIGH", "extreme", "--yolo", 7])(
+      `rejects invalid effort %s before filesystem or spawn (bounded=${bounded})`, async (reasoningEffort) => {
+        const { ctx } = makeCtx({ ...(bounded ? { command: undefined, boundedExecution: true } : {}),
+          provider: "openai-codex", model: "gpt-6.1-sol", toolsets: "search", maxTurnsPerRun: 2,
+          reasoningEffort, env: { HERMES_HOME: "/private/qa/hermes" } });
+        await expect(execute(ctx as never)).rejects.toThrow(/reasoningEffort/);
+        expect(serverUtils.runChildProcess).not.toHaveBeenCalled();
+        expect(fs.mkdtemp).not.toHaveBeenCalled();
+      },
+    );
+  }
+
+  it("rejects bounded extra arguments even when the canonical effort is valid", async () => {
+    const { ctx } = makeCtx({ command: undefined, boundedExecution: true,
+      reasoningEffort: "high", extraArgs: ["--reasoning", "high"] });
+    await expect(execute(ctx as never)).rejects.toThrow(/does not accept extraArgs/);
+    expect(serverUtils.runChildProcess).not.toHaveBeenCalled();
+    expect(fs.mkdtemp).not.toHaveBeenCalled();
+  });
+
+  it.each(["high", "low"])("rejects canonical and extraArgs effort together (%s)", async (level) => {
+    const { ctx } = makeCtx({ reasoningEffort: "high", extraArgs: ["--reasoning", level] });
+    await expect(execute(ctx as never)).rejects.toThrow(/cannot be combined/);
+    expect(serverUtils.runChildProcess).not.toHaveBeenCalled();
+  });
+
+  it("preserves legacy standard extra arguments when the canonical field is unset", async () => {
+    const extraArgs = ["--reasoning-effort", "high"];
+    const { ctx } = makeCtx({ extraArgs });
+    await execute(ctx as never);
+    expect(vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)![2].slice(-2)).toEqual(extraArgs);
   });
 
   it("forwards ctx.onSpawn to runChildProcess", async () => {

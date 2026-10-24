@@ -4,6 +4,7 @@ import {
   DEFAULT_GRACE_SEC,
   DEFAULT_TIMEOUT_SEC,
   VALID_PROVIDERS,
+  HERMES_REASONING_EFFORTS,
 } from "../shared/constants.js";
 
 function providerLabel(provider: string): string {
@@ -30,6 +31,17 @@ export function getConfigSchema(): AdapterConfigSchema {
           label: providerLabel(provider),
         })),
         hint: "Usually auto. Set this only when Hermes cannot infer the provider from the model or ~/.hermes/config.yaml.",
+      },
+      {
+        key: "reasoningEffort",
+        label: "Reasoning effort",
+        type: "select",
+        default: "",
+        options: [
+          { value: "", label: "Hermes default" },
+          ...HERMES_REASONING_EFFORTS.map((value) => ({ value, label: value })),
+        ],
+        hint: "Optional per-run --reasoning level. Model/provider support is determined by Hermes.",
       },
       {
         key: "timeoutSec",

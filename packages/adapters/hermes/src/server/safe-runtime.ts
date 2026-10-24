@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 
-import { HERMES_CLI } from "../shared/constants.js";
+import { HERMES_CLI, normalizeHermesReasoningEffort } from "../shared/constants.js";
 
 // The host can hold credentials for unrelated agents. Pass process settings
 // needed by common Python installations, proxies and Windows shims.
@@ -75,6 +75,20 @@ export function validateHermesExtraArgs(raw: unknown, bounded: boolean): string[
   }
   if (raw.length > 0) throw new Error("Bounded Hermes execution does not accept extraArgs");
   return [];
+}
+
+export function validateHermesReasoningEffort(raw: unknown, extraArgs: readonly string[]) {
+  const effort = normalizeHermesReasoningEffort(raw);
+  if (effort && extraArgs.some((arg) => {
+    const option = arg.split("=", 1)[0];
+    // argparse accepts long-option abbreviations. The former UI flag is invalid
+    // in Hermes but must not coexist with the new canonical field either.
+    return option.startsWith("--") && option.length > 2 &&
+      ("--reasoning".startsWith(option) || option === "--reasoning-effort");
+  })) {
+    throw new Error("Hermes reasoningEffort cannot be combined with reasoning options in extraArgs");
+  }
+  return effort;
 }
 
 export function resolveHermesCommandForConfig(

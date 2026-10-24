@@ -13,6 +13,7 @@ import {
   validateBoundedRuntimeOptions,
   validateBoundedToolsets,
   validateHermesExtraArgs,
+  validateHermesReasoningEffort,
 } from "./safe-runtime.js";
 
 describe("Hermes child boundary", () => {
@@ -26,6 +27,18 @@ describe("Hermes child boundary", () => {
     HERMES_YOLO_MODE: "1",
     PAPERCLIP_HERMES_BOUNDED_HOME: "/private/qa/hermes",
   };
+
+  it("rejects every long-option prefix conflict only when the canonical field is set", () => {
+    const canonical = "--reasoning";
+    const options = Array.from({ length: canonical.length - 2 }, (_, i) => canonical.slice(0, i + 3));
+    for (const option of [...options, "--reasoning-effort"]) {
+      for (const arg of [option, `${option}=high`]) {
+        expect(() => validateHermesReasoningEffort("high", [arg, "high"])).toThrow(/cannot be combined/);
+        expect(validateHermesReasoningEffort(undefined, [arg, "high"])).toBeUndefined();
+      }
+    }
+    expect(validateHermesReasoningEffort("high", ["--source", "tool"])).toBe("high");
+  });
 
   it("preserves the legacy standard host environment except Paperclip identity", () => {
     const env = buildHermesChildEnv(undefined, false, host);

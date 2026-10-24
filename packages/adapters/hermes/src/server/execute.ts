@@ -63,6 +63,7 @@ import {
   validateBoundedRuntimeOptions,
   validateBoundedToolsets,
   validateHermesExtraArgs,
+  validateHermesReasoningEffort,
 } from "./safe-runtime.js";
 
 // ---------------------------------------------------------------------------
@@ -378,6 +379,7 @@ export async function execute(
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
   const extraArgs = validateHermesExtraArgs(config.extraArgs, bounded);
+  const reasoningEffort = validateHermesReasoningEffort(config.reasoningEffort, extraArgs);
   const inheritHostEnv = !bounded && config.managedAiRouting !== true;
   const env: Record<string, string> = {
     ...buildHermesChildEnv(config.env, bounded, process.env, process.platform, inheritHostEnv),
@@ -511,6 +513,8 @@ export async function execute(
     args.push("--provider", resolvedProvider);
   }
 
+  if (reasoningEffort) args.push("--reasoning", reasoningEffort);
+
   if (toolsets) {
     args.push("-t", toolsets);
   }
@@ -572,7 +576,7 @@ export async function execute(
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stderr",
-    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
+    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], requested_reasoning=${reasoningEffort ?? "default"}, timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
   );
   if (prevSessionId) {
     await ctx.onLog(
