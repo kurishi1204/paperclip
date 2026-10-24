@@ -273,6 +273,8 @@ import {
   reconcileRetainedNativeSessionCleanup,
   reconcileRetainedNativeSessionCleanups,
   resolveHeartbeatNativeRuntimeMode,
+  assertPaperclipRunnerTaskEligibility,
+  NativeRuntimeEligibilityError,
 } from "./native-runtime/index.js";
 import {
   assertAgentCoreProfileRecoveryBinding,
@@ -27306,6 +27308,20 @@ export function heartbeatService(
     }
   }
 
+  function freshRunnerTaskIneligibility(
+    adapterType: string | null,
+    issue: { id: string; workMode: string } | null,
+  ): NativeRuntimeEligibilityError | null {
+    if (adapterType !== "paperclip_runner") return null;
+    try {
+      assertPaperclipRunnerTaskEligibility(issue);
+      return null;
+    } catch (error) {
+      if (error instanceof NativeRuntimeEligibilityError) return error;
+      throw error;
+    }
+  }
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -28088,6 +28104,7 @@ export function heartbeatService(
               id: issues.id,
               companyId: issues.companyId,
               identifier: issues.identifier,
+              workMode: issues.workMode,
               conversationAgentId: issues.conversationAgentId,
               conversationUserId: issues.conversationUserId,
               conversationState: issues.conversationState,
@@ -28170,6 +28187,7 @@ export function heartbeatService(
           }
 
           let reconciledSourceRunId: string | null = null;
+          let pendingReconciliationActionId: string | null = null;
           let reconciledRestoreRetryCount: number | null = null;
           if (executionReconciliationWake) {
             const actionId = readNonEmptyString(
@@ -28284,6 +28302,72 @@ export function heartbeatService(
               reconciledRestoreRetryCount = executionFailureRetryCount(reconciledRun!);
             }
             reconciledSourceRunId = sourceRunId;
+            pendingReconciliationActionId = action.id;
+          }
+
+          // This issue row is locked, and the saved execution-wait receipt (if
+          // any) was checked for this company, agent, actor and issue above.
+          // Existing retry/reconciliation successors have already been replayed.
+          // Reject only a new ineligible wake before coalescing or deferring it.
+          // Read the current adapter type to narrow configuration races without
+          // reversing the existing Issue/Agent lock order.
+          const [currentRunnerAgent] = await tx.select({ adapterType: agents.adapterType })
+            .from(agents).where(and(eq(agents.id, agentId), eq(agents.companyId, issue.companyId))).limit(1);
+          const taskError = freshRunnerTaskIneligibility(currentRunnerAgent ? currentRunnerAgent.adapterType : agent.adapterType, issue);
+          if (taskError) {
+            if (pendingReconciliationActionId) {
+              // A new continuation is now impossible under the current Task
+              // mode. Close the pending delivery while its action row remains
+              // locked, so the recovery producer does not resend each tick.
+              const [invalidated] = await tx.update(issueRecoveryActions).set({
+                evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+                  continuationDelivery: "invalidated",
+                  continuationDeliveryReason: taskError.code,
+                })}::jsonb`,
+                updatedAt: new Date(),
+              }).where(and(
+                eq(issueRecoveryActions.companyId, issue.companyId),
+                eq(issueRecoveryActions.sourceIssueId, issue.id),
+                eq(issueRecoveryActions.id, pendingReconciliationActionId),
+                eq(issueRecoveryActions.status, "resolved"),
+                sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+              )).returning({ id: issueRecoveryActions.id });
+              if (!invalidated) return { kind: "deferred" as const };
+            }
+            if (executionWaitRequestId) {
+              const [retired] = await tx.update(agentWakeupRequests).set({
+                status: "skipped", reason: taskError.code, error: taskError.message,
+                payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
+                  coalesce(${agentWakeupRequests.payload}->'executionWait', '{}'::jsonb) || ${JSON.stringify({
+                    reason: taskError.code,
+                    message: "Your saved message was not sent because this task's execution mode is no longer supported. Review the task and send a new request.",
+                  })}::jsonb)`,
+                finishedAt: new Date(), updatedAt: new Date(),
+              }).where(and(
+                eq(agentWakeupRequests.id, executionWaitRequestId),
+                eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+              )).returning({ id: agentWakeupRequests.id });
+              if (retired) return { kind: "skipped" as const };
+              return { kind: "deferred" as const };
+            }
+            // A durable chat input is already accepted. It needs a terminal
+            // receipt under the exact action ID so the caller can settle it;
+            // ordinary manual user wakes keep their 409 contract.
+            if (opts.requestedByActorType === "user" && !durableRequest) {
+              throw conflict(taskError.message, { code: taskError.code });
+            }
+            await tx.insert(agentWakeupRequests).values({
+              ...durableReceiptFields, companyId: issue.companyId, agentId,
+              source, triggerDetail, reason: taskError.code, payload,
+              status: "skipped", error: taskError.message,
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null, finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
           }
 
           let continuationWait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
@@ -29330,6 +29414,17 @@ export function heartbeatService(
 
     if (durableRequest) throw new Error("chat_inbound_wakeup_binding_denied");
 
+    // Old queued runs may predate this preflight. A fresh unscoped Runner
+    // request cannot borrow one through the coalescing path.
+    const unscopedTaskError = freshRunnerTaskIneligibility(agent.adapterType, null);
+    if (unscopedTaskError) {
+      if (opts.requestedByActorType === "user") {
+        throw conflict(unscopedTaskError.message, { code: unscopedTaskError.code });
+      }
+      await writeSkippedRequest(unscopedTaskError.code, { error: unscopedTaskError.message });
+      return null;
+    }
+
     const activeRuns = await db
       .select()
       .from(heartbeatRuns)
@@ -29420,9 +29515,9 @@ export function heartbeatService(
     }
 
     const queueOutcome = await db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,
-      );
+      const [lockedAgent] = await tx.select({ adapterType: agents.adapterType }).from(agents)
+        .where(and(eq(agents.id, agentId), eq(agents.companyId, agent.companyId))).for("update");
+      if (!lockedAgent) throw notFound("Agent not found");
 
       const dailyCapBlock = await getHeartbeatDailyCapBlock(
         agent,
@@ -29463,6 +29558,22 @@ export function heartbeatService(
             })
             .where(eq(agents.id, agentId));
         }
+        return { kind: "skipped" as const };
+      }
+
+      const lockedTaskError = freshRunnerTaskIneligibility(lockedAgent.adapterType, null);
+      if (lockedTaskError) {
+        if (opts.requestedByActorType === "user") {
+          throw conflict(lockedTaskError.message, { code: lockedTaskError.code });
+        }
+        await tx.insert(agentWakeupRequests).values({
+          ...durableReceiptFields, companyId: agent.companyId, agentId,
+          source, triggerDetail, reason: lockedTaskError.code, payload,
+          status: "skipped", error: lockedTaskError.message,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null, finishedAt: new Date(),
+        });
         return { kind: "skipped" as const };
       }
 
