@@ -316,7 +316,7 @@ function getPages(get, route, field = null) {
   for (let page = 1; page <= 100; page += 1) {
     const response = get(`${route}${route.includes("?") ? "&" : "?"}per_page=100&page=${page}`);
     const values = field ? response[field] : response;
-    ensure(Array.isArray(values), "pagination_shape");
+    ensure(Array.isArray(values) && values.length <= 100, "pagination_shape");
     if (field) { ensure(Number.isInteger(response.total_count), "pagination_count"); total ??= response.total_count; ensure(total === response.total_count, "pagination_changed"); }
     rows.push(...values);
     if (values.length < 100) { ensure(total === null || rows.length === total, "pagination_incomplete"); return rows; }
@@ -384,13 +384,53 @@ export function assessForkChecks(checkRuns, rollup, required = []) {
   return { checks, pending: checks.filter(c=>c.pending), failing: checks.filter(c=>!c.pending&&!c.green), successes: checks.filter(c=>c.green), missingRequired, advisory };
 }
 
-function findingSources(comments, inline, reviews, runs, review) {
+function rollupSnapshot(rollup) {
+  ensure(Array.isArray(rollup), "ci_context_unknown");
+  // Keep the typed raw row as well as its normalized state: unknown fields and
+  // same-name occurrences must not disappear from the final evidence read.
+  return rollup.map(row => {
+    ensure(row && ["CheckRun", "StatusContext"].includes(row.__typename), "ci_context_unknown");
+    return canonical({ raw: row, normalized: normalizeCheck(row) });
+  }).sort();
+}
+
+function collectCheckAnnotations(get, repository, head, runs) {
+  ensure(new Set(runs.map(r=>r.id)).size === runs.length, "ci_head_mismatch");
+  const sources = [];
+  for (const run of runs) {
+    ensure(Number.isSafeInteger(run.id) && run.id > 0 && run.head_sha === head, "ci_head_mismatch");
+    const count = run.output?.annotations_count;
+    ensure(Number.isSafeInteger(count) && count >= 0, "annotations_count_unknown");
+    if (count === 0) continue;
+    const url = `https://api.github.com/repos/${repository}/check-runs/${run.id}`;
+    ensure(run.url === url && run.output.annotations_url === `${url}/annotations`, "annotations_source_mismatch");
+    // Construct the same-repository route; never follow an output-provided URL.
+    const annotations = getPages(get, `repos/${repository}/check-runs/${run.id}/annotations`);
+    ensure(annotations.length === count, "annotations_incomplete");
+    const occurrences = new Map();
+    for (const annotation of annotations) {
+      ensure(annotation && !Array.isArray(annotation) && typeof annotation === "object" && typeof annotation.path === "string" && Number.isInteger(annotation.start_line) && Number.isInteger(annotation.end_line) && typeof annotation.annotation_level === "string" && typeof annotation.message === "string", "annotations_shape");
+      const bodySHA256 = digest(canonical(annotation));
+      const occurrence = (occurrences.get(bodySHA256) ?? 0) + 1;
+      occurrences.set(bodySHA256, occurrence);
+      // GitHub annotations have no native ID. Preserve identical occurrences
+      // under their owning check-run ID, and retain the complete response body.
+      sources.push({ id: `check_annotation:${run.id}:${bodySHA256}:${occurrence}`, version: digest(canonical({ head, checkRunID: run.id, app: run.app, annotation })), bodySHA256, checkRunID: run.id, headSha: head, annotation });
+    }
+  }
+  return sources;
+}
+
+function findingSources(comments, inline, reviews, runs, review, annotations) {
   const rows = [];
   const add = (kind, row, body) => rows.push({ id: `${kind}:${row.id}`, version: row.updated_at ?? row.submitted_at ?? row.created_at ?? "", bodySHA256: digest(Buffer.from(canonical({ body, state: row.state ?? null, commit: row.commit_id ?? null, path: row.path ?? null }))) });
   comments.forEach(r=>add("issue_comment",r,r.body));
   inline.forEach(r=>add("review_comment",r,r.body));
   reviews.forEach(r=>add("review",r,r.body));
-  runs.filter(r=>r.output && [r.output.title,r.output.summary,r.output.text].some(Boolean)).forEach(r=>add("check_output",{ ...r, updated_at: r.completed_at ?? r.started_at },r.output));
+  // Count/route fields are collection metadata; every other nonempty field is
+  // received output, including future fields we cannot semantically classify.
+  runs.filter(r=>r.output && Object.entries(r.output).some(([key,value])=>!["annotations_count","annotations_url"].includes(key) && value !== null && value !== "" && !(Array.isArray(value) && value.length === 0))).forEach(r=>add("check_output",{ ...r, updated_at: r.completed_at ?? r.started_at },r.output));
+  rows.push(...annotations);
   if (review.status === "valid") rows.push({ id: `independent_review:${review.reportSHA256}`, version: review.reportSHA256, bodySHA256: digest(Buffer.from(review.report)) });
   return rows;
 }
@@ -448,6 +488,7 @@ async function checkForkReadiness(document, options, dependencies) {
       const head = pr.head.sha;
       const metadata = view(candidate.number);
       ensure(metadata.headRefOid === head, "head_changed");
+      const rollup = rollupSnapshot(metadata.statusCheckRollup);
       const runs = getPages(get, `repos/${repository}/commits/${head}/check-runs?filter=latest`, "check_runs");
       ensure(new Set(runs.map(r=>r.id)).size === runs.length && runs.every(r=>r.head_sha===head), "ci_head_mismatch");
       const normalRuns = getPages(get, `repos/${repository}/actions/runs?head_sha=${head}&event=pull_request`, "workflow_runs").filter(r=>r.path===".github/workflows/pr.yml"&&r.head_sha===head&&r.event==="pull_request").sort((a,b)=>b.id-a.id);
@@ -479,20 +520,23 @@ async function checkForkReadiness(document, options, dependencies) {
       const inline = getPages(get, `repos/${repository}/pulls/${candidate.number}/comments`);
       const reviews = getPages(get, `repos/${repository}/pulls/${candidate.number}/reviews`);
       ensure(comments.length === pr.comments && inline.length === pr.review_comments, "findings_enumeration_incomplete");
-      const findings = assessDispositions(findingSources(comments, inline, reviews, runs, review), pointer?.dispositions);
+      const annotations = collectCheckAnnotations(get, repository, head, runs);
+      const findings = assessDispositions(findingSources(comments, inline, reviews, runs, review, annotations), pointer?.dispositions);
 
       const finalRuns = getPages(get, `repos/${repository}/commits/${head}/check-runs?filter=latest`, "check_runs");
+      const finalAnnotations = collectCheckAnnotations(get, repository, head, finalRuns);
       const finalComments = getPages(get, `repos/${repository}/issues/${candidate.number}/comments`);
       const finalInline = getPages(get, `repos/${repository}/pulls/${candidate.number}/comments`);
       const finalReviews = getPages(get, `repos/${repository}/pulls/${candidate.number}/reviews`);
-      const snapshot = (checkRows, commentRows, inlineRows, reviewRows) => canonical({
-        sources: findingSources(commentRows, inlineRows, reviewRows, checkRows, review).sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0),
-        checks: checkRows.map(r=>({id:r.id,head:r.head_sha,name:r.name,status:r.status,conclusion:r.conclusion,app:r.app?.id,slug:r.app?.slug})).sort((a,b)=>a.id-b.id),
+      const snapshot = (checkRows, commentRows, inlineRows, reviewRows, annotationRows, rollupRows) => canonical({
+        sources: findingSources(commentRows, inlineRows, reviewRows, checkRows, review, annotationRows).sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0),
+        checks: checkRows.map(r=>({id:r.id,head:r.head_sha,name:r.name,status:r.status,conclusion:r.conclusion,app:r.app?.id,slug:r.app?.slug,annotations:r.output.annotations_count})).sort((a,b)=>a.id-b.id),
+        rollup: rollupRows,
       });
-      const changedEvidence = snapshot(runs,comments,inline,reviews) !== snapshot(finalRuns,finalComments,finalInline,finalReviews);
       const final = get(`repos/${repository}/pulls/${candidate.number}`);
       const finalBranch = get(`repos/${repository}/branches/${encodeURIComponent(pr.base.ref)}`);
       const finalMetadata = view(candidate.number);
+      const changedEvidence = snapshot(runs,comments,inline,reviews,annotations,rollup) !== snapshot(finalRuns,finalComments,finalInline,finalReviews,finalAnnotations,rollupSnapshot(finalMetadata.statusCheckRollup));
       const changedHead = final.head.sha!==head || final.base.sha!==pr.base.sha || finalBranch.commit.sha!==branch.commit.sha || final.comments!==pr.comments || final.review_comments!==pr.review_comments || final.state!==pr.state || final.draft!==pr.draft || finalMetadata.headRefOid!==head || finalMetadata.reviewDecision!==metadata.reviewDecision;
       const reviewPolicies = [protection?.required_pull_request_reviews, ...rules.filter(r=>r.type==="pull_request").map(r=>r.parameters)].filter(Boolean);
       const requiredReview = reviewPolicies.some(p=>p.required_approving_review_count>0 || p.require_code_owner_reviews===true || p.require_code_owner_review===true || p.require_last_push_approval===true);

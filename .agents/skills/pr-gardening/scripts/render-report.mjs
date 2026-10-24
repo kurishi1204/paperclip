@@ -76,6 +76,10 @@ export function renderReport(readiness) {
           `- Reasons: ${escapeMarkdownText(reasonText(entry))}`,
           "",
         );
+        for (const source of findings.sources ?? []) {
+          if (!source.annotation) continue;
+          lines.push(`- Check annotation: ${escapeMarkdownText(source.id)}; head ${escapeMarkdownText(source.headSha)}; check-run ${source.checkRunID}; version ${escapeMarkdownText(source.version)}; body SHA256 ${escapeMarkdownText(source.bodySHA256)}; received body ${escapeMarkdownText(JSON.stringify(source.annotation))}`, "");
+        }
         continue;
       }
 

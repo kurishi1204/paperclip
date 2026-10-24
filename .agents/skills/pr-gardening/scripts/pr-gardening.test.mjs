@@ -355,7 +355,7 @@ function forkFixture() {
   const pointer={admissionKey:"one",pullRequest:1,headSha:HEAD,dispositions:[{sourceID:`independent_review:${digest(report)}`,sourceVersion:digest(report),bodySHA256:digest(report),disposition:"not_a_finding",reason:"The complete report contains no remaining finding",evidence:"sample.mjs:1"}]};
   const evidence=path.join(directory,"pointer.json");writeFileSync(evidence,JSON.stringify({schema:"paperclip.review-pointer/v1",repository:FORK,entries:[pointer]}));
   const pr={number:1,html_url:"https://github.com/kurishi1204/paperclip/pull/1",title:"Sample",body:"Source fix",state:"open",draft:false,mergeable:true,mergeable_state:"clean",head:{sha:HEAD},base:{ref:"master",sha:BASE},comments:0,review_comments:0,changed_files:1,user:{login:"fixture"}};
-  const ci={id:1,name:"ci",head_sha:HEAD,status:"completed",conclusion:"success",app:{id:15368,slug:"github-actions"},output:{}};
+  const ci={id:1,name:"ci",head_sha:HEAD,status:"completed",conclusion:"success",app:{id:15368,slug:"github-actions"},output:{annotations_count:0}};
   const routes={};
   const prefix=`repos/${FORK}`;
   routes[`${prefix}/pulls/1`]=pr;
@@ -466,7 +466,7 @@ test("fork verdict dispatch replaces the legacy mandatory-Greptile gate only for
 
 test("fork accepts a pending advisory Greptile with reasoned quota-comment disposition",async()=>{
  const f=forkFixture();try{
- const grep={id:2,name:"Greptile",head_sha:HEAD,status:"in_progress",conclusion:null,app:GREPTILE_APP,output:{}};
+ const grep={id:2,name:"Greptile",head_sha:HEAD,status:"in_progress",conclusion:null,app:GREPTILE_APP,output:{annotations_count:0}};
  const runPage=f.routes[`repos/${FORK}/commits/${HEAD}/check-runs?filter=latest&per_page=100&page=1`];runPage.check_runs.push(grep);runPage.total_count=2;f.view.statusCheckRollup.push({__typename:"CheckRun",name:"Greptile"});
  const comment={id:2,body:"Trial quota exhausted",updated_at:"2026-01-01T00:00:00Z"};f.pr.comments=1;f.routes[`repos/${FORK}/issues/1/comments?per_page=100&page=1`]=[comment];
  f.pointer.dispositions.push({sourceID:"issue_comment:2",sourceVersion:comment.updated_at,bodySHA256:digest(canonical({body:comment.body,state:null,commit:null,path:null})),disposition:"not_a_finding",reason:"Provider quota notice contains no code finding",evidence:"Received issue comment 2: quota notice"});
@@ -582,4 +582,69 @@ for(const emitter of [false,true])for(const kind of ["existing single-link file"
  else{assert.equal(run.status,0,run.stderr);const body=output==="-"?run.stdout:readFileSync(target,"utf8");if(emitter)assert.equal(body,`=== BEGIN PAPERCLIP REVIEW SOURCE ===\n${canonical(f.source)}\n=== END PAPERCLIP REVIEW SOURCE ===\n`);else assert.deepEqual(JSON.parse(body).summary,{total:0,ready:0,needsGardening:0,reportOnly:0});}
  if(existsSync(f.calls))assert.ok(readFileSync(f.calls,"utf8").trim().split("\n").map(JSON.parse).every(a=>a[0]==="api"&&a[1]==="--method"&&a[2]==="GET"));
  }finally{f.close();}
+});
+
+
+// All status/annotation evidence is synthetic and read through the same collector
+// as production; semantic classification belongs to the operator disposition.
+const legacyStatus = (state, context = "external-security") => ({__typename:"StatusContext",context,state,targetUrl:"https://example.test/security"});
+function annotationsFixture(f, annotations) {
+  f.ci.url=`https://api.github.com/repos/${FORK}/check-runs/1`;
+  f.ci.output={annotations_count:annotations.length,annotations_url:`${f.ci.url}/annotations`,title:"",summary:"",text:""};
+  for(let page=1;page<=Math.floor(annotations.length/100)+1;page++)f.routes[`repos/${FORK}/check-runs/1/annotations?per_page=100&page=${page}`]=annotations.slice((page-1)*100,page*100);
+}
+const annotationRow = (message = "Synthetic finding", level = "warning") => ({path:"sample.mjs",start_line:1,end_line:1,annotation_level:level,message,title:"Review",raw_details:"",blob_href:`https://github.com/${FORK}/blob/${HEAD}/sample.mjs`});
+function savePointer(f) { writeFileSync(f.evidence,JSON.stringify({schema:"paperclip.review-pointer/v1",repository:FORK,entries:[f.pointer]})); }
+function dispositionFor(source) { return {sourceID:source.id,sourceVersion:source.version,bodySHA256:source.bodySHA256,disposition:"not_a_finding",reason:"Synthetic informational annotation assessed in this test",evidence:"Complete fixture annotation body"}; }
+
+test("stable successful legacy status remains ready and initial failure stays blocking",async()=>{
+ const f=forkFixture();try{f.view.statusCheckRollup.push(legacyStatus("SUCCESS"));let r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,"ready");f.view.statusCheckRollup.at(-1).state="FAILURE";r=await checkReadiness(document,f.options(),f.deps);assert.deepEqual(r.pullRequests[0].reasons.map(x=>x.code),["checks_failing"]);}finally{f.close();}
+});
+for(const finalState of ["FAILURE","PENDING"])test(`final legacy status SUCCESS to ${finalState} blocks freshness`,async()=>{
+ const f=forkFixture();try{let calls=0;f.deps.viewPullRequest=()=>({...structuredClone(f.view),statusCheckRollup:[...structuredClone(f.view.statusCheckRollup),legacyStatus(++calls===1?"SUCCESS":finalState)]});const r=await checkReadiness(document,f.options(),f.deps);assert.equal(calls,2);assert.deepEqual(r.pullRequests[0].reasons.map(x=>x.code),["evidence_changed"]);}finally{f.close();}
+});
+for(const kind of ["addition","removal","same-name duplicate","non-state field","unknown type"])test(`full typed final rollup catches ${kind}`,async()=>{
+ const f=forkFixture();try{f.view.statusCheckRollup.push(legacyStatus("SUCCESS"));let calls=0;f.deps.viewPullRequest=()=>{const row=structuredClone(f.view);if(++calls===2){if(kind==="addition")row.statusCheckRollup.push(legacyStatus("SUCCESS","new-status"));if(kind==="removal")row.statusCheckRollup.pop();if(kind==="same-name duplicate")row.statusCheckRollup.push(legacyStatus("SUCCESS"));if(kind==="non-state field")row.statusCheckRollup.at(-1).targetUrl="https://example.test/changed";if(kind==="unknown type")row.statusCheckRollup.push({__typename:"FutureStatus",name:"new"});}return row;};const r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,"needs_gardening");assert.deepEqual(r.pullRequests[0].reasons.map(x=>[x.code,x.subcode??null]),kind==="unknown type"?[["readiness_unknown","ci_context_unknown"]]:[["evidence_changed",null]]);}finally{f.close();}
+});
+test("rollup order changes preserve duplicate occurrences without a false change",async()=>{
+ const f=forkFixture();try{f.view.statusCheckRollup.push(legacyStatus("SUCCESS"),legacyStatus("SUCCESS"));let calls=0;f.deps.viewPullRequest=()=>{const row=structuredClone(f.view);if(++calls===2)row.statusCheckRollup.reverse();return row;};const r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,"ready");assert.equal(r.pullRequests[0].checks.checks.length,3);}finally{f.close();}
+});
+
+test("annotation-only sources including notice and unknown level require complete dispositions",async()=>{
+ const f=forkFixture();try{const annotations=[annotationRow(),annotationRow("Informational notice","notice"),annotationRow("Unknown level is still received evidence","future-level")];annotationsFixture(f,annotations);let r=await checkReadiness(document,f.options(),f.deps);let entry=r.pullRequests[0];assert.deepEqual(entry.reasons.map(x=>x.code),["findings_undispositioned"]);const sources=entry.findings.sources.filter(x=>x.annotation);assert.equal(sources.length,3);assert.deepEqual(sources.map(x=>x.annotation),annotations);assert.ok(sources.every(x=>x.checkRunID===1&&x.headSha===HEAD));const report=renderReport(r);for(const source of sources){assert.ok(report.includes(source.id.replace(/_/g,"\\_")));assert.ok(report.includes(source.version));assert.ok(report.includes(source.bodySHA256));assert.ok(report.includes(source.annotation.message));}f.pointer.dispositions.push(...sources.map(dispositionFor));savePointer(f);r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,"ready",JSON.stringify(r));assert.equal(r.pullRequests[0].findings.complete,true);assert.equal(f.reads.filter(x=>x.includes("/annotations?")).length,4);}finally{f.close();}
+});
+test("annotation pagination retains 101 identical occurrences and requires every disposition",async()=>{
+ const f=forkFixture();try{annotationsFixture(f,Array.from({length:101},()=>annotationRow()));let r=await checkReadiness(document,f.options(),f.deps);const sources=r.pullRequests[0].findings.sources.filter(x=>x.annotation);assert.equal(sources.length,101);assert.equal(new Set(sources.map(x=>x.id)).size,101);assert.equal(new Set(sources.map(x=>x.bodySHA256)).size,1);assert.equal(r.pullRequests[0].findings.missing.length,101);assert.equal(f.reads.filter(x=>x.endsWith("/annotations?per_page=100&page=2")).length,2);f.pointer.dispositions.push(...sources.slice(0,-1).map(dispositionFor));savePointer(f);r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].findings.missing.length,1);f.pointer.dispositions.push(dispositionFor(sources.at(-1)));savePointer(f);r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,"ready",JSON.stringify(r));}finally{f.close();}
+});
+for(const [kind,change,subcode] of [
+ ["missing count",f=>{delete f.ci.output.annotations_count;},"annotations_count_unknown"],
+ ["negative count",f=>{f.ci.output.annotations_count=-1;},"annotations_count_unknown"],
+ ["noninteger count",f=>{f.ci.output.annotations_count=1.5;},"annotations_count_unknown"],
+ ["wrong check-run URL",f=>{f.ci.url=`https://api.github.com/repos/other/repo/check-runs/1`;},"annotations_source_mismatch"],
+ ["wrong annotations owner",f=>{f.ci.output.annotations_url=`https://api.github.com/repos/other/repo/check-runs/1/annotations`;},"annotations_source_mismatch"],
+ ["wrong annotations run ID",f=>{f.ci.output.annotations_url=`https://api.github.com/repos/${FORK}/check-runs/2/annotations`;},"annotations_source_mismatch"],
+ ["count mismatch",f=>{f.ci.output.annotations_count=2;},"annotations_incomplete"],
+ ["missing page",f=>{const original=f.deps.getJson;f.deps.getJson=route=>{if(route.includes("/annotations?"))throw new Error("annotations_unavailable");return original(route);};},"annotations_unavailable"],
+ ["wrong page shape",f=>{f.routes[`repos/${FORK}/check-runs/1/annotations?per_page=100&page=1`]={annotations:[]};},"pagination_shape"],
+ ["wrong annotation shape",f=>{f.routes[`repos/${FORK}/check-runs/1/annotations?per_page=100&page=1`]=[{}];},"annotations_shape"],
+])test(`annotation evidence remains unknown for ${kind}`,async()=>{const f=forkFixture();try{annotationsFixture(f,[annotationRow()]);change(f);const r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,"needs_gardening");assert.deepEqual(r.pullRequests[0].reasons.map(x=>[x.code,x.subcode]),[["readiness_unknown",subcode]]);}finally{f.close();}});
+for(const kind of ["body","unknown field","count","ownership","head"])test(`final annotation ${kind} changes cannot establish readiness`,async()=>{
+ const f=forkFixture();try{annotationsFixture(f,[annotationRow()]);const first=await checkReadiness(document,f.options(),f.deps);f.pointer.dispositions.push(...first.pullRequests[0].findings.sources.filter(x=>x.annotation).map(dispositionFor));savePointer(f);const original=f.deps.getJson;let pages=0,runs=0;f.deps.getJson=route=>{const row=original(route);if(route.includes("/annotations?")&&++pages===2){if(kind==="body")row[0].message="Changed finding";if(kind==="unknown field")row[0].newProviderDetail="Changed";}if(route.includes("/check-runs?filter=")&&++runs===2){if(kind==="count"){row.check_runs[0].output.annotations_count=0;}if(kind==="ownership")row.check_runs[0].output.annotations_url=`https://api.github.com/repos/other/repo/check-runs/1/annotations`;if(kind==="head")row.check_runs[0].head_sha=BASE;}return row;};const r=await checkReadiness(document,f.options(),f.deps);const entry=r.pullRequests[0];assert.equal(entry.verdict,"needs_gardening");assert.deepEqual(entry.reasons.map(x=>[x.code,x.subcode??null]),kind==="ownership"?[["readiness_unknown","annotations_source_mismatch"]]:kind==="head"?[["readiness_unknown","ci_head_mismatch"]]:[["evidence_changed",null]]);}finally{f.close();}
+});
+test("annotation reorder is stable and edited bodies invalidate prior dispositions",async()=>{
+ const f=forkFixture();try{const rows=[annotationRow("A"),annotationRow("B"),annotationRow("A")];annotationsFixture(f,rows);let r=await checkReadiness(document,f.options(),f.deps);f.pointer.dispositions.push(...r.pullRequests[0].findings.sources.filter(x=>x.annotation).map(dispositionFor));savePointer(f);const original=f.deps.getJson;let pages=0;f.deps.getJson=route=>{const row=original(route);return route.includes("/annotations?")&&++pages===2?row.reverse():row;};r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,"ready");f.deps.getJson=original;f.routes[`repos/${FORK}/check-runs/1/annotations?per_page=100&page=1`][0].raw_details="Edited details";r=await checkReadiness(document,f.options(),f.deps);assert.deepEqual(r.pullRequests[0].reasons.map(x=>x.code),["findings_undispositioned"]);assert.equal(r.pullRequests[0].findings.missing.length,1);assert.equal(r.pullRequests[0].findings.orphaned.length,1);}finally{f.close();}
+});
+
+
+test("an exact 100-annotation page requires the terminal empty page",async()=>{
+ const f=forkFixture();try{annotationsFixture(f,Array.from({length:100},(_,i)=>annotationRow(`Finding ${i}`)));const r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].findings.sources.filter(x=>x.annotation).length,100);assert.equal(f.reads.filter(x=>x.endsWith("/annotations?per_page=100&page=2")).length,2);const original=f.deps.getJson;f.deps.getJson=route=>{if(route.endsWith("/annotations?per_page=100&page=2"))throw new Error("annotations_page_unavailable");return original(route);};const missing=await checkReadiness(document,f.options(),f.deps);assert.deepEqual(missing.pullRequests[0].reasons.map(x=>[x.code,x.subcode]),[["readiness_unknown","annotations_page_unavailable"]]);}finally{f.close();}
+});
+test("overfull annotation page is unknown rather than an accepted pagination boundary",async()=>{
+ const f=forkFixture();try{const rows=Array.from({length:101},()=>annotationRow());annotationsFixture(f,rows);f.routes[`repos/${FORK}/check-runs/1/annotations?per_page=100&page=1`]=rows;const r=await checkReadiness(document,f.options(),f.deps);assert.deepEqual(r.pullRequests[0].reasons.map(x=>[x.code,x.subcode]),[["readiness_unknown","pagination_shape"]]);}finally{f.close();}
+});
+test("unknown check-output fields remain received sources rather than silent omissions",async()=>{
+ const f=forkFixture();try{f.ci.output.futureProviderOutput={message:"Do not silently omit this field"};const r=await checkReadiness(document,f.options(),f.deps);assert.deepEqual(r.pullRequests[0].reasons.map(x=>x.code),["findings_undispositioned"]);assert.deepEqual(r.pullRequests[0].findings.missing,["check_output:1"]);}finally{f.close();}
+});
+test("same-name CheckRun occurrences are retained in both status inventories",async()=>{
+ const f=forkFixture();try{const page=f.routes[`repos/${FORK}/commits/${HEAD}/check-runs?filter=latest&per_page=100&page=1`];page.check_runs.push({...structuredClone(f.ci),id:2});page.total_count=2;f.view.statusCheckRollup.push(structuredClone(f.view.statusCheckRollup[0]));let r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,"ready");assert.equal(r.pullRequests[0].checks.checks.length,2);let calls=0;f.deps.viewPullRequest=()=>{const row=structuredClone(f.view);if(++calls===2)row.statusCheckRollup.pop();return row;};r=await checkReadiness(document,f.options(),f.deps);assert.deepEqual(r.pullRequests[0].reasons.map(x=>x.code),["evidence_changed"]);}finally{f.close();}
 });
