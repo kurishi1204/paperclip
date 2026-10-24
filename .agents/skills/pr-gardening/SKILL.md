@@ -55,7 +55,10 @@ The script calls `GET /api/companies/:companyId/search/extract` with `kind=url`,
 
 ## Stage B — Verify Current-Head Readiness
 
+Run Stage B from an operator-controlled trusted adopted checkout, never from a PR checkout or a prepare worktree. Set `TRUSTED_ADOPTED_CHECKOUT` from trusted operator configuration, not PR data. Use an absolute run-owned `RUN_DIR` so input and output stay outside candidate checkouts. The candidate head is read through GitHub; it cannot choose or execute the reader.
+
 ```bash
+cd "$TRUSTED_ADOPTED_CHECKOUT"
 node .agents/skills/pr-gardening/scripts/check-readiness.mjs \
   --input "$RUN_DIR/candidates.json" \
   --output "$RUN_DIR/readiness.json" \

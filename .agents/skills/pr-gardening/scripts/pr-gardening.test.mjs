@@ -449,7 +449,11 @@ test("fork draft remains report only, missing records remain visible in report",
 test("fork verdict dispatch replaces the legacy mandatory-Greptile gate only for explicit fork policy",()=>{
  const input={policy:"fork-v1",pullRequest:{state:"open",mergeable:true,mergeable_state:"clean",draft:false,reviewDecision:""},checks:{checks:[{green:true}],pending:[],failing:[],missingRequired:[]},review:{status:"valid"},findings:{complete:true},behindBy:0,greptile:{present:false},originatingIssue:{status:"done"}};
  assert.equal(readinessVerdict(input).verdict,"ready");
- assert.equal(readinessVerdict({...input,policy:undefined}).verdict,"needs_gardening");
+ const legacy={...input,policy:undefined,pullRequest:{state:"OPEN",mergeable:"MERGEABLE",isDraft:false,reviewDecision:""}};
+ const result=readinessVerdict(legacy);assert.equal(result.verdict,"needs_gardening");
+ assert.deepEqual(result.reasons.filter(r=>r.severity==="blocking").map(r=>r.code),["greptile_missing"]);
+ const wrongShape=readinessVerdict({...legacy,pullRequest:{...legacy.pullRequest,state:"open",mergeable:true}});
+ assert.notDeepEqual(wrongShape.reasons.filter(r=>r.severity==="blocking").map(r=>r.code),["greptile_missing"]);
 });
 
 test("fork accepts a pending advisory Greptile with reasoned quota-comment disposition",async()=>{
@@ -481,6 +485,21 @@ const fs=require('fs');const a=process.argv.slice(2);fs.appendFileSync(${JSON.st
  const input=path.join(f.directory,"candidates.json"),output=path.join(f.directory,"readiness.json"),source=path.join(f.directory,"source.txt");writeFileSync(input,JSON.stringify(document));const script=fileURLToPath(new URL('./check-readiness.mjs',import.meta.url));const env={PATH:bin+path.delimiter+path.dirname(process.execPath)};
  let run=spawnSync(process.execPath,[script,'--input',input,'--output',output,'--review-evidence',f.evidence,'--trusted-review-root',f.root,'--trusted-review-registry-sha256',f.options().trusted_review_registry_sha256],{env,encoding:'utf8'});assert.equal(run.status,0,run.stderr);assert.equal(JSON.parse(readFileSync(output)).pullRequests[0].verdict,'ready',readFileSync(output,'utf8')+'\n'+run.stderr);
  run=spawnSync(process.execPath,[script,'--emit-review-input','1','--repo',FORK,'--output',source],{env,encoding:'utf8'});assert.equal(run.status,0,run.stderr);assert.equal(readFileSync(source,'utf8'),`=== BEGIN PAPERCLIP REVIEW SOURCE ===\n${canonical(f.source)}\n=== END PAPERCLIP REVIEW SOURCE ===\n`);
+ run=spawnSync(process.execPath,[script,'--input',input,'--output',output,'--repo',FORK.toUpperCase(),'--review-evidence',f.evidence,'--trusted-review-root',f.root,'--trusted-review-registry-sha256',f.options().trusted_review_registry_sha256],{env,cwd:f.directory,encoding:'utf8'});assert.equal(run.status,0,run.stderr);assert.equal(JSON.parse(readFileSync(output)).pullRequests[0].verdict,'ready');
+ const previous=readFileSync(output);run=spawnSync(process.execPath,[script,'--emit-review-input','1','--repo',FORK],{env,cwd:f.directory,encoding:'utf8'});assert.equal(run.status,1);assert.match(run.stderr,/review_output_required/);assert.ok(readFileSync(output).equals(previous));
+ run=spawnSync(process.execPath,[script,'--emit-review-input','1','--repo',FORK,'--review-dependencies',' sample.mjs ','--output',source],{env,cwd:f.directory,encoding:'utf8'});assert.equal(run.status,0,run.stderr);const withDeps=JSON.parse(readFileSync(source,'utf8').split('\n')[1]);assert.equal(withDeps.dependencyFiles[0].path,'sample.mjs');
  const argv=readFileSync(calls,'utf8').trim().split('\n').map(JSON.parse);assert.ok(argv.length>0);assert.ok(argv.every(a=>(a[0]==='api'&&a[1]==='--method'&&a[2]==='GET')||(a[0]==='pr'&&a[1]==='view')));
  }finally{f.close();}
+});
+
+test("first PR GET failure stays visible as unknown instead of disappearing from the report",async()=>{
+ const f=forkFixture();try{const r=await checkReadiness(document,f.options(),{...f.deps,getJson:()=>{throw new Error('unavailable');}});assert.equal(r.pullRequests[0].state,'unknown');assert.equal(r.pullRequests[0].verdict,'needs_gardening');const report=renderReport(r);assert.match(report,/\[#1\]/);assert.match(report,/State: `unknown`/);assert.match(report,/could not be verified/);assert.doesNotMatch(report,/every verdict below was computed/);}finally{f.close();}
+});
+
+test("review source paths use deterministic code-unit ordering",()=>{
+ const f=forkFixture();try{const prefix=`repos/${FORK}`;const after=f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree[0],before=f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree[0];for(const [tree,row]of [[TREE,after],[BASE_TREE,before]])f.routes[`${prefix}/git/trees/${tree}?recursive=1`].tree=['a.mjs','Z.mjs'].map(p=>({...row,path:p}));const files=['a.mjs','Z.mjs'].map(filename=>({filename,status:'modified',sha:after.sha}));const result=buildReviewSource(f.deps.getJson,FORK,f.pr,files,TREE,BASE,BASE,[]);assert.deepEqual(result.changedFiles.map(x=>x.path),['Z.mjs','a.mjs']);}finally{f.close();}
+});
+
+test("a new review or changed check inventory during final reads blocks the snapshot",async()=>{
+ for(const kind of ['review','check']){const f=forkFixture();try{let count=0;const original=f.deps.getJson;f.deps.getJson=route=>{const row=original(route);const chosen=kind==='review'?`repos/${FORK}/pulls/1/reviews?per_page=100&page=1`:`repos/${FORK}/commits/${HEAD}/check-runs?filter=latest&per_page=100&page=1`;if(route===chosen&&++count===2){if(kind==='review')return[{id:9,body:'New finding',state:'COMMENTED',submitted_at:'later'}];row.check_runs[0].conclusion='failure';}return row;};const r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,'needs_gardening',JSON.stringify(r));assert.ok(r.pullRequests[0].reasons.some(x=>x.code==='evidence_changed'));}finally{f.close();}}
 });

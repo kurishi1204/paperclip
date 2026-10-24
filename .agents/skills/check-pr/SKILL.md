@@ -177,6 +177,8 @@ fi
 
 If a Greptile check exists for the current head but is still pending or in progress, wait for it with the same polling pattern used by `greploop` rather than proceeding from older review material. If no Greptile check appears for the current head after a reasonable wait, report the PR as blocked on a fresh Greptile review for `HEAD_SHA` and stop. Do not mark the check complete from PR comments, PR reviews, or Greptile summaries that cannot be associated with the current head SHA.
 
+#### GitLab integration rules
+
 For GitLab installations with Greptile integration, apply the same freshness rule against the MR's current head SHA:
 
 ```bash
@@ -223,6 +225,8 @@ fi
 ```
 
 Block completion if, for `MR_SHA`, there is (a) no Greptile job or note at all (missing), (b) the newest Greptile job/note is tied to a different sha (stale), or (c) the Greptile job status is not `success`. A completed Greptile result for a different SHA is stale and must block completion.
+
+#### Perforce integration rules
 
 For Perforce installations with Greptile integration, apply the same rule using the CL's current shelved-revision identity and the Greptile webhook/review artifact tied to it; a Greptile result for an earlier shelf is stale and must block completion.
 

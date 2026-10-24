@@ -112,7 +112,7 @@ export function confidenceFor(entry) {
 }
 
 export async function checkReadiness(candidatesDocument, options = {}, dependencies = {}) {
-  if (normalizeRepository(options.repo ?? candidatesDocument.repository) === FORK_REPOSITORY) return checkForkReadiness(candidatesDocument, options, dependencies);
+  if (normalizeRepository(options.repo ?? candidatesDocument.repository).toLowerCase() === FORK_REPOSITORY) return checkForkReadiness(candidatesDocument, options, dependencies);
   const repository = normalizeRepository(options.repo ?? candidatesDocument.repository);
   const results = [];
   for (const candidate of candidatesDocument.candidates) {
@@ -318,7 +318,7 @@ export function buildReviewSource(get, repository, pr, files, treeSha, baseSha, 
     ensure(f.status === "added" ? !beforeEntry : Boolean(beforeEntry), "source_before_missing");
     ensure(f.status === "removed" ? !afterEntry : Boolean(afterEntry), "source_after_missing");
     return { path:f.filename,status:f.status,before:beforeEntry?blob(beforeEntry):null,after:afterEntry?blob(afterEntry):null };
-  }).sort((a,b)=>a.path.localeCompare(b.path));
+  }).sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0);
   ensure(Array.isArray(dependencyPaths) && dependencyPaths.every(p=>typeof p==="string") && new Set(dependencyPaths).size===dependencyPaths.length, "source_dependencies");
   const dependencyFiles = [...dependencyPaths].sort().map(p=>blob(head.get(p)));
   return { schema:SOURCE_SCHEMA,repository,headSha:pr.head.sha,treeSha,baseSha,mergeBaseSha,changedFiles,dependencyFiles };
@@ -367,7 +367,7 @@ export function assessDispositions(sources, dispositions = []) {
   return { complete: missing.length === 0, sources, missing: missing.map(s=>s.id), orphaned: dispositions.filter(d=>!sources.some(s=>s.id===d.sourceID)).map(d=>d.sourceID) };
 }
 
-export function forkReadinessVerdict({ pullRequest, checks, review, findings, behindBy, changedHead = false, requiredReview = false }) {
+export function forkReadinessVerdict({ pullRequest, checks, review, findings, behindBy, changedHead = false, changedEvidence = false, requiredReview = false }) {
   const reasons = [];
   const block = (code, message, operatorAction = false) => reasons.push({ ...reason(code, message), operatorAction });
   if (pullRequest.state !== "open") block("pr_not_open", "PR is not open");
@@ -382,6 +382,7 @@ export function forkReadinessVerdict({ pullRequest, checks, review, findings, be
   if (behindBy > 0) block("base_behind", "Head is behind the target base");
   if (review.status !== "valid") block(review.code ?? "independent_review_unreceived", "Trusted exact-head independent Opus review is unreceived or invalid", true);
   if (!findings.complete) block("findings_undispositioned", "Review sources require current reasoned dispositions", true);
+  if (changedEvidence) block("evidence_changed", "Check inventory or review sources changed during reads; repeat observation before readiness", true);
   if (changedHead) block("head_changed", "PR identity or finding counts changed during reads", true);
   return { verdict: pullRequest.draft ? "report_only" : reasons.length ? "needs_gardening" : "ready", reasons };
 }
@@ -432,13 +433,22 @@ async function checkForkReadiness(document, options, dependencies) {
       ensure(comments.length === pr.comments && inline.length === pr.review_comments, "findings_enumeration_incomplete");
       const findings = assessDispositions(findingSources(comments, inline, reviews, runs, review), pointer?.dispositions);
 
+      const finalRuns = getPages(get, `repos/${repository}/commits/${head}/check-runs?filter=latest`, "check_runs");
+      const finalComments = getPages(get, `repos/${repository}/issues/${candidate.number}/comments`);
+      const finalInline = getPages(get, `repos/${repository}/pulls/${candidate.number}/comments`);
+      const finalReviews = getPages(get, `repos/${repository}/pulls/${candidate.number}/reviews`);
+      const snapshot = (checkRows, commentRows, inlineRows, reviewRows) => canonical({
+        sources: findingSources(commentRows, inlineRows, reviewRows, checkRows, review).sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0),
+        checks: checkRows.map(r=>({id:r.id,head:r.head_sha,name:r.name,status:r.status,conclusion:r.conclusion,app:r.app?.id,slug:r.app?.slug})).sort((a,b)=>a.id-b.id),
+      });
+      const changedEvidence = snapshot(runs,comments,inline,reviews) !== snapshot(finalRuns,finalComments,finalInline,finalReviews);
       const final = get(`repos/${repository}/pulls/${candidate.number}`);
       const finalBranch = get(`repos/${repository}/branches/${encodeURIComponent(pr.base.ref)}`);
       const finalMetadata = view(candidate.number);
       const changedHead = final.head.sha!==head || final.base.sha!==pr.base.sha || finalBranch.commit.sha!==branch.commit.sha || final.comments!==pr.comments || final.review_comments!==pr.review_comments || final.state!==pr.state || final.draft!==pr.draft || finalMetadata.headRefOid!==head || finalMetadata.reviewDecision!==metadata.reviewDecision;
       const reviewPolicies = [protection?.required_pull_request_reviews, ...rules.filter(r=>r.type==="pull_request").map(r=>r.parameters)].filter(Boolean);
       const requiredReview = reviewPolicies.some(p=>p.required_approving_review_count>0 || p.require_code_owner_reviews===true || p.require_code_owner_review===true || p.require_last_push_approval===true);
-      entry = { number: candidate.number, url: pr.html_url, title: pr.title, author: pr.user?.login, purpose: summarizePullRequestBody(pr.body), state: pr.state, isDraft: pr.draft, headSha: head, baseRefName: pr.base.ref, behindBy: comparison.behind_by, originatingIssue: candidate.originatingIssue, policy: "fork-v1", checks, normalCI:{runID:normalRun.id,jobs:jobs.length,conclusion:normalRun.conclusion}, independentReview: { ...review, report: undefined }, findings, greptile: { state: checks.advisory.length ? checks.advisory.map(r=>`${r.status}:${r.conclusion??"unreceived"}`).join(", ") : "unavailable/unreceived", score: null }, source, ...readinessVerdict({policy:"fork-v1",pullRequest:{...pr,reviewDecision:metadata.reviewDecision},checks,review,findings,behindBy:comparison.behind_by,changedHead,requiredReview}) };
+      entry = { number: candidate.number, url: pr.html_url, title: pr.title, author: pr.user?.login, purpose: summarizePullRequestBody(pr.body), state: pr.state, isDraft: pr.draft, headSha: head, baseRefName: pr.base.ref, behindBy: comparison.behind_by, originatingIssue: candidate.originatingIssue, policy: "fork-v1", checks, normalCI:{runID:normalRun.id,jobs:jobs.length,conclusion:normalRun.conclusion}, independentReview: { ...review, report: undefined }, findings, greptile: { state: checks.advisory.length ? checks.advisory.map(r=>`${r.status}:${r.conclusion??"unreceived"}`).join(", ") : "unavailable/unreceived", score: null }, source, ...readinessVerdict({policy:"fork-v1",pullRequest:{...pr,reviewDecision:metadata.reviewDecision},checks,review,findings,behindBy:comparison.behind_by,changedHead,changedEvidence,requiredReview}) };
     } catch (error) {
       entry = { number: candidate.number, url: pr?.html_url, title: pr?.title ?? candidate.title ?? "Unreceived", state: pr?.state ?? "unknown", isDraft: pr?.draft ?? false, policy: "fork-v1", headSha: pr?.head?.sha ?? null, verdict: pr?.draft ? "report_only" : "needs_gardening", reasons:[{...reason("readiness_unknown", "Required GitHub or trusted-review evidence could not be verified"),subcode:/^[a-z][a-z0-9_]+$/.test(error.message)?error.message:"read_dependency_unavailable",operatorAction:true}] };
     }
@@ -449,9 +459,12 @@ async function checkForkReadiness(document, options, dependencies) {
 }
 
 async function main() {
-  const options = parseArgs(process.argv.slice(2), { input: "candidates.json", output: "readiness.json" });
+  const options = parseArgs(process.argv.slice(2), { input: "candidates.json" });
   if (options.emit_review_input) {
-    const repo = normalizeRepository(options.repo);
+    ensure(typeof options.output === "string" && options.output.trim(), "review_output_required");
+    const checkout = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
+    ensure(options.output === "-" || !inside(checkout, path.resolve(options.output)), "review_output_inside_checkout");
+    const repo = normalizeRepository(options.repo).toLowerCase();
     ensure(repo === FORK_REPOSITORY, "fork_source_only");
     const number = Number(options.emit_review_input);
     ensure(Number.isInteger(number) && number > 0,"invalid_pr");
@@ -462,7 +475,7 @@ async function main() {
     const files = getPages(get,`repos/${repo}/pulls/${number}/files`);
     ensure(files.length === pr.changed_files,"changed_files_incomplete");
     const commit = get(`repos/${repo}/git/commits/${pr.head.sha}`);
-    const source = buildReviewSource(get,repo,pr,files,commit.tree.sha,branch.commit.sha,comparison.merge_base_commit.sha,options.review_dependencies ? options.review_dependencies.split(",") : []);
+    const source = buildReviewSource(get,repo,pr,files,commit.tree.sha,branch.commit.sha,comparison.merge_base_commit.sha,options.review_dependencies ? options.review_dependencies.split(",").map(p=>p.trim()) : []);
     const final = get(`repos/${repo}/pulls/${number}`);
     const finalBranch = get(`repos/${repo}/branches/${encodeURIComponent(pr.base.ref)}`);
     ensure(final.head.sha===pr.head.sha && finalBranch.commit.sha===branch.commit.sha,"head_changed");
@@ -471,7 +484,7 @@ async function main() {
     else fs.writeFileSync(options.output,body+"\n");
     return;
   }
-  writeJson(options.output, await checkReadiness(readJson(options.input), options));
+  writeJson(options.output ?? "readiness.json", await checkReadiness(readJson(options.input), options));
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {

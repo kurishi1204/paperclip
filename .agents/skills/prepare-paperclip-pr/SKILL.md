@@ -51,9 +51,7 @@ each one).
 
 ## 4. Open the PR
 
-* Follow `CONTRIBUTING.md` (repo root,
-  https://github.com/paperclipai/paperclip/blob/master/CONTRIBUTING.md) for
-  the PR title, message format, and issue description.
+* Follow the target repository root `CONTRIBUTING.md` for the PR title, message format, and issue description. For `kurishi1204/paperclip`, use that fork's adopted contract. The upstream reference https://github.com/paperclipai/paperclip/blob/master/CONTRIBUTING.md applies to upstream targets, not as an override of the fork contract.
 * Push the branch and open the PR with `gh`.
 * Record the PR URL immediately — every report must include URLs to every PR.
 
@@ -74,7 +72,7 @@ Do not automatically request Greptile, pay for a review loop, create company wor
 ## 6. Report back and hand off
 
 * Comment on the driving task: what you did, the PR URL(s), the worktree path
-  (use `~` for home), Greptile score, and check status.
+  (use `~` for home), and check status. For this fork, report actual Greptile availability and findings; include a score only if the provider actually returned one. Other repositories retain their existing score-report rule.
 * Create a `pull_request` work product for each opened PR (plus `branch` /
   `commit` work products where the branch or a commit is itself the handoff).
 * If the task requires follow-up per PR (e.g. sub-issues per PR), create them

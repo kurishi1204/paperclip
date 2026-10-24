@@ -103,6 +103,6 @@
 - [ ] I have added or updated tests where applicable
 - [ ] I have updated relevant documentation to reflect my changes
 - [ ] I have considered and documented any risks above
-- [ ] I will not request adoption until all CI and required checks have completed successfully at this exact head; I will list any skips separately
+- [ ] I will not request adoption until all CI and required checks have completed successfully at this exact head; I will list skips separately and will not count them as successful execution
 - [ ] I will not request adoption until the target repository review gate is satisfied; for kurishi1204/paperclip I will provide the exact reviewed head, actual claude-opus-5-5 model, strict independent GO and report digest
 - [ ] I will disposition all received review findings with evidence and report actual Greptile availability/results without inventing a score
