@@ -6,6 +6,8 @@ export interface LegacyContinuationInput {
   issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null; assigneeUserId?: string | null } | null;
   agent: { id: string; companyId: string; status: string } | null;
   episode: LegacyDispositionEpisode;
+  /** Verified persisted source binding permits exhaustion only, never a new failed-run slot. */
+  boundFailedRepairEpisodeId?: string | null;
   gates: {
     stopped: boolean;
     paused: boolean;
@@ -65,7 +67,9 @@ export function decideLegacyContinuation(input: LegacyContinuationInput):
   | { kind: "enqueue"; nextAttempt: number; idempotencyKey: string; instruction: string } {
   const { run, issue, agent, gates, episode } = input;
   if (run.runtimeMode === "native") return { kind: "skip", reason: "native_finalization" };
-  if (run.status !== "succeeded") return { kind: "skip", reason: "run_not_successful" };
+  const exhaustedFailedRepair = run.status === "failed" &&
+    input.boundFailedRepairEpisodeId === episode.id && episode.attempt >= episode.maxAttempts;
+  if (run.status !== "succeeded" && !exhaustedFailedRepair) return { kind: "skip", reason: "run_not_successful" };
   if (!issue || !agent || issue.companyId !== run.companyId || agent.companyId !== run.companyId || agent.id !== run.agentId) return { kind: "skip", reason: "invalid_binding" };
   if (issue.assigneeAgentId !== run.agentId || issue.assigneeUserId) return { kind: "skip", reason: "owner_changed" };
   if (!["todo", "in_progress"].includes(issue.status)) return { kind: "skip", reason: "recorded_disposition" };
@@ -77,6 +81,7 @@ export function decideLegacyContinuation(input: LegacyContinuationInput):
     [!gates.agentInvokable || ["paused", "terminated", "pending_approval"].includes(agent.status), "agent_not_invokable"],
   ] as const) if (blocked) return { kind: "skip", reason };
   if (episode.attempt >= episode.maxAttempts) return { kind: "exhausted", attempt: episode.attempt, maxAttempts: episode.maxAttempts };
+  if (run.status !== "succeeded") return { kind: "skip", reason: "run_not_successful" };
   const nextAttempt = episode.attempt + 1;
   return {
     kind: "enqueue", nextAttempt,
