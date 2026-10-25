@@ -200,6 +200,9 @@ export function canonical(value) {
 const sourceBlock = (value) => `${SOURCE_BEGIN}${canonical(value)}${SOURCE_END}`;
 // Lossless v2 source codec. Journal admission requires an explicit v2 registry entry.
 export const REVIEW_SOURCE_V2 = "paperclip.fork-review-source/v2";
+export const READ_REVIEW_SOURCE = "paperclip.fork-review-read-corpus/v1";
+const READ_SOURCE_BEGIN = "=== BEGIN PAPERCLIP READ CORPUS MANIFEST ===\n";
+const READ_SOURCE_END = "\n=== END PAPERCLIP READ CORPUS MANIFEST ===";
 const REVERSE_DIFF_V1 = "paperclip.exact-reverse-line-diff/v1";
 const sourceKeys = ["schema", "repository", "headSha", "treeSha", "baseSha", "mergeBaseSha", "changedFiles", "dependencyFiles"];
 function exactKeys(value, keys, code = "source_v2_shape") {
@@ -325,6 +328,216 @@ export function parseReviewSourceV2Block(block, expectedSource) {
   return restored;
 }
 
+// Every byte the model must receive is a corpus file. The reverse diff is the
+// existing lossless v2 codec, so a modified file's before text is not repeated.
+export function readCorpusManifest(source) {
+  const compact = reviewSourceV2(source);
+  const files = [];
+  const add = (role, sourcePath, content, blobSha = null) => {
+    ensure(typeof sourcePath === "string" && sourcePath && !sourcePath.startsWith("/") &&
+      !sourcePath.split("/").some(part => !part || part === "." || part === ".." || part.includes("\\")) &&
+      !sourcePath.includes("\0"), "read_path_outside_corpus");
+    ensure(typeof content === "string" && content.length > 0 && !content.includes("\r") &&
+      !content.startsWith("\ufeff") && content.endsWith("\n") && !content.includes("\0") &&
+      Buffer.from(content, "utf8").toString("utf8") === content, "read_encoding_unsupported");
+    const value = Buffer.from(content, "utf8");
+    // Physical names never inherit PR paths such as AGENTS.md or .mcp.json.
+    // The reversible logical mapping remains in the pinned manifest.
+    const name = `assets/${digest(canonical({role,sourcePath,sha256:digest(value)}))}.txt`;
+    files.push({ path: name, role, sourcePath, blobSha, sha256: digest(value), bytes: value.length, lines: content.split("\n").length, content });
+  };
+  for (const file of compact.changedFiles) {
+    if (file.after) add("after", file.path, file.after.content, file.after.blobSha);
+    if (file.before && !file.after) add("before", file.before.path, file.before.content, file.before.blobSha);
+    if (file.reverseDiff) add("reverse", file.path, `${canonical(file.reverseDiff)}\n`);
+  }
+  for (const file of compact.dependencyFiles) add("deps", file.path, file.content, file.blobSha);
+  const names = files.map(file => file.path.normalize("NFKC").toLowerCase());
+  ensure(new Set(names).size === names.length && files.length > 0, "corpus_manifest_paths");
+  files.sort((a,b) => a.path.localeCompare(b.path, "en"));
+  const manifest = { schema: READ_REVIEW_SOURCE, repository: source.repository, headSha: source.headSha,
+    treeSha:source.treeSha,baseSha:source.baseSha,mergeBaseSha:source.mergeBaseSha,
+    changedFiles:source.changedFiles.map(file=>({path:file.path,status:file.status,
+      before:file.before ? {path:file.before.path,blobSha:file.before.blobSha} : null,
+      after:file.after ? {path:file.after.path,blobSha:file.after.blobSha} : null})),
+    dependencyFiles:source.dependencyFiles.map(file=>({path:file.path,blobSha:file.blobSha})),
+    logicalSourceSHA256: compact.logicalSourceSHA256,
+    files: files.map(({content, ...file}) => file) };
+  return { manifest, files };
+}
+export function readCorpusManifestBlock(source) {
+  return `${READ_SOURCE_BEGIN}${canonical(readCorpusManifest(source).manifest)}${READ_SOURCE_END}`;
+}
+
+export function readReviewSettings(start, corpus) {
+  ensure(typeof start.home === "string" && path.isAbsolute(start.home) && path.normalize(start.home) === start.home &&
+    typeof start.cwd === "string" && path.isAbsolute(start.cwd), "unsupported_launch_shape");
+  const bases = new Set();
+  const addAncestors = (leaf) => {
+    for (let directory = leaf;; directory = path.dirname(directory)) {
+      bases.add(directory);
+      if (directory === path.dirname(directory)) break;
+    }
+  };
+  addAncestors(start.cwd);
+  for (const file of corpus.files) addAncestors(path.dirname(path.join(start.cwd,file.path)));
+  bases.add(path.join(start.home,".claude"));
+  const excludes = [];
+  for (const directory of [...bases].sort()) {
+    for (const name of ["CLAUDE.md","CLAUDE.local.md",".claude/CLAUDE.md",".claude/CLAUDE.local.md","AGENTS.md",".claude/AGENTS.md"]) {
+      const candidate = path.join(directory,name);
+      excludes.push(candidate);
+      try { if (fs.lstatSync(candidate).isSymbolicLink()) excludes.push(fs.realpathSync(candidate)); }
+      catch (error) { ensure(error.code === "ENOENT", "unsupported_launch_shape"); }
+    }
+    excludes.push(path.join(directory,".claude/rules/**"));
+  }
+  return canonical({pluginConfigs:{"cc-plugin-agents-md@builtin":{options:{instructionFiles:"managed-only"}}},
+    autoMemoryEnabled:false,claudeMdExcludes:excludes,disableAllHooks:true,enabledPlugins:{}});
+}
+
+function readCorpusInventory(root, files) {
+  const rootInfo = fs.lstatSync(root);
+  ensure(rootInfo.isDirectory() && !rootInfo.isSymbolicLink() && rootInfo.uid === process.getuid() && !(rootInfo.mode & 0o077), "corpus_inventory");
+  const found = [];
+  const expectedDirectories = new Set();
+  for (const file of files) {
+    const parts = file.path.split("/");
+    for (let i=1;i<parts.length;i++) expectedDirectories.add(parts.slice(0,i).join("/"));
+  }
+  const visit = (directory, prefix = "") => {
+    for (const name of fs.readdirSync(directory).sort()) {
+      const relative = prefix ? `${prefix}/${name}` : name;
+      const full = path.join(directory, name), info = fs.lstatSync(full);
+      ensure(!info.isSymbolicLink() && info.uid === process.getuid(), "corpus_inventory");
+      if (info.isDirectory()) { ensure(expectedDirectories.has(relative) && !(info.mode & 0o077), "corpus_inventory"); visit(full, relative); }
+      else {
+        ensure(info.isFile() && info.nlink === 1 && !(info.mode & 0o222), "corpus_inventory");
+        found.push({ path: relative, mode: info.mode & 0o777, nlink: info.nlink, type: "file", sha256: digest(fs.readFileSync(full)) });
+      }
+    }
+  };
+  visit(root);
+  const expected = files.map(file => ({ path:file.path, sha256:file.sha256 })).sort((a,b)=>a.path.localeCompare(b.path,"en"));
+  const actual = found.map(({path: name, sha256}) => ({path:name,sha256})).sort((a,b)=>a.path.localeCompare(b.path,"en"));
+  ensure(canonical(actual) === canonical(expected), "corpus_inventory");
+  return { schema:"paperclip.read-corpus-inventory/v1", root, files:found.sort((a,b)=>a.path.localeCompare(b.path,"en")) };
+}
+
+const READ_EVENT_KEYS = {
+  init: ["type","subtype","cwd","session_id","tools","mcp_servers","model","permissionMode","slash_commands","apiKeySource","claude_code_version","output_style","agents","skills","plugins","capabilities","analytics_disabled","product_feedback_disabled","uuid","original_cwd","additional_directories","fast_mode_state","fast_mode_disabled_reason","per_turn_effort_active","view_mode"],
+  thinking: ["type","subtype","estimated_tokens","estimated_tokens_delta","session_id","uuid"],
+  assistant: ["type","message","parent_tool_use_id","session_id","uuid","timestamp","request_id","wire_tool_inputs","thinking_duration_ms","thinking_display"],
+  user: ["type","message","parent_tool_use_id","session_id","uuid","timestamp","tool_use_result","tool_result_meta"],
+  rate: ["type","rate_limit_info","uuid","session_id"],
+  result: ["duration_api_ms","stop_reason","session_id","total_cost_usd","usage","modelUsage","permission_denials","terminal_reason","fast_mode_state","fast_mode_disabled_reason","subagent_stats","safety_stops","is_error","num_turns","subtype","api_error_status","result","ttft_ms","type","duration_ms","uuid","ttft_stream_ms","time_to_request_ms","first_content_frame_ms","queued_turn_count","result_index"]
+};
+function onlyKeys(value, allowed, code) {
+  ensure(value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).every(key => allowed.includes(key)), code);
+}
+function readToolResult(use, event, files, root, covered) {
+  const input = use.input;
+  onlyKeys(input, ["file_path","offset","limit"], "read_result_undecodable");
+  ensure(typeof input.file_path === "string" && path.isAbsolute(input.file_path) &&
+    inside(root, input.file_path) && input.file_path === path.normalize(input.file_path), "read_path_outside_corpus");
+  const relative = path.relative(root, input.file_path).split(path.sep).join("/");
+  const file = files.get(relative);
+  ensure(file, "read_path_outside_corpus");
+  const result = event.tool_use_result, block = event.message.content[0];
+  onlyKeys(result, ["type","file"], "read_result_undecodable");
+  ensure(result.type === "text" && typeof result.file === "object" && result.file, "read_result_undecodable");
+  exactKeys(result.file, ["filePath","content","numLines","startLine","totalLines"], "read_result_undecodable");
+  const meta = result.file;
+  ensure(meta.filePath === input.file_path && typeof meta.content === "string" && typeof block.content === "string" &&
+    Number.isSafeInteger(meta.startLine) && Number.isSafeInteger(meta.numLines) && meta.numLines > 0 &&
+    meta.totalLines === file.lines && meta.startLine >= 1 && meta.startLine + meta.numLines - 1 <= file.lines &&
+    (input.offset === undefined ? meta.startLine === 1 : Number.isSafeInteger(input.offset) && input.offset === meta.startLine) &&
+    (input.limit === undefined || Number.isSafeInteger(input.limit) && input.limit > 0 && meta.numLines <= input.limit), "read_result_undecodable");
+  const lines = file.content.split("\n"), start = meta.startLine - 1, end = start + meta.numLines;
+  const expected = lines.slice(start,end).join("\n") + (end < lines.length ? "\n" : "");
+  const displayed = lines.slice(start,end).map((line,i)=>`${meta.startLine+i}\t${line}`).join("\n") + (end < lines.length ? "\n" : "");
+  ensure(meta.content === expected && block.content === displayed, "read_bytes_mismatch");
+  const set = covered.get(relative);
+  for (let i = start; i < end; i++) set.add(i);
+}
+
+// Pure evidence decoder: no model or network call, and no fallback to the UI parser.
+export function verifyReadJournal(streamBytes, corpus, start) {
+  ensure(Buffer.isBuffer(streamBytes) && streamBytes.length > 0 && streamBytes.length <= 64 * 1024 * 1024 &&
+    streamBytes.at(0) !== 0xef && streamBytes.at(-1) === 10, "journal_event_unsupported");
+  let text; try { text = new TextDecoder("utf-8", {fatal:true}).decode(streamBytes); }
+  catch { throw new Error("journal_event_unsupported"); }
+  const rows = text.slice(0,-1).split("\n");
+  ensure(rows.length >= 2 && rows.length <= 10000 && rows.every(row => row && !row.includes("\r")), "journal_event_unsupported");
+  const files = new Map(corpus.files.map(file => [file.path,file]));
+  const covered = new Map(corpus.files.map(file => [file.path,new Set()]));
+  const pending = new Map(), completed = new Set();
+  let init = 0, terminal = null, toolCalls = 0;
+  let lastAssistantIndex = -1, lastTextIndex = -1, lastText = null, lastToolResultIndex = -1;
+  for (let i=0; i<rows.length; i++) {
+    let event; try { event = JSON.parse(rows[i]); } catch { throw new Error("journal_event_unsupported"); }
+    const kind = event?.type === "system" ? (event.subtype === "init" ? "init" : event.subtype === "thinking_tokens" ? "thinking" : null)
+      : event?.type === "rate_limit_event" ? "rate" : ["assistant","user","result"].includes(event?.type) ? event.type : null;
+    ensure(kind && (kind !== "init" || i === 0) && (kind !== "result" || i === rows.length-1), "journal_event_unsupported");
+    onlyKeys(event, READ_EVENT_KEYS[kind], "journal_event_unsupported");
+    ensure(event.session_id === start.sessionID, "journal_session");
+    if (kind === "init") {
+      init++;
+      ensure(init === 1 && event.cwd === start.cwd && event.model === "claude-opus-5-5" &&
+        canonical(event.tools) === canonical(["Glob","Grep","Read"]) && event.permissionMode === "dontAsk" &&
+        event.per_turn_effort_active === true, "journal_execution");
+    } else if (kind === "thinking") {
+      ensure(init === 1 && Number.isSafeInteger(event.estimated_tokens) && Number.isSafeInteger(event.estimated_tokens_delta), "journal_event_unsupported");
+    } else if (kind === "rate") {
+      onlyKeys(event.rate_limit_info, ["status","resetsAt","rateLimitType","overageStatus","overageDisabledReason","isUsingOverage","unifiedWindows"], "journal_event_unsupported");
+      ensure(init === 1 && typeof event.rate_limit_info.status === "string", "journal_event_unsupported");
+    } else if (kind === "assistant") {
+      ensure(init === 1 && event.parent_tool_use_id === null && event.message?.role === "assistant" &&
+        Array.isArray(event.message.content) && !event.message.context_management, "journal_event_unsupported");
+      lastAssistantIndex = i;
+      const texts = event.message.content.filter(block => block?.type === "text");
+      if (texts.length) {
+        ensure(texts.length === 1 && typeof texts[0].text === "string", "journal_event_unsupported");
+        lastTextIndex = i; lastText = texts[0].text;
+      }
+      for (const block of event.message.content) {
+        ensure(block && ["thinking","text","tool_use"].includes(block.type), "journal_event_unsupported");
+        if (block.type !== "tool_use") continue;
+        onlyKeys(block, ["type","id","name","input","caller"], "journal_event_unsupported");
+        ensure(typeof block.id === "string" && block.id && !pending.has(block.id) && !completed.has(block.id), "tool_pairing");
+        ensure(["Read","Glob","Grep"].includes(block.name) && block.input && typeof block.input === "object", "read_tool_error");
+        if (block.name !== "Read") {
+          onlyKeys(block.input, block.name === "Glob" ? ["pattern","path"] : ["pattern","path","output_mode"], "journal_event_unsupported");
+          const value = block.input.path;
+          ensure(value === undefined || typeof value === "string" && inside(start.cwd, path.resolve(start.cwd,value)) && !value.split("/").includes(".."), "read_path_outside_corpus");
+          ensure(typeof block.input.pattern === "string", "journal_event_unsupported");
+          if (block.name === "Glob") ensure(!block.input.pattern.startsWith("/") && !block.input.pattern.split("/").includes(".."), "read_path_outside_corpus");
+        }
+        pending.set(block.id,block);toolCalls++;
+      }
+    } else if (kind === "user") {
+      ensure(init === 1 && event.parent_tool_use_id === null && event.message?.role === "user" &&
+        Array.isArray(event.message.content) && event.message.content.length === 1 &&
+        event.message.content[0]?.type === "tool_result", "journal_event_unsupported");
+      const block = event.message.content[0];
+      onlyKeys(block, ["tool_use_id","type","content","is_error"], "journal_event_unsupported");
+      ensure(block.is_error !== true, "read_tool_error");
+      const use = pending.get(block.tool_use_id);
+      ensure(use && !completed.has(block.tool_use_id), "tool_pairing");
+      ensure(Array.isArray(event.tool_result_meta) && event.tool_result_meta.length === 1 &&
+        event.tool_result_meta[0]?.id === block.tool_use_id && event.tool_result_meta[0]?.permission_decision?.decision === "accept", "read_tool_error");
+      if (use.name === "Read") readToolResult(use,event,files,start.cwd,covered);
+      else ensure(event.tool_use_result && typeof event.tool_use_result === "object" && typeof block.content === "string", "read_tool_error");
+      pending.delete(block.tool_use_id);completed.add(block.tool_use_id);
+      lastToolResultIndex = i;
+    } else if (kind === "result") { ensure(init === 1, "journal_execution"); terminal=event; }
+  }
+  ensure(init === 1 && terminal && pending.size === 0 && toolCalls === completed.size, "tool_pairing");
+  for (const file of corpus.files) ensure(covered.get(file.path).size === file.lines, "read_coverage_incomplete");
+  ensure(lastTextIndex === lastAssistantIndex && lastTextIndex > lastToolResultIndex && lastText === terminal.result, "report_before_source_delivery");
+  return { result:terminal, manifestSHA256:digest(canonical(corpus.manifest)), deliveredFiles:corpus.files.length, requiredFiles:corpus.files.length, toolCalls };
+}
+
 function ensure(condition, code) { if (!condition) throw new Error(code); }
 function inside(root, target) { return target === root || target.startsWith(`${root}${path.sep}`); }
 function outsideCheckoutOutput(checkout, output, code) {
@@ -387,12 +600,14 @@ export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, p
     const entry = entries[0];
     const v1 = entry.kind === "trusted-cli-journal/v1" && entry.sourceSchema === undefined;
     const v2 = entry.kind === "trusted-cli-journal/v2" && entry.sourceSchema === REVIEW_SOURCE_V2;
-    ensure((v1 || v2) && entry.purpose === "independent_implementation_review", "unsupported_review_source");
+    const read = entry.kind === "trusted-cli-read-journal/v1" && entry.sourceSchema === READ_REVIEW_SOURCE;
+    ensure((v1 || v2 || read) && entry.purpose === "independent_implementation_review", "unsupported_review_source");
+    if (read) ensure(registry.entries.filter(row => row.repository === repository && row.pullRequest === pullRequest && row.headSha === headSha).length === 1, "review_not_unique");
     // Select the decoder only after the operator-pinned entry validates. A PR
     // pointer cannot choose it. Keep direct-source callers compatible.
     if (sourceFactory !== undefined) {
       ensure(source === undefined && typeof sourceFactory === "function", "review_source_factory");
-      source = sourceFactory(v2 ? REVIEW_SOURCE_V2 : SOURCE_SCHEMA);
+      source = sourceFactory(v2 || read ? REVIEW_SOURCE_V2 : SOURCE_SCHEMA);
     }
     const bytes = (name) => {
       const artifact = entry.artifacts?.[name];
@@ -405,8 +620,7 @@ export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, p
     const claim = JSON.parse(bytes("claim"));
     const processRecord = JSON.parse(bytes("process"));
     const terminal = JSON.parse(bytes("terminal"));
-    const rawBytes = bytes("raw");
-    const raw = JSON.parse(rawBytes);
+    const rawBytes = bytes(read ? "stream" : "raw");
     const report = bytes("report");
     const system = bytes("system");
     const material = bytes("material");
@@ -421,35 +635,58 @@ export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, p
     ensure(entry.sourceInputSHA256 === digest(Buffer.from(canonical(source))), "review_source_binding");
     const materialText = material.toString("utf8");
     ensure(Buffer.from(materialText, "utf8").equals(material), "source_not_in_launch_input");
-    // One complete source block is the only admitted representation. A second
-    // block (including the other schema) cannot supply contradictory context.
-    ensure(materialText.split(SOURCE_BEGIN).length === 2 && materialText.split(SOURCE_END).length === 2, "source_not_in_launch_input");
-    const blockStart = materialText.indexOf(SOURCE_BEGIN);
-    const blockEnd = materialText.indexOf(SOURCE_END, blockStart) + SOURCE_END.length;
-    const actualBlock = materialText.slice(blockStart, blockEnd);
-    const block = v2 ? reviewSourceV2Block(source) : sourceBlock(source);
-    if (v2) parseReviewSourceV2Block(actualBlock, source);
-    ensure(actualBlock === block, "source_not_in_launch_input");
+    let corpus, readEvidence;
+    if (read) {
+      corpus = readCorpusManifest(source);
+      ensure(materialText.split(READ_SOURCE_BEGIN).length === 2 && materialText.split(READ_SOURCE_END).length === 2 &&
+        !materialText.includes(SOURCE_BEGIN) && !materialText.includes(SOURCE_END), "source_not_in_launch_input");
+      const actualBlock = materialText.slice(materialText.indexOf(READ_SOURCE_BEGIN),materialText.indexOf(READ_SOURCE_END)+READ_SOURCE_END.length);
+      ensure(actualBlock === readCorpusManifestBlock(source), "source_not_in_launch_input");
+      ensure(bytes("manifest").toString("utf8") === `${canonical(corpus.manifest)}\n`, "review_source_binding");
+      const corpusRoot = path.join(root,"corpus");
+      ensure(start.cwd === corpusRoot && fs.realpathSync(corpusRoot) === corpusRoot, "corpus_inventory");
+      const current = readCorpusInventory(corpusRoot,corpus.files);
+      const pre = JSON.parse(bytes("corpusPre")), post = JSON.parse(bytes("corpusPost"));
+      ensure(canonical(pre) === canonical(post) && canonical(pre) === canonical(current), "corpus_inventory");
+      const attempts = JSON.parse(bytes("attempts"));
+      ensure(attempts?.schema === "paperclip.review-attempts/v1" && Array.isArray(attempts.attempts), "journal_execution");
+      ensure(attempts.attempts.length === 1 && attempts.attempts[0]?.sessionID === start.sessionID &&
+        attempts.attempts[0]?.state === "completed", "retry_after_unknown");
+    } else {
+      // Existing inline v1/v2 contract is unchanged.
+      ensure(materialText.split(SOURCE_BEGIN).length === 2 && materialText.split(SOURCE_END).length === 2, "source_not_in_launch_input");
+      const blockStart = materialText.indexOf(SOURCE_BEGIN);
+      const blockEnd = materialText.indexOf(SOURCE_END, blockStart) + SOURCE_END.length;
+      const actualBlock = materialText.slice(blockStart, blockEnd);
+      const block = v2 ? reviewSourceV2Block(source) : sourceBlock(source);
+      if (v2) parseReviewSourceV2Block(actualBlock, source);
+      ensure(actualBlock === block, "source_not_in_launch_input");
+    }
     ensure(start.sessionID === processRecord.sessionID && start.sessionID === claim.sessionID && claim.singleAttempt === true && claim.noRetry === true && Number.isInteger(processRecord.pid) && processRecord.pid > 0, "journal_execution");
     const expectedArgv = [entry.cliInvocationPath, "--print", "--session-id", start.sessionID,
-      "--max-turns", "1", "--model", "claude-opus-5-5", "--effort", "high", "--output-format", "json",
+      "--max-turns", read ? "64" : "1", "--model", "claude-opus-5-5", "--effort", "high", "--output-format", read ? "stream-json" : "json",
       "--safe-mode", "--restricted", "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-      "--setting-sources", "", "--settings", '{"disableAllHooks":true,"enabledPlugins":{}}',
+      "--setting-sources", "", "--settings", read ? readReviewSettings(start,corpus) : '{"disableAllHooks":true,"enabledPlugins":{}}',
       "--disable-slash-commands", "--no-chrome", "--permission-mode", "dontAsk", "--permission-prompts", "none",
       "--no-session-persistence", "--system-prompt", system.toString("utf8")];
+    if (read) { expectedArgv[expectedArgv.indexOf("--tools")+1] = "Read,Glob,Grep"; expectedArgv.splice(expectedArgv.indexOf("--output-format")+2,0,"--verbose"); }
     ensure(canonical(start.argv) === canonical(expectedArgv), "unsupported_launch_shape");
     ensure(typeof entry.implementationSessionID === "string" && entry.implementationSessionID.trim() && entry.implementationSessionID === entry.implementationSessionID.trim(), "implementation_session_unreceived");
     ensure(typeof start.sessionID === "string" && start.sessionID.trim() && start.sessionID === start.sessionID.trim(), "journal_execution");
     ensure(entry.implementationSessionID.toLowerCase() !== start.sessionID.toLowerCase(), "review_not_independent");
-    ensure(terminal.nativeExit === 0 && terminal.inputSHA256 === digest(combined) && terminal.rawSHA256 === digest(rawBytes), "native_terminal");
-    ensure(raw.type === "result" && raw.subtype === "success" && raw.is_error === false && raw.terminal_reason === "completed" && raw.num_turns === 1 && raw.queued_turn_count === 0, "provider_terminal");
+    ensure(terminal.nativeExit === 0 && terminal.inputSHA256 === digest(combined) &&
+      (read ? terminal.streamSHA256 : terminal.rawSHA256) === digest(rawBytes), "native_terminal");
+    const raw = read ? (readEvidence = verifyReadJournal(rawBytes,corpus,start)).result : JSON.parse(rawBytes);
+    ensure(raw.type === "result" && raw.subtype === "success" && raw.is_error === false && raw.terminal_reason === "completed" &&
+      (read ? Number.isSafeInteger(raw.num_turns) && raw.num_turns >= 1 && raw.num_turns <= 64 : raw.num_turns === 1) && raw.queued_turn_count === 0, "provider_terminal");
+    if (read) ensure(raw.stop_reason === "end_turn" && raw.safety_stops === 0 && raw.result_index === 0 && raw.api_error_status === null, "provider_terminal");
     ensure(raw.session_id === start.sessionID && terminal.sessionID === raw.session_id, "provider_session");
     ensure(Object.keys(raw.modelUsage ?? {}).length === 1 && raw.modelUsage?.["claude-opus-5-5"]?.provider === "firstParty", "actual_model_provider");
     ensure(raw.permission_denials?.length === 0 && raw.subagent_stats?.spawned === 0, "review_execution_contract");
     ensure(typeof raw.result === "string" && Buffer.from(raw.result).equals(report), "actual_report");
     const lines = raw.result.replace(/\n+$/, "").split("\n");
     ensure(lines.at(-1) === "判定: GO" && lines.filter((line) => line.startsWith("判定: ")).length === 1, "review_not_go");
-    return { status: "valid", model: "claude-opus-5-5", provider: "firstParty", implementationSessionID: entry.implementationSessionID, sessionID: raw.session_id, headSha, treeSha: source.treeSha, sourceSchema: v2 ? REVIEW_SOURCE_V2 : SOURCE_SCHEMA, evidenceKind: v2 ? "lossless-v2-reconstructed-source" : "inline-v1-whole-source", inputSHA256: digest(combined), reportSHA256: digest(report), report: raw.result, verdict: "判定: GO", trustBoundary: "operator-admitted executor and journal, not signed provider attestation" };
+    return { status: "valid", model: "claude-opus-5-5", provider: "firstParty", implementationSessionID: entry.implementationSessionID, sessionID: raw.session_id, headSha, treeSha: source.treeSha, sourceSchema: read ? READ_REVIEW_SOURCE : v2 ? REVIEW_SOURCE_V2 : SOURCE_SCHEMA, evidenceKind: read ? "read-journal-delivered-source" : v2 ? "lossless-v2-reconstructed-source" : "inline-v1-whole-source", ...(readEvidence ? {manifestSHA256:readEvidence.manifestSHA256,deliveredFiles:readEvidence.deliveredFiles,requiredFiles:readEvidence.requiredFiles,toolCalls:readEvidence.toolCalls} : {}), inputSHA256: digest(combined), reportSHA256: digest(report), report: raw.result, verdict: "判定: GO", trustBoundary: "operator-admitted executor and journal, not signed provider attestation" };
   } catch (error) {
     return { status: "invalid", code: "independent_review_invalid", subcode: /^[a-z][a-z0-9_]+$/.test(error.message) ? error.message : "journal_read_unavailable" };
   }

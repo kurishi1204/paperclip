@@ -323,7 +323,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { admitTrustedJournal, assessForkChecks, assessDispositions, buildReviewSource, canonical, digest, checkReadiness, GREPTILE_APP } from "./check-readiness.mjs";
+import { admitTrustedJournal, assessForkChecks, assessDispositions, buildReviewSource, canonical, digest, checkReadiness, GREPTILE_APP, readCorpusManifest, readCorpusManifestBlock, readReviewSettings } from "./check-readiness.mjs";
 
 const FORK = "kurishi1204/paperclip";
 const HEAD = "1".repeat(40), BASE = "2".repeat(40), TREE = "3".repeat(40), BASE_TREE = "4".repeat(40);
@@ -345,12 +345,12 @@ function forkFixture() {
   const start = { scriptSHA256:digest(launcher),combinedSHA256:inputSHA,combinedBytes:Buffer.byteLength(system)+1+Buffer.byteLength(material),sessionID:session,argv:["/fixture/actual-cli","--print","--session-id",session,"--max-turns","1","--model","claude-opus-5-5","--effort","high","--output-format","json","--safe-mode","--restricted","--tools","","--strict-mcp-config","--mcp-config",'{"mcpServers":{}}',"--setting-sources","","--settings",'{"disableAllHooks":true,"enabledPlugins":{}}',"--disable-slash-commands","--no-chrome","--permission-mode","dontAsk","--permission-prompts","none","--no-session-persistence","--system-prompt",system] };
   const data = { start,claim:{sessionID:session,singleAttempt:true,noRetry:true},process:{sessionID:session,pid:123},terminal:{nativeExit:0,inputSHA256:inputSHA,sessionID:session},raw,report,system,material,launcher,cli };
   const admission = { key:"one",kind:"trusted-cli-journal/v1",purpose:"independent_implementation_review",repository:FORK,pullRequest:1,headSha:HEAD,sourceInputSHA256:digest(canonical(source)),cliSHA256:digest(cli),cliInvocationPath:"/fixture/actual-cli",implementationSessionID:"different-implementation-session",artifacts:{} };
-  let registrySHA;
+  let registrySHA;const extraEntries=[];
   const seal = () => {
     const bytes = (name) => typeof data[name] === "string" ? Buffer.from(data[name]) : Buffer.from(JSON.stringify(data[name]));
     data.terminal.rawSHA256 = digest(bytes("raw"));
     for(const name of Object.keys(data)) { const b=bytes(name);writeFileSync(path.join(root,name),b,{mode:0o600});admission.artifacts[name]={path:name,sha256:digest(b)}; }
-    const b=Buffer.from(JSON.stringify({schema:"paperclip.operator-review-registry/v1",entries:[admission]}));writeFileSync(path.join(root,"registry.json"),b,{mode:0o600});registrySHA=digest(b);
+    const b=Buffer.from(JSON.stringify({schema:"paperclip.operator-review-registry/v1",entries:[admission,...extraEntries]}));writeFileSync(path.join(root,"registry.json"),b,{mode:0o600});registrySHA=digest(b);
   };seal();
   const pointer={admissionKey:"one",pullRequest:1,headSha:HEAD,dispositions:[{sourceID:`independent_review:${digest(report)}`,sourceVersion:digest(report),bodySHA256:digest(report),disposition:"not_a_finding",reason:"The complete report contains no remaining finding",evidence:"sample.mjs:1"}]};
   const evidence=path.join(directory,"pointer.json");writeFileSync(evidence,JSON.stringify({schema:"paperclip.review-pointer/v1",repository:FORK,entries:[pointer]}));
@@ -375,7 +375,7 @@ function forkFixture() {
   routes[`${prefix}/compare/master...${HEAD}`]={behind_by:0,merge_base_commit:{sha:BASE}};
   const view={headRefOid:HEAD,reviewDecision:"",statusCheckRollup:[{__typename:"CheckRun",name:"ci",status:"COMPLETED",conclusion:"SUCCESS"}]};
   const reads=[];
-  return {directory,root,data,admission,source,pointer,seal,pr,ci,routes,view,reads,evidence,
+  return {directory,root,data,admission,extraEntries,source,pointer,seal,pr,ci,routes,view,reads,evidence,
     options:()=>({review_evidence:evidence,trusted_review_root:root,trusted_review_registry_sha256:registrySHA}),
     admissionArgs:()=>({trustedRoot:root,registrySHA256:registrySHA,repository:FORK,pullRequest:1,headSha:HEAD,source,pointer,checkoutRoot:path.dirname(new URL(import.meta.url).pathname)}),
     deps:{getJson:(route)=>{reads.push(route);assert.ok(Object.hasOwn(routes,route),route);return structuredClone(routes[route]);},viewPullRequest:()=>structuredClone(view)},
@@ -740,6 +740,124 @@ function v2JournalFixture() {
  f.seal();
  return f;
 }
+
+function readJournalFixture() {
+ const f=forkFixture(), dependency="export const dependency = 1;\n", depBlob=hashBlob(dependency), prefix=`repos/${FORK}`;
+ f.source.dependencyFiles.push({path:"dependency.mjs",blobSha:depBlob,content:dependency});
+ f.pointer.dependencies=["dependency.mjs"];
+ writeFileSync(f.evidence,JSON.stringify({schema:"paperclip.review-pointer/v1",repository:FORK,entries:[f.pointer]}));
+ f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree.push({path:"dependency.mjs",type:"blob",mode:"100644",sha:depBlob});
+ f.routes[`${prefix}/git/blobs/${depBlob}`]={sha:depBlob,encoding:"base64",size:Buffer.byteLength(dependency),content:Buffer.from(dependency).toString("base64")};
+ f.admission.kind="trusted-cli-read-journal/v1";f.admission.sourceSchema="paperclip.fork-review-read-corpus/v1";
+ f.admission.sourceInputSHA256=digest(canonical(f.source));
+ const corpus=readCorpusManifest(f.source);mkdirSync(path.join(f.root,"corpus"),{mode:0o700});const cwd=realpathSync(path.join(f.root,"corpus"));
+ for(const file of corpus.files) { const target=path.join(cwd,file.path);mkdirSync(path.dirname(target),{recursive:true,mode:0o700});writeFileSync(target,file.content,{mode:0o400}); }
+ const inventory={schema:"paperclip.read-corpus-inventory/v1",root:cwd,files:corpus.files.map(file=>({path:file.path,mode:0o400,nlink:1,type:"file",sha256:file.sha256}))};
+ f.data.manifest=`${canonical(corpus.manifest)}\n`;f.data.corpusPre=inventory;f.data.corpusPost=structuredClone(inventory);
+ f.data.attempts={schema:"paperclip.review-attempts/v1",attempts:[{sessionID:f.data.start.sessionID,state:"completed"}]};
+ f.data.material=`Review all corpus files.\n${readCorpusManifestBlock(f.source)}`;
+ const combined=Buffer.concat([Buffer.from(f.data.system),Buffer.from([0]),Buffer.from(f.data.material)]);
+ f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(combined);f.data.start.combinedBytes=combined.length;f.data.start.cwd=cwd;f.data.start.home=path.join(f.directory,"synthetic-home");
+ const argv=f.data.start.argv;argv[argv.indexOf("--max-turns")+1]="64";argv[argv.indexOf("--output-format")+1]="stream-json";argv.splice(argv.indexOf("--output-format")+2,0,"--verbose");argv[argv.indexOf("--tools")+1]="Read,Glob,Grep";argv[argv.indexOf("--settings")+1]=readReviewSettings(f.data.start,corpus);
+ const sid=f.data.start.sessionID;
+ const events=[{type:"system",subtype:"init",cwd,session_id:sid,model:"claude-opus-5-5",tools:["Glob","Grep","Read"],permissionMode:"dontAsk",per_turn_effort_active:true}];
+ for(const [index,file] of corpus.files.entries()) {
+   const id=`toolu_fixture_${index}`,filePath=path.join(cwd,file.path),lines=file.content.split("\n");
+   events.push({type:"assistant",parent_tool_use_id:null,session_id:sid,message:{role:"assistant",content:[{type:"tool_use",id,name:"Read",input:{file_path:filePath}}]}});
+   events.push({type:"user",parent_tool_use_id:null,session_id:sid,message:{role:"user",content:[{type:"tool_result",tool_use_id:id,content:lines.map((line,i)=>`${i+1}\t${line}`).join("\n")}]},tool_use_result:{type:"text",file:{filePath,content:file.content,numLines:lines.length,startLine:1,totalLines:lines.length}},tool_result_meta:[{id,permission_decision:{decision:"accept",source:"config",reason_type:"mode"}}]});
+ }
+ events.splice(2,0,{type:"system",subtype:"thinking_tokens",session_id:sid,estimated_tokens:1,estimated_tokens_delta:1});
+ events.splice(3,0,{type:"rate_limit_event",session_id:sid,rate_limit_info:{status:"allowed"}});
+ events.push({type:"assistant",parent_tool_use_id:null,session_id:sid,message:{role:"assistant",content:[{type:"text",text:f.data.report}]}});
+ events.push({...f.data.raw,num_turns:4,stop_reason:"end_turn",safety_stops:0,result_index:0,api_error_status:null});
+ f.data.stream=events.map(event=>JSON.stringify(event)).join("\n")+"\n";
+ f.data.terminal.streamSHA256=digest(f.data.stream);
+ f.seal();
+ return {f,corpus,events,cwd,refresh(){f.data.stream=events.map(event=>JSON.stringify(event)).join("\n")+"\n";f.data.terminal.streamSHA256=digest(f.data.stream);f.seal();}};
+}
+test("read journal old kind fails and new pinned kind reaches real readiness with full reconstructed source",async()=>{
+ const x=readJournalFixture(),{f,corpus}=x;try{
+   assert.deepEqual(corpus.files.map(file=>({path:file.path,mode:statSync(path.join(x.cwd,file.path)).mode&0o777,nlink:statSync(path.join(x.cwd,file.path)).nlink,type:"file",sha256:digest(readFileSync(path.join(x.cwd,file.path)))})),f.data.corpusPre.files);
+   f.admission.kind="trusted-cli-journal/v1";delete f.admission.sourceSchema;f.seal();
+   const old=await checkReadiness(document,f.options(),f.deps);assert.equal(old.pullRequests[0].independentReview.subcode,"source_not_in_launch_input");
+   f.admission.kind="trusted-cli-read-journal/v1";f.admission.sourceSchema="paperclip.fork-review-read-corpus/v1";f.seal();
+   const accepted=await checkReadiness(document,f.options(),f.deps);
+   assert.equal(accepted.pullRequests[0].verdict,"ready",JSON.stringify(accepted));
+   const review=accepted.pullRequests[0].independentReview;
+   assert.equal(review.status,"valid");assert.equal(review.evidenceKind,"read-journal-delivered-source");
+   assert.equal(review.deliveredFiles,corpus.files.length);assert.equal(review.requiredFiles,corpus.files.length);
+   assert.equal(review.toolCalls,corpus.files.length);assert.equal(review.manifestSHA256,digest(canonical(corpus.manifest)));
+   assert.match(renderReport(accepted),/Read corpus: manifest [0-9a-f]{64}; delivered 3\/3 files; tool calls 3/);
+   assert.equal(accepted.pullRequests[0].source.changedFiles[0].before.content,"old source\n");
+   assert.equal(accepted.pullRequests[0].source.dependencyFiles[0].content,"export const dependency = 1;\n");
+ }finally{f.close();}
+});
+test("read journal combines exact Read ranges before accepting a full source file",async()=>{
+ const x=readJournalFixture(),{f,events}=x;try{
+   const index=events.findIndex(e=>e.type==="user"),first=events[index],use=events.find(e=>e.type==="assistant").message.content[0],id="toolu_fixture_split";
+   first.tool_use_result.file.numLines=1;first.tool_use_result.file.content="new source\n";first.message.content[0].content="1\tnew source\n";
+   const secondUse={type:"assistant",parent_tool_use_id:null,session_id:f.data.start.sessionID,message:{role:"assistant",content:[{...use,id,input:{file_path:use.input.file_path,offset:2,limit:1}}]}};
+   const secondResult={type:"user",parent_tool_use_id:null,session_id:f.data.start.sessionID,message:{role:"user",content:[{type:"tool_result",tool_use_id:id,content:"2\t"}]},tool_use_result:{type:"text",file:{filePath:use.input.file_path,content:"",numLines:1,startLine:2,totalLines:2}},tool_result_meta:[{id,permission_decision:{decision:"accept"}}]};
+   events.splice(index+1,0,secondUse,secondResult);x.refresh();
+   const result=await checkReadiness(document,f.options(),f.deps);
+   assert.equal(result.pullRequests[0].verdict,"ready",JSON.stringify(result.pullRequests[0].independentReview));
+   assert.equal(result.pullRequests[0].independentReview.toolCalls,4);
+ }finally{f.close();}
+});
+test("Grep searches literal path-like regex within the corpus without counting as source delivery",async()=>{
+ const x=readJournalFixture(),{f,events}=x;try{
+   const id="toolu_fixture_grep",sid=f.data.start.sessionID;
+   events.splice(1,0,
+     {type:"assistant",parent_tool_use_id:null,session_id:sid,message:{role:"assistant",content:[{type:"tool_use",id,name:"Grep",input:{pattern:"/api|../import",path:x.cwd,output_mode:"content"}}]}},
+     {type:"user",parent_tool_use_id:null,session_id:sid,message:{role:"user",content:[{type:"tool_result",tool_use_id:id,content:"No matches found"}]},tool_use_result:{mode:"content",numFiles:0},tool_result_meta:[{id,permission_decision:{decision:"accept"}}]});
+   x.refresh();const result=await checkReadiness(document,f.options(),f.deps);
+   assert.equal(result.pullRequests[0].verdict,"ready",JSON.stringify(result.pullRequests[0].independentReview));
+   assert.equal(result.pullRequests[0].independentReview.toolCalls,4);
+   assert.equal(result.pullRequests[0].independentReview.deliveredFiles,3);
+ }finally{f.close();}
+});
+for(const [name,mutate,subcode] of [
+ ["one source never read",x=>{x.events.splice(1,4);},"read_coverage_incomplete"],
+ ["altered Read bytes",x=>{const result=x.events.find(e=>e.type==="user");result.tool_use_result.file.content="altered\n";},"read_bytes_mismatch"],
+ ["partial Read only",x=>{const result=x.events.find(e=>e.type==="user");result.tool_use_result.file.content="new source\n";result.tool_use_result.file.numLines=1;result.message.content[0].content="1\tnew source\n";},"read_coverage_incomplete"],
+ ["Read outside corpus",x=>{const use=x.events.find(e=>e.type==="assistant");use.message.content[0].input.file_path=path.join(x.cwd,"..","outside");},"read_path_outside_corpus"],
+ ["orphan result",x=>{const result=x.events.find(e=>e.type==="user");result.message.content[0].tool_use_id="never_used";},"tool_pairing"],
+ ["mixed session",x=>{const result=x.events.find(e=>e.type==="user");result.session_id="other-session";},"journal_session"],
+ ["compaction event",x=>{x.events.splice(1,0,{type:"system",subtype:"compact_boundary",session_id:x.f.data.start.sessionID});},"journal_event_unsupported"],
+ ["unknown stream event",x=>{x.events.splice(1,0,{type:"future_event",session_id:x.f.data.start.sessionID});},"journal_event_unsupported"],
+ ["duplicate tool result",x=>{const result=x.events.find(e=>e.type==="user");x.events.splice(x.events.indexOf(result)+1,0,structuredClone(result));},"tool_pairing"],
+ ["failed Read",x=>{const result=x.events.find(e=>e.type==="user");result.message.content[0].is_error=true;},"read_tool_error"],
+ ["non GO verdict",x=>{x.events.at(-1).result="判定: CONDITIONAL GO\n";x.events.at(-2).message.content[0].text=x.f.data.report="判定: CONDITIONAL GO\n";},"review_not_go"],
+ ["GO text before final Read",x=>{const text=x.events.splice(x.events.length-2,1)[0];x.events.splice(1,0,text);},"report_before_source_delivery"],
+ ["result differs from final assistant text",x=>{x.events.at(-2).message.content[0].text="Different conclusion\n";},"report_before_source_delivery"],
+ ["unknown previous attempt",x=>{x.f.data.attempts.attempts.unshift({sessionID:"prior",state:"unknown"});},"retry_after_unknown"],
+ ["second head entry",x=>{x.f.extraEntries.push({...x.f.admission,key:"other"});},"review_not_unique"],
+ ["symlink in corpus",x=>{const file=x.corpus.files[0];rmSync(path.join(x.cwd,file.path));symlinkSync(path.join(x.cwd,x.corpus.files[1].path),path.join(x.cwd,file.path));},"corpus_inventory"],
+ ["manifest from other source",x=>{x.f.data.manifest='{"other":true}\n';},"review_source_binding"],
+ ["extra model usage",x=>{x.events.at(-1).modelUsage.other={provider:"firstParty"};},"actual_model_provider"],
+ ["resumed argv",x=>{x.f.data.start.argv.push("--resume","old-session");},"unsupported_launch_shape"],
+]) test(`read journal rejects ${name}`,()=>{const x=readJournalFixture();try{mutate(x);x.refresh();const result=admitTrustedJournal(x.f.admissionArgs());assert.deepEqual(result,{status:"invalid",code:"independent_review_invalid",subcode},JSON.stringify(result));}finally{x.f.close();}});
+test("read corpus fails closed on unmeasured text encodings and empty or unterminated files",()=>{
+ const f=forkFixture();try{for(const content of ["", "new\r\n", "\ufeffnew\n", "new"]) {
+   f.source.changedFiles[0].after.content=content;f.source.changedFiles[0].after.blobSha=hashBlob(content);
+   assert.throws(()=>readCorpusManifest(f.source),/read_encoding_unsupported/);
+ }}finally{f.close();}
+});
+test("read corpus maps instruction and tool-config source paths to inert physical asset names",()=>{
+ const f=forkFixture();try{
+   const file=f.source.changedFiles[0];file.path=file.before.path=file.after.path="AGENTS.md";
+   const dep="{\"mcpServers\":{}}\n";f.source.dependencyFiles.push({path:".mcp.json",blobSha:hashBlob(dep),content:dep});
+   const corpus=readCorpusManifest(f.source);
+   assert.deepEqual(new Set(corpus.manifest.files.map(row=>row.role)),new Set(["after","reverse","deps"]));
+   assert.deepEqual(new Set(corpus.manifest.files.map(row=>row.sourcePath)),new Set(["AGENTS.md",".mcp.json"]));
+   assert.ok(corpus.manifest.files.every(row=>/^assets\/[0-9a-f]{64}\.txt$/.test(row.path)));
+   const settings=JSON.parse(readReviewSettings({cwd:"/private/tmp/isolated/corpus",home:"/private/tmp/isolated/home"},corpus));
+   assert.equal(settings.pluginConfigs["cc-plugin-agents-md@builtin"].options.instructionFiles,"managed-only");
+   assert.equal(settings.autoMemoryEnabled,false);
+   assert.ok(settings.claudeMdExcludes.includes("/private/tmp/isolated/CLAUDE.md"));
+   assert.ok(settings.claudeMdExcludes.includes("/private/tmp/isolated/corpus/assets/.claude/rules/**"));
+ }finally{f.close();}
+});
 test("explicit v2 registry admits only a restored exact logical v1 source",()=>{
  const f=v2JournalFixture();try{
   const review=admitTrustedJournal(f.admissionArgs());
