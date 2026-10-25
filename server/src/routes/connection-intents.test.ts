@@ -8,8 +8,14 @@ import {
   RUNTIME_CONNECTION_TOOL_DEFINITIONS,
   wakeConnectionIntentAfterResolution,
 } from "./connection-intents.js";
+import { RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES } from "../services/connection-tool-definitions.js";
 
 describe("runtime connection MCP contract", () => {
+  it("derives client read approvals only from the first-party advertised read tool", () => {
+    expect(RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES).toEqual(["connections_search"]);
+    expect(Object.isFrozen(RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES)).toBe(true);
+    expect(RUNTIME_CONNECTION_TOOL_DEFINITIONS.every((tool) => !("annotations" in tool) && !("clientApprovalRisk" in tool))).toBe(true);
+  });
   it("advertises both canonical tools with the shared descriptions and narrow schemas", () => {
     expect(
       RUNTIME_CONNECTION_TOOL_DEFINITIONS.map((tool) => tool.name),
