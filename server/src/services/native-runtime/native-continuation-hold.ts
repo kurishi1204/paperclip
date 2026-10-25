@@ -1,5 +1,6 @@
-import { heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
-import { and, eq, sql, type SQL, type SQLWrapper } from "drizzle-orm";
+import { environmentLeases, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { and, asc, eq, notInArray, sql, type SQL, type SQLWrapper } from "drizzle-orm";
+import { isCancelledNativeStartup } from "../cancelled-native-startup.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
 
 export type NativeContinuationIssueFacts = Pick<typeof issues.$inferSelect,
@@ -204,7 +205,10 @@ function nativeContinuationOrphanSql(run: SQLWrapper): SQL<boolean> {
 }
 
 export function nativeContinuationRecoveryPathSql(
-  input: { agentId?: string | null; orphanedOnly?: boolean } = {},
+  input: { agentId?: string | null; orphanedOnly?: boolean;
+    /** Internal, transaction-local proof IDs only. The source writer must
+     * obtain these under its issue lock with lockCancelledStartupRecoveryExemptions. */
+    provenCancelledStartupRunIds?: readonly string[] } = {},
 ): SQL<boolean> {
   const run = sql.identifier("native_recovery_run");
   const finalization = sql.identifier("native_recovery_finalization");
@@ -221,18 +225,82 @@ export function nativeContinuationRecoveryPathSql(
       and ${r("native_issue_id")} = ${i("id")}
       and ${i("status")} not in ('done', 'cancelled')
       and ${input.agentId ? sql`${r("agent_id")} = ${input.agentId}` : sql`true`}
+      and ${input.provenCancelledStartupRunIds?.length
+        ? notInArray(r("id"), [...input.provenCancelledStartupRunIds]) : sql`true`}
       and ${nativeContinuationRecoveryRowSql(run, finalization)}
       and ${input.orphanedOnly ? nativeContinuationOrphanSql(run) : sql`true`}
   )`;
 }
 
-/** No locks, writes, limits or dispatch authority checks. The SQL used here
- * and at the source write has identical settlement and receipt semantics. */
+async function isSameOwnerCancelledStartup(
+  db: NativeContinuationReader,
+  issue: NativeContinuationIssueFacts,
+  run: typeof heartbeatRuns.$inferSelect,
+  finalization: typeof nativeRunFinalizations.$inferSelect,
+): Promise<boolean> {
+  // This only removes an unnecessary evidence hold for the unchanged owner.
+  // It neither retries the stopped run nor authorizes a new provider turn.
+  // Cross-owner history and explicitly board-owned uncertainty still require
+  // the existing reconciliation decision, even when attempt is zero.
+  const owner = finalization.failureDetail?.recoveryOwner;
+  if (issue.assigneeUserId !== null || issue.assigneeAgentId !== run.agentId
+    || (owner && typeof owner === "object" && "kind" in owner && owner.kind === "board")) return false;
+  return isCancelledNativeStartup(db as Db, run, finalization);
+}
+
+/** The caller already holds I. Reprove the one existing complete cancellation
+ * receipt under F then R and existing lease locks; a busy row stays protected by the SQL fence.
+ * SKIP LOCKED avoids waiting on a coordinator that may need the issue lock.
+ * Do not persist or carry these IDs into a later transaction. */
+export async function lockCancelledStartupRecoveryExemptions(
+  db: NativeContinuationReader,
+  issue: NativeContinuationIssueFacts,
+): Promise<string[]> {
+  if (!issue.assigneeAgentId || issue.assigneeUserId !== null) return [];
+  const candidates = await db.select({ runId: heartbeatRuns.id }).from(heartbeatRuns)
+    .innerJoin(nativeRunFinalizations, and(
+      eq(nativeRunFinalizations.runId, heartbeatRuns.id),
+      eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId),
+      eq(nativeRunFinalizations.issueId, heartbeatRuns.nativeIssueId),
+    )).where(and(
+      eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.nativeIssueId, issue.id),
+      eq(heartbeatRuns.agentId, issue.assigneeAgentId), eq(heartbeatRuns.status, "cancelled"),
+      nativeContinuationRecoveryRowSql(sql`${heartbeatRuns}`, sql`${nativeRunFinalizations}`),
+    )).orderBy(asc(heartbeatRuns.id));
+  const proven: string[] = [];
+  for (const { runId } of candidates) {
+    const [finalization] = await db.select().from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.companyId, issue.companyId),
+      eq(nativeRunFinalizations.issueId, issue.id), eq(nativeRunFinalizations.runId, runId),
+    )).for("update", { skipLocked: true });
+    if (!finalization) continue;
+    const [run] = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.nativeIssueId, issue.id),
+      eq(heartbeatRuns.id, runId),
+    )).for("update", { skipLocked: true });
+    if (!run) continue;
+    const leaseScope = and(eq(environmentLeases.companyId, issue.companyId), eq(environmentLeases.heartbeatRunId, runId));
+    const lockedLeases = await db.select({ id: environmentLeases.id }).from(environmentLeases)
+      .where(leaseScope).for("update", { skipLocked: true });
+    const allLeases = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(leaseScope);
+    const lockedIds = new Set(lockedLeases.map(lease => lease.id));
+    // Lease updates need not lock F/R. Pin every current row, while the R
+    // FOR UPDATE lock also fences new FK-referencing leases/events.
+    if (lockedIds.size !== allLeases.length || allLeases.some(lease => !lockedIds.has(lease.id))) continue;
+    if (await isSameOwnerCancelledStartup(db, issue, run, finalization)) proven.push(runId);
+  }
+  return proven;
+}
+
+/** Advisory reads only. The conservative SQL candidate set is narrowed by the
+ * existing complete startup-cancellation proof, never by attempt/PID alone.
+ * A source write independently reproves any exemption under I/F/R locks. */
 export async function readNativeContinuationRecoveryPath(
   db: NativeContinuationReader,
   input: { companyId: string; issueId: string; agentId?: string | null },
 ): Promise<{ pending: boolean; orphaned: boolean; orphanedRunIds: string[]; boardEvidenceWaiting: boolean }> {
   const rows = await db.select({
+    issue: issues, run: heartbeatRuns, finalization: nativeRunFinalizations,
     runId: heartbeatRuns.id,
     orphaned: nativeContinuationOrphanSql(sql`${heartbeatRuns}`),
     boardEvidenceWaiting: nativeBoardEvidenceWaitingSql(sql`${nativeRunFinalizations}`),
@@ -252,7 +320,11 @@ export async function readNativeContinuationRecoveryPath(
       input.agentId ? eq(heartbeatRuns.agentId, input.agentId) : sql`true`,
       nativeContinuationRecoveryRowSql(sql`${heartbeatRuns}`, sql`${nativeRunFinalizations}`),
     ));
-  const orphanedRunIds = rows.filter(row => row.orphaned).map(row => row.runId).sort();
-  return { pending: rows.length > 0, orphaned: orphanedRunIds.length > 0, orphanedRunIds,
-    boardEvidenceWaiting: rows.some(row => row.boardEvidenceWaiting) };
+  const pending = [] as typeof rows;
+  for (const row of rows) {
+    if (!await isSameOwnerCancelledStartup(db, row.issue, row.run, row.finalization)) pending.push(row);
+  }
+  const orphanedRunIds = pending.filter(row => row.orphaned).map(row => row.runId).sort();
+  return { pending: pending.length > 0, orphaned: orphanedRunIds.length > 0, orphanedRunIds,
+    boardEvidenceWaiting: pending.some(row => row.boardEvidenceWaiting) };
 }

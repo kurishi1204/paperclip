@@ -7,7 +7,7 @@ import { eq, inArray, sql } from "drizzle-orm";
 import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  activityLog, agentWakeupRequests, agents, companies, createDb, environmentLeases, heartbeatRuns,
+  activityLog, agentWakeupRequests, agents, companies, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns,
   issueComments, issueRecoveryActions, issueRelations, issues, nativeRunFinalizations, startEmbeddedPostgresTestDatabase,
 } from "@paperclipai/db";
 
@@ -25,7 +25,7 @@ import { issueRoutes } from "../routes/issues.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { collectDispositionRepairSourceState } from "../services/recovery/disposition-repair.js";
-import { readNativeContinuationHold } from "../services/native-runtime/native-continuation-hold.js";
+import { lockCancelledStartupRecoveryExemptions, readNativeContinuationHold, readNativeContinuationRecoveryPath } from "../services/native-runtime/native-continuation-hold.js";
 import { claimNativeSessionResumptions } from "../services/native-runtime/native-finalization-reconciler.js";
 import { isCancelledNativeStartup } from "../services/cancelled-native-startup.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
@@ -1001,6 +1001,247 @@ describe("native continuation ownership: automatic clear and adoption", () => {
     };
   }
 
+  async function seedCancelledHistoricalStartup() {
+    const f = await seed({ status: "in_progress" });
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, f.actorRunId));
+    await db.update(heartbeatRuns).set({ status: "cancelled", nativePhase: "observed",
+      errorCode: "operator_interrupted", finishedAt: new Date(),
+      resultJson: { startupPreparationSettledAt: new Date().toISOString() } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "observed", attempt: 0,
+      controllerGeneration: 0, controllerBootId: null, controllerPid: null,
+      leaseOwner: null, leaseExpiresAt: null, recoveryState: null, failureDetail: null })
+      .where(eq(nativeRunFinalizations.runId, f.runId));
+    await db.update(issues).set({ executionRunId: null, checkoutRunId: null })
+      .where(eq(issues.id, f.issueId));
+    return f;
+  }
+
+  it("A8 a proven same-owner cancelled startup creates no BOARD hold or automatic replay", async () => {
+    const f = await seedCancelledHistoricalStartup();
+    const before = { issue: await f.readIssue(),
+      run: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]!,
+      finalization: (await db.select().from(nativeRunFinalizations)
+        .where(eq(nativeRunFinalizations.runId, f.runId)))[0]! };
+    expect(await isCancelledNativeStartup(db, before.run, before.finalization)).toBe(true);
+    const path = await readNativeContinuationRecoveryPath(db, { companyId: f.companyId, issueId: f.issueId });
+    const recovery = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+    const actions = await db.select().from(issueRecoveryActions);
+    const afterSweep = await f.readIssue();
+    const updated = await issueService(db, { preserveHeldNativeContinuation: true })
+      .update(f.issueId, { status: "todo" });
+    observations.push({ kind: "A8_cancelled_startup", pending: path.pending,
+      boardActions: actions.length, operatorCancelExempted: recovery.operatorCancelExempted,
+      sourceUnchangedThroughSweep: JSON.stringify(afterSweep) === JSON.stringify(before.issue),
+      guardedUpdateAccepted: updated !== null, wakes: (await db.select().from(agentWakeupRequests)).length });
+    expect(path).toEqual({ pending: false, orphaned: false, orphanedRunIds: [], boardEvidenceWaiting: false });
+    expect(actions).toHaveLength(0);
+    expect(recovery.operatorCancelExempted).toBe(1);
+    expect(afterSweep).toEqual(before.issue);
+    expect(updated).not.toBeNull();
+    expect((await f.readIssue()).status).toBe("todo");
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]).toEqual(before.run);
+    expect((await db.select().from(nativeRunFinalizations)
+      .where(eq(nativeRunFinalizations.runId, f.runId)))[0]).toEqual(before.finalization);
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+  });
+
+  it.each(["board_owned", "attempt_one", "provider_event", "remote_without_receipt"] as const)(
+    "A8 cancellation exemptions preserve contradictory or explicitly owned evidence (%s)", async boundary => {
+      const f = await seedCancelledHistoricalStartup();
+      if (boundary === "board_owned") await db.update(nativeRunFinalizations).set({
+        phase: "terminal_failure", failureDetail: { recoveryOwner: { kind: "board" } },
+      }).where(eq(nativeRunFinalizations.runId, f.runId));
+      if (boundary === "attempt_one") await db.update(nativeRunFinalizations).set({ attempt: 1 })
+        .where(eq(nativeRunFinalizations.runId, f.runId));
+      if (boundary === "provider_event") await db.insert(heartbeatRunEvents).values({
+        companyId: f.companyId, runId: f.runId, agentId: f.agentId, seq: 1, eventType: "adapter.invoke" });
+      if (boundary === "remote_without_receipt") await db.insert(environmentLeases).values({
+        companyId: f.companyId, heartbeatRunId: f.runId, provider: "synthetic_remote",
+        status: "released", releasedAt: new Date(),
+      });
+      const before = await f.readIssue();
+      const path = await readNativeContinuationRecoveryPath(db, { companyId: f.companyId, issueId: f.issueId });
+      const updated = await issueService(db, { preserveHeldNativeContinuation: true })
+        .update(f.issueId, { status: "todo" });
+      observations.push({ kind: "A8_cancelled_evidence_refused", boundary, pending: path.pending,
+        guardedUpdateAccepted: updated !== null });
+      expect(path.pending).toBe(true);
+      expect(updated).toBeNull();
+      expect(await f.readIssue()).toEqual(before);
+      expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    });
+
+  it("A8 cancellation proof is repeated under source locks and backs off from a busy coordinator", async () => {
+    const f = await seedCancelledHistoricalStartup();
+    expect((await readNativeContinuationRecoveryPath(db, { companyId: f.companyId, issueId: f.issueId })).pending).toBe(false);
+    const before = await f.readIssue();
+    let announce!: () => void, release!: () => void;
+    const acquired = new Promise<void>(resolve => { announce = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const holder = db.transaction(async tx => {
+      await tx.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)).for("update");
+      announce(); await released;
+    });
+    await acquired;
+    let busy: unknown;
+    try {
+      busy = await issueService(db, { preserveHeldNativeContinuation: true }).update(f.issueId, { status: "todo" });
+      expect(busy).toBeNull();
+      expect(await f.readIssue()).toEqual(before);
+    } finally { release(); await holder; }
+    // The earlier advisory proof is not an admission receipt. Contradictory
+    // durable launch evidence arriving before the write must revoke exemption.
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId,
+      runId: f.runId, agentId: f.agentId, seq: 1, eventType: "adapter.invoke" });
+    const denied = await issueService(db, { preserveHeldNativeContinuation: true })
+      .update(f.issueId, { status: "todo" });
+    observations.push({ kind: "A8_cancelled_lock_reproof", busyRefused: busy === null,
+      lateEvidenceRefused: denied === null, sourceUnchanged: JSON.stringify(await f.readIssue()) === JSON.stringify(before) });
+    expect(denied).toBeNull();
+    expect(await f.readIssue()).toEqual(before);
+  });
+
+  it.each([{ formed: false, quota: false }, { formed: true, quota: false },
+    { formed: false, quota: true }, { formed: true, quota: true }])(
+    "A8 stranded escalation commits source, action and quota reservation together (formed=$formed, quota=$quota)", async ({ formed, quota }) => {
+    const outcomes: Record<string, unknown>[] = [];
+      const f = await seed({ checkout: true, status: "in_progress", phase: "terminal_failure" });
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, f.actorRunId));
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
+      if (quota) await db.update(heartbeatRuns).set({ errorCode: "provider_quota",
+        resultJson: { providerQuotaRetryNotBefore: new Date(Date.now() + 60_000).toISOString() } })
+        .where(eq(heartbeatRuns.id, f.runId));
+      const before = await f.readIssue();
+      let crossed = 0;
+      let formedSource: typeof issues.$inferSelect | undefined;
+      const wrap = (tx: typeof db) => new Proxy(tx, { get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver);
+        if (property !== "select") return typeof value === "function" ? value.bind(target) : value;
+        return (...fields: unknown[]) => {
+          const builder = Reflect.apply(target.select, target, fields);
+          const from = builder.from.bind(builder);
+          Object.defineProperty(builder, "from", { value: (table: unknown) => {
+            const selected = Reflect.apply(from, builder, [table]) as { for: (...args: unknown[]) => unknown };
+            if (table !== issues) return selected;
+            const lock = selected.for.bind(selected);
+            Object.defineProperty(selected, "for", { value: (...args: unknown[]) => {
+              const query = Reflect.apply(lock, selected, args) as PromiseLike<unknown>;
+              const then = query.then.bind(query);
+              Object.defineProperty(query, "then", { value: (resolve?: (value: unknown) => unknown, reject?: (reason: unknown) => unknown) =>
+                Promise.resolve().then(async () => {
+                  if (crossed++ === 0 && formed) await db.transaction(async other => {
+                    await other.select().from(issues).where(eq(issues.id, f.issueId)).for("update");
+                    await other.update(nativeRunFinalizations).set({ phase: "retryable_failure", recoveryState: "resuming_session" })
+                      .where(eq(nativeRunFinalizations.runId, f.runId));
+                    [formedSource] = await other.select().from(issues).where(eq(issues.id, f.issueId));
+                  });
+                }).then(() => then(resolve, reject)) });
+              return query;
+            }});
+            return selected;
+          }});
+          return builder;
+        };
+      }});
+      const intercepted = new Proxy(db, { get(target, property, receiver) {
+        if (property === "transaction") return (callback: (tx: typeof db) => Promise<unknown>) =>
+          target.transaction(tx => callback(wrap(tx as unknown as typeof db)));
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      }});
+      const result = await recoveryService(intercepted, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+      const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId));
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      const comments = await db.select().from(issueComments).where(eq(issueComments.companyId, f.companyId));
+      const after = await f.readIssue();
+      outcomes.push({ quota, crossed, escalated: result.escalated, actions: actions.length,
+        runs: runs.length, wakes: wakes.length, comments: comments.length,
+        sourceAccepted: after.status === "blocked", formationPreserved: formed ? JSON.stringify(after) === JSON.stringify(formedSource) : null });
+      observations.push({ kind: "A8_stranded_atomic_escalation", formed, outcomes });
+      if (formed) {
+        expect(after).toEqual(formedSource);
+        expect(after).toEqual(before);
+        expect(actions).toHaveLength(0);
+        expect(runs).toHaveLength(1);
+        expect(wakes).toHaveLength(0);
+        expect(comments).toHaveLength(0);
+        expect(result.escalated).toBe(0);
+      } else {
+        expect(after.status).toBe("blocked");
+        expect(actions).toHaveLength(1);
+        expect(actions[0]).toMatchObject({ ownerType: quota ? "system" : "board", returnOwnerAgentId: f.agentId });
+        expect(runs).toHaveLength(quota ? 2 : 1);
+        expect(wakes).toHaveLength(quota ? 1 : 0);
+        expect(comments).toHaveLength(quota ? 0 : 1);
+        expect(result.escalated).toBe(1);
+      }
+  });
+
+  it("A8 simultaneous resumption dispatch callers receive different arrays with one lease in total", async () => {
+    const f = await seed({ checkout: true, status: "in_progress" });
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, f.actorRunId));
+    await persistNativeResumeEvidence(f);
+    const [a, b] = await Promise.all([
+      claimNativeSessionResumptions({ db, runnerInstanceId: "synthetic-dispatch-a", runIds: [f.runId] }),
+      claimNativeSessionResumptions({ db, runnerInstanceId: "synthetic-dispatch-b", runIds: [f.runId] }),
+    ]);
+    observations.push({ kind: "A8_concurrent_claim_delivery", first: a.length, second: b.length,
+      distinctArrays: a !== b, distinctRunIds: new Set([...a, ...b].map(x => x.runId)).size });
+    expect(a).not.toBe(b);
+    expect([...a, ...b]).toHaveLength(1);
+    expect([...a, ...b][0]!.runId).toBe(f.runId);
+  });
+
+  it("A8 cancellation admission pins existing leases and fences new lease and event evidence", async () => {
+    const f = await seedCancelledHistoricalStartup();
+    const [lease] = await db.insert(environmentLeases).values({ companyId: f.companyId,
+      heartbeatRunId: f.runId, provider: "local", status: "released", releasedAt: new Date() }).returning();
+    const before = await f.readIssue();
+    let announce!: () => void, release!: () => void;
+    const acquired = new Promise<void>(resolve => { announce = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const holder = db.transaction(async tx => {
+      await tx.select().from(environmentLeases).where(eq(environmentLeases.id, lease!.id)).for("update");
+      announce(); await released;
+    });
+    await acquired;
+    let busy: unknown;
+    try {
+      busy = await issueService(db, { preserveHeldNativeContinuation: true }).update(f.issueId, { status: "todo" });
+      expect(busy).toBeNull();
+      expect(await f.readIssue()).toEqual(before);
+    } finally { release(); await holder; }
+    const codes: string[] = [];
+    await db.transaction(async tx => {
+      const [issue] = await tx.select().from(issues).where(eq(issues.id, f.issueId)).for("update");
+      expect(await lockCancelledStartupRecoveryExemptions(tx as unknown as typeof db, issue!)).toEqual([f.runId]);
+      for (const evidence of ["lease", "event"] as const) {
+        let code = "unexpected_commit";
+        try {
+          await db.transaction(async other => {
+            await other.execute(sql`set local lock_timeout = '100ms'`);
+            if (evidence === "lease") await other.insert(environmentLeases).values({
+              companyId: f.companyId, heartbeatRunId: f.runId, provider: "local", status: "active" });
+            else await other.insert(heartbeatRunEvents).values({ companyId: f.companyId,
+              runId: f.runId, agentId: f.agentId, seq: 1, eventType: "adapter.invoke" });
+          });
+        } catch (error) {
+          const detail = error as { code?: string; cause?: { code?: string } };
+          code = detail.cause?.code ?? detail.code ?? "unknown";
+        }
+        codes.push(code);
+        expect(code).toBe("55P03");
+      }
+    });
+    expect(await db.select().from(environmentLeases)).toEqual([lease]);
+    expect(await db.select().from(heartbeatRunEvents)).toHaveLength(0);
+    observations.push({ kind: "A8_cancellation_evidence_locks", busyLeaseRefused: busy === null,
+      newLeaseAndEventLockCodes: codes, historicalLeaseUnchanged: true });
+  });
+
   async function receiveSyntheticBoardDelivery(f: Awaited<ReturnType<typeof seedBoardNativeHandoff>>) {
     let requested = 0;
     let deliveredRunId: string | null = null;
@@ -1245,6 +1486,10 @@ describe("native continuation ownership: automatic clear and adoption", () => {
     const rejectedBefore = await readRejected();
     expect(rejectedBefore.runs).toHaveLength(inserted.length);
     expect(rejectedBefore.finalizations).toHaveLength(rejectedIds.length);
+    const firstPage = await claimNativeSessionResumptions({ db, runnerInstanceId: "synthetic-current-owner",
+      runIds: [...rejectedIds, f.runId], limit: 1, now: new Date() });
+    expect(firstPage).toHaveLength(0);
+    expect(await readRejected()).toEqual(rejectedBefore);
     const claims = await claimNativeSessionResumptions({ db, runnerInstanceId: "synthetic-current-owner",
       runIds: [...rejectedIds, f.runId], limit: 1, now: new Date() });
     expect(claims).toHaveLength(1);
@@ -1283,6 +1528,7 @@ describe("native continuation ownership: automatic clear and adoption", () => {
     observations.push({ kind: "A7_bound_resume", nowaitErrors: transactionErrors, claimCount: claims.length,
       sameRun: claims[0]!.runId === f.runId, issuedLease: claimed.finalization.leaseOwner,
       earlierIneligibleCandidates: rejectedIds.length, rejectedCandidatesUnchanged: true, successLimit: 1,
+      firstPageClaims: firstPage.length, ticksToReachClaim: 2,
       claimedPhase: claimed.finalization.phase, boardHTTPStatus: response.status,
       qualification: "Real I-lock NOWAIT backoff with a promise barrier, then a same-run lease; real reassignment/BOARD rejects the prior successful claim. No provider/session executed." });
   });

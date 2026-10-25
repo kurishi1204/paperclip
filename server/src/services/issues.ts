@@ -11,7 +11,7 @@ import type { ExecutionProjection } from "@paperclipai/shared";
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import { isExplicitContinuationRetryClaim } from "./explicit-continuation-retry-claim.js";
-import { nativeContinuationHoldSql, nativeContinuationRecoveryPathSql, readNativeContinuationHold } from "./native-runtime/native-continuation-hold.js";
+import { lockCancelledStartupRecoveryExemptions, nativeContinuationHoldSql, nativeContinuationRecoveryPathSql, readNativeContinuationHold } from "./native-runtime/native-continuation-hold.js";
 import { executionBlockerPredicate, executionContinuationDeliveryPredicate } from "./execution-blocker.js";
 import { markdownToPlainText, parseMarkdown } from "chat";
 import {
@@ -11026,6 +11026,8 @@ export function issueService(
             await readNativeContinuationHold(tx, {
               issue: receiptExisting, runId: receiptExisting.executionRunId,
             })) return null;
+        const provenCancelledStartupRunIds = preserveHeldNativeContinuation
+          ? await lockCancelledStartupRecoveryExemptions(tx, receiptExisting) : [];
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.
@@ -11090,7 +11092,7 @@ export function issueService(
             ? and(
               idPredicate,
               sql`not (${nativeContinuationHoldSql()})`,
-              sql`not (${nativeContinuationRecoveryPathSql()})`,
+              sql`not (${nativeContinuationRecoveryPathSql({ provenCancelledStartupRunIds })})`,
               // Terminal UNKNOWNs and a reconciled turn awaiting its owned
               // delivery are waiting paths, not permission for bounded repair
               // to change the source or reserve competing work. Explicit owner

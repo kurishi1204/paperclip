@@ -328,26 +328,73 @@ export async function dispatchNativeSessionResumptions(input: {
   return claims;
 }
 
+type NativeSessionResumeInput = {
+  db: Db;
+  runnerInstanceId: string;
+  runIds?: string[];
+  now?: Date;
+  limit?: number;
+};
+type NativeSessionResumeSweep = {
+  allCursor: string | null;
+  targetedCursor: string | null;
+  pending: Promise<void> | null;
+};
+const nativeSessionResumeSweeps = new WeakMap<Db, NativeSessionResumeSweep>();
+const nativeSessionResumePageSize = 25;
+
 /**
  * Claims explicit, result-less retryable failures for same-run recovery.
  * Merely expired `observed` ownership stays blocked because lease expiry alone
  * does not prove that the original provider owner stopped. Eligibility remains
  * independent of the live feature flag and legacy scheduler.
  */
-export async function claimNativeSessionResumptions(input: {
-  db: Db;
-  runnerInstanceId: string;
-  runIds?: string[];
-  now?: Date;
-  limit?: number;
-}): Promise<NativeSessionResumeClaim[]> {
-  const now = input.now ?? new Date();
+export async function claimNativeSessionResumptions(
+  input: NativeSessionResumeInput,
+): Promise<NativeSessionResumeClaim[]> {
   const claimLimit = input.limit ?? 25;
   if (!Number.isSafeInteger(claimLimit) || claimLimit < 0) {
     throw new RangeError("Native session resume claim limit must be a non-negative safe integer.");
   }
   if (claimLimit === 0) return [];
-  const candidates = await input.db
+
+  let sweep = nativeSessionResumeSweeps.get(input.db);
+  if (!sweep) {
+    sweep = { allCursor: null, targetedCursor: null, pending: null };
+    nativeSessionResumeSweeps.set(input.db, sweep);
+  }
+  const owned = sweep;
+  // The production callers are one reaper batch and single-run timers. Timers
+  // inspect their exact Run without moving either sweep cursor. Batch and all
+  // scans keep separate positions; unrelated independent batch populations are
+  // not separate fairness scopes.
+  const runIds = input.runIds?.length ? [...new Set(input.runIds)] : undefined;
+  const request = { ...input, runIds };
+  const operation = () => claimNativeSessionResumePage(
+    request, owned, claimLimit,
+  );
+  // Claims are consumed by dispatchers, so never join callers onto one claims
+  // array as the cleanup sweep does for outcomes. Queue a fresh query for each
+  // caller; an overlapping single-run timer must not lose its only dispatch.
+  const pending = (owned.pending ?? Promise.resolve()).then(operation);
+  const tail = pending.then(() => undefined, () => undefined);
+  owned.pending = tail;
+  void tail.then(() => {
+    if (owned.pending === tail) owned.pending = null;
+  });
+  return pending;
+}
+
+async function claimNativeSessionResumePage(
+  input: NativeSessionResumeInput,
+  sweep: NativeSessionResumeSweep,
+  claimLimit: number,
+): Promise<NativeSessionResumeClaim[]> {
+  const now = input.now ?? new Date();
+  const cursorKey = input.runIds?.length === 1
+    ? null
+    : input.runIds?.length ? "targetedCursor" : "allCursor";
+  const selectCandidates = (cursor: string | null) => input.db
     .select({ runId: heartbeatRuns.id, companyId: heartbeatRuns.companyId, issueId: nativeRunFinalizations.issueId })
     .from(heartbeatRuns)
     .innerJoin(
@@ -374,17 +421,24 @@ export async function claimNativeSessionResumptions(input: {
         ...(input.runIds?.length
           ? [inArray(heartbeatRuns.id, input.runIds)]
           : []),
+        ...(cursor ? [gt(heartbeatRuns.id, cursor)] : []),
       ),
     )
-    // Inspect every durable candidate before classifying it. A bound/owner
-    // check after LIMIT lets rejected orphan rows occupy the same first page
-    // forever. These rows contain only identity/scope; bound the successful
-    // claims below rather than silently truncating the eligible population.
-    .orderBy(heartbeatRuns.id);
+    .orderBy(asc(heartbeatRuns.id))
+    .limit(nativeSessionResumePageSize);
+  let candidates = await selectCandidates(cursorKey ? sweep[cursorKey] : null);
+  if (candidates.length === 0 && cursorKey && sweep[cursorKey] !== null) {
+    sweep[cursorKey] = null;
+    candidates = await selectCandidates(null);
+  }
 
   const claims: NativeSessionResumeClaim[] = [];
   for (const candidate of candidates) {
     if (claims.length >= claimLimit) break;
+    // Advance on rejected authority and NOWAIT backoff too. A damaged or
+    // reassigned row must not occupy every tick's bounded first page. Advance
+    // only inspected rows when the success limit stops a page early.
+    if (cursorKey) sweep[cursorKey] = candidate.runId;
     const leaseOwner = `${input.runnerInstanceId}:resume:${randomUUID()}`;
     let terminalRunToEmit: typeof heartbeatRuns.$inferSelect | null = null;
     let claimed = false;

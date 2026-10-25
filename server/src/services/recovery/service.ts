@@ -958,8 +958,8 @@ export function recoveryService(
   const budgets = budgetService(db);
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
 
-  async function getAgent(agentId: string) {
-    return db
+  async function getAgent(agentId: string, database: Db = db) {
+    return database
       .select()
       .from(agents)
       .where(eq(agents.id, agentId))
@@ -2550,7 +2550,7 @@ export function recoveryService(
     previousStatus: StrandedPreviousStatus;
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
-  }) {
+  }, database: Db = db) {
     const recoveryCause = resolveStrandedRecoveryCause(
       input.latestRun,
       input.recoveryCause,
@@ -2561,7 +2561,8 @@ export function recoveryService(
     });
     const isProviderQuotaWait = recoveryCause === "provider_quota";
     const now = new Date();
-    const action = await recoveryActionsSvc.upsertSourceScoped({
+    const actionsSvc = database === db ? recoveryActionsSvc : issueRecoveryActionService(database);
+    const action = await actionsSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
       // A configuration-incomplete failure carries a per-identity fingerprint
@@ -2675,8 +2676,8 @@ export function recoveryService(
     latestRun: LatestIssueRun;
     actionId: string;
     agentId: string;
-  }) {
-    const existing = await db
+  }, database: Db = db) {
+    const existing = await database
       .select()
       .from(heartbeatRuns)
       .where(
@@ -2694,7 +2695,7 @@ export function recoveryService(
 
     const now = new Date();
     const retryAt = readProviderQuotaRetryAt(input.latestRun, now);
-    return db.transaction(async (tx) => {
+    return database.transaction(async (tx) => {
       const wakeup = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -2750,7 +2751,7 @@ export function recoveryService(
       await tx
         .update(agentWakeupRequests)
         .set({ runId: scheduledRun.id, updatedAt: now })
-        .where(eq(agentWakeupRequests.id, wakeup.id));
+        .where(and(eq(agentWakeupRequests.id, wakeup.id), eq(agentWakeupRequests.companyId, input.issue.companyId)));
       await tx
         .update(issueRecoveryActions)
         .set({
@@ -2763,7 +2764,9 @@ export function recoveryService(
           timeoutAt: retryAt,
           updatedAt: now,
         })
-        .where(eq(issueRecoveryActions.id, input.actionId));
+        .where(and(eq(issueRecoveryActions.id, input.actionId),
+          eq(issueRecoveryActions.companyId, input.issue.companyId),
+          eq(issueRecoveryActions.sourceIssueId, input.issue.id)));
       return scheduledRun;
     });
   }
@@ -2904,8 +2907,9 @@ export function recoveryService(
   async function existingUnresolvedBlockerIssues(
     companyId: string,
     issueId: string,
+    database: Db = db,
   ) {
-    return db
+    return database
       .select({ id: issueRelations.issueId, identifier: issues.identifier })
       .from(issueRelations)
       .innerJoin(
@@ -2928,8 +2932,9 @@ export function recoveryService(
   async function existingUnresolvedBlockerIssueIds(
     companyId: string,
     issueId: string,
+    database: Db = db,
   ) {
-    return existingUnresolvedBlockerIssues(companyId, issueId).then((rows) =>
+    return existingUnresolvedBlockerIssues(companyId, issueId, database).then((rows) =>
       rows.map((row) => row.id),
     );
   }
@@ -4166,239 +4171,271 @@ export function recoveryService(
       });
     }
 
-    const recoveryCause = resolveStrandedRecoveryCause(
-      input.latestRun,
-      input.recoveryCause,
-    );
-    const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
-      issue: input.issue,
-      previousStatus: input.previousStatus,
-      latestRun: input.latestRun,
-      recoveryCause,
-      successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
-    });
-    const isProviderQuotaWait =
-      recoveryCause === "provider_quota" &&
-      !recoveryAction.ownerAgentId &&
-      Boolean(recoveryAction.returnOwnerAgentId);
-    if (isProviderQuotaWait && recoveryAction.returnOwnerAgentId) {
-      await ensureProviderQuotaWaitRecoveryMonitor({
-        issue: input.issue,
-        latestRun: input.latestRun,
-        actionId: recoveryAction.id,
-        agentId: recoveryAction.returnOwnerAgentId,
-      });
-    }
-    const blockerIds = await existingUnresolvedBlockerIssueIds(
-      input.issue.companyId,
-      input.issue.id,
-    );
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-      blockedByIssueIds: blockerIds,
-    });
-    if (!updated) return null;
-    if (isProviderQuotaWait) return updated;
-    const sourceAssigneePreserved =
-      updated.assigneeAgentId === input.issue.assigneeAgentId &&
-      updated.assigneeUserId === input.issue.assigneeUserId;
+    const publications: ActivityPublication[] = [];
+    const postCommitActions: IssuePostCommitAction[] = [];
+    let updatedIssue: typeof issues.$inferSelect | null;
+    try {
+      updatedIssue = await db.transaction(async (tx) => {
+        const [current] = await tx.select().from(issues).where(and(
+          eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id),
+        )).for("update").limit(1);
+        if (!current || current.hiddenAt || ["done", "cancelled"].includes(current.status)
+          || current.status !== input.issue.status
+          || current.assigneeAgentId !== input.issue.assigneeAgentId
+          || current.assigneeUserId !== input.issue.assigneeUserId) return null;
+        const blockerIds = await existingUnresolvedBlockerIssueIds(
+          current.companyId, current.id, tx as unknown as Db,
+        );
+        // The guarded source update owns every escalation effect. A retained
+        // native path must leave the action, retry reservation and notice alone.
+        const updated = await issuesSvc.update(current.id, {
+          status: "blocked", blockedByIssueIds: blockerIds,
+          companyGuard: current.companyId, expectedRevision: current.revision,
+        }, tx, publications, postCommitActions);
+        if (!updated) return null;
+        const recoveryCause = resolveStrandedRecoveryCause(
+          input.latestRun,
+          input.recoveryCause,
+        );
+        const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
+          issue: current,
+          previousStatus: input.previousStatus,
+          latestRun: input.latestRun,
+          recoveryCause,
+          successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
+        }, tx as unknown as Db);
+        const isProviderQuotaWait =
+          recoveryCause === "provider_quota" &&
+          !recoveryAction.ownerAgentId &&
+          Boolean(recoveryAction.returnOwnerAgentId);
+        if (isProviderQuotaWait && recoveryAction.returnOwnerAgentId) {
+          await ensureProviderQuotaWaitRecoveryMonitor({
+            issue: current,
+            latestRun: input.latestRun,
+            actionId: recoveryAction.id,
+            agentId: recoveryAction.returnOwnerAgentId,
+          }, tx as unknown as Db);
+        }
+        if (isProviderQuotaWait) return updated;
+        const sourceAssigneePreserved =
+          updated.assigneeAgentId === current.assigneeAgentId &&
+          updated.assigneeUserId === current.assigneeUserId;
 
-    const recoveryOwner = recoveryAction.ownerAgentId
-      ? await getAgent(recoveryAction.ownerAgentId)
-      : null;
-    const sourceAssignee = input.issue.assigneeAgentId
-      ? await getAgent(input.issue.assigneeAgentId)
-      : null;
-    let notice: SuccessfulRunHandoffNotice | null = null;
-    if (
-      input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON &&
-      input.successfulRunHandoffEvidence
-    ) {
-      const [sourceRun] = input.successfulRunHandoffEvidence.sourceRunId
-        ? await db
+        const recoveryOwner = recoveryAction.ownerAgentId
+          ? await getAgent(recoveryAction.ownerAgentId, tx as unknown as Db)
+          : null;
+        const sourceAssignee = current.assigneeAgentId
+          ? await getAgent(current.assigneeAgentId, tx as unknown as Db)
+          : null;
+        let notice: SuccessfulRunHandoffNotice | null = null;
+        if (
+          input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON &&
+          input.successfulRunHandoffEvidence
+        ) {
+          const [sourceRun] = input.successfulRunHandoffEvidence.sourceRunId
+            ? await tx
+                .select({
+                  id: heartbeatRuns.id,
+                  status: heartbeatRuns.status,
+                  agentId: heartbeatRuns.agentId,
+                })
+                .from(heartbeatRuns)
+                .where(
+                  and(
+                    eq(
+                      heartbeatRuns.id,
+                      input.successfulRunHandoffEvidence.sourceRunId,
+                    ),
+                    eq(heartbeatRuns.companyId, current.companyId),
+                  ),
+                )
+                .limit(1)
+            : [];
+          notice = buildSuccessfulRunHandoffExhaustedNotice({
+            issue: current,
+            sourceRun: sourceRun ?? null,
+            correctiveRun: input.latestRun
+              ? {
+                  id: input.latestRun.id,
+                  status: input.latestRun.status,
+                  agentId: input.latestRun.agentId,
+                }
+              : null,
+            sourceAssignee,
+            recoveryIssue: null,
+            recoveryActionId: recoveryAction.id,
+            recoveryOwner,
+            latestIssueStatus: current.status,
+            latestHandoffRunStatus: input.latestRun?.status ?? "unknown",
+            missingDisposition:
+              input.successfulRunHandoffEvidence.missingDisposition,
+          });
+        }
+        const escalationNotice = buildStrandedRecoveryEscalationNotice({
+          seed: input.notice,
+          fallbackBody: input.comment,
+          recoveryCause,
+          recoveryActionId: recoveryAction.id,
+          recoveryOwner:
+            recoveryAction.ownerAgentId && recoveryOwner
+              ? { id: recoveryOwner.id, name: recoveryOwner.name }
+              : null,
+          sourceRun: input.latestRun
+            ? {
+                id: input.latestRun.id,
+                agentId: input.latestRun.agentId,
+                status: input.latestRun.status,
+                errorCode: input.latestRun.errorCode,
+                errorSummary: input.latestRun.error
+                  ? redactSensitiveText(input.latestRun.error)
+                  : null,
+              }
+            : null,
+        });
+
+        const shouldPostEscalationComment =
+          recoveryAction.attemptCount === 1 ||
+          input.recoveryCause === "workspace_validation_failed" ||
+          input.recoveryCause === "configuration_incomplete";
+        if (shouldPostEscalationComment) {
+          const escalationCommentMarker = `Recovery action: \`${recoveryAction.id}\``;
+
+          const hasEscalationComment = await tx
             .select({
-              id: heartbeatRuns.id,
-              status: heartbeatRuns.status,
-              agentId: heartbeatRuns.agentId,
+              id: issueComments.id,
+              body: issueComments.body,
+              metadata: issueComments.metadata,
             })
-            .from(heartbeatRuns)
+            .from(issueComments)
             .where(
               and(
-                eq(
-                  heartbeatRuns.id,
-                  input.successfulRunHandoffEvidence.sourceRunId,
-                ),
-                eq(heartbeatRuns.companyId, input.issue.companyId),
+                eq(issueComments.companyId, current.companyId),
+                eq(issueComments.issueId, current.id),
+                eq(issueComments.authorType, "system"),
               ),
             )
-            .limit(1)
-        : [];
-      notice = buildSuccessfulRunHandoffExhaustedNotice({
-        issue: input.issue,
-        sourceRun: sourceRun ?? null,
-        correctiveRun: input.latestRun
-          ? {
-              id: input.latestRun.id,
-              status: input.latestRun.status,
-              agentId: input.latestRun.agentId,
+            .orderBy(desc(issueComments.createdAt))
+            .limit(50)
+            .then((rows) =>
+              rows.some(
+                (row) =>
+                  noticeMetadataReferencesRecoveryAction(
+                    row.metadata,
+                    recoveryAction.id,
+                  ) || (row.body ?? "").includes(escalationCommentMarker),
+              ),
+            );
+
+          if (!hasEscalationComment) {
+            if (notice) {
+              await issuesSvc.addComment(
+                current.id,
+                notice.body,
+                {},
+                {
+                  authorType: "system",
+                  presentation: notice.presentation,
+                  metadata: notice.metadata,
+                },
+                tx,
+              );
+            } else {
+              await issuesSvc.addComment(
+                current.id,
+                escalationNotice.body,
+                {},
+                {
+                  authorType: "system",
+                  presentation: escalationNotice.presentation,
+                  metadata: escalationNotice.metadata,
+                },
+                tx,
+              );
             }
-          : null,
-        sourceAssignee,
-        recoveryIssue: null,
-        recoveryActionId: recoveryAction.id,
-        recoveryOwner,
-        latestIssueStatus: input.issue.status,
-        latestHandoffRunStatus: input.latestRun?.status ?? "unknown",
-        missingDisposition:
-          input.successfulRunHandoffEvidence.missingDisposition,
-      });
-    }
-    const escalationNotice = buildStrandedRecoveryEscalationNotice({
-      seed: input.notice,
-      fallbackBody: input.comment,
-      recoveryCause,
-      recoveryActionId: recoveryAction.id,
-      recoveryOwner:
-        recoveryAction.ownerAgentId && recoveryOwner
-          ? { id: recoveryOwner.id, name: recoveryOwner.name }
-          : null,
-      sourceRun: input.latestRun
-        ? {
-            id: input.latestRun.id,
-            agentId: input.latestRun.agentId,
-            status: input.latestRun.status,
-            errorCode: input.latestRun.errorCode,
-            errorSummary: input.latestRun.error
-              ? redactSensitiveText(input.latestRun.error)
-              : null,
           }
-        : null,
-    });
+        }
 
-    const shouldPostEscalationComment =
-      recoveryAction.attemptCount === 1 ||
-      input.recoveryCause === "workspace_validation_failed" ||
-      input.recoveryCause === "configuration_incomplete";
-    if (shouldPostEscalationComment) {
-      const escalationCommentMarker = `Recovery action: \`${recoveryAction.id}\``;
-
-      const hasEscalationComment = await db
-        .select({
-          id: issueComments.id,
-          body: issueComments.body,
-          metadata: issueComments.metadata,
-        })
-        .from(issueComments)
-        .where(
-          and(
-            eq(issueComments.issueId, input.issue.id),
-            eq(issueComments.authorType, "system"),
-          ),
-        )
-        .orderBy(desc(issueComments.createdAt))
-        .limit(50)
-        .then((rows) =>
-          rows.some(
-            (row) =>
-              noticeMetadataReferencesRecoveryAction(
-                row.metadata,
-                recoveryAction.id,
-              ) || (row.body ?? "").includes(escalationCommentMarker),
-          ),
-        );
-
-      if (!hasEscalationComment) {
-        if (notice) {
-          await issuesSvc.addComment(
-            input.issue.id,
-            notice.body,
-            {},
-            {
-              authorType: "system",
-              presentation: notice.presentation,
-              metadata: notice.metadata,
+        await logActivity(tx as unknown as Db, {
+          companyId: current.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action:
+            input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+              ? "issue.successful_run_handoff_escalated"
+              : "issue.updated",
+          entityType: "issue",
+          entityId: current.id,
+          details: {
+            identifier: current.identifier,
+            status: "blocked",
+            previousStatus: input.previousStatus,
+            source:
+              input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+                ? "recovery.reconcile_successful_run_handoff_missing_state"
+                : input.recoveryCause === "workspace_validation_failed"
+                  ? "recovery.reconcile_workspace_validation_failed"
+                  : input.recoveryCause === "configuration_incomplete"
+                    ? "recovery.reconcile_configuration_incomplete"
+                    : input.recoveryCause ===
+                        "execution_review_participant_recovery"
+                      ? "recovery.reconcile_execution_review_participant"
+                      : "recovery.reconcile_stranded_assigned_issue",
+            recoveryCause: input.recoveryCause ?? "stranded_assigned_issue",
+            latestRunId: input.latestRun?.id ?? null,
+            latestRunStatus: input.latestRun?.status ?? null,
+            latestRunErrorCode: input.latestRun?.errorCode ?? null,
+            recoveryActionId: recoveryAction.id,
+            recoveryOwnerType: recoveryAction.ownerType,
+            recoveryOwnerAgentId: recoveryAction.ownerAgentId,
+            previousOwnerAgentId: recoveryAction.previousOwnerAgentId,
+            returnOwnerAgentId: recoveryAction.returnOwnerAgentId,
+            routingPolicy:
+              parseObject(recoveryAction.evidence).routingPolicy ?? null,
+            sourceAssigneeBefore: {
+              agentId: current.assigneeAgentId,
+              userId: current.assigneeUserId,
             },
-          );
-        } else {
-          await issuesSvc.addComment(
-            input.issue.id,
-            escalationNotice.body,
-            {},
-            {
-              authorType: "system",
-              presentation: escalationNotice.presentation,
-              metadata: escalationNotice.metadata,
+            sourceAssigneeAfter: {
+              agentId: updated.assigneeAgentId,
+              userId: updated.assigneeUserId,
             },
+            sourceAssigneePreserved,
+            blockerIssueIds: blockerIds,
+          },
+        }, publications);
+
+        if (!sourceAssigneePreserved) {
+          logger.error(
+            {
+              issueId: current.id,
+              beforeAssigneeAgentId: current.assigneeAgentId,
+              afterAssigneeAgentId: updated.assigneeAgentId,
+              beforeAssigneeUserId: current.assigneeUserId,
+              afterAssigneeUserId: updated.assigneeUserId,
+            },
+            "automatic stranded recovery observed a concurrent source-owner change",
           );
         }
+
+        return updated;
+      });
+    } catch (error) {
+      logger.warn({ err: error, issueId: input.issue.id, runId: input.latestRun?.id },
+        "Stranded escalation rolled back; no partial recovery action or retry was committed");
+      return null;
+    }
+    if (updatedIssue) {
+      try {
+        for (const publication of publications) publishActivity(publication);
+        await executeIssuePostCommitActions(db, postCommitActions);
+      } catch (error) {
+        logger.warn({ err: error, issueId: input.issue.id, runId: input.latestRun?.id },
+          "Stranded escalation committed; postcommit delivery is unconfirmed");
       }
     }
-
-    await logActivity(db, {
-      companyId: input.issue.companyId,
-      actorType: "system",
-      actorId: "system",
-      agentId: null,
-      runId: null,
-      action:
-        input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
-          ? "issue.successful_run_handoff_escalated"
-          : "issue.updated",
-      entityType: "issue",
-      entityId: input.issue.id,
-      details: {
-        identifier: input.issue.identifier,
-        status: "blocked",
-        previousStatus: input.previousStatus,
-        source:
-          input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
-            ? "recovery.reconcile_successful_run_handoff_missing_state"
-            : input.recoveryCause === "workspace_validation_failed"
-              ? "recovery.reconcile_workspace_validation_failed"
-              : input.recoveryCause === "configuration_incomplete"
-                ? "recovery.reconcile_configuration_incomplete"
-                : input.recoveryCause ===
-                    "execution_review_participant_recovery"
-                  ? "recovery.reconcile_execution_review_participant"
-                  : "recovery.reconcile_stranded_assigned_issue",
-        recoveryCause: input.recoveryCause ?? "stranded_assigned_issue",
-        latestRunId: input.latestRun?.id ?? null,
-        latestRunStatus: input.latestRun?.status ?? null,
-        latestRunErrorCode: input.latestRun?.errorCode ?? null,
-        recoveryActionId: recoveryAction.id,
-        recoveryOwnerType: recoveryAction.ownerType,
-        recoveryOwnerAgentId: recoveryAction.ownerAgentId,
-        previousOwnerAgentId: recoveryAction.previousOwnerAgentId,
-        returnOwnerAgentId: recoveryAction.returnOwnerAgentId,
-        routingPolicy:
-          parseObject(recoveryAction.evidence).routingPolicy ?? null,
-        sourceAssigneeBefore: {
-          agentId: input.issue.assigneeAgentId,
-          userId: input.issue.assigneeUserId,
-        },
-        sourceAssigneeAfter: {
-          agentId: updated.assigneeAgentId,
-          userId: updated.assigneeUserId,
-        },
-        sourceAssigneePreserved,
-        blockerIssueIds: blockerIds,
-      },
-    });
-
-    if (!sourceAssigneePreserved) {
-      logger.error(
-        {
-          issueId: input.issue.id,
-          beforeAssigneeAgentId: input.issue.assigneeAgentId,
-          afterAssigneeAgentId: updated.assigneeAgentId,
-          beforeAssigneeUserId: input.issue.assigneeUserId,
-          afterAssigneeUserId: updated.assigneeUserId,
-        },
-        "automatic stranded recovery observed a concurrent source-owner change",
-      );
-    }
-
-    return updated;
+    return updatedIssue;
   }
 
   async function persistAdapterFailureRecoveryClassification(
