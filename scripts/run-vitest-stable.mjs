@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadShardDurations, selectGeneralServerShard } from "./general-server-shard.mjs";
 
 import { assertSelectedTests, partitionTestLines } from "./test-line-shard.mjs";
@@ -609,6 +609,24 @@ if (options.dryRun) {
     ),
   );
   process.exit(0);
+}
+
+// Use the production lookup before any expensive suite starts. The child owns
+// the listener and is bounded even if the host's lookup command does not return.
+// Resolve probe dependencies beside this source; cwd selects the target tests.
+const testHost = spawnSync(process.execPath, [
+  "--import", pathToFileURL(path.join(scriptsDir, "../cli/node_modules/tsx/dist/loader.mjs")).href,
+  path.join(scriptsDir, "check-vitest-test-host.mjs"),
+], {
+  cwd: repoRoot,
+  env: process.env,
+  stdio: "inherit",
+  timeout: 15_000,
+  killSignal: "SIGKILL",
+});
+if (testHost.error || testHost.status !== 0) {
+  console.error(`[test:host] Preflight failed before Vitest: ${testHost.error?.message ?? `probe exit ${testHost.status ?? testHost.signal}`}`);
+  process.exit(1);
 }
 
 if (options.mode === generalModeName || options.mode === allModeName) {

@@ -49,6 +49,16 @@ function dryRunJson(args, envOverrides = {}) {
   return JSON.parse(result.stdout);
 }
 
+test("dry-run remains byte-identical when ownership tools are unavailable", () => {
+  const expected = dryRun([]);
+  const unavailable = dryRun([], { PATH: "" });
+  assert.equal(expected.status, 0);
+  assert.equal(unavailable.status, 0);
+  assert.equal(unavailable.stdout, expected.stdout);
+  assert.equal(unavailable.stderr, expected.stderr);
+});
+
+
 const SHARD_COUNT = 12;
 const SERIALIZED_SHARD_COUNT = 9;
 
