@@ -167,14 +167,17 @@ function nativeContinuationRecoveryRowSql(run: SQLWrapper, finalization: SQLWrap
     select 1 from ${issueRecoveryActions} as native_handoff_action
     where ${a("company_id")} = ${f("company_id")}
       and ${a("source_issue_id")} = ${f("issue_id")}
-      and ${a("status")} = 'resolved'
       and (
-        (${f("failure_detail")}->>'replacementDenied' = 'operator_reconciled'
+        ((${a("status")} = 'resolved'
+            or (${a("status")} = 'cancelled'
+              and ${evidence}->'continuationRequested' = 'false'::jsonb))
+          and ${f("failure_detail")}->>'replacementDenied' = 'operator_reconciled'
           and ${evidence}->'executionReconciliation'->>'runId' = ${r("id")}::text
           and ${receiptString("executionReconciliation", "actorId")}
           and ${receiptString("executionReconciliation", "recordedAt")})
         or
-        (${f("failure_detail")}->>'replacementDenied' = 'explicit_user_continuation'
+        (${a("status")} = 'resolved'
+          and ${f("failure_detail")}->>'replacementDenied' = 'explicit_user_continuation'
           and ${receiptString("explicitUserContinuation", "actorId")}
           and ${receiptString("explicitUserContinuation", "recordedAt")}
           and ${receiptString("explicitUserContinuation", "runId")}

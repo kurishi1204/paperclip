@@ -9359,6 +9359,25 @@ export function issueRoutes(
           }
         }
 
+        const reconciliationSourceRunId =
+          activeRecoveryAction.evidence.runId ??
+          activeRecoveryAction.evidence.sourceRunId;
+        const [nativeRecoverySource] =
+          sourceIssueStatus !== "todo" &&
+          typeof reconciliationSourceRunId === "string" &&
+          isUuidLike(reconciliationSourceRunId)
+            ? await tx
+                .select({ id: heartbeatRuns.id })
+                .from(heartbeatRuns)
+                .where(and(
+                  eq(heartbeatRuns.companyId, lockedIssue.companyId),
+                  eq(heartbeatRuns.id, reconciliationSourceRunId),
+                  eq(heartbeatRuns.runtimeMode, "native"),
+                  sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${lockedIssue.id}`,
+                ))
+                .limit(1)
+            : [];
+        const recordOnlyReconciliation = nativeRecoverySource != null;
         if (
           sourceIssueStatus === "todo" &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
@@ -9369,9 +9388,21 @@ export function issueRoutes(
             companyId: lockedIssue.companyId,
             issueId: lockedIssue.id,
             agentId: lockedIssue.assigneeAgentId,
-            sourceRunId:
-              activeRecoveryAction.evidence.runId ??
-              activeRecoveryAction.evidence.sourceRunId,
+            sourceRunId: reconciliationSourceRunId,
+            decision: executionReconciliation,
+            recoveryAction: activeRecoveryAction,
+          });
+        } else if (recordOnlyReconciliation && executionReconciliation) {
+          assertBoard(req);
+          // Validate the recorded source against its current owner before an
+          // execution-policy transition can assign a different reviewer. The
+          // issue lock and this transaction retain that proof through recording.
+          await validateExecutionReconciliation({
+            db: tx as unknown as Db,
+            companyId: lockedIssue.companyId,
+            issueId: lockedIssue.id,
+            agentId: lockedIssue.assigneeAgentId,
+            sourceRunId: reconciliationSourceRunId,
             decision: executionReconciliation,
             recoveryAction: activeRecoveryAction,
           });
@@ -9426,7 +9457,7 @@ export function issueRoutes(
           }
         }
 
-        if (executionReconciliation) {
+        if (executionReconciliation && !recordOnlyReconciliation) {
           // The authorized chat retry is the sole durable delivery owner.
           // Never also enqueue a generic successor that lacks chat provenance.
           await markExecutionReconciliation(
@@ -9573,6 +9604,26 @@ export function issueRoutes(
                 );
           if (!updatedIssue) throw notFound("Issue not found");
           issue = updatedIssue;
+        }
+
+        if (
+          recordOnlyReconciliation &&
+          (executionReconciliation || !["done", "cancelled"].includes(issue.status))
+        ) {
+          assertBoard(req);
+          if (!executionReconciliation) {
+            throw conflict(
+              "Reconcile the recorded execution and its action outcomes before moving this task into review or another nonterminal status. This recovery action has not been resolved.",
+            );
+          }
+          await markExecutionReconciliation(
+            tx as unknown as Db,
+            activeRecoveryAction,
+            executionReconciliation,
+            actor.actorId,
+            undefined,
+            { requestContinuation: false },
+          );
         }
 
         const recordedOutcome =

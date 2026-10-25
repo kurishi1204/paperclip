@@ -29,6 +29,8 @@ import { lockCancelledStartupRecoveryExemptions, readNativeContinuationHold, rea
 import { claimNativeSessionResumptions } from "../services/native-runtime/native-finalization-reconciler.js";
 import { isCancelledNativeStartup } from "../services/cancelled-native-startup.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { executionProjectionForRun, projectExecution } from "../services/execution-projection.js";
+import { buildExecutionContinuation } from "../services/execution-continuation.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
 import { legacyDispositionFingerprint } from "../services/recovery/legacy-continuation.js";
 import {
@@ -1365,6 +1367,149 @@ describe("native continuation ownership: automatic clear and adoption", () => {
       expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0]).toEqual(oldFinalization);
       expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
     });
+
+  it.each([false, true])("A11 same-owner receipt refuses a second unresolved native source (%s)", async otherOrphan => {
+    const f = await seedBoardNativeHandoff();
+    await db.update(issues).set({ assigneeAgentId: f.agentId }).where(eq(issues.id, f.issueId));
+    await db.update(issueRecoveryActions).set({ returnOwnerAgentId: f.agentId })
+      .where(eq(issueRecoveryActions.id, f.action.id));
+    f.newAgentId = f.agentId;
+    if (otherOrphan) {
+      const otherRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: otherRunId, companyId: f.companyId,
+        agentId: f.agentId, runtimeMode: "native", nativeIssueId: f.issueId,
+        status: "failed", finishedAt: new Date(), contextSnapshot: { issueId: f.issueId } });
+      await db.insert(nativeRunFinalizations).values({ runId: otherRunId, companyId: f.companyId,
+        issueId: f.issueId, phase: "retryable_failure", resultId: null, recoveryState: "resuming_session" });
+    }
+    const before = { issue: await f.readIssue(), action: await f.readAction(),
+      runs: await db.select().from(heartbeatRuns), finals: await db.select().from(nativeRunFinalizations) };
+    const response = await f.resolve();
+    observations.push({ kind: "A11_same_owner_orphans", otherOrphan, httpStatus: response.status,
+      error: response.body.error ?? null });
+    expect(response.status, JSON.stringify(response.body)).toBe(otherOrphan ? 409 : 200);
+    if (otherOrphan) {
+      expect(response.body.error).toContain("Other native executions");
+      expect(await f.readIssue()).toEqual(before.issue);
+      expect(await f.readAction()).toEqual(before.action);
+      expect(await db.select().from(heartbeatRuns)).toEqual(before.runs);
+      expect(await db.select().from(nativeRunFinalizations)).toEqual(before.finals);
+    } else await receiveSyntheticBoardDelivery(f);
+  });
+
+  it.each(["restored", "false_positive", "cancelled"])(
+    "A11 review transition requires outcome evidence before resolving (%s)", async outcome => {
+      const f = await seedBoardNativeHandoff();
+      f.body.outcome = outcome;
+      f.body.sourceIssueStatus = "in_review";
+      delete (f.body as { executionReconciliation?: unknown }).executionReconciliation;
+      const before = { issue: await f.readIssue(), action: await f.readAction(),
+        finals: await db.select().from(nativeRunFinalizations) };
+      const response = await f.resolve();
+      observations.push({ kind: "A11_review_requires_receipt", outcome, httpStatus: response.status,
+        error: response.body.error ?? null });
+      expect(response.status, JSON.stringify(response.body)).toBe(409);
+      expect(await f.readIssue()).toEqual(before.issue);
+      expect(await f.readAction()).toEqual(before.action);
+      expect(await db.select().from(nativeRunFinalizations)).toEqual(before.finals);
+    });
+
+  it.each(["restored", "false_positive", "cancelled"])(
+    "A11 records review outcome without replay or a false queued projection (%s)", async outcome => {
+      const f = await seedBoardNativeHandoff();
+      f.body.outcome = outcome;
+      f.body.sourceIssueStatus = "in_review";
+      const source = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]!;
+      const response = await f.resolve();
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      const action = await f.readAction();
+      const finalization = (await db.select().from(nativeRunFinalizations)
+        .where(eq(nativeRunFinalizations.runId, f.runId)))[0]!;
+      expect(action.status).toBe(outcome === "cancelled" ? "cancelled" : "resolved");
+      expect(action.evidence).toMatchObject({ continuationRequested: false,
+        executionReconciliation: { runId: f.runId, providerStopped: true, actionOutcome: "not_performed" } });
+      expect(action.evidence.continuationDelivery).toBeUndefined();
+      expect(action.evidence.continuationDeliveryOwner).toBeUndefined();
+      expect(action.evidence.continuationRunId).toBeUndefined();
+      expect(finalization.failureDetail).toMatchObject({ replacementDenied: "operator_reconciled" });
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+      expect((await f.readIssue()).status).toBe("in_review");
+      let requested = 0;
+      await deliverReconciledExecutions(db, async () => { requested++; throw new Error("record_only_must_not_wake"); });
+      expect(requested).toBe(0);
+      await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
+      expect((await f.readAction()).status).toBe(action.status);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]).toEqual(source);
+      const projection = projectExecution(source, finalization, [], action);
+      expect(projection.phase).toBe("completed");
+      expect(projection.label).toBe("Reconciled without continuation");
+      expect(projection.successorRunId).toBeNull();
+      expect(await executionProjectionForRun(db, f.companyId, f.runId)).toMatchObject({
+        phase: "completed", label: "Reconciled without continuation", successorRunId: null });
+      observations.push({ kind: "A11_review_record_only", outcome, httpStatus: response.status,
+        actionStatus: action.status, requested, projection,
+        qualification: "Synthetic BOARD route, durable receipt, blocker, sweep and projection only; no live provider stop or company acceptance." });
+    });
+
+  it("A11 cancelled record-only evidence reaches the next assignee context", async () => {
+    const f = await seedBoardNativeHandoff();
+    f.body.outcome = "cancelled";
+    f.body.sourceIssueStatus = "in_review";
+    const response = await f.resolve();
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const continuation = await buildExecutionContinuation({ db, companyId: f.companyId,
+      issueId: f.issueId, agentId: f.newAgentId, context: {}, summary: null, exposeLowTrustRaw: false });
+    expect(continuation.recoveryOutcomes).toEqual([{ recoveryActionId: f.action.id,
+      decision: (await f.readAction()).evidence.executionReconciliation }]);
+    observations.push({ kind: "A11_record_only_context", receiptCount: continuation.recoveryOutcomes?.length,
+      qualification: "Actual continuation builder reads a synthetic operator receipt; no model was called." });
+  });
+
+  it.each([false, true])("A11 requested completion follows actual review transition (%s)", async receipt => {
+    const f = await seedBoardNativeHandoff();
+    const reviewerId = randomUUID(), stageId = randomUUID();
+    await db.insert(agents).values({ id: reviewerId, companyId: f.companyId,
+      name: "Synthetic independent reviewer", role: "engineer", status: "active",
+      adapterType: "paperclip_runner", adapterConfig: { provider: "codex" } });
+    await db.update(issues).set({ executionPolicy: { mode: "normal", commentRequired: true,
+      stages: [{ id: stageId, type: "review", approvalsNeeded: 1,
+        participants: [{ id: randomUUID(), type: "agent", agentId: reviewerId, userId: null }] }] } })
+      .where(eq(issues.id, f.issueId));
+    f.body.sourceIssueStatus = "done";
+    if (!receipt) delete (f.body as { executionReconciliation?: unknown }).executionReconciliation;
+    const before = { issue: await f.readIssue(), action: await f.readAction(),
+      finals: await db.select().from(nativeRunFinalizations) };
+    const response = await f.resolve();
+    observations.push({ kind: "A11_actual_review_transition", receipt, httpStatus: response.status,
+      error: response.body.error ?? null, issue: { status: (await f.readIssue()).status,
+        assigneeAgentId: (await f.readIssue()).assigneeAgentId } });
+    expect(response.status, JSON.stringify(response.body)).toBe(receipt ? 200 : 409);
+    if (receipt) {
+      expect(await f.readIssue()).toMatchObject({ status: "in_review", assigneeAgentId: reviewerId });
+      expect((await f.readAction()).evidence.continuationRequested).toBe(false);
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    } else {
+      expect(await f.readIssue()).toEqual(before.issue);
+      expect(await f.readAction()).toEqual(before.action);
+      expect(await db.select().from(nativeRunFinalizations)).toEqual(before.finals);
+    }
+  });
+
+  it("A11 genuine terminal completion keeps the old no-replay closure without inventing a receipt", async () => {
+    const f = await seedBoardNativeHandoff();
+    f.body.sourceIssueStatus = "done";
+    delete (f.body as { executionReconciliation?: unknown }).executionReconciliation;
+    const finalization = (await db.select().from(nativeRunFinalizations)
+      .where(eq(nativeRunFinalizations.runId, f.runId)))[0];
+    const response = await f.resolve();
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect((await f.readIssue()).status).toBe("done");
+    expect((await f.readAction()).evidence.executionReconciliation).toBeUndefined();
+    expect((await f.readAction()).evidence.continuationDelivery).toBeUndefined();
+    expect((await db.select().from(nativeRunFinalizations)
+      .where(eq(nativeRunFinalizations.runId, f.runId)))[0]).toEqual(finalization);
+  });
 
   it("A6 BOARD can explicitly hand off a proven never-claimed cancelled startup", async () => {
     const f = await seedBoardNativeHandoff("never_claimed");

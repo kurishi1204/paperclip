@@ -90,7 +90,8 @@ export async function validateExecutionReconciliation(input: {
       "The recovery source or task owner changed. Inspect the current execution before continuing.",
     );
   }
-  if (run.agentId !== agentId && !isCurrentReviewer) {
+  const crossOwner = run.agentId !== agentId && !isCurrentReviewer;
+  if (crossOwner) {
     const action = input.recoveryAction;
     const activeAction = action && action.companyId === companyId && action.sourceIssueId === issueId
       ? await issueRecoveryActionService(db).getActiveForIssue(companyId, issueId)
@@ -126,18 +127,18 @@ export async function validateExecutionReconciliation(input: {
         : !hasRemoteTerminationReceipt(lease)))) {
       throw conflict("Verify the previous execution environment's cleanup and remote termination receipt before handing it back.");
     }
-    // Saved input has not acquired execution authority. Do not let that input
-    // block the very BOARD receipt that releases it. Queued/active execution
-    // and other unresolved native work remain competing paths under I.
-    const sourceState = await collectDispositionRepairSourceState(db, {
-      issue: task, excludeRunId: run.id, excludeDeferredWakeupRequests: true,
-    });
-    if (sourceState.hasActiveExecutionPath)
-      throw conflict("Another execution already owns this task. Inspect it before handing back the old execution.");
-    const otherOrphans = sourceState.nativeOrphanedRunIds.filter(id => id !== run.id);
-    if (otherOrphans.length) {
-      throw conflict(`Other native executions still need separate outcome evidence: ${otherOrphans.join(", ")}.`);
-    }
+  }
+  // Saved input has no execution authority. Other unresolved native sources
+  // require separate evidence for every owner, before a receipt or outbox is
+  // recorded. A same-owner source can itself retain its bound resume path.
+  const sourceState = await collectDispositionRepairSourceState(db, {
+    issue: task, excludeRunId: run.id, excludeDeferredWakeupRequests: true,
+  });
+  if (crossOwner && sourceState.hasActiveExecutionPath)
+    throw conflict("Another execution already owns this task. Inspect it before handing back the old execution.");
+  const otherOrphans = sourceState.nativeOrphanedRunIds.filter(id => id !== run.id);
+  if (otherOrphans.length) {
+    throw conflict(`Other native executions still need separate outcome evidence: ${otherOrphans.join(", ")}.`);
   }
   if (hasWorkspaceRestoreFailure(run.resultJson) &&
       (!decision.workspaceRepairEvidence || decision.workspaceRepairEvidence.trim().length < 20)) {
@@ -201,7 +202,12 @@ export async function markExecutionReconciliation(
   decision: ExecutionReconciliation,
   actorId: string,
   deliveryOwner?: { kind: "chat_failed_run_retry"; actionId: string },
+  options: { requestContinuation?: boolean } = {},
 ) {
+  const requestContinuation = options.requestContinuation !== false;
+  if (!requestContinuation && deliveryOwner) {
+    throw conflict("A record-only reconciliation cannot delegate a continuation.");
+  }
   if (deliveryOwner) {
     const [retry] = await db
       .select()
@@ -246,8 +252,11 @@ export async function markExecutionReconciliation(
           actorId,
           recordedAt: new Date().toISOString(),
         },
-        continuationDelivery: deliveryOwner ? "delegated" : "pending",
-        ...(deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
+        continuationRequested: requestContinuation,
+        continuationDelivery: requestContinuation ? (deliveryOwner ? "delegated" : "pending") : undefined,
+        ...(!requestContinuation
+          ? { continuationDeliveryOwner: undefined, continuationRunId: undefined }
+          : deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
       },
     })
     .where(
