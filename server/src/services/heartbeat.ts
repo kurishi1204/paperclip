@@ -637,6 +637,7 @@ import {
 import {
   findMissingHotRestartSnapshotRunIds,
   readHotRestartIntent,
+  readHotRestartIntentWithSource,
   readProcessStartedAt,
   removeHotRestartIntent,
   shouldHonorHotRestartIntentForProcess,
@@ -14699,6 +14700,19 @@ export function heartbeatService(
     );
   }
 
+  function getShutdownRunDisposition(
+    run: typeof heartbeatRuns.$inferSelect,
+    adapterType: string,
+  ) {
+    // Both the receipt and the drain use the same ownership decision.
+    if (run.runtimeMode === "legacy" && run.controllerBootId &&
+        run.controllerBootId !== legacyControllerBootId) return "unowned" as const;
+    if (isNativeRunnerOwnershipHeld(run)) return "unowned" as const;
+    if (run.runtimeMode === "native" && adapterType === "paperclip_runner")
+      return "suspend" as const;
+    return "interrupt" as const;
+  }
+
   async function prepareHotRestartShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
@@ -14708,9 +14722,9 @@ export function heartbeatService(
     if (idleSessions.failed > 0) {
       logger.warn({ idleSessions }, "idle native sessions could not checkpoint before controller shutdown");
     }
-    let intent: Awaited<ReturnType<typeof readHotRestartIntent>>;
+    let request: Awaited<ReturnType<typeof readHotRestartIntentWithSource>>;
     try {
-      intent = await readHotRestartIntent();
+      request = await readHotRestartIntentWithSource();
     } catch (err) {
       logger.warn(
         { err },
@@ -14723,19 +14737,23 @@ export function heartbeatService(
       };
     }
 
+    const intent = request?.intent;
     if (!intent)
       return {
         mode: "not_requested" as const,
         skipDrain: false as const,
         activeRunIds: [] as string[],
       };
-    if (intent.drainRequired)
+    if (intent.drainRequired && request?.source !== "instance") {
+      // A legacy-only marker can belong to another instance. Keep its old
+      // drain behavior without writing this server's runs into that request.
       return {
         mode: "drain_required" as const,
         skipDrain: false as const,
         activeRunIds: [] as string[],
       };
-    if (!shouldHonorHotRestartIntentForProcess(intent)) {
+    }
+    if (!intent.drainRequired && !shouldHonorHotRestartIntentForProcess(intent)) {
       logger.warn(
         { expectedPid: intent.previousServerPid, currentPid: process.pid },
         "hot-restart intent targets a different server pid; falling back to normal shutdown drain",
@@ -14761,6 +14779,27 @@ export function heartbeatService(
       ...intent,
       previousServerVersion: intent.previousServerVersion ?? serverVersion,
     };
+
+    if (intent.drainRequired) {
+      // Explicit drains still need the complete live set so startup can report
+      // the runs interrupted by the normal shutdown path.
+      await writeHotRestartShutdownSnapshot({
+        intent: {
+          ...intentWithVersion,
+          drainRunIds: activeRuns
+            .filter(({ run, adapterType }) => getShutdownRunDisposition(run, adapterType) === "interrupt")
+            .map(({ run }) => run.id),
+        },
+        signal,
+        activeRuns: snapshotRuns,
+        capturedAt: now,
+      });
+      return {
+        mode: "drain_required" as const,
+        skipDrain: false as const,
+        activeRunIds: snapshotRuns.map((run) => run.runId),
+      };
+    }
 
     const serverStdioRuns = activeRuns.filter(isServerStdioBoundHotRestartRun);
     if (serverStdioRuns.length > 0) {
@@ -15000,13 +15039,14 @@ export function heartbeatService(
         classify(candidate, "lost", "selective_drain_not_finalized", patch);
         continue;
       }
-      if (intent.drainRequired && !hasSelectiveAcpDrain) {
-        classify(candidate, "skipped", "drain_required", patch);
-        continue;
-      }
-
       if (run.runtimeMode === "native" && adapterType === "paperclip_runner") {
         classify(candidate, "skipped", "native_restart_recovery_owned", patch);
+        continue;
+      }
+      if (intent.drainRequired && !hasSelectiveAcpDrain) {
+        const interruptionExpected = intent.drainRunIds?.includes(candidate.runId);
+        classify(candidate, interruptionExpected ? "lost" : "skipped",
+          interruptionExpected ? "drain_not_finalized" : "drain_required", patch);
         continue;
       }
 
@@ -15333,13 +15373,9 @@ export function heartbeatService(
     for (const { run, agent } of activeRuns) {
       // Shutdown owns only this boot's legacy executions. Expired foreign
       // owners belong to the reaper, not another container's drain.
-      if (run.runtimeMode === "legacy" && run.controllerBootId &&
-          run.controllerBootId !== legacyControllerBootId) continue;
-      if (isNativeRunnerOwnershipHeld(run)) continue;
-      if (
-        run.runtimeMode === "native" &&
-        agent.adapterType === "paperclip_runner"
-      ) {
+      const disposition = getShutdownRunDisposition(run, agent.adapterType);
+      if (disposition === "unowned") continue;
+      if (disposition === "suspend") {
         // A graceful shutdown relinquishes controller authority just like a
         // hot restart. Leaving the old event consumer attached lets its
         // finalizer interrupt/suspend Claude while the next server is adopting
