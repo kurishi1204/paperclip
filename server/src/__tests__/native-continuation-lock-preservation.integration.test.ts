@@ -1311,6 +1311,61 @@ describe("native continuation ownership: automatic clear and adoption", () => {
       qualification: "Real HTTP route, validator, receipt, outbox and queued gate; actor stub and synthetic DB wake callback only. No provider stop or production authentication acceptance." });
   });
 
+  it.each(["deferred_issue_execution", "queued"] as const)(
+    "A9 BOARD preserves waiting user input without confusing it with execution (%s)", async status => {
+      const f = await seedBoardNativeHandoff();
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId,
+        agentId: f.newAgentId, source: "automation", requestedByActorType: "user",
+        requestedByActorId: "synthetic-owner", status,
+        payload: { issueId: f.issueId, reason: "Synthetic waiting user instruction" } }).returning();
+      const response = await f.resolve();
+      const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id));
+      observations.push({ kind: "A9_waiting_user_input", status, httpStatus: response.status,
+        error: response.body.error ?? null, wakeUnchanged: JSON.stringify(after) === JSON.stringify(wake),
+        qualification: "Real BOARD route with synthetic pending input; downstream user delivery is not claimed." });
+      expect(after).toEqual(wake);
+      expect(response.status, JSON.stringify(response.body)).toBe(status === "deferred_issue_execution" ? 200 : 409);
+      if (status === "deferred_issue_execution") {
+        expect((await f.readAction()).status).toBe("resolved");
+        await receiveSyntheticBoardDelivery(f);
+        expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id)))[0]).toEqual(wake);
+      }
+    });
+
+  it.each([false, true])(
+    "A9 an orphan blocks fresh dispatch before a recovery action exists (reset=%s)", async reset => {
+      const f = await seedBoardNativeHandoff("retryable");
+      await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.action.id));
+      await db.update(issues).set({ status: "todo", conversationAgentId: reset ? f.newAgentId : null,
+        conversationUserId: reset ? "synthetic-owner" : null, conversationState: reset ? "active" : null })
+        .where(eq(issues.id, f.issueId));
+      let commentId: string | null = null;
+      if (reset) {
+        const [comment] = await db.insert(issueComments).values({ companyId: f.companyId,
+          issueId: f.issueId, authorType: "user", authorUserId: "synthetic-owner", body: "/new" }).returning();
+        commentId = comment!.id;
+      }
+      const oldRun = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0];
+      const oldFinalization = (await db.select().from(nativeRunFinalizations)
+        .where(eq(nativeRunFinalizations.runId, f.runId)))[0];
+      const blocker = await getExecutionBlocker(db, f.companyId, f.issueId,
+        { conversationResetCommentId: commentId });
+      const [next] = await db.insert(heartbeatRuns).values({ companyId: f.companyId,
+        agentId: f.newAgentId, runtimeMode: "legacy", status: "queued", invocationSource: "assignment",
+        contextSnapshot: { issueId: f.issueId, wakeReason: "issue_assigned",
+          ...(commentId ? { wakeCommentId: commentId } : {}) } }).returning();
+      const admission = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId: next!.id, companyId: f.companyId, expectedStatus: "queued", now: new Date() });
+      observations.push({ kind: "A9_orphan_admission_gap", reset, blocker,
+        admission, qualification: "Actual queued-run admission gate under I/R locks; no provider start." });
+      expect(blocker).toMatchObject({ runId: f.runId, cause: "native_continuation_requires_reconciliation",
+        canContinue: false, canRetry: false });
+      expect(admission).toMatchObject({ outcome: "cancelled", errorCode: "execution_reconciliation_required" });
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]).toEqual(oldRun);
+      expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0]).toEqual(oldFinalization);
+      expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
+    });
+
   it("A6 BOARD can explicitly hand off a proven never-claimed cancelled startup", async () => {
     const f = await seedBoardNativeHandoff("never_claimed");
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();

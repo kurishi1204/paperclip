@@ -97,6 +97,9 @@ export async function collectDispositionRepairSourceState(
     issue: DispositionRepairIssue;
     excludeRunId?: string | null;
     excludeWakeupRequestId?: string | null;
+    /** An explicit BOARD receipt may release saved, not-yet-admitted input.
+     * Ordinary recovery keeps counting it as a durable execution path. */
+    excludeDeferredWakeupRequests?: boolean;
   },
 ): Promise<DispositionRepairSourceState> {
   const issue = input.issue;
@@ -196,7 +199,8 @@ export async function collectDispositionRepairSourceState(
         .where(
           and(
             eq(agentWakeupRequests.companyId, issue.companyId),
-            inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+            inArray(agentWakeupRequests.status, input.excludeDeferredWakeupRequests
+              ? ["queued"] : ["queued", "deferred_issue_execution"]),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
             input.excludeWakeupRequestId
               ? ne(agentWakeupRequests.id, input.excludeWakeupRequestId)

@@ -126,7 +126,12 @@ export async function validateExecutionReconciliation(input: {
         : !hasRemoteTerminationReceipt(lease)))) {
       throw conflict("Verify the previous execution environment's cleanup and remote termination receipt before handing it back.");
     }
-    const sourceState = await collectDispositionRepairSourceState(db, { issue: task, excludeRunId: run.id });
+    // Saved input has not acquired execution authority. Do not let that input
+    // block the very BOARD receipt that releases it. Queued/active execution
+    // and other unresolved native work remain competing paths under I.
+    const sourceState = await collectDispositionRepairSourceState(db, {
+      issue: task, excludeRunId: run.id, excludeDeferredWakeupRequests: true,
+    });
     if (sourceState.hasActiveExecutionPath)
       throw conflict("Another execution already owns this task. Inspect it before handing back the old execution.");
     const otherOrphans = sourceState.nativeOrphanedRunIds.filter(id => id !== run.id);
