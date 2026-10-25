@@ -760,7 +760,10 @@ function readJournalFixture() {
  f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(combined);f.data.start.combinedBytes=combined.length;f.data.start.cwd=cwd;f.data.start.home=path.join(f.directory,"synthetic-home");
  const argv=f.data.start.argv;argv[argv.indexOf("--max-turns")+1]="64";argv[argv.indexOf("--output-format")+1]="stream-json";argv.splice(argv.indexOf("--output-format")+2,0,"--verbose");argv[argv.indexOf("--tools")+1]="Read,Glob,Grep";argv[argv.indexOf("--settings")+1]=readReviewSettings(f.data.start,corpus);
  const sid=f.data.start.sessionID;
- const events=[{type:"system",subtype:"init",cwd,session_id:sid,model:"claude-opus-5-5",tools:["Glob","Grep","Read"],permissionMode:"dontAsk",per_turn_effort_active:true}];
+ const events=[{type:"system",subtype:"init",cwd,original_cwd:cwd,session_id:sid,model:"claude-opus-5-5",tools:["Glob","Grep","Read"],permissionMode:"dontAsk",per_turn_effort_active:true,
+   claude_code_version:"2.1.306",apiKeySource:"none",mcp_servers:[],skills:[],slash_commands:[],additional_directories:[],
+   plugins:[{name:"cc-plugin-agents-md",path:"builtin",source:"cc-plugin-agents-md@builtin"},{name:"cc-plugin-telemetry",path:"builtin",source:"cc-plugin-telemetry@builtin"},{name:"cc-plugin-plugin-authoring",path:"builtin",source:"cc-plugin-plugin-authoring@builtin"}],
+   agents:["claude","Explore","general-purpose","Plan"]}];
  for(const [index,file] of corpus.files.entries()) {
    const id=`toolu_fixture_${index}`,filePath=path.join(cwd,file.path),lines=file.content.split("\n");
    events.push({type:"assistant",parent_tool_use_id:null,session_id:sid,message:{role:"assistant",content:[{type:"tool_use",id,name:"Read",input:{file_path:filePath}}]}});
@@ -794,7 +797,9 @@ test("read journal old kind fails and new pinned kind reaches real readiness wit
 });
 test("read journal combines exact Read ranges before accepting a full source file",async()=>{
  const x=readJournalFixture(),{f,events}=x;try{
-   const index=events.findIndex(e=>e.type==="user"),first=events[index],use=events.find(e=>e.type==="assistant").message.content[0],id="toolu_fixture_split";
+   const target=x.corpus.files.find(file=>file.role==="after"&&file.sourcePath==="sample.mjs");
+   const use=events.find(e=>e.type==="assistant"&&e.message.content[0]?.input?.file_path===path.join(x.cwd,target.path)).message.content[0];
+   const index=events.findIndex(e=>e.type==="user"&&e.message.content[0].tool_use_id===use.id),first=events[index],id="toolu_fixture_split";
    first.tool_use_result.file.numLines=1;first.tool_use_result.file.content="new source\n";first.message.content[0].content="1\tnew source\n";
    const secondUse={type:"assistant",parent_tool_use_id:null,session_id:f.data.start.sessionID,message:{role:"assistant",content:[{...use,id,input:{file_path:use.input.file_path,offset:2,limit:1}}]}};
    const secondResult={type:"user",parent_tool_use_id:null,session_id:f.data.start.sessionID,message:{role:"user",content:[{type:"tool_result",tool_use_id:id,content:"2\t"}]},tool_use_result:{type:"text",file:{filePath:use.input.file_path,content:"",numLines:1,startLine:2,totalLines:2}},tool_result_meta:[{id,permission_decision:{decision:"accept"}}]};
@@ -819,7 +824,7 @@ test("Grep searches literal path-like regex within the corpus without counting a
 for(const [name,mutate,subcode] of [
  ["one source never read",x=>{x.events.splice(1,4);},"read_coverage_incomplete"],
  ["altered Read bytes",x=>{const result=x.events.find(e=>e.type==="user");result.tool_use_result.file.content="altered\n";},"read_bytes_mismatch"],
- ["partial Read only",x=>{const result=x.events.find(e=>e.type==="user");result.tool_use_result.file.content="new source\n";result.tool_use_result.file.numLines=1;result.message.content[0].content="1\tnew source\n";},"read_coverage_incomplete"],
+ ["partial Read only",x=>{const target=x.corpus.files.find(file=>file.role==="after"&&file.sourcePath==="sample.mjs");const result=x.events.find(e=>e.type==="user"&&e.tool_use_result?.file?.filePath===path.join(x.cwd,target.path));result.tool_use_result.file.content="new source\n";result.tool_use_result.file.numLines=1;result.message.content[0].content="1\tnew source\n";},"read_coverage_incomplete"],
  ["Read outside corpus",x=>{const use=x.events.find(e=>e.type==="assistant");use.message.content[0].input.file_path=path.join(x.cwd,"..","outside");},"read_path_outside_corpus"],
  ["orphan result",x=>{const result=x.events.find(e=>e.type==="user");result.message.content[0].tool_use_id="never_used";},"tool_pairing"],
  ["mixed session",x=>{const result=x.events.find(e=>e.type==="user");result.session_id="other-session";},"journal_session"],
@@ -856,7 +861,54 @@ test("read corpus maps instruction and tool-config source paths to inert physica
    assert.equal(settings.autoMemoryEnabled,false);
    assert.ok(settings.claudeMdExcludes.includes("/private/tmp/isolated/CLAUDE.md"));
    assert.ok(settings.claudeMdExcludes.includes("/private/tmp/isolated/corpus/assets/.claude/rules/**"));
+   assert.ok(settings.claudeMdExcludes.includes("/private/tmp/isolated/home/.claude/rules/**"));
+   assert.ok(settings.claudeMdExcludes.includes("/private/tmp/isolated/home/.claude/CLAUDE.md"));
  }finally{f.close();}
+});
+test("read reverse asset is deterministic multiline text with complete before reconstruction",()=>{
+ const before=`${"old long paragraph ".repeat(160)}\n`,after="new paragraph\n",source=sourceV2Fixture(before,after);
+ source.dependencyFiles[0].content="dependency\n";source.dependencyFiles[0].blobSha=hashBlob("dependency\n");
+ const reverse=sourceCodec.readCorpusManifest(source).files.find(file=>file.role==="reverse");
+ const original=sourceCodec.reviewSourceV2(source).changedFiles[0].reverseDiff;
+ assert.ok(Buffer.byteLength(canonical(original))>2000);
+ assert.ok(reverse.content.split("\n").length>4);
+ assert.ok(Math.max(...reverse.content.split("\n").map(line=>Buffer.byteLength(line)))<2000);
+ assert.deepEqual(sourceCodec.parseReadReverseDiff(reverse.content),original);
+ assert.equal(sourceCodec.renderReadReverseDiff(original),reverse.content);
+ assert.equal(sourceCodec.restoreReviewSourceV2(sourceCodec.reviewSourceV2(source)).changedFiles[0].before.content,before);
+ assert.throws(()=>sourceCodec.parseReadReverseDiff(`${canonical(original)}\n`),/read_reverse_asset_invalid/);
+});
+test("read corpus rejects an unsupported physical line before emission",()=>{
+ const source=sourceV2Fixture("old\n",`${"x".repeat(2000)}\n`);
+ source.dependencyFiles[0].content="dependency\n";source.dependencyFiles[0].blobSha=hashBlob("dependency\n");
+ assert.throws(()=>sourceCodec.readCorpusManifest(source),/read_line_profile_unsupported/);
+});
+test("read emitter check-only and write use the same manifest and inert assets",()=>{
+ const x=readJournalFixture(),root=mkdtempSync(path.join(os.tmpdir(),"read-emitter-")),output=path.join(root,"packet");
+ try {
+   const dry=sourceCodec.emitReadCorpus(x.f.source,output,{checkOnly:true,checkoutRoot:process.cwd()});
+   assert.equal(dry.state,"CHECK_ONLY_NO_FILES_WRITTEN");assert.equal(existsSync(output),false);
+   const wrote=sourceCodec.emitReadCorpus(x.f.source,output,{checkoutRoot:process.cwd()});
+   assert.equal(wrote.state,"EMITTED");assert.equal(wrote.manifestSHA256,dry.manifestSHA256);
+   const corpus=sourceCodec.readCorpusManifest(x.f.source);
+   assert.equal(readFileSync(path.join(output,"manifest.json"),"utf8"),`${canonical(corpus.manifest)}\n`);
+   assert.equal(readFileSync(path.join(output,"material.md"),"utf8"),`Review every listed corpus file before the final judgment.\n${sourceCodec.readCorpusManifestBlock(x.f.source)}\n`);
+   assert.deepEqual(JSON.parse(readFileSync(path.join(output,"corpus-pre.json"),"utf8")).files.map(row=>row.path).sort(),corpus.files.map(row=>row.path).sort());
+   for(const file of corpus.files){const target=path.join(output,"corpus",file.path);assert.equal(readFileSync(target,"utf8"),file.content);assert.equal(statSync(target).mode&0o777,0o400);}
+   assert.throws(()=>sourceCodec.emitReadCorpus(x.f.source,output,{checkOnly:true,checkoutRoot:process.cwd()}),/review_output_exists/);
+ }finally{x.f.close();rmSync(root,{recursive:true,force:true});}
+});
+for(const [name,mutate] of [
+ ["extra plugin",init=>init.plugins.push({name:"untrusted",path:"local",source:"untrusted@local"})],
+ ["extra agent",init=>init.agents.push("user-agent")],
+ ["nonempty MCP",init=>init.mcp_servers.push("private")],
+ ["nonempty skills",init=>init.skills.push("untrusted")],
+ ["nonempty slash commands",init=>init.slash_commands.push("untrusted")],
+ ["extra directory",init=>init.additional_directories.push("/private/tmp/other")],
+ ["unknown CLI version",init=>{init.claude_code_version="future";}],
+ ["different original cwd",init=>{init.original_cwd="/private/tmp/other";}],
+])test(`read journal rejects init ${name}`,()=>{
+ const x=readJournalFixture();try{mutate(x.events[0]);x.refresh();const r=admitTrustedJournal(x.f.admissionArgs());assert.deepEqual(r,{status:"invalid",code:"independent_review_invalid",subcode:"journal_execution"});}finally{x.f.close();}
 });
 test("explicit v2 registry admits only a restored exact logical v1 source",()=>{
  const f=v2JournalFixture();try{

@@ -203,6 +203,9 @@ export const REVIEW_SOURCE_V2 = "paperclip.fork-review-source/v2";
 export const READ_REVIEW_SOURCE = "paperclip.fork-review-read-corpus/v1";
 const READ_SOURCE_BEGIN = "=== BEGIN PAPERCLIP READ CORPUS MANIFEST ===\n";
 const READ_SOURCE_END = "\n=== END PAPERCLIP READ CORPUS MANIFEST ===";
+// A preparation profile, not a claim about every Claude Code Read limit.
+const READ_MAX_DISPLAY_LINE_BYTES = 2000;
+const READ_REVERSE_ASSET = "paperclip.read-reverse-diff/v1";
 const REVERSE_DIFF_V1 = "paperclip.exact-reverse-line-diff/v1";
 const sourceKeys = ["schema", "repository", "headSha", "treeSha", "baseSha", "mergeBaseSha", "changedFiles", "dependencyFiles"];
 function exactKeys(value, keys, code = "source_v2_shape") {
@@ -328,6 +331,51 @@ export function parseReviewSourceV2Block(block, expectedSource) {
   return restored;
 }
 
+// Keep v2's canonical reverse diff as the logical contract. Its physical Read
+// asset is multiline JSON with short text segments, so one large before edit
+// cannot become one unreadable physical line.
+export function renderReadReverseDiff(diff) {
+  exactKeys(diff, ["schema", "afterLineCount", "edits"]);
+  ensure(diff.schema === REVERSE_DIFF_V1 && Array.isArray(diff.edits), "read_reverse_asset_invalid");
+  const physical = { schema: READ_REVERSE_ASSET, afterLineCount: diff.afterLineCount,
+    edits: diff.edits.map(edit => {
+      exactKeys(edit, ["afterStartLine", "deleteLineCount", "beforeText"]);
+      sourceText(edit.beforeText);
+      const chars = Array.from(edit.beforeText), beforeTextSegments = [];
+      for (let i = 0; i < chars.length; i += 256) beforeTextSegments.push(chars.slice(i,i+256).join(""));
+      return { afterStartLine: edit.afterStartLine, deleteLineCount: edit.deleteLineCount, beforeTextSegments };
+    }) };
+  const rendered = `${JSON.stringify(physical,null,2)}\n`;
+  ensure(canonical(parseReadReverseDiff(rendered)) === canonical(diff), "read_reverse_asset_invalid");
+  return rendered;
+}
+
+export function parseReadReverseDiff(rendered) {
+  ensure(typeof rendered === "string" && rendered.endsWith("\n"), "read_reverse_asset_invalid");
+  let physical; try { physical = JSON.parse(rendered); } catch { throw new Error("read_reverse_asset_invalid"); }
+  exactKeys(physical, ["schema", "afterLineCount", "edits"], "read_reverse_asset_invalid");
+  ensure(physical.schema === READ_REVERSE_ASSET && Number.isSafeInteger(physical.afterLineCount) && Array.isArray(physical.edits), "read_reverse_asset_invalid");
+  const diff = { schema: REVERSE_DIFF_V1, afterLineCount: physical.afterLineCount,
+    edits: physical.edits.map(edit => {
+      exactKeys(edit, ["afterStartLine", "deleteLineCount", "beforeTextSegments"], "read_reverse_asset_invalid");
+      ensure(Array.isArray(edit.beforeTextSegments) && edit.beforeTextSegments.every(segment => typeof segment === "string" && Array.from(segment).length <= 256), "read_reverse_asset_invalid");
+      const beforeText = edit.beforeTextSegments.join(""); sourceText(beforeText);
+      return { afterStartLine: edit.afterStartLine, deleteLineCount: edit.deleteLineCount, beforeText };
+    }) };
+  ensure(`${JSON.stringify(physical,null,2)}\n` === rendered && renderReadReverseDiffCanonical(diff) === rendered, "read_reverse_asset_invalid");
+  return diff;
+}
+
+function renderReadReverseDiffCanonical(diff) {
+  const physical = { schema: READ_REVERSE_ASSET, afterLineCount: diff.afterLineCount,
+    edits: diff.edits.map(edit => {
+      const chars = Array.from(edit.beforeText), beforeTextSegments = [];
+      for (let i = 0; i < chars.length; i += 256) beforeTextSegments.push(chars.slice(i,i+256).join(""));
+      return { afterStartLine: edit.afterStartLine, deleteLineCount: edit.deleteLineCount, beforeTextSegments };
+    }) };
+  return `${JSON.stringify(physical,null,2)}\n`;
+}
+
 // Every byte the model must receive is a corpus file. The reverse diff is the
 // existing lossless v2 codec, so a modified file's before text is not repeated.
 export function readCorpusManifest(source) {
@@ -344,12 +392,14 @@ export function readCorpusManifest(source) {
     // Physical names never inherit PR paths such as AGENTS.md or .mcp.json.
     // The reversible logical mapping remains in the pinned manifest.
     const name = `assets/${digest(canonical({role,sourcePath,sha256:digest(value)}))}.txt`;
-    files.push({ path: name, role, sourcePath, blobSha, sha256: digest(value), bytes: value.length, lines: content.split("\n").length, content });
+    const lines = content.split("\n");
+    ensure(lines.every((line,index) => Buffer.byteLength(`${index+1}\t${line}`, "utf8") <= READ_MAX_DISPLAY_LINE_BYTES), "read_line_profile_unsupported");
+    files.push({ path: name, role, sourcePath, blobSha, sha256: digest(value), bytes: value.length, lines: lines.length, content });
   };
   for (const file of compact.changedFiles) {
     if (file.after) add("after", file.path, file.after.content, file.after.blobSha);
     if (file.before && !file.after) add("before", file.before.path, file.before.content, file.before.blobSha);
-    if (file.reverseDiff) add("reverse", file.path, `${canonical(file.reverseDiff)}\n`);
+    if (file.reverseDiff) add("reverse", file.path, renderReadReverseDiff(file.reverseDiff));
   }
   for (const file of compact.dependencyFiles) add("deps", file.path, file.content, file.blobSha);
   const names = files.map(file => file.path.normalize("NFKC").toLowerCase());
@@ -381,7 +431,7 @@ export function readReviewSettings(start, corpus) {
   };
   addAncestors(start.cwd);
   for (const file of corpus.files) addAncestors(path.dirname(path.join(start.cwd,file.path)));
-  bases.add(path.join(start.home,".claude"));
+  bases.add(start.home);
   const excludes = [];
   for (const directory of [...bases].sort()) {
     for (const name of ["CLAUDE.md","CLAUDE.local.md",".claude/CLAUDE.md",".claude/CLAUDE.local.md","AGENTS.md",".claude/AGENTS.md"]) {
@@ -424,6 +474,34 @@ function readCorpusInventory(root, files) {
   return { schema:"paperclip.read-corpus-inventory/v1", root, files:found.sort((a,b)=>a.path.localeCompare(b.path,"en")) };
 }
 
+// One public operator entry uses this generator for both preflight and write.
+// The result still needs an independently authorized executor, post-inventory,
+// terminal record and operator-pinned registry before admission.
+export function emitReadCorpus(source, output, {checkOnly=false, checkoutRoot=path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..")}={}) {
+  ensure(typeof checkOnly === "boolean", "check_only_boolean");
+  ensure(typeof output === "string" && path.isAbsolute(output) && path.normalize(output) === output && output !== "-", "review_output_required");
+  ensure(!fs.existsSync(output), "review_output_exists");
+  outsideCheckoutOutput(checkoutRoot,output,"review_output_inside_checkout");
+  const corpus = readCorpusManifest(source);
+  const manifestBytes = Buffer.from(`${canonical(corpus.manifest)}\n`);
+  const materialBytes = Buffer.from(`Review every listed corpus file before the final judgment.\n${readCorpusManifestBlock(source)}\n`);
+  const profile = { schema:"paperclip.read-corpus-emission/v1", output, corpusRoot:path.join(output,"corpus"),
+    manifestSHA256:digest(manifestBytes), materialSHA256:digest(materialBytes), logicalSourceSHA256:corpus.manifest.logicalSourceSHA256,
+    fileCount:corpus.files.length, files:corpus.manifest.files.map(({path:name,role,sourcePath,bytes,sha256})=>({path:name,role,sourcePath,bytes,sha256})),
+    lineProfileMaxDisplayBytes:READ_MAX_DISPLAY_LINE_BYTES, state:checkOnly ? "CHECK_ONLY_NO_FILES_WRITTEN" : "EMITTED" };
+  if (checkOnly) return profile;
+  fs.mkdirSync(output,{mode:0o700});
+  const corpusRoot = path.join(output,"corpus");
+  fs.mkdirSync(corpusRoot,{mode:0o700});
+  fs.mkdirSync(path.join(corpusRoot,"assets"),{mode:0o700});
+  for (const file of corpus.files) fs.writeFileSync(path.join(corpusRoot,file.path),file.content,{flag:"wx",mode:0o400});
+  fs.writeFileSync(path.join(output,"manifest.json"),manifestBytes,{flag:"wx",mode:0o400});
+  fs.writeFileSync(path.join(output,"material.md"),materialBytes,{flag:"wx",mode:0o400});
+  const pre = readCorpusInventory(corpusRoot,corpus.files);
+  fs.writeFileSync(path.join(output,"corpus-pre.json"),`${canonical(pre)}\n`,{flag:"wx",mode:0o400});
+  return profile;
+}
+
 const READ_EVENT_KEYS = {
   init: ["type","subtype","cwd","session_id","tools","mcp_servers","model","permissionMode","slash_commands","apiKeySource","claude_code_version","output_style","agents","skills","plugins","capabilities","analytics_disabled","product_feedback_disabled","uuid","original_cwd","additional_directories","fast_mode_state","fast_mode_disabled_reason","per_turn_effort_active","view_mode"],
   thinking: ["type","subtype","estimated_tokens","estimated_tokens_delta","session_id","uuid"],
@@ -432,6 +510,16 @@ const READ_EVENT_KEYS = {
   rate: ["type","rate_limit_info","uuid","session_id"],
   result: ["duration_api_ms","stop_reason","session_id","total_cost_usd","usage","modelUsage","permission_denials","terminal_reason","fast_mode_state","fast_mode_disabled_reason","subagent_stats","safety_stops","is_error","num_turns","subtype","api_error_status","result","ttft_ms","type","duration_ms","uuid","ttft_stream_ms","time_to_request_ms","first_content_frame_ms","queued_turn_count","result_index"]
 };
+// Observed from the pinned Claude Code 2.1.306 Read-only CLI run. Builtins are
+// declarations, not spawned subagents or proof that hidden instructions vanish.
+const READ_INIT_BUILTIN_PLUGINS = [
+  {name:"cc-plugin-agents-md",path:"builtin",source:"cc-plugin-agents-md@builtin"},
+  {name:"cc-plugin-telemetry",path:"builtin",source:"cc-plugin-telemetry@builtin"},
+  {name:"cc-plugin-plugin-authoring",path:"builtin",source:"cc-plugin-plugin-authoring@builtin"},
+];
+const READ_INIT_BUILTIN_AGENTS = ["claude","Explore","general-purpose","Plan"];
+const sameSet = (actual, expected) => Array.isArray(actual) && actual.length === expected.length &&
+  canonical(actual.map(x=>canonical(x)).sort()) === canonical(expected.map(x=>canonical(x)).sort());
 function onlyKeys(value, allowed, code) {
   ensure(value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).every(key => allowed.includes(key)), code);
 }
@@ -485,7 +573,11 @@ export function verifyReadJournal(streamBytes, corpus, start) {
       init++;
       ensure(init === 1 && event.cwd === start.cwd && event.model === "claude-opus-5-5" &&
         canonical(event.tools) === canonical(["Glob","Grep","Read"]) && event.permissionMode === "dontAsk" &&
-        event.per_turn_effort_active === true, "journal_execution");
+        event.per_turn_effort_active === true && event.claude_code_version === "2.1.306" &&
+        event.original_cwd === start.cwd && event.apiKeySource === "none" &&
+        sameSet(event.plugins, READ_INIT_BUILTIN_PLUGINS) && sameSet(event.agents, READ_INIT_BUILTIN_AGENTS) &&
+        canonical(event.mcp_servers) === "[]" && canonical(event.skills) === "[]" &&
+        canonical(event.slash_commands) === "[]" && canonical(event.additional_directories) === "[]", "journal_execution");
     } else if (kind === "thinking") {
       ensure(init === 1 && Number.isSafeInteger(event.estimated_tokens) && Number.isSafeInteger(event.estimated_tokens_delta), "journal_event_unsupported");
     } else if (kind === "rate") {
@@ -957,11 +1049,18 @@ async function main() {
     ensure(files.length === pr.changed_files,"changed_files_incomplete");
     const commit = get(`repos/${repo}/git/commits/${pr.head.sha}`);
     const schema = options.source_schema ?? "v1";
-    ensure(["v1", "v2"].includes(schema), "source_schema_unsupported");
-    const source = buildReviewSource(get,repo,pr,files,commit.tree.sha,branch.commit.sha,comparison.merge_base_commit.sha,options.review_dependencies ? options.review_dependencies.split(",").map(p=>p.trim()) : [], schema === "v2" ? REVIEW_SOURCE_V2 : SOURCE_SCHEMA);
+    ensure(["v1", "v2", "read"].includes(schema), "source_schema_unsupported");
+    const source = buildReviewSource(get,repo,pr,files,commit.tree.sha,branch.commit.sha,comparison.merge_base_commit.sha,options.review_dependencies ? options.review_dependencies.split(",").map(p=>p.trim()) : [], schema === "v1" ? SOURCE_SCHEMA : REVIEW_SOURCE_V2);
     const final = get(`repos/${repo}/pulls/${number}`);
     const finalBranch = get(`repos/${repo}/branches/${encodeURIComponent(pr.base.ref)}`);
     ensure(final.head.sha===pr.head.sha && finalBranch.commit.sha===branch.commit.sha,"head_changed");
+    if (schema === "read") {
+      ensure(options.check_only === undefined || options.check_only === true, "check_only_boolean");
+      const profile = emitReadCorpus(source,options.output,{checkOnly:options.check_only === true,checkoutRoot:checkout});
+      process.stdout.write(`${canonical(profile)}\n`);
+      return;
+    }
+    ensure(options.check_only !== true, "check_only_read_corpus_only");
     // The default remains v1; v2 requires an explicit operator schema selection.
     const body = schema === "v2" ? reviewSourceV2Block(source) : sourceBlock(source);
     if (options.output === "-") process.stdout.write(body+"\n");
