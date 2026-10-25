@@ -5,6 +5,7 @@ import { z } from "zod";
 import { agentWakeupRequests, chatConversations, chatEndpoints, heartbeatRuns, issueComments, issues, issueRecoveryActions, toolConnections, type Db } from "@paperclipai/db";
 import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
+import { readNativeContinuationRecoveryPath } from "./native-runtime/native-continuation-hold.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { EXECUTION_RECONCILIATION_CAUSES, type ExecutionBlocker } from "@paperclipai/shared";
 
@@ -15,6 +16,17 @@ export function executionBlockerPredicate() {
     inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
     or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
       sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
+  );
+}
+
+/** This existing outbox owns an explicit continuation that has not completed
+ * delivery. Generic recovery must wait; this is not a dispatch authorization.
+ * Keep it separate from getExecutionBlocker so the authorized delivery itself
+ * can use its existing admission contract. Caller supplies company/issue scope. */
+export function executionContinuationDeliveryPredicate() {
+  return and(
+    eq(issueRecoveryActions.status, "resolved"),
+    inArray(sql`${issueRecoveryActions.evidence}->>'continuationDelivery'`, ["pending", "delegated"]),
   );
 }
 
@@ -32,9 +44,14 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     executionBlockerPredicate(),
     sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
   )).orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
+  // Reassignment can remove an old native binding before recovery records an
+  // action. Read the shared settlement proof at admission too; resetting the
+  // model context cannot settle these prior execution effects.
+  const nativeRecovery = await readNativeContinuationRecoveryPath(db, { companyId, issueId });
+  const nativeEvidenceWaiting = nativeRecovery.orphaned || nativeRecovery.boardEvidenceWaiting;
   // A persisted user /new is an ordered context command, not a retry of uncertain work.
   // The normal issue execution lock still serializes it behind any active turn.
-  if (!restoreHold && conversation?.agentId && options?.conversationResetCommentId) {
+  if (!restoreHold && !nativeEvidenceWaiting && conversation?.agentId && options?.conversationResetCommentId) {
     const [command] = await db.select().from(issueComments).where(and(
       eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
       eq(issueComments.id, options.conversationResetCommentId),
@@ -55,7 +72,32 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     executionBlockerPredicate(),
     boundary ? gt(issueRecoveryActions.createdAt, boundary.createdAt) : undefined,
   )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)).limit(1);
-  if (!action) return null;
+  if (!action) {
+    if (!nativeEvidenceWaiting) return null;
+    const sourceRunIds = nativeRecovery.orphanedRunIds;
+    // The shared reader identifies all orphans, but board-owned evidence can
+    // include another bound source. Never present one ID as the sole source
+    // when this projection cannot establish that identity.
+    const sourceRunId = sourceRunIds.length === 1 && !nativeRecovery.boardEvidenceWaiting
+      ? sourceRunIds[0]! : null;
+    const [source] = sourceRunId ? await db.select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.nativeIssueId, issueId), eq(heartbeatRuns.id, sourceRunId))).limit(1) : [];
+    const sources = sourceRunIds.length
+      ? `Unsettled native source runs: ${sourceRunIds.join(", ")}. ` : "";
+    const boardEvidence = nativeRecovery.boardEvidenceWaiting
+      ? "Board-owned native outcome evidence is unresolved; its complete source set is not identified by this hold. " : "";
+    return {
+      recoveryActionId: null,
+      runId: sourceRunId,
+      agentId: source?.agentId ?? null,
+      cause: "native_continuation_requires_reconciliation",
+      nextAction: `${sources}${boardEvidence}Inspect every recorded native execution and reconcile its outcome before starting another provider session. Reassignment and context reset do not settle prior effects.`,
+      runStatus: source?.status ?? null,
+      canContinue: false,
+      canRetry: false,
+    };
+  }
   const parsedRunId = z.string().guid().safeParse(action.evidence.runId ?? action.evidence.sourceRunId);
   const runId = parsedRunId.success ? parsedRunId.data : null;
   const [run] = runId ? await db.select().from(heartbeatRuns).where(and(

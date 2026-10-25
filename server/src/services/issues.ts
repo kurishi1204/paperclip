@@ -11,6 +11,8 @@ import type { ExecutionProjection } from "@paperclipai/shared";
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import { isExplicitContinuationRetryClaim } from "./explicit-continuation-retry-claim.js";
+import { lockCancelledStartupRecoveryExemptions, nativeContinuationHoldSql, nativeContinuationRecoveryPathSql, readNativeContinuationHold } from "./native-runtime/native-continuation-hold.js";
+import { executionBlockerPredicate, executionContinuationDeliveryPredicate } from "./execution-blocker.js";
 import { markdownToPlainText, parseMarkdown } from "chat";
 import {
   and,
@@ -6621,7 +6623,13 @@ export async function readIssueCommentRunLogText(run: {
   return content;
 }
 
-export function issueService(db: Db) {
+export function issueService(
+  db: Db,
+  internalOptions: { preserveHeldNativeContinuation?: boolean } = {},
+) {
+  // Trusted automatic-recovery policy, never an issue payload or permission.
+  // Explicit owner operations use the default service and retain their semantics.
+  const preserveHeldNativeContinuation = internalOptions.preserveHeldNativeContinuation === true;
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
 
@@ -7503,6 +7511,7 @@ export function issueService(db: Db) {
           companyId: issues.companyId,
           status: issues.status,
           assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
         })
@@ -7544,6 +7553,9 @@ export function issueService(db: Db) {
       ]);
       const stale =
         !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
+      if (await readNativeContinuationHold(tx, { issue: lockedIssue, runId: input.expectedCheckoutRunId })) {
+        return { adopted: null, latest: lockedIssue };
+      }
       if (isExplicitContinuationRetryClaim(lockedIssue, existingRun)) {
         return { adopted: null, latest: lockedIssue };
       }
@@ -7551,6 +7563,9 @@ export function issueService(db: Db) {
         const executionRun = await tx.select().from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, lockedIssue.executionRunId)).for("update")
           .then(rows => rows[0] ?? null);
+        if (await readNativeContinuationHold(tx, { issue: lockedIssue, runId: lockedIssue.executionRunId })) {
+          return { adopted: null, latest: lockedIssue };
+        }
         if (isExplicitContinuationRetryClaim(lockedIssue, executionRun)) {
           return { adopted: null, latest: lockedIssue };
         }
@@ -7576,6 +7591,13 @@ export function issueService(db: Db) {
             eq(issues.status, "in_progress"),
             eq(issues.assigneeAgentId, input.actorAgentId),
             eq(issues.checkoutRunId, input.expectedCheckoutRunId),
+            sql`not (${nativeContinuationHoldSql()})`,
+            // R and F can have been read in different snapshots. A same-run
+            // claim that has already returned R to running is not cleanable.
+            notExists(db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.id, issues.checkoutRunId),
+              notInArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+            ))),
           ),
         )
         .returning({
@@ -7664,7 +7686,9 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ id: issues.id, companyId: issues.companyId, executionRunId: issues.executionRunId })
+        .select({ id: issues.id, companyId: issues.companyId, status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId,
+          checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -7680,6 +7704,7 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
       if (isExplicitContinuationRetryClaim(issue, run)) return false;
+      if (await readNativeContinuationHold(tx, { issue, runId: issue.executionRunId })) return false;
 
       const updated = await tx
         .update(issues)
@@ -7693,6 +7718,13 @@ export function issueService(db: Db) {
           and(
             eq(issues.id, issueId),
             eq(issues.executionRunId, issue.executionRunId),
+            sql`not (${nativeContinuationHoldSql()})`,
+            // R and F can have been read in different snapshots. A same-run
+            // claim that has already returned R to running is not cleanable.
+            notExists(db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.id, issues.executionRunId),
+              notInArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+            ))),
           ),
         )
         .returning({ id: issues.id })
@@ -7715,6 +7747,9 @@ export function issueService(db: Db) {
         .select({
           id: issues.id,
           companyId: issues.companyId,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
         })
@@ -7733,6 +7768,7 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
       if (isExplicitContinuationRetryClaim(issue, run)) return false;
+      if (await readNativeContinuationHold(tx, { issue, runId: issue.checkoutRunId })) return false;
 
       if (
         issue.executionRunId &&
@@ -7752,6 +7788,7 @@ export function issueService(db: Db) {
         )
           return false;
         if (isExplicitContinuationRetryClaim(issue, executionRun)) return false;
+        if (await readNativeContinuationHold(tx, { issue, runId: issue.executionRunId })) return false;
       }
 
       const updated = await tx
@@ -7767,6 +7804,13 @@ export function issueService(db: Db) {
           and(
             eq(issues.id, issueId),
             eq(issues.checkoutRunId, issue.checkoutRunId),
+            sql`not (${nativeContinuationHoldSql()})`,
+            // R and F can have been read in different snapshots. A same-run
+            // claim that has already returned R to running is not cleanable.
+            notExists(db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              or(eq(heartbeatRuns.id, issues.checkoutRunId), eq(heartbeatRuns.id, issues.executionRunId)),
+              notInArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+            ))),
             issue.executionRunId
               ? eq(issues.executionRunId, issue.executionRunId)
               : isNull(issues.executionRunId),
@@ -10975,6 +11019,15 @@ export function issueService(db: Db) {
             currentRevision: receiptExisting.revision,
           });
         }
+        // Recheck the existing retention predicate after the common issue lock,
+        // before any write or post-commit effect. No additional F/R locks or
+        // dispatch authority are introduced by this automatic-recovery guard.
+        if (preserveHeldNativeContinuation && receiptExisting.executionRunId &&
+            await readNativeContinuationHold(tx, {
+              issue: receiptExisting, runId: receiptExisting.executionRunId,
+            })) return null;
+        const provenCancelledStartupRunIds = preserveHeldNativeContinuation
+          ? await lockCancelledStartupRecoveryExemptions(tx, receiptExisting) : [];
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.
@@ -11018,18 +11071,10 @@ export function issueService(db: Db) {
         });
         // Ownership changes invalidate observed handoff versions even if status
         // stays the same, including an A -> B -> A assignment race.
-        if ((issueData.assigneeAgentId !== undefined && issueData.assigneeAgentId !== receiptExisting.assigneeAgentId)
-          || (issueData.assigneeUserId !== undefined && issueData.assigneeUserId !== receiptExisting.assigneeUserId)) {
+        const ownershipChanged = (issueData.assigneeAgentId !== undefined && issueData.assigneeAgentId !== receiptExisting.assigneeAgentId)
+          || (issueData.assigneeUserId !== undefined && issueData.assigneeUserId !== receiptExisting.assigneeUserId);
+        if (ownershipChanged) {
           patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
-          // Invalidate human direction at the common assignment boundary, including
-          // plugin/service writes that do not go through HTTP run cancellation.
-          // Keep the requester attribution for audit; cancellation revokes its use.
-          await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date() })
-            .where(and(eq(agentWakeupRequests.companyId, receiptExisting.companyId),
-              eq(agentWakeupRequests.requestedByActorType, "user"),
-              sql`coalesce(${agentWakeupRequests.payload}->>'issueId', ${agentWakeupRequests.payload}->>'taskId',
-                ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'issueId',
-                ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'taskId') = ${id}`));
         }
         // Reasserting Blocked or changing its blockers is a fresh decision even
         // when the status string stays the same. Invalidate recovery's prior
@@ -11043,10 +11088,45 @@ export function issueService(db: Db) {
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(idPredicate)
+          .where(preserveHeldNativeContinuation
+            ? and(
+              idPredicate,
+              sql`not (${nativeContinuationHoldSql()})`,
+              sql`not (${nativeContinuationRecoveryPathSql({ provenCancelledStartupRunIds })})`,
+              // Terminal UNKNOWNs and a reconciled turn awaiting its owned
+              // delivery are waiting paths, not permission for bounded repair
+              // to change the source or reserve competing work. Explicit owner
+              // operations use the default factory and retain their contract.
+              notExists(tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+                eq(issueRecoveryActions.companyId, issues.companyId),
+                eq(issueRecoveryActions.sourceIssueId, issues.id),
+                or(executionBlockerPredicate(), executionContinuationDeliveryPredicate()),
+              ))),
+              // A claim may already have resumed the bound run before this
+              // issue lock. Not-H is not permission to clear a live native run.
+              notExists(tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+                eq(heartbeatRuns.id, issues.executionRunId),
+                eq(heartbeatRuns.companyId, issues.companyId),
+                eq(heartbeatRuns.nativeIssueId, issues.id),
+                eq(heartbeatRuns.runtimeMode, "native"),
+                notInArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+              ))),
+            )
+            : idPredicate)
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        if (ownershipChanged) {
+          // Invalidate human direction only after the guarded source write
+          // succeeds. A newly observed hold must leave these requests intact.
+          // Keep requester attribution; cancellation revokes its use.
+          await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date() })
+            .where(and(eq(agentWakeupRequests.companyId, receiptExisting.companyId),
+              eq(agentWakeupRequests.requestedByActorType, "user"),
+              sql`coalesce(${agentWakeupRequests.payload}->>'issueId', ${agentWakeupRequests.payload}->>'taskId',
+                ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'issueId',
+                ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'taskId') = ${id}`));
+        }
         await recordChatCompletion(tx, receiptExisting, updated);
         // An operator explicitly choosing a disposition owns that decision,
         // including choosing In Review while the conversation is Idle.
@@ -11564,8 +11644,10 @@ export function issueService(db: Db) {
       const current = await db
         .select({
           id: issues.id,
+          companyId: issues.companyId,
           status: issues.status,
           assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
         })
@@ -11644,7 +11726,8 @@ export function issueService(db: Db) {
         const executionRun = await db.select().from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, current.executionRunId)).then(rows => rows[0] ?? null);
         const stale = !executionRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status);
-        if (stale && !isExplicitContinuationRetryClaim({ ...current, companyId: issueCompany.companyId }, executionRun)) {
+        if (stale && !isExplicitContinuationRetryClaim(current, executionRun) &&
+            !(await readNativeContinuationHold(db, { issue: current, runId: current.executionRunId }))) {
           const now = new Date();
           const adoptionSet: Record<string, unknown> = {
             assigneeAgentId: agentId,
@@ -11666,6 +11749,13 @@ export function issueService(db: Db) {
                 eq(issues.id, id),
                 inArray(issues.status, expectedStatuses),
                 eq(issues.executionRunId, current.executionRunId),
+                sql`not (${nativeContinuationHoldSql()})`,
+            // R and F can have been read in different snapshots. A same-run
+            // claim that has already returned R to running is not cleanable.
+            notExists(db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.id, issues.executionRunId),
+              notInArray(heartbeatRuns.status, [...TERMINAL_HEARTBEAT_RUN_STATUSES]),
+            ))),
                 or(
                   isNull(issues.assigneeAgentId),
                   eq(issues.assigneeAgentId, agentId),

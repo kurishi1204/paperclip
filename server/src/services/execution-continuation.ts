@@ -354,7 +354,14 @@ export async function buildExecutionContinuation(input: {
       and(
         eq(issueRecoveryActions.companyId, companyId),
         eq(issueRecoveryActions.sourceIssueId, issueId),
-        eq(issueRecoveryActions.status, "resolved"),
+        or(
+          eq(issueRecoveryActions.status, "resolved"),
+          and(
+            eq(issueRecoveryActions.status, "cancelled"),
+            sql`${issueRecoveryActions.evidence}->'continuationRequested' = 'false'::jsonb`,
+            sql`jsonb_typeof(${issueRecoveryActions.evidence}->'executionReconciliation') = 'object'`,
+          ),
+        ),
       ),
     );
   const lastTerminal = priorRuns.findLast((run) =>

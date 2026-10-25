@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
+import { and, eq, inArray, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -7,11 +7,14 @@ import {
   heartbeatRuns,
   issueApprovals,
   issueRelations,
+  issueRecoveryActions,
   issueThreadInteractions,
   issueWorkProducts,
   issues,
 } from "@paperclipai/db";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
+import { executionBlockerPredicate, executionContinuationDeliveryPredicate } from "../execution-blocker.js";
+import { readNativeContinuationRecoveryPath } from "../native-runtime/native-continuation-hold.js";
 
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 
@@ -34,6 +37,10 @@ export type DispositionRepairSourceState = {
   fingerprint: string;
   dependencyIssueIds: string[];
   hasActiveExecutionPath: boolean;
+  hasNativeRecoveryPath: boolean;
+  hasRecoveryWaitingPath: boolean;
+  hasUnresolvedRecoveryWait: boolean;
+  nativeOrphanedRunIds: string[];
   hasDurableWaitingPath: boolean;
   durablePathReason: string | null;
 };
@@ -75,16 +82,28 @@ export function dispositionRepairDelayMs(attempt: number, fingerprint: string) {
   );
 }
 
+/** An unsettled native result owns a recovery path even when its run is
+ * temporarily failed. This is retention, not permission to dispatch/resume. */
+export async function hasNativeRecoveryExecutionPath(
+  db: Pick<Db, "select">,
+  input: { companyId: string; issueId: string; agentId?: string | null },
+): Promise<boolean> {
+  return (await readNativeContinuationRecoveryPath(db, input)).pending;
+}
+
 export async function collectDispositionRepairSourceState(
   db: Db,
   input: {
     issue: DispositionRepairIssue;
     excludeRunId?: string | null;
     excludeWakeupRequestId?: string | null;
+    /** An explicit BOARD receipt may release saved, not-yet-admitted input.
+     * Ordinary recovery keeps counting it as a durable execution path. */
+    excludeDeferredWakeupRequests?: boolean;
   },
 ): Promise<DispositionRepairSourceState> {
   const issue = input.issue;
-  const [blockers, children, interactions, linkedApprovals, workProducts, activeRuns, queuedWakes] =
+  const [blockers, children, interactions, linkedApprovals, workProducts, activeRuns, queuedWakes, nativeRecovery, reconciliation, delivery] =
     await Promise.all([
       db
         .select({ id: issues.id, status: issues.status, assigneeAgentId: issues.assigneeAgentId })
@@ -169,7 +188,8 @@ export async function collectDispositionRepairSourceState(
           and(
             eq(heartbeatRuns.companyId, issue.companyId),
             inArray(heartbeatRuns.status, [...ACTIVE_RUN_STATUSES]),
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+            or(eq(heartbeatRuns.nativeIssueId, issue.id),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`),
             input.excludeRunId ? ne(heartbeatRuns.id, input.excludeRunId) : sql`true`,
           ),
         ),
@@ -179,13 +199,25 @@ export async function collectDispositionRepairSourceState(
         .where(
           and(
             eq(agentWakeupRequests.companyId, issue.companyId),
-            inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+            inArray(agentWakeupRequests.status, input.excludeDeferredWakeupRequests
+              ? ["queued"] : ["queued", "deferred_issue_execution"]),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
             input.excludeWakeupRequestId
               ? ne(agentWakeupRequests.id, input.excludeWakeupRequestId)
               : sql`true`,
           ),
         ),
+      // Excluding a repair's queued reservation must not exclude an unsettled
+      // native continuation: only its native recovery can settle that result.
+      readNativeContinuationRecoveryPath(db, { companyId: issue.companyId, issueId: issue.id }),
+      db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, issue.companyId),
+        eq(issueRecoveryActions.sourceIssueId, issue.id), executionBlockerPredicate(),
+      )).limit(1),
+      db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, issue.companyId),
+        eq(issueRecoveryActions.sourceIssueId, issue.id), executionContinuationDeliveryPredicate(),
+      )).limit(1),
     ]);
 
   const pendingExecutionState = parseIssueExecutionState(issue.executionState);
@@ -193,19 +225,27 @@ export async function collectDispositionRepairSourceState(
   const pendingApproval = linkedApprovals.some((row) =>
     row.status === "pending" || row.status === "revision_requested",
   );
-  const durablePathReason = issue.assigneeUserId
-    ? "user_owner"
-    : blockers.length > 0
-      ? "blocker"
-      : issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now()
-        ? "monitor"
-        : pendingExecutionState?.status === "pending"
-          ? "execution_stage"
-          : pendingInteraction
-            ? "interaction"
-            : pendingApproval
-              ? "approval"
-              : null;
+  const durablePathReason = reconciliation.length > 0
+    ? "execution_reconciliation"
+    : delivery.length > 0
+      ? "execution_continuation_delivery"
+      : nativeRecovery.boardEvidenceWaiting
+        ? "native_execution_evidence"
+        : nativeRecovery.orphaned
+          ? "native_continuation_reconciliation"
+          : issue.assigneeUserId
+            ? "user_owner"
+            : blockers.length > 0
+              ? "blocker"
+              : issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now()
+                ? "monitor"
+                : pendingExecutionState?.status === "pending"
+                  ? "execution_stage"
+                  : pendingInteraction
+                    ? "interaction"
+                    : pendingApproval
+                      ? "approval"
+                      : null;
 
   const durableState = {
     source: {
@@ -233,7 +273,11 @@ export async function collectDispositionRepairSourceState(
   return {
     fingerprint: `disposition_repair:v1:${digest}`,
     dependencyIssueIds: [...new Set([...blockers.map((row) => row.id), ...children.map((row) => row.id)])],
-    hasActiveExecutionPath: activeRuns.length > 0 || queuedWakes.length > 0,
+    hasActiveExecutionPath: activeRuns.length > 0 || queuedWakes.length > 0 || (nativeRecovery.pending && !nativeRecovery.orphaned && !nativeRecovery.boardEvidenceWaiting),
+    hasNativeRecoveryPath: nativeRecovery.pending && !nativeRecovery.orphaned && !nativeRecovery.boardEvidenceWaiting,
+    hasRecoveryWaitingPath: nativeRecovery.pending || reconciliation.length > 0 || delivery.length > 0,
+    hasUnresolvedRecoveryWait: nativeRecovery.orphaned || nativeRecovery.boardEvidenceWaiting || reconciliation.length > 0 || delivery.length > 0,
+    nativeOrphanedRunIds: nativeRecovery.orphanedRunIds,
     hasDurableWaitingPath: durablePathReason !== null,
     durablePathReason,
   };

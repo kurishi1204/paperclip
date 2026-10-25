@@ -42,6 +42,8 @@ type Recovery = Pick<
   Partial<
     Pick<typeof issueRecoveryActions.$inferSelect, "status" | "evidence">
   >;
+const isRecordOnlyReconciliation = (evidence: Recovery["evidence"]) =>
+  !!evidence?.executionReconciliation && evidence.continuationRequested === false;
 
 /** Batched reads; list consumers do not perform per-task polling. */
 export async function executionProjectionsForRuns(
@@ -116,6 +118,7 @@ export async function executionProjectionsForRuns(
               "active",
               "escalated",
               "resolved",
+              "cancelled",
             ]),
           ),
         )
@@ -127,11 +130,13 @@ export async function executionProjectionsForRuns(
     const matching = recovery.filter(
       (row) =>
         row.issueId === issueId &&
-        (row.status !== "resolved" || row.evidence.executionReconciliation || row.evidence.automaticRecovery) &&
+        (row.status === "cancelled"
+          ? isRecordOnlyReconciliation(row.evidence)
+          : row.status !== "resolved" || row.evidence.executionReconciliation || row.evidence.automaticRecovery) &&
         (row.evidence.runId === run.id || row.evidence.sourceRunId === run.id),
     );
     const action =
-      matching.find((row) => row.status !== "resolved") ?? matching[0];
+      matching.find((row) => row.status === "active" || row.status === "escalated") ?? matching[0];
     projections.set(
       run.id,
       projectExecution(
@@ -189,6 +194,16 @@ export function projectExecution(
   };
   const set = (phase: ExecutionProjection["phase"], label: string) =>
     Object.assign(projection, { phase, label });
+  if (
+    (recoveryAction?.status === "resolved" || recoveryAction?.status === "cancelled") &&
+    isRecordOnlyReconciliation(recoveryAction.evidence)
+  ) {
+    projection.cause = null;
+    projection.nextAction = null;
+    projection.retryAt = null;
+    projection.successorRunId = null;
+    return set("completed", "Reconciled without continuation");
+  }
   if (recoveryAction?.status === "resolved" && recoveryAction.evidence?.automaticRecovery) {
     projection.cause = recoveryAction.cause;
     projection.nextAction = recoveryAction.nextAction;
