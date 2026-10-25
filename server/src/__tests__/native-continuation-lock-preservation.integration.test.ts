@@ -7,8 +7,8 @@ import { eq, inArray, sql } from "drizzle-orm";
 import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  activityLog, agentWakeupRequests, agents, companies, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns,
-  issueComments, issueRecoveryActions, issueRelations, issues, nativeRunFinalizations, startEmbeddedPostgresTestDatabase,
+  activityLog, agentWakeupRequests, agents, companies, completionContracts, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns,
+  issueComments, issueRecoveryActions, issueRelations, issues, nativeRunFinalizations, nativeRunResults, startEmbeddedPostgresTestDatabase,
 } from "@paperclipai/db";
 
 const effects = vi.hoisted(() => ({ telemetry: vi.fn(), provider: vi.fn(() => {
@@ -1395,6 +1395,75 @@ describe("native continuation ownership: automatic clear and adoption", () => {
       expect(await db.select().from(heartbeatRuns)).toEqual(before.runs);
       expect(await db.select().from(nativeRunFinalizations)).toEqual(before.finals);
     } else await receiveSyntheticBoardDelivery(f);
+  });
+
+  it.each(["committed", "applied", "missing_result", "missing_finalization"] as const)(
+    "A12 historical native source needs reconciliation only without a settled result (%s)", async settlement => {
+      const f = await seedBoardNativeHandoff();
+      // Deliberately synthesize a historical action. The current native writer
+      // skips generic successful-run handoff, so this is not proof that it
+      // creates this lineage in production. Exercise the actual HTTP consumer.
+      await db.update(issueRecoveryActions).set({ cause: "successful_run_missing_state",
+        evidence: { sourceRunId: f.runId, recoveryCause: "successful_run_missing_state" } })
+        .where(eq(issueRecoveryActions.id, f.action.id));
+      const contractId = randomUUID();
+      await db.insert(completionContracts).values({ id: contractId, companyId: f.companyId,
+        issueId: f.issueId, revision: 1, schemaVersion: "synthetic/v1", policyVersion: "synthetic/v1",
+        risk: "low", completionAuthority: "agent", incompleteCriteriaPolicy: "block",
+        contractJson: { synthetic: true }, canonicalSha256: "synthetic-contract",
+        createdByActorType: "user", createdByActorId: "synthetic-owner" });
+      await db.update(heartbeatRuns).set({ status: "succeeded", completionContractId: contractId,
+        nativePhase: "committed", errorCode: null, error: null })
+        .where(eq(heartbeatRuns.id, f.runId));
+      const [result] = await db.insert(nativeRunResults).values({ companyId: f.companyId,
+        issueId: f.issueId, runId: f.runId, completionContractId: contractId,
+        serverFingerprint: "synthetic-settled-result", schemaStatus: "valid",
+        resultJson: { synthetic: true }, canonicalSha256: "synthetic-result" }).returning();
+      if (settlement === "missing_finalization") {
+        await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId));
+      } else {
+        await db.update(nativeRunFinalizations).set({
+          phase: settlement === "missing_result" ? "committed" : settlement,
+          resultId: settlement === "missing_result" ? null : result!.id,
+          recoveryState: null, failureDetail: null,
+        }).where(eq(nativeRunFinalizations.runId, f.runId));
+      }
+      f.body.sourceIssueStatus = "in_review";
+      delete (f.body as { executionReconciliation?: unknown }).executionReconciliation;
+      const before = { issue: await f.readIssue(), action: await f.readAction(),
+        runs: await db.select().from(heartbeatRuns), finals: await db.select().from(nativeRunFinalizations),
+        results: await db.select().from(nativeRunResults) };
+      const response = await f.resolve();
+      const settled = settlement === "committed" || settlement === "applied";
+      observations.push({ kind: "A12_historical_successful_source", settlement, httpStatus: response.status,
+        error: response.body.error ?? null,
+        qualification: "Synthetic historical action with real FK-owned result; no normal writer reachability or live acceptance asserted." });
+      expect(response.status, JSON.stringify(response.body)).toBe(settled ? 200 : 409);
+      if (settled) {
+        expect((await f.readIssue()).status).toBe("in_review");
+        expect((await f.readAction()).status).toBe("resolved");
+        expect((await f.readAction()).evidence.executionReconciliation).toBeUndefined();
+        expect((await f.readAction()).evidence.continuationDelivery).toBeUndefined();
+      } else {
+        expect(await f.readIssue()).toEqual(before.issue);
+        expect(await f.readAction()).toEqual(before.action);
+      }
+      expect(await db.select().from(heartbeatRuns)).toEqual(before.runs);
+      expect(await db.select().from(nativeRunFinalizations)).toEqual(before.finals);
+      expect(await db.select().from(nativeRunResults)).toEqual(before.results);
+    });
+
+  it("A12 cancelled todo receipt is rejected by the real HTTP input boundary", async () => {
+    const f = await seedBoardNativeHandoff();
+    f.body.outcome = "cancelled";
+    const before = { issue: await f.readIssue(), action: await f.readAction(),
+      finals: await db.select().from(nativeRunFinalizations) };
+    const response = await f.resolve();
+    observations.push({ kind: "A12_cancelled_todo_schema", httpStatus: response.status, error: response.body.error });
+    expect(response.status, JSON.stringify(response.body)).toBe(400);
+    expect(await f.readIssue()).toEqual(before.issue);
+    expect(await f.readAction()).toEqual(before.action);
+    expect(await db.select().from(nativeRunFinalizations)).toEqual(before.finals);
   });
 
   it.each(["restored", "false_positive", "cancelled"])(

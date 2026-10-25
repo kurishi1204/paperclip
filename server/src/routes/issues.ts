@@ -60,6 +60,7 @@ import {
   issueThreadInteractions,
   issues as issueRows,
   issueWorkProducts,
+  nativeRunFinalizations,
   pipelineCaseIssueLinks,
   pipelineCases,
   pipelineStages,
@@ -9369,11 +9370,24 @@ export function issueRoutes(
             ? await tx
                 .select({ id: heartbeatRuns.id })
                 .from(heartbeatRuns)
+                .leftJoin(nativeRunFinalizations, and(
+                  eq(nativeRunFinalizations.runId, heartbeatRuns.id),
+                  eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId),
+                  eq(nativeRunFinalizations.issueId, heartbeatRuns.nativeIssueId),
+                ))
                 .where(and(
                   eq(heartbeatRuns.companyId, lockedIssue.companyId),
                   eq(heartbeatRuns.id, reconciliationSourceRunId),
                   eq(heartbeatRuns.runtimeMode, "native"),
                   sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${lockedIssue.id}`,
+                  // A historical action can refer to an already-settled source.
+                  // Exempt only a succeeded run with its own durable result;
+                  // absent/incomplete finalization remains evidence-gated.
+                  sql`not coalesce((
+                    ${heartbeatRuns.status} = 'succeeded'
+                    and ${nativeRunFinalizations.phase} in ('committed', 'applied')
+                    and ${nativeRunFinalizations.resultId} is not null
+                  ), false)`,
                 ))
                 .limit(1)
             : [];
