@@ -1,7 +1,7 @@
 import { dismissAutomaticCompletionReviews } from "../services/native-runtime/automatic-completion-reviews.js";
 import * as childCompletionDelivery from "../services/native-runtime/native-child-completion-delivery.js";
 import { nativeCompletionFeedback } from "../services/native-runtime/native-completion-feedback.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -13,6 +13,7 @@ import {
   completionContracts,
   createDb,
   heartbeatRuns,
+  issueExecutionDecisions,
   issueThreadInteractions,
   issueRecoveryActions,
   issueWorkProducts,
@@ -2190,6 +2191,49 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     expect(decision!.reasonCode).toBe("prior_status_preserved_no_live_path");
     expect(decision!.decisionJson.effects).toEqual([expect.objectContaining({ kind: "record_finalization_error" })]);
     expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, incomplete.issueId))).toHaveLength(0);
+  }, 30_000);
+
+  it("actual finalizer preserves a same-run approval verdict after a successor advances the stage and lease", async () => {
+    const seeded = await seedFixture({ ...corpus.fixtures[0]!, id: `formal-approval-successor-${randomUUID()}` });
+    const stageId = randomUUID(), laterStageId = randomUUID(), laterDecisionId = randomUUID();
+    const summary = "Return the task with concrete changes.";
+    const reservedInput = { decision: "request_changes", summary, expectedStageId: stageId,
+      expectedStatusVersion: 0, expectedRevision: 0, expectedLastDecisionId: null };
+    const canonical = JSON.stringify(Object.fromEntries(Object.entries(reservedInput).sort(([a], [b]) => a.localeCompare(b))));
+    const digest = createHash("sha256").update(canonical).digest("hex");
+    const [formal] = await db.insert(issueExecutionDecisions).values({ companyId, issueId: seeded.issueId,
+      stageId, stageType: "approval", actorAgentId: agentId, createdByRunId: seeded.runId,
+      outcome: "changes_requested", body: summary,
+    }).returning();
+    await db.update(heartbeatRuns).set({ resultJson: { approvalStageAttempts: {
+      [stageId]: { digest, callId: "formal-approval", input: reservedInput, state: "committed", decisionId: formal!.id },
+    } } }).where(eq(heartbeatRuns.id, seeded.runId));
+    const workerId = randomUUID(), successorRunId = randomUUID();
+    await db.insert(agents).values({ id: workerId, companyId, name: "Successor worker", adapterType: "paperclip_runner", status: "idle" });
+    await db.insert(heartbeatRuns).values({ id: successorRunId, companyId, agentId: workerId,
+      status: "running", runtimeMode: "native", nativeIssueId: seeded.issueId,
+      contextSnapshot: { issueId: seeded.issueId } });
+    await db.insert(issueExecutionDecisions).values({ id: laterDecisionId, companyId, issueId: seeded.issueId,
+      stageId: laterStageId, stageType: "review", actorAgentId: workerId, createdByRunId: successorRunId,
+      outcome: "approved", body: "Later worker stage moved forward.",
+    });
+    await db.update(issues).set({ status: "in_review", assigneeAgentId: workerId,
+      checkoutRunId: successorRunId, executionRunId: successorRunId,
+      executionAgentNameKey: "successor-worker", executionLockedAt: new Date(),
+      executionState: { status: "pending", currentStageId: laterStageId, currentStageType: "review",
+        lastDecisionId: laterDecisionId, lastDecisionOutcome: "approved" },
+    }).where(eq(issues.id, seeded.issueId));
+    const [before] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    await finalizeNativeRun({ db, runId: seeded.runId, workspaceFinalizeStatus: "succeeded" });
+    const [after] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    const [decision] = await db.select().from(statusDecisions).where(eq(statusDecisions.runId, seeded.runId));
+    expect(decision?.reasonCode).toBe("formal_approval_decision_recorded");
+    expect(after).toMatchObject({ status: "in_review", assigneeAgentId: workerId,
+      checkoutRunId: successorRunId, executionRunId: successorRunId,
+      executionAgentNameKey: "successor-worker" });
+    expect(after?.executionLockedAt).toEqual(before?.executionLockedAt);
+    expect(after?.updatedAt).toEqual(before?.updatedAt);
+    expect(after?.executionState).toMatchObject({ lastDecisionId: laterDecisionId });
   }, 30_000);
 
   it("rejects wrong, missing, and duplicate criterion IDs before accepting completion", async () => {

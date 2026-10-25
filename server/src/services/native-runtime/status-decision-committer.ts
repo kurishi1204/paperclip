@@ -1,8 +1,9 @@
 import { readNativePlanWait, type NativePlanWaitSource } from "./native-plan-wait.js";
+import { readFormalIssueApprovalDecision } from "./formal-issue-approval-decision.js";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
 import { isConversation } from "../agent-conversations.js";
 import { hasPendingNativeChildCompletion, type NativeChildCompletionRecipient } from "./native-child-completion-delivery.js";
-import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { CreateIssueThreadInteraction } from "@paperclipai/shared";
 import {
@@ -531,6 +532,7 @@ async function materializeDecisionEffect(input: {
   effect: NativeStatusEffect;
   failpoint?: NativeStatusCommitFailpoint;
   preMaterializedEffects?: ReadonlyMap<string, NativeMaterializedStatusEffect>;
+  formalApprovalDecisionId?: string;
   /** Terminal heartbeat_runs rows this effect wrote. The caller emits agent.task_run for each, after its transaction commits. */
   terminalRunsToEmit?: (typeof heartbeatRuns.$inferSelect)[];
 }): Promise<NativeMaterializedStatusEffect> {
@@ -1486,6 +1488,22 @@ async function materializeDecisionEffect(input: {
     };
   }
   if (effect.kind === "release_checkout") {
+    if (input.formalApprovalDecisionId) {
+      // The verdict may already have reassigned the issue. Release only lease
+      // fields that still name this run; never clear a successor's checkout.
+      const [released] = await input.tx.update(issues).set({
+        checkoutRunId: sql`case when ${issues.checkoutRunId} = ${input.runId}::uuid then null else ${issues.checkoutRunId} end`,
+        executionRunId: sql`case when ${issues.executionRunId} = ${input.runId}::uuid then null else ${issues.executionRunId} end`,
+        executionAgentNameKey: sql`case when ${issues.executionRunId} = ${input.runId}::uuid then null else ${issues.executionAgentNameKey} end`,
+        executionLockedAt: sql`case when ${issues.executionRunId} = ${input.runId}::uuid then null else ${issues.executionLockedAt} end`,
+        updatedAt: new Date(),
+      }).where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.companyId),
+        or(eq(issues.checkoutRunId, input.runId), eq(issues.executionRunId, input.runId))))
+        .returning({ id: issues.id, checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId });
+      return { effectKind: effect.kind, targetType: "issue_checkout", targetId: input.issue.id,
+        payload: { checkoutRunId: released ? released.checkoutRunId : input.issue.checkoutRunId,
+          executionRunId: released ? released.executionRunId : input.issue.executionRunId } };
+    }
     const [released] = await input.tx
       .update(issues)
       .set({
@@ -1561,6 +1579,7 @@ export async function commitNativeStatusDecision(input: {
   requireProviderFailureOwner?: { agentId: string; reviewContext: NativeReviewAssignmentContext | null };
   requireBoardResponseWaitSource?: NativeBoardResponseWaitSource;
   requireBoardResponseWaitOrigin?: NativeBoardResponseWaitOrigin;
+  requireFormalApprovalDecision?: { id: string; agentId: string };
   reviewResponsePresentation?: {
     agentId: string;
     resultId: string;
@@ -1576,6 +1595,9 @@ export async function commitNativeStatusDecision(input: {
   }
   if (reasonCode.startsWith("native_provider_overloaded") && !input.requireProviderFailureOwner) {
     throw new Error("native_provider_failure_owner_required");
+  }
+  if ((reasonCode === "formal_approval_decision_recorded") !== Boolean(input.requireFormalApprovalDecision)) {
+    throw new Error("native_formal_approval_source_required");
   }
   const publications: ActivityPublication[] = [];
   const terminalRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
@@ -1608,6 +1630,11 @@ export async function commitNativeStatusDecision(input: {
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (!issue) throw new NativeStatusRaceError();
+    if (input.requireFormalApprovalDecision) {
+      const original = await readFormalIssueApprovalDecision({ db: tx as unknown as Db,
+        issue, runId: input.runId, agentId: input.requireFormalApprovalDecision.agentId });
+      if (!original || original.id !== input.requireFormalApprovalDecision.id) throw new NativeStatusRaceError();
+    }
     // A completed model turn cannot close a persistent conversation. Preserve
     // the task here; the response finalizer records its durable waiting state.
     if (issue.conversationAgentId && input.decision.statusAction === "done") {
@@ -1978,6 +2005,7 @@ export async function commitNativeStatusDecision(input: {
           runId: input.runId,
           decisionId: decisionRow.id,
           effect,
+          formalApprovalDecisionId: input.requireFormalApprovalDecision?.id,
           failpoint: input.failpoint,
           preMaterializedEffects,
           terminalRunsToEmit,

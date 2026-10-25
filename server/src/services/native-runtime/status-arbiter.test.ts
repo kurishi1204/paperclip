@@ -103,6 +103,30 @@ describe("native status authority", () => {
     }
   });
 
+  it("preserves a same-run formal approval decision even with complete finish evidence", () => {
+    for (const priorIssueStatus of ["in_progress", "done"] as const) {
+      const decision = arbitrate({ priorIssueStatus, formalApprovalDecisionId: "decision-1" });
+      expect(decision).toMatchObject({
+        statusAction: "preserve", toStatus: priorIssueStatus,
+        reasonCode: "formal_approval_decision_recorded",
+        effects: [{ kind: "release_checkout" }],
+      });
+    }
+    const failedProvider = arbitrate({
+      priorIssueStatus: "in_progress", terminalState: "failed", providerModelRejected: true,
+      formalApprovalDecisionId: "decision-1",
+    });
+    expect(failedProvider).toMatchObject({
+      statusAction: "preserve", toStatus: "in_progress",
+      reasonCode: "formal_approval_decision_recorded",
+      effects: [{ kind: "release_checkout" }],
+    });
+    expect(failedProvider.effects).not.toContainEqual(expect.objectContaining({ kind: "bind_blocker" }));
+    expect(arbitrate({ priorIssueStatus: "in_progress", formalApprovalDecisionId: "decision-1", workspaceFinalizeStatus: "failed" }))
+      .toMatchObject({ statusAction: "preserve", reasonCode: "finalization_failed_claim_preserved",
+        effects: [{ kind: "record_finalization_error" }] });
+  });
+
   it("routes an unfinished reviewer action to bounded recovery instead of retrying the worker task", () => {
     const decision = arbitrate({ priorIssueStatus: "in_review", nativeReviewOutcome: "pending" });
     expect(decision).toMatchObject({ statusAction: "preserve", toStatus: "in_review" });
@@ -562,7 +586,7 @@ describe("native status authority", () => {
       expect.objectContaining({
         statusAction: "blocked",
         toStatus: "blocked",
-        policyVersion: "phase6-v10",
+        policyVersion: "phase6-v11",
         reasonCode: "current_track_blocker_waiting",
         unblockDescriptor: {
           owner: "board",

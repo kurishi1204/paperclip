@@ -15,6 +15,7 @@ import { assertAssignableAgent } from "../agent-assignability.js";
 import { authorizationService } from "../authorization.js";
 import { resolveCoreTrustPreset } from "../trust-preset-resolver.js";
 import { normalizeIssueExecutionPolicy } from "../issue-execution-policy.js";
+import { runnerGoalService } from "../runner-goals.js";
 import { buildLowTrustSourceTrust } from "../source-trust.js";
 import { handoffPlanContext } from "./handoff-plan-context.js";
 import { callCreateSkillTool, callUpdateSkillTool } from "../skill-tools.js";
@@ -46,6 +47,8 @@ import { and, desc, eq, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
+  agentSessionGoalActions,
+  agentTaskSessions,
   assets,
   runnerApiResponseReservations,
   agents,
@@ -56,6 +59,7 @@ import {
   documentRevisions,
   heartbeatRuns,
   issueApprovals,
+  issueExecutionDecisions,
   issueComments,
   issueDocuments,
   issues,
@@ -111,6 +115,23 @@ const IMPLEMENTED_OPERATIONS = new Set([
 const NATIVE_REVIEW_READ_TOOLS = new Set([
   "get_task_context", "get_task_history", "list_documents", "read_document", "list_document_revisions",
 ]);
+const APPROVAL_STAGE_TOOL = "decide_issue_approval_stage";
+const APPROVAL_STAGE_DEFINITION = {
+  name: APPROVAL_STAGE_TOOL,
+  description: "Decide the configured approval stage assigned to this running task. Read get_task_context first and supply its exact stage and issue versions. Approve or request concrete changes. This is separate from completion review and general approvals.",
+  inputSchema: {
+    type: "object", additionalProperties: false,
+    properties: {
+      decision: { type: "string", enum: ["approve", "request_changes"] },
+      summary: { type: "string", minLength: 1, maxLength: 20000 },
+      expectedStageId: { type: "string", format: "uuid" },
+      expectedStatusVersion: { type: "integer", minimum: 0 },
+      expectedRevision: { type: "integer", minimum: 0 },
+      expectedLastDecisionId: { type: ["string", "null"], format: "uuid" },
+    },
+    required: ["decision", "summary", "expectedStageId", "expectedStatusVersion", "expectedRevision", "expectedLastDecisionId"],
+  },
+};
 
 type Binding = {
   /** Server-derived scope for one addressed native completion review. */
@@ -266,6 +287,7 @@ export class PaperclipRunnerToolAuthority {
     definitions.push(LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION);
     definitions.push(REUSE_CHAT_ATTACHMENT_TOOL_DEFINITION);
     definitions.push(READ_CHAT_ATTACHMENT_TOOL_DEFINITION);
+    if (workMode === "standard") definitions.push(APPROVAL_STAGE_DEFINITION);
     const connectionTools = [...RUNTIME_CONNECTION_TOOL_DEFINITIONS,
       ...(this.binding.connectorAssignments ?? []).flatMap((assignment) => assignment.tools)];
     const assignedTools = this.binding.assignedMcpTools?.definitions((tools) =>
@@ -278,6 +300,14 @@ export class PaperclipRunnerToolAuthority {
     callId: string;
     arguments: unknown;
   }): Promise<unknown> {
+    if (call.tool === APPROVAL_STAGE_TOOL) {
+      if (this.binding.nativeReview || (this.binding.workMode ?? "standard") !== "standard") {
+        throw forbidden("Approval stage decision is unavailable in this run mode");
+      }
+      // A prior verdict may have returned the task to its worker. Receipt
+      // recovery therefore precedes #boundContext, which requires assignment.
+      return this.#decideIssueApprovalStage(call.callId, call.arguments);
+    }
     if (this.binding.nativeReview) {
       if (call.tool === "resolve_review") return this.#resolveReview(call.arguments);
       if (!NATIVE_REVIEW_READ_TOOLS.has(call.tool)) {
@@ -477,6 +507,7 @@ export class PaperclipRunnerToolAuthority {
         return { ...response, apiOperationId: operationId };
       }
       case "get_task_context": {
+        const stage = record(context.issue.executionState);
         const childTasks = await this.db.select().from(issues)
           .where(and(
             eq(issues.companyId, this.binding.companyId),
@@ -492,6 +523,13 @@ export class PaperclipRunnerToolAuthority {
             ...this.binding, conversationMode: isConversation(context.issue),
           }),
           activeTask: redactedTask(context.issue),
+          executionStage: stage.status === "pending" ? {
+            stageId: stage.currentStageId,
+            stageType: stage.currentStageType,
+            statusVersion: context.issue.statusVersion,
+            revision: context.issue.revision,
+            lastDecisionId: stage.lastDecisionId ?? null,
+          } : null,
           childTasks: childTasks.slice(0, 100).map(redactedTask),
           childTasksTruncated: childTasks.length > 100,
           delegationGuidance: "Reuse existing child tasks for delegated work. Inspect a completed child's comments and documents before creating another task for the same deliverable. Use search_tasks if the child task list is truncated.",
@@ -784,6 +822,180 @@ export class PaperclipRunnerToolAuthority {
     const approval = await approvalService(this.db).getById(id);
     if (!approval || approval.companyId !== this.binding.companyId) throw new Error("paperclip_runner_approval_not_found");
     return approval;
+  }
+
+  async #decideIssueApprovalStage(callId: string, value: unknown): Promise<unknown> {
+    const raw = record(value);
+    const expectedKeys = ["decision", "summary", "expectedStageId", "expectedStatusVersion", "expectedRevision", "expectedLastDecisionId"];
+    if (Object.keys(raw).some((key) => !expectedKeys.includes(key)) || expectedKeys.some((key) => !(key in raw)) ||
+        !["approve", "request_changes"].includes(String(raw.decision)) ||
+        typeof raw.summary !== "string" || !raw.summary.trim() || raw.summary.length > 20_000 ||
+        !Number.isSafeInteger(raw.expectedStatusVersion) || Number(raw.expectedStatusVersion) < 0 ||
+        !Number.isSafeInteger(raw.expectedRevision) || Number(raw.expectedRevision) < 0) {
+      throw badRequest("Approval decision requires an exact stage, version, revision, prior decision, and concrete summary");
+    }
+    const input = {
+      decision: raw.decision as "approve" | "request_changes",
+      summary: raw.summary.trim(),
+      expectedStageId: requiredUuid(raw.expectedStageId),
+      expectedStatusVersion: raw.expectedStatusVersion as number,
+      expectedRevision: raw.expectedRevision as number,
+      expectedLastDecisionId: raw.expectedLastDecisionId === null ? null : requiredUuid(raw.expectedLastDecisionId),
+    };
+    const digest = createHash("sha256").update(canonicalJson(input)).digest("hex");
+    const [identity] = await this.db.select({ run: heartbeatRuns, actor: agents }).from(heartbeatRuns)
+      .innerJoin(agents, eq(agents.id, this.binding.agentId)).where(and(
+        eq(heartbeatRuns.id, this.binding.runId), eq(heartbeatRuns.companyId, this.binding.companyId),
+        eq(heartbeatRuns.agentId, this.binding.agentId), eq(heartbeatRuns.nativeIssueId, this.binding.issueId),
+        eq(agents.companyId, this.binding.companyId),
+      )).limit(1);
+    if (!identity || identity.run.runtimeMode !== "native" || identity.run.status !== "running" ||
+        ["paused", "terminated", "pending_approval", "error"].includes(identity.actor.status)) {
+      throw forbidden("This native run cannot decide the approval stage");
+    }
+    const receiptKey = input.expectedStageId;
+    const existingAttempt = record(record(identity.run.resultJson).approvalStageAttempts)[receiptKey];
+    const prior = record(existingAttempt);
+    const priorHistory = record(identity.run.resultJson).approvalStageAttemptHistory;
+    if ((Array.isArray(priorHistory) && priorHistory.some((entry) => record(entry).callId === callId)) ||
+        (existingAttempt !== undefined && prior.callId === callId && prior.digest !== digest)) {
+      throw badRequest("Approval call id was already used for another decision attempt");
+    }
+    const priorDefiniteFailure = typeof prior.failureStatus === "number" && prior.failureStatus >= 400 && prior.failureStatus < 500 && ![408, 429].includes(prior.failureStatus);
+    if (existingAttempt !== undefined && prior.digest !== digest && !priorDefiniteFailure) {
+      throw badRequest("This run already attempted a different verdict for this approval stage");
+    }
+    if (existingAttempt !== undefined && prior.digest === digest && priorDefiniteFailure) {
+      throw new HttpError(prior.failureStatus as number, "Approval stage verdict was rejected; read the current task state");
+    }
+    let sendPost = false;
+    if (existingAttempt === undefined || prior.digest !== digest) {
+      const goal = await runnerGoalService(this.db).projection(this.binding.companyId, this.binding.issueId, this.binding.agentId);
+      if (goal?.pendingAction || (goal?.goal && goal.goal.status !== "complete")) {
+        throw forbidden("Finish the active goal and its pending control action before deciding this approval stage");
+      }
+      sendPost = await this.db.transaction(async (tx) => {
+        await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, this.binding.issueId), eq(issues.companyId, this.binding.companyId),
+        )).for("update");
+        const [current] = await tx.select({ issue: issues, run: heartbeatRuns, actor: agents }).from(heartbeatRuns)
+          .innerJoin(issues, eq(issues.id, this.binding.issueId))
+          .innerJoin(agents, eq(agents.id, this.binding.agentId)).where(and(
+            eq(heartbeatRuns.id, this.binding.runId), eq(heartbeatRuns.companyId, this.binding.companyId),
+            eq(heartbeatRuns.agentId, this.binding.agentId), eq(heartbeatRuns.nativeIssueId, this.binding.issueId),
+            eq(issues.companyId, this.binding.companyId), eq(agents.companyId, this.binding.companyId),
+          )).limit(1).for("update");
+        if (!current || current.run.runtimeMode !== "native" || current.run.status !== "running" ||
+            ["paused", "terminated", "pending_approval", "error"].includes(current.actor.status)) {
+          throw forbidden("Approval stage run binding changed");
+        }
+        const resultJson = record(current.run.resultJson);
+        const attempts = record(resultJson.approvalStageAttempts);
+        const atStage = record(attempts[receiptKey]);
+        const history = Array.isArray(resultJson.approvalStageAttemptHistory) ? [...resultJson.approvalStageAttemptHistory] : [];
+        if (history.some((entry) => record(entry).callId === callId) ||
+            (attempts[receiptKey] !== undefined && atStage.callId === callId && atStage.digest !== digest)) {
+          throw badRequest("Approval call id was already used for another decision attempt");
+        }
+        if (attempts[receiptKey] !== undefined) {
+          const failed = typeof atStage.failureStatus === "number" && atStage.failureStatus >= 400 && atStage.failureStatus < 500 && ![408, 429].includes(atStage.failureStatus);
+          if (atStage.digest !== digest && !failed) throw badRequest("A different approval verdict is already reserved");
+          if (atStage.digest === digest) return false;
+        }
+        if (current.issue.assigneeAgentId !== this.binding.agentId || current.issue.executionRunId !== this.binding.runId) {
+          throw forbidden("Approval stage is no longer assigned to this run");
+        }
+        if (current.issue.workMode !== "standard") throw forbidden("Approval stage decision requires standard work mode");
+        const state = record(current.issue.executionState);
+        if (current.issue.status !== "in_review" || state.status !== "pending" ||
+            state.currentStageType !== "approval" || state.currentStageId !== input.expectedStageId ||
+            record(state.currentParticipant).type !== "agent" ||
+            record(state.currentParticipant).agentId !== this.binding.agentId ||
+            current.issue.statusVersion !== input.expectedStatusVersion || current.issue.revision !== input.expectedRevision ||
+            (state.lastDecisionId ?? null) !== input.expectedLastDecisionId) {
+          throw badRequest("Approval stage changed; read get_task_context again");
+        }
+        await tx.insert(agentTaskSessions).values({ companyId: this.binding.companyId,
+          agentId: this.binding.agentId, adapterType: current.actor.adapterType, taskKey: this.binding.issueId,
+        }).onConflictDoNothing();
+        const [session] = await tx.select().from(agentTaskSessions).where(and(
+          eq(agentTaskSessions.companyId, this.binding.companyId), eq(agentTaskSessions.agentId, this.binding.agentId),
+          eq(agentTaskSessions.adapterType, current.actor.adapterType), eq(agentTaskSessions.taskKey, this.binding.issueId),
+        )).limit(1).for("update");
+        const sessionGoal = record(session?.goalJson);
+        const [openAction] = session ? await tx.select({ id: agentSessionGoalActions.id }).from(agentSessionGoalActions).where(and(
+          eq(agentSessionGoalActions.sessionId, session.id),
+          sql`${agentSessionGoalActions.status} in ('pending', 'delivering', 'delivered')`,
+        )).limit(1) : [];
+        if (!session || openAction || (typeof sessionGoal.objective === "string" && sessionGoal.status !== "complete")) {
+          throw forbidden("Approval stage goal or control action is active");
+        }
+        if (attempts[receiptKey] !== undefined) history.push({ ...atStage, stageId: receiptKey });
+        attempts[receiptKey] = { digest, callId, input, reservedAt: new Date().toISOString() };
+        await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, approvalStageAttempts: attempts,
+          approvalStageAttemptHistory: history } })
+          .where(eq(heartbeatRuns.id, this.binding.runId));
+        return true;
+      });
+    }
+    const persistResult = async (result: Record<string, unknown>) => {
+      await this.db.transaction(async (tx) => {
+        const [run] = await tx.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, this.binding.runId), eq(heartbeatRuns.companyId, this.binding.companyId),
+          eq(heartbeatRuns.agentId, this.binding.agentId), eq(heartbeatRuns.nativeIssueId, this.binding.issueId),
+        )).limit(1).for("update");
+        if (!run || run.runtimeMode !== "native") throw forbidden("Approval receipt run disappeared");
+        const resultJson = record(run.resultJson);
+        const attempts = record(resultJson.approvalStageAttempts);
+        const saved = record(attempts[receiptKey]);
+        if (saved.digest !== digest) throw forbidden("Approval receipt no longer matches this run");
+        attempts[receiptKey] = { ...saved, ...result };
+        await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, approvalStageAttempts: attempts } })
+          .where(eq(heartbeatRuns.id, this.binding.runId));
+      });
+    };
+    const readOriginal = async () => {
+      const rows = await this.db.select().from(issueExecutionDecisions).where(and(
+        eq(issueExecutionDecisions.companyId, this.binding.companyId),
+        eq(issueExecutionDecisions.issueId, this.binding.issueId),
+        eq(issueExecutionDecisions.stageId, input.expectedStageId),
+        eq(issueExecutionDecisions.stageType, "approval"),
+        eq(issueExecutionDecisions.actorAgentId, this.binding.agentId),
+        eq(issueExecutionDecisions.createdByRunId, this.binding.runId),
+      )).orderBy(desc(issueExecutionDecisions.createdAt)).limit(2);
+      const matching = rows.filter((row) => row.outcome === (input.decision === "approve" ? "approved" : "changes_requested") && row.body === input.summary);
+      if (rows.length !== 1 || matching.length !== 1) {
+        if (rows.length) throw forbidden("Approval stage original decision conflicts with this run's receipt");
+        return null;
+      }
+      return { decisionId: matching[0]!.id, outcome: matching[0]!.outcome, stageId: matching[0]!.stageId, deduplicated: !sendPost };
+    };
+    if (!sendPost) {
+      const original = await readOriginal();
+      if (original) { await persistResult({ decisionId: original.decisionId, state: "committed" }); return original; }
+      throw new SemanticToolOutcomeUnknownError("approval_stage_outcome_unknown: reserved call cannot be resent");
+    }
+    let responseStatus: number | null = null;
+    try {
+      const apiUrl = this.binding.apiUrl ?? process.env.PAPERCLIP_API_URL;
+      if (!apiUrl) throw new Error("Paperclip API origin is unavailable");
+      const token = createLocalAgentJwt(this.binding.agentId, this.binding.companyId, identity.actor.adapterType, this.binding.runId, identity.run.responsibleUserId);
+      const response = await fetch(`${apiUrl.replace(/\/$/, "")}/api/issues/${this.binding.issueId}/approval-stage-decisions`, {
+        method: "POST", redirect: "error", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify(input), signal: AbortSignal.timeout(30_000),
+      });
+      responseStatus = response.status;
+    } catch {
+      // Reservation is already durable. Resolve a committed verdict below;
+      // a transport failure is never authority to issue a second POST.
+    }
+    const original = await readOriginal();
+    if (original) { await persistResult({ decisionId: original.decisionId, state: "committed" }); return original; }
+    if (responseStatus !== null && responseStatus >= 400 && responseStatus < 500 && ![408, 429].includes(responseStatus)) {
+      await persistResult({ failureStatus: responseStatus, state: "definite_failure" });
+      throw new HttpError(responseStatus, "Approval stage verdict was rejected; read the current task state");
+    }
+    throw new SemanticToolOutcomeUnknownError("approval_stage_outcome_unknown: inspect the task before any further action");
   }
 
   async #boundContext() {
