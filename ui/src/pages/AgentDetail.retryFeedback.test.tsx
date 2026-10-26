@@ -246,6 +246,54 @@ describe("AgentDetail retry feedback across canonical navigation", () => {
     expect(container.textContent).toContain("unknown-prefix denial");
   });
 
+  it("explains an unresolved company next to disabled Retry until the company is confirmed", async () => {
+    navigation.holdCanonical = false;
+    companyView.companies = [];
+    const router = makeRouter(`/PAP/agents/maya/runs/${runId}`);
+    await renderRouter(router);
+
+    const button = retryButton();
+    expect(button?.disabled).toBe(true);
+    const descriptionId = button?.getAttribute("aria-describedby");
+    expect(descriptionId).toBeTruthy();
+    const explanation = document.getElementById(descriptionId!);
+    expect(explanation?.textContent).toBe("Retry is unavailable until the company is confirmed. Reload the page if this persists.");
+    expect(button?.parentElement?.contains(explanation)).toBe(true);
+    await clickRetry();
+    expect(agentsApiMock.retryFailedRun).not.toHaveBeenCalled();
+
+    await updateCompanies([{ id: "company-1", issuePrefix: "PAP" }]);
+    await waitFor(() => expect(retryButton()?.disabled).toBe(false));
+    expect(retryButton()?.hasAttribute("aria-describedby")).toBe(false);
+    expect(document.getElementById(descriptionId!)).toBeNull();
+    expect(agentsApiMock.retryFailedRun).not.toHaveBeenCalled();
+  });
+
+  it("explains a deferred successful retry while company confirmation blocks navigation", async () => {
+    navigation.holdCanonical = false;
+    const retry = deferred<{ runId: null; issueId: string }>();
+    agentsApiMock.retryFailedRun.mockReturnValue(retry.promise);
+    const originalPath = `/PAP/agents/maya/runs/${runId}`;
+    const router = makeRouter(originalPath);
+    await renderRouter(router);
+    await clickRetry();
+    await updateCompanies([]);
+    await act(async () => { retry.resolve({ runId: null, issueId: "issue-1" }); });
+    await flush();
+
+    expect(router.state.location.pathname).toBe(originalPath);
+    expect(retryButton()?.disabled).toBe(true);
+    const descriptionId = retryButton()?.getAttribute("aria-describedby");
+    expect(descriptionId).toBeTruthy();
+    expect(document.getElementById(descriptionId!)?.textContent)
+      .toBe("Retry is unavailable until the company is confirmed. Reload the page if this persists.");
+    expect(agentsApiMock.retryFailedRun).toHaveBeenCalledTimes(1);
+
+    await updateCompanies([{ id: "company-1", issuePrefix: "PAP" }]);
+    await waitFor(() => expect(router.state.location.pathname).toBe("/PAP/issues/issue-1"));
+    expect(agentsApiMock.retryFailedRun).toHaveBeenCalledTimes(1);
+  });
+
   it("retains a denial that arrives before canonical navigation", async () => {
     agentsApiMock.retryFailedRun.mockRejectedValue(new Error("early denial"));
     const router = makeRouter();

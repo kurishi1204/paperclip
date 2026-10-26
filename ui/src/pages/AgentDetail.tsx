@@ -6,7 +6,7 @@ import { AgentCharacter } from "../components/AgentCharacter";
 import { characterStateForAgent } from "@paperclipai/shared";
 import { mergeRunLogChunks, readChunkSeq } from "../lib/run-log-chunks";
 import { getPageVisibility, usePageVisibility } from "../lib/page-visibility";
-import { useCallback, useEffect, useMemo, useState, useRef } from "react";
+import { useCallback, useEffect, useId, useMemo, useState, useRef } from "react";
 import { useParams, useNavigate, Link, Navigate, useBeforeUnload, type NavigateFunction } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import {
@@ -3473,6 +3473,7 @@ export function AgentFileRunNotice({ resultJson }: { resultJson: HeartbeatRun["r
 function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig, retryRun, retryFeedbackScope, retryRouteReady }: { run: HeartbeatRun; agentRouteId: string; adapterType: string; adapterConfig: Record<string, unknown>; retryRun: RetryRunAction; retryFeedbackScope: boolean; retryRouteReady: boolean }) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const retryUnavailableDescriptionId = useId();
   const { data: hydratedRun } = useQuery({
     queryKey: queryKeys.runDetail(initialRun.id),
     queryFn: () => heartbeatsApi.get(initialRun.id),
@@ -3709,18 +3710,26 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig, 
                 </Button>
               )}
               {canRetryRun && !canResumeLostRun && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="text-xs h-6 px-2"
-                  onClick={() => {
-                    if (retryRouteReady && (!retryBelongsToRun || !retryRun.isPending)) retryRun.mutate(retryScope);
-                  }}
-                  disabled={!retryRouteReady || (retryBelongsToRun && retryRun.isPending)}
-                >
-                  <RotateCcw className="h-3.5 w-3.5 mr-1" />
-                  {retryBelongsToRun && retryRun.isPending ? "Retrying…" : "Retry"}
-                </Button>
+                <>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-xs h-6 px-2"
+                    onClick={() => {
+                      if (retryRouteReady && (!retryBelongsToRun || !retryRun.isPending)) retryRun.mutate(retryScope);
+                    }}
+                    disabled={!retryRouteReady || (retryBelongsToRun && retryRun.isPending)}
+                    aria-describedby={!retryRouteReady ? retryUnavailableDescriptionId : undefined}
+                  >
+                    <RotateCcw className="h-3.5 w-3.5 mr-1" />
+                    {retryBelongsToRun && retryRun.isPending ? "Retrying…" : "Retry"}
+                  </Button>
+                  {!retryRouteReady && (
+                    <span id={retryUnavailableDescriptionId} className="text-xs text-muted-foreground">
+                      Retry is unavailable until the company is confirmed. Reload the page if this persists.
+                    </span>
+                  )}
+                </>
               )}
               <Button
                 variant="ghost"
