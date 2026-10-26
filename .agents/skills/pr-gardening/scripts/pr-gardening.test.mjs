@@ -986,13 +986,34 @@ test("read emitter check-only and write use the same manifest and inert assets",
    assert.equal(dry.state,"CHECK_ONLY_NO_FILES_WRITTEN");assert.equal(existsSync(output),false);
    const wrote=sourceCodec.emitReadCorpus(x.f.source,output,{checkoutRoot:process.cwd()});
    assert.equal(wrote.state,"EMITTED");assert.equal(wrote.manifestSHA256,dry.manifestSHA256);
+   assert.deepEqual(wrote.recommendedRanges,dry.recommendedRanges);
+   assert.equal(wrote.recommendedDisplayBytes,16*1024);
+   assert.equal(dry.recommendedRanges.length,sourceCodec.readCorpusManifest(x.f.source).files.length);
    const corpus=sourceCodec.readCorpusManifest(x.f.source);
    assert.equal(readFileSync(path.join(output,"manifest.json"),"utf8"),`${canonical(corpus.manifest)}\n`);
-   assert.equal(readFileSync(path.join(output,"material.md"),"utf8"),`Review every listed corpus file before the final judgment.\n${sourceCodec.readCorpusManifestBlock(x.f.source)}\n`);
+   assert.ok(readFileSync(path.join(output,"material.md"),"utf8").includes(`Suggested ranges: ${canonical(dry.recommendedRanges)}\n${sourceCodec.readCorpusManifestBlock(x.f.source)}\n`));
    assert.deepEqual(JSON.parse(readFileSync(path.join(output,"corpus-pre.json"),"utf8")).files.map(row=>row.path).sort(),corpus.files.map(row=>row.path).sort());
    for(const file of corpus.files){const target=path.join(output,"corpus",file.path);assert.equal(readFileSync(target,"utf8"),file.content);assert.equal(statSync(target).mode&0o777,0o400);}
    assert.throws(()=>sourceCodec.emitReadCorpus(x.f.source,output,{checkOnly:true,checkoutRoot:process.cwd()}),/review_output_exists/);
  }finally{x.f.close();rmSync(root,{recursive:true,force:true});}
+});
+test("read emitter recommends complete bounded ranges for a large source from one common entry",()=>{
+ const source=sourceV2Fixture("old\n","new\n");
+ source.dependencyFiles[0].content="export const value = 1;\n".repeat(3600);
+ source.dependencyFiles[0].blobSha=hashBlob(source.dependencyFiles[0].content);
+ const root=mkdtempSync(path.join(os.tmpdir(),"read-large-profile-")),output=path.join(root,"packet");
+ try {
+   const dry=sourceCodec.emitReadCorpus(source,output,{checkOnly:true,checkoutRoot:process.cwd()});
+   const wrote=sourceCodec.emitReadCorpus(source,output,{checkoutRoot:process.cwd()});
+   assert.deepEqual(wrote.recommendedRanges,dry.recommendedRanges);
+   const dependency=sourceCodec.readCorpusManifest(source).files.find(file=>file.role==="deps");
+   const ranges=dry.recommendedRanges.filter(range=>range.path===dependency.path);
+   assert.ok(ranges.length>1);
+   let next=1;
+   for(const range of ranges){assert.equal(range.offset,next);assert.ok(range.displayBytes<=16*1024);next+=range.limit;}
+   assert.equal(next,dependency.lines+1);
+   assert.ok(readFileSync(path.join(output,"material.md"),"utf8").includes(`Suggested ranges: ${canonical(dry.recommendedRanges)}`));
+ }finally{rmSync(root,{recursive:true,force:true});}
 });
 for(const [name,mutate] of [
  ["extra plugin",init=>init.plugins.push({name:"untrusted",path:"local",source:"untrusted@local"})],

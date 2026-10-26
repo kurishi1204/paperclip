@@ -205,6 +205,8 @@ const READ_SOURCE_BEGIN = "=== BEGIN PAPERCLIP READ CORPUS MANIFEST ===\n";
 const READ_SOURCE_END = "\n=== END PAPERCLIP READ CORPUS MANIFEST ===";
 // A preparation profile, not a claim about every Claude Code Read limit.
 const READ_MAX_DISPLAY_LINE_BYTES = 2000;
+// A measured preparation target, not a universal CLI output guarantee.
+const READ_RECOMMENDED_DISPLAY_BYTES = 16 * 1024;
 const READ_REVERSE_ASSET = "paperclip.read-reverse-diff/v1";
 const REVERSE_DIFF_V1 = "paperclip.exact-reverse-line-diff/v1";
 const sourceKeys = ["schema", "repository", "headSha", "treeSha", "baseSha", "mergeBaseSha", "changedFiles", "dependencyFiles"];
@@ -419,6 +421,26 @@ export function readCorpusManifestBlock(source) {
   return `${READ_SOURCE_BEGIN}${canonical(readCorpusManifest(source).manifest)}${READ_SOURCE_END}`;
 }
 
+function recommendedReadRanges(files) {
+  return files.flatMap(file => {
+    const lines = file.content.split("\n"), ranges = [];
+    let offset = 1, displayBytes = 0;
+    for (let index = 0; index < lines.length; index++) {
+      const lineBytes = Buffer.byteLength(`${index+1}\t${lines[index]}`, "utf8");
+      const separatorBytes = index + 1 === offset ? 0 : 1;
+      if (displayBytes && displayBytes + separatorBytes + lineBytes > READ_RECOMMENDED_DISPLAY_BYTES) {
+        ranges.push({path:file.path,offset,limit:index+1-offset,displayBytes});
+        offset = index+1;
+        displayBytes = 0;
+      }
+      displayBytes += (displayBytes ? 1 : 0) + lineBytes;
+    }
+    ranges.push({path:file.path,offset,limit:lines.length+1-offset,displayBytes});
+    ensure(ranges.every(range => range.limit > 0 && range.displayBytes <= READ_RECOMMENDED_DISPLAY_BYTES), "read_line_profile_unsupported");
+    return ranges;
+  });
+}
+
 export function readReviewSettings(start, corpus) {
   ensure(typeof start.home === "string" && path.isAbsolute(start.home) && path.normalize(start.home) === start.home &&
     typeof start.cwd === "string" && path.isAbsolute(start.cwd), "unsupported_launch_shape");
@@ -486,12 +508,14 @@ export function emitReadCorpus(source, output, {checkOnly=false, checkoutRoot=pa
   ensure(!fs.existsSync(canonicalOutput), "review_output_exists");
   outsideCheckoutOutput(checkoutRoot,canonicalOutput,"review_output_inside_checkout");
   const corpus = readCorpusManifest(source);
+  const recommendedRanges = recommendedReadRanges(corpus.files);
   const manifestBytes = Buffer.from(`${canonical(corpus.manifest)}\n`);
-  const materialBytes = Buffer.from(`Review every listed corpus file before the final judgment.\n${readCorpusManifestBlock(source)}\n`);
+  const materialBytes = Buffer.from(`Review every listed corpus file before the final judgment. Use these suggested Read offset/limit ranges to cover every line; the 16 KiB display target is based on one observed CLI profile, not a delivery guarantee. Stop if a Read result is missing or incomplete.\nSuggested ranges: ${canonical(recommendedRanges)}\n${readCorpusManifestBlock(source)}\n`);
   const profile = { schema:"paperclip.read-corpus-emission/v1", output:canonicalOutput, corpusRoot:path.join(canonicalOutput,"corpus"),
     manifestSHA256:digest(manifestBytes), materialSHA256:digest(materialBytes), logicalSourceSHA256:corpus.manifest.logicalSourceSHA256,
     fileCount:corpus.files.length, files:corpus.manifest.files.map(({path:name,role,sourcePath,bytes,sha256})=>({path:name,role,sourcePath,bytes,sha256})),
-    lineProfileMaxDisplayBytes:READ_MAX_DISPLAY_LINE_BYTES, state:checkOnly ? "CHECK_ONLY_NO_FILES_WRITTEN" : "EMITTED" };
+    lineProfileMaxDisplayBytes:READ_MAX_DISPLAY_LINE_BYTES, recommendedDisplayBytes:READ_RECOMMENDED_DISPLAY_BYTES,
+    recommendedRanges, state:checkOnly ? "CHECK_ONLY_NO_FILES_WRITTEN" : "EMITTED" };
   if (checkOnly) return profile;
   fs.mkdirSync(canonicalOutput,{mode:0o700});
   const corpusRoot = path.join(canonicalOutput,"corpus");
