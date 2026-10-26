@@ -881,13 +881,28 @@ test("read journal combines exact Read ranges before accepting a full source fil
    const target=x.corpus.files.find(file=>file.role==="after"&&file.sourcePath==="sample.mjs");
    const use=events.find(e=>e.type==="assistant"&&e.message.content[0]?.input?.file_path===path.join(x.cwd,target.path)).message.content[0];
    const index=events.findIndex(e=>e.type==="user"&&e.message.content[0].tool_use_id===use.id),first=events[index],id="toolu_fixture_split";
-   first.tool_use_result.file.numLines=1;first.tool_use_result.file.content="new source\n";first.message.content[0].content="1\tnew source\n";
+   first.tool_use_result.file.numLines=1;first.tool_use_result.file.content="new source";first.message.content[0].content="1\tnew source";
    const secondUse={type:"assistant",parent_tool_use_id:null,session_id:f.data.start.sessionID,message:{role:"assistant",content:[{...use,id,input:{file_path:use.input.file_path,offset:2,limit:1}}]}};
    const secondResult={type:"user",parent_tool_use_id:null,session_id:f.data.start.sessionID,message:{role:"user",content:[{type:"tool_result",tool_use_id:id,content:"2\t"}]},tool_use_result:{type:"text",file:{filePath:use.input.file_path,content:"",numLines:1,startLine:2,totalLines:2}},tool_result_meta:[{id,permission_decision:{decision:"accept"}}]};
    events.splice(index+1,0,secondUse,secondResult);x.refresh();
    const result=await checkReadiness(document,f.options(),f.deps);
    assert.equal(result.pullRequests[0].verdict,"ready",JSON.stringify(result.pullRequests[0].independentReview));
    assert.equal(result.pullRequests[0].independentReview.toolCalls,4);
+   first.tool_use_result.file.content="new source\n";first.message.content[0].content="1\tnew source\n";x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"read_bytes_mismatch"});
+ }finally{f.close();}
+});
+test("read journal rejects an invented LF after a non-EOF Read range",()=>{
+ const x=readJournalFixture(),{f,events}=x;try{
+   const target=x.corpus.files.find(file=>file.role==="after"&&file.sourcePath==="sample.mjs");
+   const result=events.find(e=>e.type==="user"&&e.tool_use_result?.file?.filePath===path.join(x.cwd,target.path));
+   result.tool_use_result.file.numLines=1;
+   result.tool_use_result.file.content="new source\n";
+   result.message.content[0].content="1\tnew source\n";
+   x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"read_bytes_mismatch"});
  }finally{f.close();}
 });
 test("Grep searches literal path-like regex within the corpus without counting as source delivery",async()=>{
@@ -905,7 +920,7 @@ test("Grep searches literal path-like regex within the corpus without counting a
 for(const [name,mutate,subcode] of [
  ["one source never read",x=>{x.events.splice(1,4);},"read_coverage_incomplete"],
  ["altered Read bytes",x=>{const result=x.events.find(e=>e.type==="user");result.tool_use_result.file.content="altered\n";},"read_bytes_mismatch"],
- ["partial Read only",x=>{const target=x.corpus.files.find(file=>file.role==="after"&&file.sourcePath==="sample.mjs");const result=x.events.find(e=>e.type==="user"&&e.tool_use_result?.file?.filePath===path.join(x.cwd,target.path));result.tool_use_result.file.content="new source\n";result.tool_use_result.file.numLines=1;result.message.content[0].content="1\tnew source\n";},"read_coverage_incomplete"],
+ ["partial Read only",x=>{const target=x.corpus.files.find(file=>file.role==="after"&&file.sourcePath==="sample.mjs");const result=x.events.find(e=>e.type==="user"&&e.tool_use_result?.file?.filePath===path.join(x.cwd,target.path));result.tool_use_result.file.content="new source";result.tool_use_result.file.numLines=1;result.message.content[0].content="1\tnew source";},"read_coverage_incomplete"],
  ["Read outside corpus",x=>{const use=x.events.find(e=>e.type==="assistant");use.message.content[0].input.file_path=path.join(x.cwd,"..","outside");},"read_path_outside_corpus"],
  ["orphan result",x=>{const result=x.events.find(e=>e.type==="user");result.message.content[0].tool_use_id="never_used";},"tool_pairing"],
  ["mixed session",x=>{const result=x.events.find(e=>e.type==="user");result.session_id="other-session";},"journal_session"],

@@ -545,8 +545,10 @@ function readToolResult(use, event, files, root, covered) {
     (input.offset === undefined ? meta.startLine === 1 : Number.isSafeInteger(input.offset) && input.offset === meta.startLine) &&
     (input.limit === undefined || Number.isSafeInteger(input.limit) && input.limit > 0 && meta.numLines <= input.limit), "read_result_undecodable");
   const lines = file.content.split("\n"), start = meta.startLine - 1, end = start + meta.numLines;
-  const expected = lines.slice(start,end).join("\n") + (end < lines.length ? "\n" : "");
-  const displayed = lines.slice(start,end).map((line,i)=>`${meta.startLine+i}\t${line}`).join("\n") + (end < lines.length ? "\n" : "");
+  // Claude Code's Read range omits the separator after its last returned line.
+  // An EOF read includes the file's final LF through the final empty line.
+  const expected = lines.slice(start,end).join("\n");
+  const displayed = lines.slice(start,end).map((line,i)=>`${meta.startLine+i}\t${line}`).join("\n");
   ensure(meta.content === expected && block.content === displayed, "read_bytes_mismatch");
   const set = covered.get(relative);
   for (let i = start; i < end; i++) set.add(i);
