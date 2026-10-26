@@ -744,8 +744,8 @@ function v2JournalFixture() {
  return f;
 }
 
-function readJournalFixture({tempRoot=os.tmpdir()}={}) {
- const f=forkFixture({tempRoot}), dependency="export const dependency = 1;\n", depBlob=hashBlob(dependency), prefix=`repos/${FORK}`;
+function readJournalFixture({tempRoot=os.tmpdir(),dependencyContent="export const dependency = 1;\n"}={}) {
+ const f=forkFixture({tempRoot}), dependency=dependencyContent, depBlob=hashBlob(dependency), prefix=`repos/${FORK}`;
  f.source.dependencyFiles.push({path:"dependency.mjs",blobSha:depBlob,content:dependency});
  f.pointer.dependencies=["dependency.mjs"];
  writeFileSync(f.evidence,JSON.stringify({schema:"paperclip.review-pointer/v1",repository:FORK,entries:[f.pointer]}));
@@ -783,12 +783,11 @@ function readJournalFixture({tempRoot=os.tmpdir()}={}) {
 }
 // Use the public writer's files and pre-inventory as the actual admission
 // inputs. The receiver computes its own current inventory from the filesystem.
-function emittedReadJournalFixture({tempRoot=os.tmpdir(),emitPacket=null}={}) {
- const x=readJournalFixture({tempRoot}),{f,events,corpus}=x,oldCwd=x.cwd;
+function emittedReadJournalFixture({tempRoot=os.tmpdir(),emitPacket=null,dependencyContent}={}) {
+ const x=readJournalFixture({tempRoot,dependencyContent}),{f,events,corpus}=x,oldCwd=x.cwd;
  rmSync(path.join(f.root,"corpus"),{recursive:true});
  const output=path.join(f.root,"packet-one");
- if (emitPacket) emitPacket(f,output);
- else sourceCodec.emitReadCorpus(f.source,output,{checkoutRoot:process.cwd()});
+ const profile=emitPacket ? emitPacket(f,output) : sourceCodec.emitReadCorpus(f.source,output,{checkoutRoot:process.cwd()});
  const cwd=realpathSync(path.join(output,"corpus"));
  for(let i=0;i<events.length;i++)events[i]=JSON.parse(JSON.stringify(events[i]).replaceAll(oldCwd,cwd));
  f.data.manifest=readFileSync(path.join(output,"manifest.json"),"utf8");
@@ -801,16 +800,14 @@ function emittedReadJournalFixture({tempRoot=os.tmpdir(),emitPacket=null}={}) {
  f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(combined);f.data.start.combinedBytes=combined.length;
  Object.assign(f.artifactPaths,{manifest:"packet-one/manifest.json",material:"packet-one/material.md",corpusPre:"packet-one/corpus-pre.json"});
  x.cwd=cwd;x.refresh();
- return {...x,output};
+ return {...x,output,profile};
 }
 function emitDocumentedReadCommand(f,output,documentPath) {
  const content=readFileSync(documentPath,"utf8");
- const example=content.match(/`check-readiness\.mjs --emit-review-input <PR>[^`]*--check-only`/);
+ const example=content.match(/`(?:node \.agents\/skills\/pr-gardening\/scripts\/)?check-readiness\.mjs --emit-review-input <PR>[^`]*--check-only`/);
  assert.ok(example,`missing documented command: ${documentPath}`);
  const command=example[0].slice(1,-1).replace("<PR>","1")
    .replace(/<comma-separated[^>]*>/,"dependency.mjs").replace("<absolute-new-directory>",output);
- const parts=command.split(/\s+/);
- assert.equal(parts.shift(),"check-readiness.mjs");
  const checkout=path.join(f.directory,"documented-checkout"),scripts=path.join(checkout,".agents/skills/pr-gardening/scripts");
  mkdirSync(scripts,{recursive:true});
  for(const name of ["check-readiness.mjs","lib.mjs"])copyFileSync(fileURLToPath(new URL(`./${name}`,import.meta.url)),path.join(scripts,name));
@@ -818,9 +815,9 @@ function emitDocumentedReadCommand(f,output,documentPath) {
  writeFileSync(routes,JSON.stringify(f.routes));
  const bin=path.join(f.directory,"documented-bin");mkdirSync(bin);
  const stub=path.join(bin,"gh");writeFileSync(stub,`#!${process.execPath}\nconst fs=require('fs');const args=process.argv.slice(2),routes=JSON.parse(fs.readFileSync(${JSON.stringify(routes)},'utf8'));fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='api'&&args[1]==='--method'&&args[2]==='GET'&&Object.hasOwn(routes,args[3]))process.stdout.write(JSON.stringify(routes[args[3]]));else process.exit(8);\n`);chmodSync(stub,0o700);
- const invoke=(argv)=>spawnSync(process.execPath,[realpathSync(path.join(scripts,"check-readiness.mjs")),...argv],{env:{PATH:bin+path.delimiter+path.dirname(process.execPath)},encoding:"utf8"});
- const dry=invoke(parts);assert.equal(dry.status,0,dry.stderr);assert.equal(existsSync(output),false);
- const profile=JSON.parse(dry.stdout),written=invoke(parts.filter(arg=>arg!=="--check-only"));
+ const invoke=(line)=>spawnSync("/bin/sh",["-c",line],{cwd:checkout,env:{PATH:bin+path.delimiter+path.dirname(process.execPath)},encoding:"utf8"});
+ const dry=invoke(command);assert.equal(dry.status,0,dry.stderr);assert.equal(existsSync(output),false);
+ const profile=JSON.parse(dry.stdout),written=invoke(command.replace(/ --check-only$/, ""));
  assert.equal(written.status,0,written.stderr);
  assert.deepEqual(JSON.parse(written.stdout).recommendedRanges,profile.recommendedRanges);
  assert.equal(profile.corpusRoot,realpathSync(path.join(output,"corpus")));
@@ -839,6 +836,37 @@ test("emitted Read packet reaches the actual admitted receiver",()=>{
    assert.equal(review.status,"valid",JSON.stringify(review));
    assert.equal(review.deliveredFiles,x.corpus.files.length);
  }finally{x.f.close();}
+});
+test("emitter's actual recommended ranges reach admission and one missing boundary fails",()=>{
+ const x=emittedReadJournalFixture({dependencyContent:"export const value = 1;\n".repeat(1200)}),{f,events,corpus}=x;
+ try {
+   const ranges=x.profile.recommendedRanges;
+   assert.deepEqual(ranges,sourceCodec.emitReadCorpus(f.source,path.join(f.root,"unused-profile"),{checkOnly:true,checkoutRoot:process.cwd()}).recommendedRanges);
+   const splitPath=corpus.files.find(file=>file.role==="deps").path;
+   assert.ok(ranges.filter(range=>range.path===splitPath).length>1);
+   const start=events[0],final=events.slice(-2),pairs=[];
+   for(const [index,range] of ranges.entries()){
+     const file=corpus.files.find(row=>row.path===range.path),filePath=path.join(x.cwd,range.path);
+     assert.ok(file);
+     const lines=file.content.split("\n"),slice=lines.slice(range.offset-1,range.offset-1+range.limit);
+     const id=`toolu_recommended_${index}`;
+     pairs.push(
+       {type:"assistant",parent_tool_use_id:null,session_id:f.data.start.sessionID,message:{role:"assistant",content:[{type:"tool_use",id,name:"Read",input:{file_path:filePath,offset:range.offset,limit:range.limit}}]}},
+       {type:"user",parent_tool_use_id:null,session_id:f.data.start.sessionID,message:{role:"user",content:[{type:"tool_result",tool_use_id:id,content:slice.map((line,i)=>`${range.offset+i}\t${line}`).join("\n")}]},tool_use_result:{type:"text",file:{filePath,content:slice.join("\n"),numLines:slice.length,startLine:range.offset,totalLines:lines.length}},tool_result_meta:[{id,permission_decision:{decision:"accept",source:"config",reason_type:"mode"}}]}
+     );
+   }
+   events.splice(0,events.length,start,...pairs,...final);x.refresh();
+   const admitted=admitTrustedJournal(f.admissionArgs());
+   assert.equal(admitted.status,"valid",JSON.stringify(admitted));
+   assert.equal(admitted.toolCalls,ranges.length);
+   assert.equal(admitted.deliveredFiles,corpus.files.length);
+   const missing=ranges.find(range=>range.path===splitPath&&range.offset>1);
+   const at=events.findIndex(event=>event.type==="assistant"&&event.message?.content?.[0]?.input?.file_path===path.join(x.cwd,splitPath)&&event.message.content[0].input.offset===missing.offset);
+   assert.ok(at>0);
+   events.splice(at,2);x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"read_coverage_incomplete"});
+ }finally{f.close();}
 });
 test("emitted Read packets for two candidates share one pinned registry",()=>{
  const x=emittedReadJournalFixture(),{f,corpus}=x;try{
