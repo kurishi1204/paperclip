@@ -535,7 +535,7 @@ export function emitReadCorpus(source, output, {checkOnly=false, checkoutRoot=pa
 const READ_EVENT_KEYS = {
   init: ["type","subtype","cwd","session_id","tools","mcp_servers","model","permissionMode","slash_commands","apiKeySource","claude_code_version","output_style","agents","skills","plugins","capabilities","analytics_disabled","product_feedback_disabled","uuid","original_cwd","additional_directories","fast_mode_state","fast_mode_disabled_reason","per_turn_effort_active","view_mode"],
   thinking: ["type","subtype","estimated_tokens","estimated_tokens_delta","session_id","uuid"],
-  assistant: ["type","message","parent_tool_use_id","session_id","uuid","timestamp","request_id","wire_tool_inputs","thinking_duration_ms","thinking_display"],
+  assistant: ["type","message","parent_tool_use_id","session_id","uuid","timestamp","request_id","wire_tool_inputs","thinking_duration_ms","thinking_display","narration_block_indexes"],
   user: ["type","message","parent_tool_use_id","session_id","uuid","timestamp","tool_use_result","tool_result_meta"],
   rate: ["type","rate_limit_info","uuid","session_id"],
   result: ["duration_api_ms","stop_reason","session_id","total_cost_usd","usage","modelUsage","permission_denials","terminal_reason","fast_mode_state","fast_mode_disabled_reason","subagent_stats","safety_stops","is_error","num_turns","subtype","api_error_status","result","ttft_ms","type","duration_ms","uuid","ttft_stream_ms","time_to_request_ms","first_content_frame_ms","queued_turn_count","result_index"]
@@ -552,6 +552,24 @@ const sameSet = (actual, expected) => Array.isArray(actual) && actual.length ===
   canonical(actual.map(x=>canonical(x)).sort()) === canonical(expected.map(x=>canonical(x)).sort());
 function onlyKeys(value, allowed, code) {
   ensure(value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).every(key => allowed.includes(key)), code);
+}
+function validateNarrationIndexes(event) {
+  if (!Object.hasOwn(event,"narration_block_indexes")) return;
+  const indexes = event.narration_block_indexes, blocks = event.message.content;
+  ensure(Array.isArray(indexes) && indexes.length > 0 && indexes.length <= blocks.length, "journal_event_unsupported");
+  const seen = new Set();
+  for (const index of indexes) {
+    ensure(Number.isSafeInteger(index) && index >= 0 && index < blocks.length &&
+      !seen.has(index) && blocks[index]?.type === "thinking", "journal_event_unsupported");
+    seen.add(index);
+  }
+}
+function validateGrepInput(input) {
+  onlyKeys(input, ["pattern","path","output_mode","head_limit","-A","-B"], "journal_event_unsupported");
+  ensure(input.output_mode === undefined || input.output_mode === "content", "journal_event_unsupported");
+  ensure(input.head_limit === undefined || Number.isSafeInteger(input.head_limit) && input.head_limit > 0, "journal_event_unsupported");
+  for (const key of ["-A","-B"])
+    ensure(input[key] === undefined || Number.isSafeInteger(input[key]) && input[key] >= 0, "journal_event_unsupported");
 }
 function readToolResult(use, event, files, root, covered) {
   const input = use.input;
@@ -618,6 +636,7 @@ export function verifyReadJournal(streamBytes, corpus, start) {
     } else if (kind === "assistant") {
       ensure(init === 1 && event.parent_tool_use_id === null && event.message?.role === "assistant" &&
         Array.isArray(event.message.content) && !event.message.context_management, "journal_event_unsupported");
+      validateNarrationIndexes(event);
       lastAssistantIndex = i;
       const texts = event.message.content.filter(block => block?.type === "text");
       if (texts.length) {
@@ -631,7 +650,8 @@ export function verifyReadJournal(streamBytes, corpus, start) {
         ensure(typeof block.id === "string" && block.id && !pending.has(block.id) && !completed.has(block.id), "tool_pairing");
         ensure(["Read","Glob","Grep"].includes(block.name) && block.input && typeof block.input === "object", "read_tool_error");
         if (block.name !== "Read") {
-          onlyKeys(block.input, block.name === "Glob" ? ["pattern","path"] : ["pattern","path","output_mode"], "journal_event_unsupported");
+          if (block.name === "Glob") onlyKeys(block.input, ["pattern","path"], "journal_event_unsupported");
+          else validateGrepInput(block.input);
           const value = block.input.path;
           ensure(value === undefined || typeof value === "string" && inside(start.cwd, path.resolve(start.cwd,value)) && !value.split("/").includes(".."), "read_path_outside_corpus");
           ensure(typeof block.input.pattern === "string", "journal_event_unsupported");

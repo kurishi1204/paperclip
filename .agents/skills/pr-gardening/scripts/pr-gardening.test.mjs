@@ -964,6 +964,59 @@ test("read journal rejects an invented LF after a non-EOF Read range",()=>{
      {status:"invalid",code:"independent_review_invalid",subcode:"read_bytes_mismatch"});
  }finally{f.close();}
 });
+test("observed narration index annotates synthetic thinking without changing Read evidence",()=>{
+ const x=readJournalFixture(),{f,events}=x;try{
+   const narration={type:"assistant",parent_tool_use_id:null,session_id:f.data.start.sessionID,
+     message:{role:"assistant",content:[{type:"thinking",thinking:"Synthetic thinking placeholder."}]},
+     narration_block_indexes:[0]};
+   events.splice(1,0,narration);x.refresh();
+   assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
+   for(const invalid of [[1],[-1],[0,0],["0"],[0.5],0,[]]){
+     narration.narration_block_indexes=invalid;x.refresh();
+     assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+       {status:"invalid",code:"independent_review_invalid",subcode:"journal_event_unsupported"});
+   }
+   narration.narration_block_indexes=[0];
+   narration.message.content[0].type="text";x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"journal_event_unsupported"});
+   narration.message.content[0].type="thinking";
+   const result=events.find(event=>event.type==="user"&&event.tool_use_result?.file);
+   result.tool_use_result.file.content="synthetic altered bytes";
+   result.message.content[0].content="1\tsynthetic altered bytes";x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"read_bytes_mismatch"});
+ }finally{f.close();}
+});
+test("Grep formatting metadata remains scoped discovery and cannot fill missing Reads",()=>{
+ const x=readJournalFixture(),{f,events}=x;try{
+   const id="toolu_synthetic_grep_format",sid=f.data.start.sessionID;
+   const use={type:"assistant",parent_tool_use_id:null,session_id:sid,message:{role:"assistant",content:[{type:"tool_use",id,name:"Grep",input:{pattern:"synthetic",path:x.cwd,output_mode:"content",head_limit:80,"-A":8,"-B":3}}]}};
+   const result={type:"user",parent_tool_use_id:null,session_id:sid,message:{role:"user",content:[{type:"tool_result",tool_use_id:id,content:"synthetic match"}]},tool_use_result:{mode:"content",numFiles:1},tool_result_meta:[{id,permission_decision:{decision:"accept"}}]};
+   events.splice(1,0,use,result);x.refresh();
+   const accepted=admitTrustedJournal(f.admissionArgs());
+   assert.equal(accepted.status,"valid",JSON.stringify(accepted));
+   assert.equal(accepted.deliveredFiles,x.corpus.files.length);
+   const input=use.message.content[0].input;
+   for(const [key,value] of [["head_limit","80"],["-A",-1],["-B",1.5],["unexpected",true]]){
+     const before=input[key];input[key]=value;x.refresh();
+     assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+       {status:"invalid",code:"independent_review_invalid",subcode:"journal_event_unsupported"});
+     if(before===undefined)delete input[key];else input[key]=before;
+   }
+   input.path=path.dirname(x.cwd);x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"read_path_outside_corpus"});
+   input.path=x.cwd;
+   const readAt=events.findIndex(event=>event.type==="assistant"&&event.message.content[0]?.name==="Read");
+   const readID=events[readAt].message.content[0].id;
+   const resultAt=events.findIndex(event=>event.type==="user"&&event.message.content[0]?.tool_use_id===readID);
+   assert.ok(resultAt>readAt);
+   events.splice(resultAt,1);events.splice(readAt,1);x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"read_coverage_incomplete"});
+ }finally{f.close();}
+});
 test("Grep searches literal path-like regex within the corpus without counting as source delivery",async()=>{
  const x=readJournalFixture(),{f,events}=x;try{
    const id="toolu_fixture_grep",sid=f.data.start.sessionID;
