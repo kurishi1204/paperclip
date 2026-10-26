@@ -12,9 +12,11 @@ describe("chat connector UI contract", () => {
     expect(setup).not.toContain("Close the active Paperclip task");
   });
 
-  it("retries the selected failed run from every Board entry point", () => {
+  it("keeps direct retry wiring in Board entry points with local mutations", () => {
+    // AgentDetail hoists its retry mutation above the route-backed RunDetail.
+    // AgentDetail.retryFeedback.test.tsx mounts the real component and checks
+    // selected-run API arguments, duplicate clicks, late results, and scope changes.
     for (const file of [
-      "AgentDetail.tsx",
       "AgentDetail.production.tsx",
       "Inbox.tsx",
       "LegacyInbox.tsx",

@@ -27,6 +27,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
+import { nativeApprovalStageDecisionSchema, type NativeApprovalStageDecision } from "./native-approval-stage-contract.js";
 import {
   and,
   asc,
@@ -42,6 +43,8 @@ import type { ChatChannelService } from "../services/chat-channels.js";
 import {
   activityLog,
   agentWakeupRequests,
+  agentSessionGoalActions,
+  agentTaskSessions,
   agents,
   approvals,
   chatConversations,
@@ -12885,10 +12888,67 @@ export function issueRoutes(
     res.json(await prepareCommanderAdmission(db,existing.companyId,existing.id,actor.actorId,input));
   });
 
-  router.patch(
-    "/issues/:id",
-    validateIssueMutationBody(updateIssueRouteSchema),
-    async (req, res) => {
+  const assertNativeApprovalStage = async (
+    query: Db,
+    req: Request,
+    issue: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
+    expected: NativeApprovalStageDecision,
+    lockRun = false,
+  ) => {
+    const actor = req.actor;
+    const state = parseIssueExecutionState(issue.executionState);
+    if (actor.type !== "agent" || actor.source !== "agent_jwt" || !actor.agentId || !actor.runId ||
+        issue.companyId !== actor.companyId || issue.assigneeAgentId !== actor.agentId || issue.assigneeUserId !== null ||
+        issue.workMode !== "standard" ||
+        issue.executionRunId !== actor.runId || issue.status !== "in_review" ||
+        issue.statusVersion !== expected.expectedStatusVersion || issue.revision !== expected.expectedRevision ||
+        state?.status !== "pending" || state.currentStageType !== "approval" ||
+        state.currentStageId !== expected.expectedStageId || state.lastDecisionId !== expected.expectedLastDecisionId ||
+        state.currentParticipant?.type !== "agent" || state.currentParticipant.agentId !== actor.agentId) {
+      throw conflict("Approval stage or run binding changed; read the task again before deciding");
+    }
+    const runQuery = query.select({ id: heartbeatRuns.id, agentStatus: agents.status }).from(heartbeatRuns)
+      .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, heartbeatRuns.companyId))).where(and(
+      eq(heartbeatRuns.id, actor.runId), eq(heartbeatRuns.companyId, issue.companyId),
+      eq(heartbeatRuns.agentId, actor.agentId), eq(heartbeatRuns.nativeIssueId, issue.id),
+      eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "running"),
+    )).limit(1);
+    const [run] = lockRun ? await runQuery.for("update") : await runQuery;
+    if (!run || ["paused", "terminated", "pending_approval", "error"].includes(run.agentStatus))
+      throw forbidden("Approval stage decision requires an active agent and current native run");
+    const goal = await runnerGoals.projection(issue.companyId, issue.id, actor.agentId);
+    if (goal?.pendingAction || (goal?.goal && goal.goal.status !== "complete")) {
+      throw conflict("Finish the active goal and its control action before deciding this approval stage", { code: "native_approval_goal_active" });
+    }
+  };
+  const assertLockedNativeApprovalGoal = async (query: Db, req: Request, issue: NonNullable<Awaited<ReturnType<typeof svc.getById>>>) => {
+    const agentId = req.actor.agentId;
+    if (!agentId) throw forbidden("Approval stage decision requires an agent");
+    const [agent] = await query.select({ adapterType: agents.adapterType }).from(agents).where(and(
+      eq(agents.id, agentId), eq(agents.companyId, issue.companyId),
+    )).limit(1);
+    if (!agent) throw forbidden("Approval stage agent is unavailable");
+    // Goal control inserts the same unique session row before taking its row
+    // lock. This protects a previously absent goal from appearing mid-verdict.
+    await query.insert(agentTaskSessions).values({
+      companyId: issue.companyId, agentId, adapterType: agent.adapterType, taskKey: issue.id,
+    }).onConflictDoNothing();
+    const [session] = await query.select().from(agentTaskSessions).where(and(
+      eq(agentTaskSessions.companyId, issue.companyId), eq(agentTaskSessions.agentId, agentId),
+      eq(agentTaskSessions.adapterType, agent.adapterType), eq(agentTaskSessions.taskKey, issue.id),
+    )).limit(1).for("update");
+    if (!session) throw conflict("Approval stage goal state is unavailable");
+    const goal = readObject(session.goalJson);
+    const [openAction] = await query.select({ id: agentSessionGoalActions.id }).from(agentSessionGoalActions).where(and(
+      eq(agentSessionGoalActions.sessionId, session.id),
+      inArray(agentSessionGoalActions.status, ["pending", "delivering", "delivered"]),
+    )).limit(1);
+    if (openAction || (typeof goal.objective === "string" && goal.status !== "complete")) {
+      throw conflict("Finish the active goal and its control action before deciding this approval stage", { code: "native_approval_goal_active" });
+    }
+  };
+
+  const handleIssuePatch = async (req: Request, res: Response, formalApprovalExpected?: NativeApprovalStageDecision) => {
       const id = req.params.id as string;
       // Conditional edits must fail before run cancellation, wake, or workspace work.
       const expectedRevision = req.body.expectedRevision as number | undefined;
@@ -12911,6 +12971,7 @@ export function issueRoutes(
         "Issue not found",
       );
       if (!existing) return;
+      if (formalApprovalExpected) await assertNativeApprovalStage(db, req, existing, formalApprovalExpected);
       const boardReviewExpected = req.body.boardReviewExpected as { stageId: string; reviewerAgentId: string; resume?: boolean; resubmit?: boolean; lastDecisionId?: string; workerAgentId?: string; changesRequestedCount?: number; revision: number; statusVersion: number } | undefined;
       const boardReviewResume = boardReviewExpected?.resume === true;
       const boardReviewResubmit = boardReviewExpected?.resubmit === true;
@@ -13421,6 +13482,13 @@ export function issueRoutes(
       )) {
         throw conflict("QA review precondition no longer matches the pending stage");
       }
+      if (formalApprovalExpected && (
+        !transition.decision || transition.decision.stageId !== formalApprovalExpected.expectedStageId ||
+        transition.decision.stageType !== "approval" ||
+        transition.decision.outcome !== (formalApprovalExpected.decision === "approve" ? "approved" : "changes_requested")
+      )) {
+        throw conflict("Approval stage transition no longer matches the run-bound verdict");
+      }
       if (decisionId) {
         const nextExecutionState = transition.patch.executionState;
         if (!nextExecutionState || typeof nextExecutionState !== "object") {
@@ -13650,7 +13718,7 @@ export function issueRoutes(
       // Only this request may finish a mutation that intentionally stops its
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
-      if (!boardReviewExpected && req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
+      if (!boardReviewExpected && !formalApprovalExpected && req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
         await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,
@@ -13693,7 +13761,7 @@ export function issueRoutes(
         updateFields.status !== existing.status &&
         isClosedIssueStatus(updateFields.status);
       if (
-        req.actor.source !== "mcp_oauth" && !assigneeWillChange &&
+        req.actor.source !== "mcp_oauth" && !formalApprovalExpected && !assigneeWillChange &&
         terminalizingIssue &&
         existing.assigneeAgentId
       ) {
@@ -13939,11 +14007,17 @@ export function issueRoutes(
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
         reviewPolicySensitiveMutationRequested ||
-        Boolean(qaReviewExpected) || Boolean(boardReviewExpected);
+        Boolean(qaReviewExpected) || Boolean(boardReviewExpected) || Boolean(formalApprovalExpected);
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
             if (boardReviewExpected) await assertBoardReviewStart(tx, await svc.getByIdForUpdate(id, tx));
+            if (formalApprovalExpected) {
+              const locked = await svc.getByIdForUpdate(id, tx);
+              if (!locked) throw conflict("Approval stage disappeared");
+              await assertNativeApprovalStage(tx as unknown as Db, req, locked, formalApprovalExpected, true);
+              await assertLockedNativeApprovalGoal(tx as unknown as Db, req, locked);
+            }
             await assertLockedQaReviewExpectation(tx);
             if (
               reviewPolicySensitiveMutationRequested &&
@@ -15221,8 +15295,16 @@ export function issueRoutes(
         return;
       }
       res.json({ ...issueResponse, changes, comment });
-    },
-  );
+  };
+  router.patch("/issues/:id", validateIssueMutationBody(updateIssueRouteSchema), (req, res) => handleIssuePatch(req, res));
+  router.post("/issues/:id/approval-stage-decisions", async (req, res) => {
+    const expected = nativeApprovalStageDecisionSchema.parse(req.body);
+    req.body = {
+      status: expected.decision === "approve" ? "done" : "in_progress",
+      comment: expected.summary,
+    };
+    return handleIssuePatch(req, res, expected);
+  });
 
   router.delete("/issues/:id", async (req, res) => {
     const id = req.params.id as string;

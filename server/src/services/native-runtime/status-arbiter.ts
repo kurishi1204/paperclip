@@ -1,7 +1,7 @@
 import type { NativeEvidenceAssessment } from "./evidence-classifier.js";
 import { NATIVE_MODEL_REJECTION_MESSAGE, NATIVE_PROVIDER_CAPACITY_MAX_RETRIES, NATIVE_PROVIDER_OVERLOADED_CODE, NATIVE_PROVIDER_OVERLOADED_MESSAGE } from "./native-provider-failure.js";
 
-export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v10";
+export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v11";
 
 export type NativeAuthoritativeIssueStatus =
   | "backlog"
@@ -120,6 +120,8 @@ export function arbitrateNativeStatus(input: {
   reviewOwnerUserId?: string | null;
   /** Review decisions own task state; a reviewer's finish report cannot override them. */
   nativeReviewOutcome?: "resolved" | "pending" | "stale";
+  /** The committed issue_execution_decisions row for this exact run and formal approval stage. */
+  formalApprovalDecisionId?: string | null;
   /** Re-derived from the committed runner terminal and pinned execution identity. */
   providerModelRejected?: boolean;
   providerOverloaded?: boolean;
@@ -128,6 +130,14 @@ export function arbitrateNativeStatus(input: {
   agentId: string;
   priorIssueStatus: NativeAuthoritativeIssueStatus;
 }): NativeStatusDecision {
+  if (input.formalApprovalDecisionId && input.workspaceFinalizeStatus === "succeeded") {
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve", toStatus: input.priorIssueStatus,
+      reasonCode: "formal_approval_decision_recorded", unblockDescriptor: null,
+      effects: [{ kind: "release_checkout" }],
+    };
+  }
   if (["done", "cancelled"].includes(input.priorIssueStatus)) {
     return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,

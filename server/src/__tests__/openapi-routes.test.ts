@@ -6,6 +6,7 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
 import { errorHandler } from "../middleware/index.js";
+import { nativeApprovalStageDecisionSchema } from "../routes/native-approval-stage-contract.js";
 import { buildOpenApiSpec, openApiRoutes } from "../routes/openapi.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -246,6 +247,58 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents the strict native approval-stage decision accepted by the Issue receiver", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/issues/{id}/approval-stage-decisions"].post;
+    expect(operation.security).toEqual([{ AgentRunAuth: [] }]);
+    expect(operation["x-paperclip-authorization"]).toEqual({
+      actor: "agent", heartbeatBound: true, taskBound: true,
+    });
+    expect(operation.parameters[0].schema).toEqual({ type: "string", format: "uuid" });
+
+    const body = operation.requestBody.content["application/json"].schema;
+    expect(operation.requestBody.required).toBe(true);
+    expect(body.additionalProperties).toBe(false);
+    expect(body.required).toEqual([
+      "decision", "summary", "expectedStageId", "expectedStatusVersion",
+      "expectedRevision", "expectedLastDecisionId",
+    ]);
+    expect(body.properties.decision.enum).toEqual(["approve", "request_changes"]);
+    expect(body.properties.summary).toMatchObject({ minLength: 1, maxLength: 20_000 });
+    expect(body.properties.expectedLastDecisionId).toMatchObject({
+      type: "string", format: "uuid", nullable: true,
+    });
+    for (const key of ["expectedStatusVersion", "expectedRevision"]) {
+      expect(body.properties[key]).toMatchObject({ type: "integer", minimum: 0 });
+    }
+
+    const valid = {
+      decision: "request_changes",
+      summary: " Return to worker ",
+      expectedStageId: "11111111-1111-4111-8111-111111111111",
+      expectedStatusVersion: 0,
+      expectedRevision: 0,
+      expectedLastDecisionId: null,
+    };
+    expect(nativeApprovalStageDecisionSchema.parse(valid).summary).toBe("Return to worker");
+    expect(nativeApprovalStageDecisionSchema.safeParse({ ...valid, extra: true }).success).toBe(false);
+    expect(nativeApprovalStageDecisionSchema.safeParse({ ...valid, expectedLastDecisionId: "null" }).success).toBe(false);
+    expect(nativeApprovalStageDecisionSchema.safeParse({ ...valid, decision: "done" }).success).toBe(false);
+    expect(nativeApprovalStageDecisionSchema.safeParse({ ...valid, summary: " " }).success).toBe(false);
+    expect(nativeApprovalStageDecisionSchema.safeParse({ ...valid, summary: "x".repeat(20_001) }).success).toBe(false);
+    expect(nativeApprovalStageDecisionSchema.safeParse({ ...valid, expectedRevision: -1 }).success).toBe(false);
+    expect(nativeApprovalStageDecisionSchema.safeParse({ ...valid, expectedStatusVersion: 0.5 }).success).toBe(false);
+
+    const result = operation.responses["200"].content["application/json"].schema;
+    expect(result.required).toEqual(["id", "identifier", "updatedAt", "changes", "comment"]);
+    expect(result.properties.identifier).toEqual({ type: "string", nullable: true });
+    expect(result.properties.comment.nullable).toBeUndefined();
+    expect(result.properties.comment.required).toEqual(["id", "body"]);
+    for (const status of ["400", "401", "403", "404", "409", "422"]) {
+      expect(operation.responses[status]).toBeDefined();
+    }
+  });
+
   it("documents commander admission and Run-bound requirement envelope authority", () => {
     const { spec } = loadSpecRoutes();
     const admission = spec.paths["/api/issues/{id}/commander-admission"].post;

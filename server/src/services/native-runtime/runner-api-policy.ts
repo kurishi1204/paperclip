@@ -55,6 +55,7 @@ export function runnerApiMutationRestriction(path: string): string | null {
       path,
     ) ||
     (issueRoute && /\/queued-comments\/\{[^}]+\}\/steer$/.test(path)) ||
+    (issueRoute && /\/approval-stage-decisions$/.test(path)) ||
     (issueRoute &&
       /\/(interactions|accepted-plan-decompositions|stalled-review-decision|tree-holds|watchdog|recovery-actions|scheduled-retry|monitor|admin|checkout|release|cancel|resume|wake|run|retry|recover|tree-control)(\/|$)/.test(
         path,

@@ -6,6 +6,7 @@ import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import { readPersistedNativeProviderFailure } from "./native-provider-failure-evidence.js";
 import { dismissAutomaticCompletionReviews } from "./automatic-completion-reviews.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
+import { readFormalIssueApprovalDecision } from "./formal-issue-approval-decision.js";
 import { conversationNativeDecision, isConversation } from "../agent-conversations.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { randomUUID } from "node:crypto";
@@ -328,9 +329,7 @@ async function recordRetryableFailure(input: {
     }
     input = { ...input, coordinator: current, run: currentRun };
     const issue = await tx
-      .select({
-        lastStatusDecisionId: issues.lastStatusDecisionId,
-      })
+      .select()
       .from(issues)
       .where(
         and(
@@ -341,6 +340,10 @@ async function recordRetryableFailure(input: {
       .for("update")
       .limit(1)
       .then((rows) => rows[0] ?? null);
+    const formalApprovalDecision = input.failureScope === "workspace" && issue
+      ? await readFormalIssueApprovalDecision({ db: tx as unknown as Db,
+          issue, runId: input.run.id, agentId: input.run.agentId })
+      : null;
     const latestDecision = issue?.lastStatusDecisionId
       ? await tx
           .select({
@@ -486,7 +489,10 @@ async function recordRetryableFailure(input: {
         },
         tx,
       );
-    } else if (exhausted) {
+    } else if (exhausted && !formalApprovalDecision) {
+      // The formal decision already handed this issue to its next owner (or
+      // completed it). A late export failure belongs to the old run's audit
+      // and board recovery action, not to the successor's issue status/lease.
       await issueService(tx as unknown as Db).update(
         input.coordinator.issueId,
         {
@@ -1207,6 +1213,9 @@ export async function finalizeNativeRun(input: {
       .then((rows) => rows[0] ?? null);
     if (!authoritativeIssue)
       throw new Error("native_finalization_issue_missing");
+    const formalApprovalDecision = await readFormalIssueApprovalDecision({
+      db: input.db, issue: authoritativeIssue, runId: run.id, agentId: run.agentId,
+    });
     const governanceGate = await pendingNativeGovernance({
       db: input.db,
       companyId: run.companyId,
@@ -1298,6 +1307,7 @@ export async function finalizeNativeRun(input: {
       providerModelRejected: providerFailure?.errorCode === "native_provider_model_rejected" && ownsProviderFailureDecision,
       providerOverloaded: providerFailure?.errorCode === "native_provider_overloaded" && ownsProviderFailureDecision,
       providerFailureSuperseded: providerFailure?.errorCode === "native_provider_overloaded" && !ownsProviderFailureDecision,
+      formalApprovalDecisionId: formalApprovalDecision?.id ?? null,
       failureRetryCount: executionFailureRetryCount(run),
       ...(reviewContext ? { nativeReviewOutcome: nativeReview
         ? nativeReview.interaction.status === "pending" ? "pending" as const : "resolved" as const
@@ -1381,6 +1391,8 @@ export async function finalizeNativeRun(input: {
         priorStatusVersion: Number(authoritativeIssue.statusVersion),
         priorDecisionId: authoritativeIssue.lastStatusDecisionId,
         decision,
+        requireFormalApprovalDecision: decision.reasonCode === "formal_approval_decision_recorded" && formalApprovalDecision
+          ? { id: formalApprovalDecision.id, agentId: run.agentId } : undefined,
         requirePlanWaitSource:
           decision.reasonCode === "native_plan_accepted_waiting_for_continuation"
             ? planWait?.source : undefined,

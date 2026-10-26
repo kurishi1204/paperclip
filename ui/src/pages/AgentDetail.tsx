@@ -6,7 +6,7 @@ import { AgentCharacter } from "../components/AgentCharacter";
 import { characterStateForAgent } from "@paperclipai/shared";
 import { mergeRunLogChunks, readChunkSeq } from "../lib/run-log-chunks";
 import { getPageVisibility, usePageVisibility } from "../lib/page-visibility";
-import { useCallback, useEffect, useMemo, useState, useRef } from "react";
+import { useCallback, useEffect, useId, useMemo, useState, useRef } from "react";
 import { useParams, useNavigate, Link, Navigate, useBeforeUnload, type NavigateFunction } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import {
@@ -156,6 +156,26 @@ const runStatusIcons: Record<string, { icon: typeof CheckCircle2; color: string 
 };
 
 const RUN_LOG_PAGE_BYTES = 256_000;
+
+type RetryRunScope = {
+  companyId: string;
+  agentId: string;
+  runId: string;
+};
+
+type RetryRunAction = {
+  isPending: boolean;
+  isError: boolean;
+  error: Error | null;
+  variables: RetryRunScope | undefined;
+  mutate: (scope: RetryRunScope) => void;
+};
+
+function sameRetryRunScope(left: RetryRunScope | undefined, right: RetryRunScope): boolean {
+  return left?.companyId === right.companyId
+    && left.agentId === right.agentId
+    && left.runId === right.runId;
+}
 
 const REDACTED_ENV_VALUE = "***REDACTED***";
 const SECRET_ENV_KEY_RE =
@@ -823,6 +843,45 @@ export function AgentDetail() {
   }, [canonicalAgentRef, navigate, prepareAgentNavigation, routeAgentRef]);
   const agentLookupRef = agent?.id ?? routeAgentRef;
   const resolvedAgentId = agent?.id ?? null;
+  // Keep retry feedback above the route-backed RunDetail: canonical UUID-to-slug
+  // navigation can temporarily replace that child with PageSkeleton.
+  const retryRun = useMutation({
+    mutationFn: (scope: RetryRunScope) => agentsApi.retryFailedRun(scope.agentId, scope.runId, scope.companyId),
+    onSuccess: (_result, scope) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(scope.companyId, scope.agentId) });
+    },
+  });
+  const retryScope = retryRun.variables;
+  const knownDifferentRetryScope = Boolean(retryScope && (
+    urlRunId !== retryScope.runId
+    || (companyPrefix && routeCompanyId && routeCompanyId !== retryScope.companyId)
+    || (!companyPrefix && selectedCompanyId && selectedCompanyId !== retryScope.companyId)
+    || (agent && (agent.id !== retryScope.agentId || agent.companyId !== retryScope.companyId))
+  ));
+  const currentRetryScope = Boolean(retryScope && agent && !knownDifferentRetryScope
+    && lookupCompanyId === retryScope.companyId
+    && urlRunId === retryScope.runId
+    && (!companyPrefix || routeCompanyId === retryScope.companyId));
+  // A transiently unavailable company list must not erase feedback for the
+  // rendered agent/run. Keep navigation stricter: it waits for route identity.
+  const retryFeedbackScope = Boolean(retryScope && agent && !knownDifferentRetryScope
+    && agent.id === retryScope.agentId && agent.companyId === retryScope.companyId
+    && urlRunId === retryScope.runId
+    && (!routeCompanyId || routeCompanyId === retryScope.companyId)
+    && (routeCompanyId || !selectedCompanyId || selectedCompanyId === retryScope.companyId));
+  const retryRouteReady = Boolean(agent && lookupCompanyId === agent.companyId
+    && (!companyPrefix || routeCompanyId === agent.companyId));
+  useEffect(() => {
+    if (knownDifferentRetryScope) retryRun.reset();
+  }, [knownDifferentRetryScope, retryRun.reset]);
+  useEffect(() => {
+    if (!currentRetryScope || !retryRun.isSuccess || !retryRun.data) return;
+    const result = retryRun.data;
+    // Consume once: an idempotent retry may return a run already selected.
+    retryRun.reset();
+    if (result.runId) navigate(`/agents/${canonicalAgentRef}/runs/${result.runId}`);
+    else if (result.issueId) navigate(`/issues/${result.issueId}`);
+  }, [currentRetryScope, retryRun.isSuccess, retryRun.data, retryRun.reset, canonicalAgentRef, navigate]);
   const { data: boardAccess } = useQuery({
     queryKey: queryKeys.access.currentBoardAccess,
     queryFn: () => accessApi.getCurrentBoardAccess(),
@@ -1494,6 +1553,9 @@ export function AgentDetail() {
           selectedRunId={urlRunId ?? null}
           adapterType={agent.adapterType}
           adapterConfig={agent.adapterConfig}
+          retryRun={retryRun}
+          retryFeedbackScope={retryFeedbackScope}
+          retryRouteReady={retryRouteReady}
         />
       )}
 
@@ -3312,6 +3374,9 @@ function RunsTab({
   selectedRunId,
   adapterType,
   adapterConfig,
+  retryRun,
+  retryFeedbackScope,
+  retryRouteReady,
 }: {
   runs: HeartbeatRun[];
   companyId: string;
@@ -3320,6 +3385,9 @@ function RunsTab({
   selectedRunId: string | null;
   adapterType: string;
   adapterConfig: Record<string, unknown>;
+  retryRun: RetryRunAction;
+  retryFeedbackScope: boolean;
+  retryRouteReady: boolean;
 }) {
   const { isMobile } = useSidebar();
 
@@ -3348,7 +3416,7 @@ function RunsTab({
             <ArrowLeft className="h-3.5 w-3.5" />
             Back to runs
           </Link>
-          <RunDetail key={selectedRun.id} run={selectedRun} agentRouteId={agentRouteId} adapterType={adapterType} adapterConfig={adapterConfig} />
+          <RunDetail key={selectedRun.id} run={selectedRun} agentRouteId={agentRouteId} adapterType={adapterType} adapterConfig={adapterConfig} retryRun={retryRun} retryFeedbackScope={retryFeedbackScope} retryRouteReady={retryRouteReady} />
         </div>
       );
     }
@@ -3379,7 +3447,7 @@ function RunsTab({
       {/* Right: run detail — natural height, page scrolls */}
       {selectedRun && (
         <div className="flex-1 min-w-0 pl-4">
-          <RunDetail key={selectedRun.id} run={selectedRun} agentRouteId={agentRouteId} adapterType={adapterType} adapterConfig={adapterConfig} />
+          <RunDetail key={selectedRun.id} run={selectedRun} agentRouteId={agentRouteId} adapterType={adapterType} adapterConfig={adapterConfig} retryRun={retryRun} retryFeedbackScope={retryFeedbackScope} retryRouteReady={retryRouteReady} />
         </div>
       )}
     </div>
@@ -3402,9 +3470,10 @@ export function AgentFileRunNotice({ resultJson }: { resultJson: HeartbeatRun["r
   </>;
 }
 
-function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }: { run: HeartbeatRun; agentRouteId: string; adapterType: string; adapterConfig: Record<string, unknown> }) {
+function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig, retryRun, retryFeedbackScope, retryRouteReady }: { run: HeartbeatRun; agentRouteId: string; adapterType: string; adapterConfig: Record<string, unknown>; retryRun: RetryRunAction; retryFeedbackScope: boolean; retryRouteReady: boolean }) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const retryUnavailableDescriptionId = useId();
   const { data: hydratedRun } = useQuery({
     queryKey: queryKeys.runDetail(initialRun.id),
     queryFn: () => heartbeatsApi.get(initialRun.id),
@@ -3516,17 +3585,8 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
     if (taskKey) payload.taskKey = taskKey;
     return payload;
   }, [run.contextSnapshot]);
-  const retryRun = useMutation({
-    mutationFn: async () => {
-      return agentsApi.retryFailedRun(run.agentId, run.id, run.companyId);
-    },
-    onSuccess: (newRun) => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(run.companyId, run.agentId) });
-      if (newRun.runId)
-        navigate(`/agents/${agentRouteId}/runs/${newRun.runId}`);
-      else if (newRun.issueId) navigate(`/issues/${newRun.issueId}`);
-    },
-  });
+  const retryScope = { companyId: run.companyId, agentId: run.agentId, runId: run.id };
+  const retryBelongsToRun = retryFeedbackScope && sameRetryRunScope(retryRun.variables, retryScope);
 
   const rerunWithTrace = useMutation({
     mutationFn: async () => {
@@ -3650,16 +3710,26 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 </Button>
               )}
               {canRetryRun && !canResumeLostRun && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="text-xs h-6 px-2"
-                  onClick={() => retryRun.mutate()}
-                  disabled={retryRun.isPending}
-                >
-                  <RotateCcw className="h-3.5 w-3.5 mr-1" />
-                  {retryRun.isPending ? "Retrying…" : "Retry"}
-                </Button>
+                <>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-xs h-6 px-2"
+                    onClick={() => {
+                      if (retryRouteReady && (!retryBelongsToRun || !retryRun.isPending)) retryRun.mutate(retryScope);
+                    }}
+                    disabled={!retryRouteReady || (retryBelongsToRun && retryRun.isPending)}
+                    aria-describedby={!retryRouteReady ? retryUnavailableDescriptionId : undefined}
+                  >
+                    <RotateCcw className="h-3.5 w-3.5 mr-1" />
+                    {retryBelongsToRun && retryRun.isPending ? "Retrying…" : "Retry"}
+                  </Button>
+                  {!retryRouteReady && (
+                    <span id={retryUnavailableDescriptionId} className="text-xs text-muted-foreground">
+                      Retry is unavailable until the company is confirmed. Reload the page if this persists.
+                    </span>
+                  )}
+                </>
               )}
               <Button
                 variant="ghost"
@@ -3747,7 +3817,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 {resumeRun.error instanceof Error ? resumeRun.error.message : "Failed to resume run"}
               </div>
             )}
-            {retryRun.isError && (
+            {retryBelongsToRun && retryRun.isError && (
               <div className="text-xs text-destructive">
                 {retryRun.error instanceof Error ? retryRun.error.message : "Failed to retry run"}
               </div>
