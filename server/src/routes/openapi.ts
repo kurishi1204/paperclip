@@ -5,6 +5,7 @@ import {
 } from "./experimental-api-paths.js";
 import { Router } from "express";
 import { z } from "zod";
+import { nativeApprovalStageDecisionSchema } from "./native-approval-stage-contract.js";
 import { prepareCommanderAdmissionSchema } from "../services/commander-cycle.js";
 import {
   createAiConnectionSchema,
@@ -1694,7 +1695,7 @@ function resolveOperationAuthLevel(
   if (path === "/api/mcp/setup" || path === "/api/mcp/device/consent" || path.startsWith("/api/mcp/requests/") || path.startsWith("/api/mcp/connections")) return "board";
   if (PUBLIC_OPERATIONS.has(key)) return "public";
   if (key === "POST /api/companies/{companyId}/agent-commentary") return "agent_heartbeat";
-  if (key === "POST /api/mcp/project-tools" || key === "POST /api/mcp/qa-review" || key === "POST /api/companies/{companyId}/slack/tasks/{issueId}/tools" || key === "GET /api/issues/{id}/requirement-envelope") return "agent_run";
+  if (key === "POST /api/mcp/project-tools" || key === "POST /api/mcp/qa-review" || key === "POST /api/companies/{companyId}/slack/tasks/{issueId}/tools" || key === "GET /api/issues/{id}/requirement-envelope" || key === "POST /api/issues/{id}/approval-stage-decisions") return "agent_run";
   if (RUNTIME_TOOLS_OPERATIONS.has(key)) return "runtime_tools";
   if (INSTANCE_ADMIN_OPERATIONS.has(key)) return "instance_admin";
   if (
@@ -4115,6 +4116,41 @@ registry.registerPath({
     400: r.badRequest,
     401: r.unauthorized,
     404: r.notFound,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/approval-stage-decisions",
+  tags: ["issues"],
+  summary: "Decide the current configured Issue approval stage",
+  description:
+    "Requires the assigned active native agent's run-bound JWT in standard work mode. " +
+    "The exact pending approval stage, status version, issue revision, and nullable last decision ID " +
+    "are checked before and inside the issue transaction. Approve advances to the next pending " +
+    "stage, or marks the Issue done after the final stage; " +
+    "request_changes returns work to the worker. The summary is committed as the decision comment. " +
+    "This does not resolve a completion review or a general approval, and ordinary Issue PATCH " +
+    "cannot carry these preconditions. Returns the committed Issue update and comment, or the " +
+    "same minimal Issue update when Prefer: return=minimal is requested.",
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    body: jsonBody(nativeApprovalStageDecisionSchema),
+  },
+  responses: {
+    200: r.ok(z.object({
+      id: z.string().uuid(),
+      identifier: z.string().nullable(),
+      updatedAt: z.string().datetime(),
+      changes: z.record(z.string(), z.unknown()),
+      comment: z.object({ id: z.string().uuid(), body: z.string() }).passthrough(),
+    }).passthrough()),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
     422: r.unprocessable,
   },
 });

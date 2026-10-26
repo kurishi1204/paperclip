@@ -174,6 +174,49 @@ describe("native issue approval stage", () => {
     expect(run?.status).toBe("running");
   });
 
+  it.each([
+    { minimal: true, nullIdentifier: false },
+    { minimal: false, nullIdentifier: false },
+    { minimal: true, nullIdentifier: true },
+    { minimal: false, nullIdentifier: true },
+  ])("returns the documented Issue update from the dedicated HTTP receiver (%j)", async ({ minimal, nullIdentifier }) => {
+    if (nullIdentifier) {
+      await server.db.update(issues).set({ identifier: null }).where(eq(issues.id, fixture.issueId));
+    }
+    const current = (await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!;
+    const token = createLocalAgentJwt(fixture.agentId, fixture.companyId, "paperclip_runner", fixture.runId)!;
+    const response = await fetch(`${server.apiUrl}/api/issues/${fixture.issueId}/approval-stage-decisions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        ...(minimal ? { Prefer: "return=minimal" } : {}),
+      },
+      body: JSON.stringify({
+        decision: "approve", summary: "Acceptance evidence is complete.",
+        expectedStageId: approvalStageId,
+        expectedStatusVersion: current.statusVersion,
+        expectedRevision: current.revision,
+        expectedLastDecisionId: previousDecisionId,
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("preference-applied")).toBe(minimal ? "return=minimal" : null);
+    const body = await response.json() as Record<string, unknown>;
+    if (minimal) {
+      expect(Object.keys(body).sort()).toEqual(["changes", "comment", "id", "identifier", "updatedAt"]);
+    } else {
+      expect(body.status).toBe("done");
+    }
+    expect(body).toMatchObject({
+      id: fixture.issueId,
+      identifier: current.identifier,
+      comment: { body: "Acceptance evidence is complete." },
+    });
+    expect(body.updatedAt).toEqual(expect.any(String));
+    expect(body.changes).toEqual(expect.any(Object));
+  });
+
   it.each(["null", "undefined"])("normalizes a provider %s sentinel for a first approval decision", async (sentinel) => {
     const [issue] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
     await server.db.update(issues).set({ executionState: {

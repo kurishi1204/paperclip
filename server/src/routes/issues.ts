@@ -27,6 +27,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
+import { nativeApprovalStageDecisionSchema, type NativeApprovalStageDecision } from "./native-approval-stage-contract.js";
 import {
   and,
   asc,
@@ -383,15 +384,6 @@ const updateIssueRouteSchema = updateIssueSchema.extend({
     lastDecisionId: z.string().uuid().nullable(),
   }).strict().optional(),
 });
-const nativeApprovalStageDecisionSchema = z.object({
-  decision: z.enum(["approve", "request_changes"]),
-  summary: z.string().trim().min(1).max(20_000),
-  expectedStageId: z.string().uuid(),
-  expectedStatusVersion: z.number().int().nonnegative(),
-  expectedRevision: z.number().int().nonnegative(),
-  expectedLastDecisionId: z.string().uuid().nullable(),
-}).strict();
-type NativeApprovalStageDecision = z.infer<typeof nativeApprovalStageDecisionSchema>;
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),

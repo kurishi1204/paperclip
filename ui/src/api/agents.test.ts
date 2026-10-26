@@ -1,10 +1,24 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { agentsApi } from "./agents";
-import { api } from "./client";
+import { api, ApiError } from "./client";
 
 afterEach(() => vi.restoreAllMocks());
 
 describe("agentsApi.retryFailedRun", () => {
+  it("surfaces a server 409 denial with its message and does not dispatch again", async () => {
+    const denial = new ApiError("The original run cannot be retried.", 409, { error: "The original run cannot be retried." });
+    const post = vi.spyOn(api, "post").mockRejectedValue(denial);
+    await expect(agentsApi.retryFailedRun("agent-1", "original-failure", "company-1"))
+      .rejects.toBe(denial);
+    expect(post).toHaveBeenCalledOnce();
+    expect(post).toHaveBeenCalledWith("/agents/agent-1/wakeup?companyId=company-1", {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "retry_failed_run",
+      failedRunId: "original-failure",
+    });
+  });
+
   it.each(["failed", "timed_out", "cancelled", "interrupted"])(
     "reports a replayed %s retry instead of silently succeeding",
     async (status) => {
