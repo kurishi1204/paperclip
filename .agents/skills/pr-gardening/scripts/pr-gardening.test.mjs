@@ -783,11 +783,12 @@ function readJournalFixture({tempRoot=os.tmpdir()}={}) {
 }
 // Use the public writer's files and pre-inventory as the actual admission
 // inputs. The receiver computes its own current inventory from the filesystem.
-function emittedReadJournalFixture({tempRoot=os.tmpdir()}={}) {
+function emittedReadJournalFixture({tempRoot=os.tmpdir(),emitPacket=null}={}) {
  const x=readJournalFixture({tempRoot}),{f,events,corpus}=x,oldCwd=x.cwd;
  rmSync(path.join(f.root,"corpus"),{recursive:true});
  const output=path.join(f.root,"packet-one");
- sourceCodec.emitReadCorpus(f.source,output,{checkoutRoot:process.cwd()});
+ if (emitPacket) emitPacket(f,output);
+ else sourceCodec.emitReadCorpus(f.source,output,{checkoutRoot:process.cwd()});
  const cwd=realpathSync(path.join(output,"corpus"));
  for(let i=0;i<events.length;i++)events[i]=JSON.parse(JSON.stringify(events[i]).replaceAll(oldCwd,cwd));
  f.data.manifest=readFileSync(path.join(output,"manifest.json"),"utf8");
@@ -802,6 +803,36 @@ function emittedReadJournalFixture({tempRoot=os.tmpdir()}={}) {
  x.cwd=cwd;x.refresh();
  return {...x,output};
 }
+function emitDocumentedReadCommand(f,output,documentPath) {
+ const content=readFileSync(documentPath,"utf8");
+ const example=content.match(/`check-readiness\.mjs --emit-review-input <PR>[^`]*--check-only`/);
+ assert.ok(example,`missing documented command: ${documentPath}`);
+ const command=example[0].slice(1,-1).replace("<PR>","1")
+   .replace(/<comma-separated[^>]*>/,"dependency.mjs").replace("<absolute-new-directory>",output);
+ const parts=command.split(/\s+/);
+ assert.equal(parts.shift(),"check-readiness.mjs");
+ const checkout=path.join(f.directory,"documented-checkout"),scripts=path.join(checkout,".agents/skills/pr-gardening/scripts");
+ mkdirSync(scripts,{recursive:true});
+ for(const name of ["check-readiness.mjs","lib.mjs"])copyFileSync(fileURLToPath(new URL(`./${name}`,import.meta.url)),path.join(scripts,name));
+ const routes=path.join(f.directory,"documented-routes.json"),calls=path.join(f.directory,"documented-gh-calls.jsonl");
+ writeFileSync(routes,JSON.stringify(f.routes));
+ const bin=path.join(f.directory,"documented-bin");mkdirSync(bin);
+ const stub=path.join(bin,"gh");writeFileSync(stub,`#!${process.execPath}\nconst fs=require('fs');const args=process.argv.slice(2),routes=JSON.parse(fs.readFileSync(${JSON.stringify(routes)},'utf8'));fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='api'&&args[1]==='--method'&&args[2]==='GET'&&Object.hasOwn(routes,args[3]))process.stdout.write(JSON.stringify(routes[args[3]]));else process.exit(8);\n`);chmodSync(stub,0o700);
+ const invoke=(argv)=>spawnSync(process.execPath,[realpathSync(path.join(scripts,"check-readiness.mjs")),...argv],{env:{PATH:bin+path.delimiter+path.dirname(process.execPath)},encoding:"utf8"});
+ const dry=invoke(parts);assert.equal(dry.status,0,dry.stderr);assert.equal(existsSync(output),false);
+ const profile=JSON.parse(dry.stdout),written=invoke(parts.filter(arg=>arg!=="--check-only"));
+ assert.equal(written.status,0,written.stderr);
+ assert.deepEqual(JSON.parse(written.stdout).recommendedRanges,profile.recommendedRanges);
+ assert.equal(profile.corpusRoot,realpathSync(path.join(output,"corpus")));
+ assert.ok(readFileSync(path.join(output,"material.md"),"utf8").includes(`The absolute corpus root is ${profile.corpusRoot}`));
+ assert.ok(readFileSync(calls,"utf8").trim().split("\n").map(JSON.parse).every(args=>args[0]==="api"&&args[1]==="--method"&&args[2]==="GET"));
+}
+for(const name of ["skill","contributing"])test(`documented ${name} Read command reaches actual admission through fake GitHub`,()=>{
+ const documentPath=name==="skill"?fileURLToPath(new URL('../SKILL.md',import.meta.url)):fileURLToPath(new URL('../../../../CONTRIBUTING.md',import.meta.url));
+ const x=emittedReadJournalFixture({emitPacket:(f,output)=>emitDocumentedReadCommand(f,output,documentPath)});
+ try {const review=admitTrustedJournal(x.f.admissionArgs());assert.equal(review.status,"valid",JSON.stringify(review));assert.equal(review.deliveredFiles,x.corpus.files.length);}
+ finally{x.f.close();}
+});
 test("emitted Read packet reaches the actual admitted receiver",()=>{
  const x=emittedReadJournalFixture();try{
    const review=admitTrustedJournal(x.f.admissionArgs());
@@ -1013,6 +1044,22 @@ test("read emitter recommends complete bounded ranges for a large source from on
    for(const range of ranges){assert.equal(range.offset,next);assert.ok(range.displayBytes<=16*1024);next+=range.limit;}
    assert.equal(next,dependency.lines+1);
    assert.ok(readFileSync(path.join(output,"material.md"),"utf8").includes(`Suggested ranges: ${canonical(dry.recommendedRanges)}`));
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test("read emitter keeps the final LF empty line with its preceding line",()=>{
+ const source=sourceV2Fixture("old\n","new\n");
+ source.dependencyFiles[0].content=Array(9).fill("x".repeat(1700)).concat("y".repeat(1051)).join("\n")+"\n";
+ source.dependencyFiles[0].blobSha=hashBlob(source.dependencyFiles[0].content);
+ const root=mkdtempSync(path.join(os.tmpdir(),"read-eof-profile-")),output=path.join(root,"packet");
+ try {
+   const profile=sourceCodec.emitReadCorpus(source,output,{checkOnly:true,checkoutRoot:process.cwd()});
+   const dependency=sourceCodec.readCorpusManifest(source).files.find(file=>file.role==="deps");
+   const ranges=profile.recommendedRanges.filter(range=>range.path===dependency.path);
+   assert.ok(ranges.length>1);
+   assert.ok(ranges.at(-1).limit>=2,"isolated EOF-empty Read remains unmeasured");
+   assert.ok(ranges.every(range=>range.displayBytes<=16*1024));
+   assert.equal(ranges.reduce((total,range)=>total+range.limit,0),dependency.lines);
+   assert.equal(existsSync(output),false);
  }finally{rmSync(root,{recursive:true,force:true});}
 });
 for(const [name,mutate] of [

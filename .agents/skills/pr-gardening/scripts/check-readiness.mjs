@@ -428,7 +428,10 @@ function recommendedReadRanges(files) {
     for (let index = 0; index < lines.length; index++) {
       const lineBytes = Buffer.byteLength(`${index+1}\t${lines[index]}`, "utf8");
       const separatorBytes = index + 1 === offset ? 0 : 1;
-      if (displayBytes && displayBytes + separatorBytes + lineBytes > READ_RECOMMENDED_DISPLAY_BYTES) {
+      // Leave room for the final empty line that carries the file's LF. An
+      // isolated EOF-empty Read has not been observed in the supported CLI.
+      const finalEmptyBytes = index === lines.length - 2 ? 1 + Buffer.byteLength(`${lines.length}\t`, "utf8") : 0;
+      if (displayBytes && displayBytes + separatorBytes + lineBytes + finalEmptyBytes > READ_RECOMMENDED_DISPLAY_BYTES) {
         ranges.push({path:file.path,offset,limit:index+1-offset,displayBytes});
         offset = index+1;
         displayBytes = 0;
@@ -509,16 +512,16 @@ export function emitReadCorpus(source, output, {checkOnly=false, checkoutRoot=pa
   outsideCheckoutOutput(checkoutRoot,canonicalOutput,"review_output_inside_checkout");
   const corpus = readCorpusManifest(source);
   const recommendedRanges = recommendedReadRanges(corpus.files);
+  const corpusRoot = path.join(canonicalOutput,"corpus");
   const manifestBytes = Buffer.from(`${canonical(corpus.manifest)}\n`);
-  const materialBytes = Buffer.from(`Review every listed corpus file before the final judgment. Use these suggested Read offset/limit ranges to cover every line; the 16 KiB display target is based on one observed CLI profile, not a delivery guarantee. Stop if a Read result is missing or incomplete.\nSuggested ranges: ${canonical(recommendedRanges)}\n${readCorpusManifestBlock(source)}\n`);
-  const profile = { schema:"paperclip.read-corpus-emission/v1", output:canonicalOutput, corpusRoot:path.join(canonicalOutput,"corpus"),
+  const materialBytes = Buffer.from(`Review every listed corpus file before the final judgment. The absolute corpus root is ${corpusRoot}; each suggested path is relative to that root, and Read file_path must be absolute. Use these suggested Read offset/limit ranges to cover every line; the 16 KiB display target is based on one observed CLI profile, not a delivery guarantee. Stop if a Read result is missing or incomplete.\nSuggested ranges: ${canonical(recommendedRanges)}\n${readCorpusManifestBlock(source)}\n`);
+  const profile = { schema:"paperclip.read-corpus-emission/v1", output:canonicalOutput, corpusRoot,
     manifestSHA256:digest(manifestBytes), materialSHA256:digest(materialBytes), logicalSourceSHA256:corpus.manifest.logicalSourceSHA256,
     fileCount:corpus.files.length, files:corpus.manifest.files.map(({path:name,role,sourcePath,bytes,sha256})=>({path:name,role,sourcePath,bytes,sha256})),
     lineProfileMaxDisplayBytes:READ_MAX_DISPLAY_LINE_BYTES, recommendedDisplayBytes:READ_RECOMMENDED_DISPLAY_BYTES,
     recommendedRanges, state:checkOnly ? "CHECK_ONLY_NO_FILES_WRITTEN" : "EMITTED" };
   if (checkOnly) return profile;
   fs.mkdirSync(canonicalOutput,{mode:0o700});
-  const corpusRoot = path.join(canonicalOutput,"corpus");
   fs.mkdirSync(corpusRoot,{mode:0o700});
   fs.mkdirSync(path.join(corpusRoot,"assets"),{mode:0o700});
   for (const file of corpus.files) fs.writeFileSync(path.join(corpusRoot,file.path),file.content,{flag:"wx",mode:0o400});
