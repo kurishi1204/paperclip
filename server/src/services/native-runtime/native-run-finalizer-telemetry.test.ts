@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -8,6 +8,7 @@ import {
   createDb,
   heartbeatRuns,
   heartbeatRunEvents,
+  issueExecutionDecisions,
   issues,
   nativeRunFinalizations,
   nativeRunResults,
@@ -705,6 +706,56 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
         .where(eq(heartbeatRuns.id, fixture.runId))
         .then((rows) => rows[0]?.status),
     ).resolves.toBe("failed");
+    const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect(issue?.status).toBe("blocked");
+  });
+
+  it("keeps the successor worker lease when a prior formal approval run exhausts workspace export retries", async () => {
+    const fixture = await seedNativeRun();
+    const stageId = randomUUID(), decisionId = randomUUID(), workerId = randomUUID(), successorRunId = randomUUID();
+    const summary = "The worker must add the missing evidence.";
+    const input = { decision: "request_changes", summary, expectedStageId: stageId,
+      expectedStatusVersion: 0, expectedRevision: 0, expectedLastDecisionId: null };
+    const digest = createHash("sha256").update(JSON.stringify(input, Object.keys(input).sort())).digest("hex");
+    await db.insert(agents).values({ id: workerId, companyId, name: "Successor worker", adapterType: "codex_local", status: "running" });
+    await db.insert(heartbeatRuns).values({ id: successorRunId, companyId, agentId: workerId,
+      status: "running", runtimeMode: "native", nativeIssueId: fixture.issueId,
+      contextSnapshot: { issueId: fixture.issueId } });
+    await db.insert(issueExecutionDecisions).values({ id: decisionId, companyId, issueId: fixture.issueId,
+      stageId, stageType: "approval", actorAgentId: agentId, createdByRunId: fixture.runId,
+      outcome: "changes_requested", body: summary });
+    await db.update(heartbeatRuns).set({ resultJson: { approvalStageAttempts: {
+      [stageId]: { digest, callId: "formal-approval", input, decisionId, state: "committed" },
+    } } }).where(eq(heartbeatRuns.id, fixture.runId));
+    await db.update(issues).set({ status: "in_progress", assigneeAgentId: workerId,
+      checkoutRunId: successorRunId, executionRunId: successorRunId,
+      executionAgentNameKey: "successor-worker", executionLockedAt: new Date(),
+      executionState: { status: "changes_requested", lastDecisionId: decisionId },
+    }).where(eq(issues.id, fixture.issueId));
+    await db.insert(nativeRunFinalizations).values({ runId: fixture.runId, companyId,
+      issueId: fixture.issueId, phase: "observed", attempt: 1 });
+    const [baseline] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await recordNativeFinalizationFailure({ db, runId: fixture.runId,
+        error: new Error("native_workspace_sync_out_failed"),
+        projectRunStatus: true, failureScope: "workspace" });
+    }
+    const [after] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    for (const key of ["status", "statusVersion", "revision", "assigneeAgentId", "checkoutRunId",
+      "executionRunId", "executionAgentNameKey", "executionLockedAt"] as const) {
+      expect(after?.[key], key).toEqual(baseline?.[key]);
+    }
+    expect(after?.executionState).toEqual(baseline?.executionState);
+    const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, fixture.runId));
+    expect(coordinator).toMatchObject({ phase: "terminal_failure", failureCode: "native_workspace_sync_out_retry_exhausted",
+      failureDetail: { workspaceFinalizeAttempt: 3, recoveryOwner: { kind: "board" } } });
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId));
+    expect(actions).toContainEqual(expect.objectContaining({ status: "active", ownerType: "board",
+      cause: "native_workspace_sync_out_retry_exhausted" }));
+    expect(actions.filter((action) => action.status === "active" && action.ownerType === "agent")).toHaveLength(0);
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successorRunId));
+    expect(successor?.status).toBe("running");
   });
 
   it("blocks immediately when the sandbox with unexported changes is gone", async () => {

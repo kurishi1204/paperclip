@@ -174,6 +174,58 @@ describe("native issue approval stage", () => {
     expect(run?.status).toBe("running");
   });
 
+  it.each(["null", "undefined"])("normalizes a provider %s sentinel for a first approval decision", async (sentinel) => {
+    const [issue] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    await server.db.update(issues).set({ executionState: {
+      ...(issue!.executionState as Record<string, unknown>), lastDecisionId: null,
+      lastDecisionOutcome: null,
+    } }).where(eq(issues.id, fixture.issueId));
+    const current = (await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!;
+    const malformed = await rpc(`bad-null-sentinel-${sentinel}`, "tools/call", { name: "decide_issue_approval_stage", arguments: {
+      decision: "approve", summary: "First approval stage accepted.", expectedStageId: approvalStageId,
+      expectedStatusVersion: current.statusVersion, expectedRevision: current.revision,
+      expectedLastDecisionId: "not-a-uuid",
+    } });
+    expect(malformed.result?.isError).toBe(true);
+    const [before] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+    expect((before?.resultJson as Record<string, unknown>)?.approvalStageAttempts).toBeUndefined();
+    const verdict = await rpc(`null-sentinel-${sentinel}`, "tools/call", { name: "decide_issue_approval_stage", arguments: {
+      decision: "approve", summary: "First approval stage accepted.", expectedStageId: approvalStageId,
+      expectedStatusVersion: current.statusVersion, expectedRevision: current.revision,
+      expectedLastDecisionId: sentinel,
+    } });
+    expect(verdict.result?.isError).not.toBe(true);
+    const [decision] = await server.db.select().from(issueExecutionDecisions).where(and(
+      eq(issueExecutionDecisions.issueId, fixture.issueId), eq(issueExecutionDecisions.stageId, approvalStageId),
+    ));
+    expect(decision?.outcome).toBe("approved");
+    const [run] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+    const attempts = (run?.resultJson as { approvalStageAttempts?: Record<string,
+      { input?: { expectedLastDecisionId?: string | null } }> })?.approvalStageAttempts;
+    expect(attempts?.[approvalStageId]?.input?.expectedLastDecisionId).toBeNull();
+  });
+
+  it("does not reserve an approval decision when its trusted API origin is absent", async () => {
+    const current = (await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!;
+    const args = { decision: "approve", summary: "Approved after verification.",
+      expectedStageId: approvalStageId, expectedStatusVersion: current.statusVersion,
+      expectedRevision: current.revision, expectedLastDecisionId: previousDecisionId };
+    vi.stubEnv("PAPERCLIP_API_URL", "");
+    try {
+      const unavailable = await rpc("missing-api-origin", "tools/call", {
+        name: "decide_issue_approval_stage", arguments: args,
+      });
+      expect(unavailable.result?.isError).toBe(true);
+      const [run] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+      expect((run?.resultJson as Record<string, unknown>)?.approvalStageAttempts).toBeUndefined();
+      expect(await server.db.select().from(issueExecutionDecisions).where(and(
+        eq(issueExecutionDecisions.issueId, fixture.issueId), eq(issueExecutionDecisions.stageId, approvalStageId),
+      ))).toHaveLength(0);
+    } finally { vi.stubEnv("PAPERCLIP_API_URL", server.apiUrl); }
+    const retry = await rpc("origin-restored", "tools/call", { name: "decide_issue_approval_stage", arguments: args });
+    expect(retry.result?.isError).not.toBe(true);
+  });
+
   it("rejects extra input, stale CAS, other actor, stage, and run before recording a decision", async () => {
     const current = (await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!;
     const valid = { decision: "approve", summary: "Approved after verification.",

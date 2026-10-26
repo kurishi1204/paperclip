@@ -329,9 +329,7 @@ async function recordRetryableFailure(input: {
     }
     input = { ...input, coordinator: current, run: currentRun };
     const issue = await tx
-      .select({
-        lastStatusDecisionId: issues.lastStatusDecisionId,
-      })
+      .select()
       .from(issues)
       .where(
         and(
@@ -342,6 +340,10 @@ async function recordRetryableFailure(input: {
       .for("update")
       .limit(1)
       .then((rows) => rows[0] ?? null);
+    const formalApprovalDecision = input.failureScope === "workspace" && issue
+      ? await readFormalIssueApprovalDecision({ db: tx as unknown as Db,
+          issue, runId: input.run.id, agentId: input.run.agentId })
+      : null;
     const latestDecision = issue?.lastStatusDecisionId
       ? await tx
           .select({
@@ -487,7 +489,10 @@ async function recordRetryableFailure(input: {
         },
         tx,
       );
-    } else if (exhausted) {
+    } else if (exhausted && !formalApprovalDecision) {
+      // The formal decision already handed this issue to its next owner (or
+      // completed it). A late export failure belongs to the old run's audit
+      // and board recovery action, not to the successor's issue status/lease.
       await issueService(tx as unknown as Db).update(
         input.coordinator.issueId,
         {

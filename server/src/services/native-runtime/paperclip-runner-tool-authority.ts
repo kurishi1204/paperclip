@@ -127,7 +127,9 @@ const APPROVAL_STAGE_DEFINITION = {
       expectedStageId: { type: "string", format: "uuid" },
       expectedStatusVersion: { type: "integer", minimum: 0 },
       expectedRevision: { type: "integer", minimum: 0 },
-      expectedLastDecisionId: { type: ["string", "null"], format: "uuid" },
+      // Some native providers serialize JSON null as a string. The receiver
+      // normalizes only those sentinels, then validates every real ID below.
+      expectedLastDecisionId: { type: ["string", "null"] },
     },
     required: ["decision", "summary", "expectedStageId", "expectedStatusVersion", "expectedRevision", "expectedLastDecisionId"],
   },
@@ -834,13 +836,14 @@ export class PaperclipRunnerToolAuthority {
         !Number.isSafeInteger(raw.expectedRevision) || Number(raw.expectedRevision) < 0) {
       throw badRequest("Approval decision requires an exact stage, version, revision, prior decision, and concrete summary");
     }
+    const lastDecisionId = nullableProviderId(raw.expectedLastDecisionId);
     const input = {
       decision: raw.decision as "approve" | "request_changes",
       summary: raw.summary.trim(),
       expectedStageId: requiredUuid(raw.expectedStageId),
       expectedStatusVersion: raw.expectedStatusVersion as number,
       expectedRevision: raw.expectedRevision as number,
-      expectedLastDecisionId: raw.expectedLastDecisionId === null ? null : requiredUuid(raw.expectedLastDecisionId),
+      expectedLastDecisionId: lastDecisionId === null ? null : requiredUuid(lastDecisionId),
     };
     const digest = createHash("sha256").update(canonicalJson(input)).digest("hex");
     const [identity] = await this.db.select({ run: heartbeatRuns, actor: agents }).from(heartbeatRuns)
@@ -870,6 +873,10 @@ export class PaperclipRunnerToolAuthority {
     }
     let sendPost = false;
     if (existingAttempt === undefined || prior.digest !== digest) {
+      // This is a local configuration failure, before any HTTP send can occur.
+      // Do not reserve an UNKNOWN outcome that would poison a later healthy run.
+      const apiUrl = this.binding.apiUrl ?? process.env.PAPERCLIP_API_URL;
+      if (!apiUrl) throw new Error("Paperclip API origin is unavailable");
       const goal = await runnerGoalService(this.db).projection(this.binding.companyId, this.binding.issueId, this.binding.agentId);
       if (goal?.pendingAction || (goal?.goal && goal.goal.status !== "complete")) {
         throw forbidden("Finish the active goal and its pending control action before deciding this approval stage");
@@ -2177,8 +2184,8 @@ function requiredString(value: unknown): string {
  * Some native tool transports cannot faithfully express a nullable string in
  * their provider-facing schema and send the JSON null sentinel as a string.
  * Normalize only the well-known empty/null sentinels at the control-plane
- * boundary; real revision ids remain untouched and optimistic concurrency is
- * still enforced by the document service.
+ * boundary. Real identifiers remain untouched; each caller applies its own
+ * validation and optimistic-concurrency check after normalization.
  */
 function nullableProviderId(value: unknown): string | null {
   if (value === null || value === undefined) return null;
