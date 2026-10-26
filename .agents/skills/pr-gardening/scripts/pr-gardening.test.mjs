@@ -328,8 +328,8 @@ import { admitTrustedJournal, assessForkChecks, assessDispositions, buildReviewS
 const FORK = "kurishi1204/paperclip";
 const HEAD = "1".repeat(40), BASE = "2".repeat(40), TREE = "3".repeat(40), BASE_TREE = "4".repeat(40);
 const hashBlob = (s) => createHash("sha1").update(`blob ${Buffer.byteLength(s)}\0${s}`).digest("hex");
-function forkFixture() {
-  const directory = mkdtempSync(path.join(os.tmpdir(),"fork-quality-test-"));
+function forkFixture({tempRoot=os.tmpdir()}={}) {
+  const directory = mkdtempSync(path.join(tempRoot,"fork-quality-test-"));
   const root = path.join(directory,"operator"); mkdirSync(root,{mode:0o700});
   const old = "old source\n", current = "new source\n";
   const oldBlob = hashBlob(old), newBlob = hashBlob(current);
@@ -345,11 +345,14 @@ function forkFixture() {
   const start = { scriptSHA256:digest(launcher),combinedSHA256:inputSHA,combinedBytes:Buffer.byteLength(system)+1+Buffer.byteLength(material),sessionID:session,argv:["/fixture/actual-cli","--print","--session-id",session,"--max-turns","1","--model","claude-opus-5-5","--effort","high","--output-format","json","--safe-mode","--restricted","--tools","","--strict-mcp-config","--mcp-config",'{"mcpServers":{}}',"--setting-sources","","--settings",'{"disableAllHooks":true,"enabledPlugins":{}}',"--disable-slash-commands","--no-chrome","--permission-mode","dontAsk","--permission-prompts","none","--no-session-persistence","--system-prompt",system] };
   const data = { start,claim:{sessionID:session,singleAttempt:true,noRetry:true},process:{sessionID:session,pid:123},terminal:{nativeExit:0,inputSHA256:inputSHA,sessionID:session},raw,report,system,material,launcher,cli };
   const admission = { key:"one",kind:"trusted-cli-journal/v1",purpose:"independent_implementation_review",repository:FORK,pullRequest:1,headSha:HEAD,sourceInputSHA256:digest(canonical(source)),cliSHA256:digest(cli),cliInvocationPath:"/fixture/actual-cli",implementationSessionID:"different-implementation-session",artifacts:{} };
-  let registrySHA;const extraEntries=[];
+  let registrySHA;const extraEntries=[],artifactPaths={};
   const seal = () => {
     const bytes = (name) => typeof data[name] === "string" ? Buffer.from(data[name]) : Buffer.from(JSON.stringify(data[name]));
     data.terminal.rawSHA256 = digest(bytes("raw"));
-    for(const name of Object.keys(data)) { const b=bytes(name);writeFileSync(path.join(root,name),b,{mode:0o600});admission.artifacts[name]={path:name,sha256:digest(b)}; }
+    for(const name of Object.keys(data)) { const b=bytes(name),relative=artifactPaths[name]??name,target=path.join(root,relative);
+      if(artifactPaths[name])assert.deepEqual(readFileSync(target),b);
+      else writeFileSync(target,b,{mode:0o600});
+      admission.artifacts[name]={path:relative,sha256:digest(b)}; }
     const b=Buffer.from(JSON.stringify({schema:"paperclip.operator-review-registry/v1",entries:[admission,...extraEntries]}));writeFileSync(path.join(root,"registry.json"),b,{mode:0o600});registrySHA=digest(b);
   };seal();
   const pointer={admissionKey:"one",pullRequest:1,headSha:HEAD,dispositions:[{sourceID:`independent_review:${digest(report)}`,sourceVersion:digest(report),bodySHA256:digest(report),disposition:"not_a_finding",reason:"The complete report contains no remaining finding",evidence:"sample.mjs:1"}]};
@@ -375,7 +378,7 @@ function forkFixture() {
   routes[`${prefix}/compare/master...${HEAD}`]={behind_by:0,merge_base_commit:{sha:BASE}};
   const view={headRefOid:HEAD,reviewDecision:"",statusCheckRollup:[{__typename:"CheckRun",name:"ci",status:"COMPLETED",conclusion:"SUCCESS"}]};
   const reads=[];
-  return {directory,root,data,admission,extraEntries,source,pointer,seal,pr,ci,routes,view,reads,evidence,
+  return {directory,root,data,admission,extraEntries,artifactPaths,source,pointer,seal,pr,ci,routes,view,reads,evidence,
     options:()=>({review_evidence:evidence,trusted_review_root:root,trusted_review_registry_sha256:registrySHA}),
     admissionArgs:()=>({trustedRoot:root,registrySHA256:registrySHA,repository:FORK,pullRequest:1,headSha:HEAD,source,pointer,checkoutRoot:path.dirname(new URL(import.meta.url).pathname)}),
     deps:{getJson:(route)=>{reads.push(route);assert.ok(Object.hasOwn(routes,route),route);return structuredClone(routes[route]);},viewPullRequest:()=>structuredClone(view)},
@@ -741,8 +744,8 @@ function v2JournalFixture() {
  return f;
 }
 
-function readJournalFixture() {
- const f=forkFixture(), dependency="export const dependency = 1;\n", depBlob=hashBlob(dependency), prefix=`repos/${FORK}`;
+function readJournalFixture({tempRoot=os.tmpdir()}={}) {
+ const f=forkFixture({tempRoot}), dependency="export const dependency = 1;\n", depBlob=hashBlob(dependency), prefix=`repos/${FORK}`;
  f.source.dependencyFiles.push({path:"dependency.mjs",blobSha:depBlob,content:dependency});
  f.pointer.dependencies=["dependency.mjs"];
  writeFileSync(f.evidence,JSON.stringify({schema:"paperclip.review-pointer/v1",repository:FORK,entries:[f.pointer]}));
@@ -778,6 +781,84 @@ function readJournalFixture() {
  f.seal();
  return {f,corpus,events,cwd,refresh(){f.data.stream=events.map(event=>JSON.stringify(event)).join("\n")+"\n";f.data.terminal.streamSHA256=digest(f.data.stream);f.seal();}};
 }
+// Use the public writer's files and pre-inventory as the actual admission
+// inputs. The receiver computes its own current inventory from the filesystem.
+function emittedReadJournalFixture({tempRoot=os.tmpdir()}={}) {
+ const x=readJournalFixture({tempRoot}),{f,events,corpus}=x,oldCwd=x.cwd;
+ rmSync(path.join(f.root,"corpus"),{recursive:true});
+ const output=path.join(f.root,"packet-one");
+ sourceCodec.emitReadCorpus(f.source,output,{checkoutRoot:process.cwd()});
+ const cwd=realpathSync(path.join(output,"corpus"));
+ for(let i=0;i<events.length;i++)events[i]=JSON.parse(JSON.stringify(events[i]).replaceAll(oldCwd,cwd));
+ f.data.manifest=readFileSync(path.join(output,"manifest.json"),"utf8");
+ f.data.material=readFileSync(path.join(output,"material.md"),"utf8");
+ f.data.corpusPre=readFileSync(path.join(output,"corpus-pre.json"),"utf8");
+ f.data.corpusPost=JSON.parse(f.data.corpusPre);
+ f.data.start.cwd=cwd;
+ f.data.start.argv[f.data.start.argv.indexOf("--settings")+1]=readReviewSettings(f.data.start,corpus);
+ const combined=Buffer.concat([Buffer.from(f.data.system),Buffer.from([0]),Buffer.from(f.data.material)]);
+ f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(combined);f.data.start.combinedBytes=combined.length;
+ Object.assign(f.artifactPaths,{manifest:"packet-one/manifest.json",material:"packet-one/material.md",corpusPre:"packet-one/corpus-pre.json"});
+ x.cwd=cwd;x.refresh();
+ return {...x,output};
+}
+test("emitted Read packet reaches the actual admitted receiver",()=>{
+ const x=emittedReadJournalFixture();try{
+   const review=admitTrustedJournal(x.f.admissionArgs());
+   assert.equal(review.status,"valid",JSON.stringify(review));
+   assert.equal(review.deliveredFiles,x.corpus.files.length);
+ }finally{x.f.close();}
+});
+test("emitted Read packets for two candidates share one pinned registry",()=>{
+ const x=emittedReadJournalFixture(),{f,corpus}=x;try{
+   const output=path.join(f.root,"packet-two");sourceCodec.emitReadCorpus(f.source,output,{checkoutRoot:process.cwd()});
+   const cwd=realpathSync(path.join(output,"corpus")),session="22222222-2222-4222-8222-222222222222";
+   const data=structuredClone(f.data),oldSession=f.data.start.sessionID;
+   data.manifest=readFileSync(path.join(output,"manifest.json"),"utf8");
+   data.material=readFileSync(path.join(output,"material.md"),"utf8");
+   data.corpusPre=readFileSync(path.join(output,"corpus-pre.json"),"utf8");data.corpusPost=JSON.parse(data.corpusPre);
+   data.start.cwd=cwd;data.start.sessionID=data.claim.sessionID=data.process.sessionID=data.terminal.sessionID=data.raw.session_id=session;
+   data.attempts.attempts[0].sessionID=session;
+   data.start.argv=data.start.argv.map(value=>value===oldSession?session:value);
+   data.start.argv[data.start.argv.indexOf("--settings")+1]=readReviewSettings(data.start,corpus);
+   data.stream=data.stream.replaceAll(x.cwd,cwd).replaceAll(oldSession,session);
+   const combined=Buffer.concat([Buffer.from(data.system),Buffer.from([0]),Buffer.from(data.material)]);
+   data.start.combinedSHA256=data.terminal.inputSHA256=digest(combined);data.start.combinedBytes=combined.length;
+   data.terminal.rawSHA256=digest(JSON.stringify(data.raw));data.terminal.streamSHA256=digest(data.stream);
+   const entry=structuredClone(f.admission);entry.key="two";entry.pullRequest=2;entry.implementationSessionID="second-implementation-session";entry.artifacts={};
+   const evidence=path.join(output,"evidence");mkdirSync(evidence,{mode:0o700});
+   for(const [name,value] of Object.entries(data)){
+     const bytes=Buffer.from(typeof value==="string"?value:JSON.stringify(value));
+     const relative=["manifest","material","corpusPre"].includes(name)?`packet-two/${{manifest:"manifest.json",material:"material.md",corpusPre:"corpus-pre.json"}[name]}`:`packet-two/evidence/${name}`;
+     const target=path.join(f.root,relative);
+     if(["manifest","material","corpusPre"].includes(name))assert.deepEqual(readFileSync(target),bytes);
+     else writeFileSync(target,bytes,{mode:0o600});
+     entry.artifacts[name]={path:relative,sha256:digest(bytes)};
+   }
+   f.extraEntries.push(entry);f.seal();
+   const first=admitTrustedJournal(f.admissionArgs());
+   const second=admitTrustedJournal({...f.admissionArgs(),pullRequest:2,pointer:{admissionKey:"two",pullRequest:2,headSha:HEAD}});
+   assert.equal(first.status,"valid",JSON.stringify(first));assert.equal(second.status,"valid",JSON.stringify(second));
+   chmodSync(path.join(output,"corpus",corpus.files[0].path),0o600);
+   assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
+   assert.deepEqual(admitTrustedJournal({...f.admissionArgs(),pullRequest:2,pointer:{admissionKey:"two",pullRequest:2,headSha:HEAD}}),
+     {status:"invalid",code:"independent_review_invalid",subcode:"corpus_inventory"});
+ }finally{x.f.close();}
+});
+test("emitted Read packet rejects a writable packet parent",()=>{
+ const x=emittedReadJournalFixture();try{
+   chmodSync(x.output,0o770);
+   assert.deepEqual(admitTrustedJournal(x.f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"corpus_inventory"});
+ }finally{x.f.close();}
+});
+test("emitted Read packet through /tmp alias records canonical corpus root",()=>{
+ assert.notEqual(realpathSync("/tmp"),"/tmp","this test requires a real /tmp symlink alias");
+ const x=emittedReadJournalFixture({tempRoot:"/tmp"});try{
+   assert.equal(JSON.parse(readFileSync(path.join(x.output,"corpus-pre.json"),"utf8")).root,x.cwd);
+   const review=admitTrustedJournal(x.f.admissionArgs());assert.equal(review.status,"valid",JSON.stringify(review));
+ }finally{x.f.close();}
+});
 test("read journal old kind fails and new pinned kind reaches real readiness with full reconstructed source",async()=>{
  const x=readJournalFixture(),{f,corpus}=x;try{
    assert.deepEqual(corpus.files.map(file=>({path:file.path,mode:statSync(path.join(x.cwd,file.path)).mode&0o777,nlink:statSync(path.join(x.cwd,file.path)).nlink,type:"file",sha256:digest(readFileSync(path.join(x.cwd,file.path)))})),f.data.corpusPre.files);

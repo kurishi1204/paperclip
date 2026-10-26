@@ -480,25 +480,28 @@ function readCorpusInventory(root, files) {
 export function emitReadCorpus(source, output, {checkOnly=false, checkoutRoot=path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..")}={}) {
   ensure(typeof checkOnly === "boolean", "check_only_boolean");
   ensure(typeof output === "string" && path.isAbsolute(output) && path.normalize(output) === output && output !== "-", "review_output_required");
-  ensure(!fs.existsSync(output), "review_output_exists");
-  outsideCheckoutOutput(checkoutRoot,output,"review_output_inside_checkout");
+  // Resolve an existing parent once. The emitted pre-inventory and the reader
+  // must name the same physical directory even through /tmp-style aliases.
+  const canonicalOutput = path.join(fs.realpathSync(path.dirname(output)),path.basename(output));
+  ensure(!fs.existsSync(canonicalOutput), "review_output_exists");
+  outsideCheckoutOutput(checkoutRoot,canonicalOutput,"review_output_inside_checkout");
   const corpus = readCorpusManifest(source);
   const manifestBytes = Buffer.from(`${canonical(corpus.manifest)}\n`);
   const materialBytes = Buffer.from(`Review every listed corpus file before the final judgment.\n${readCorpusManifestBlock(source)}\n`);
-  const profile = { schema:"paperclip.read-corpus-emission/v1", output, corpusRoot:path.join(output,"corpus"),
+  const profile = { schema:"paperclip.read-corpus-emission/v1", output:canonicalOutput, corpusRoot:path.join(canonicalOutput,"corpus"),
     manifestSHA256:digest(manifestBytes), materialSHA256:digest(materialBytes), logicalSourceSHA256:corpus.manifest.logicalSourceSHA256,
     fileCount:corpus.files.length, files:corpus.manifest.files.map(({path:name,role,sourcePath,bytes,sha256})=>({path:name,role,sourcePath,bytes,sha256})),
     lineProfileMaxDisplayBytes:READ_MAX_DISPLAY_LINE_BYTES, state:checkOnly ? "CHECK_ONLY_NO_FILES_WRITTEN" : "EMITTED" };
   if (checkOnly) return profile;
-  fs.mkdirSync(output,{mode:0o700});
-  const corpusRoot = path.join(output,"corpus");
+  fs.mkdirSync(canonicalOutput,{mode:0o700});
+  const corpusRoot = path.join(canonicalOutput,"corpus");
   fs.mkdirSync(corpusRoot,{mode:0o700});
   fs.mkdirSync(path.join(corpusRoot,"assets"),{mode:0o700});
   for (const file of corpus.files) fs.writeFileSync(path.join(corpusRoot,file.path),file.content,{flag:"wx",mode:0o400});
-  fs.writeFileSync(path.join(output,"manifest.json"),manifestBytes,{flag:"wx",mode:0o400});
-  fs.writeFileSync(path.join(output,"material.md"),materialBytes,{flag:"wx",mode:0o400});
+  fs.writeFileSync(path.join(canonicalOutput,"manifest.json"),manifestBytes,{flag:"wx",mode:0o400});
+  fs.writeFileSync(path.join(canonicalOutput,"material.md"),materialBytes,{flag:"wx",mode:0o400});
   const pre = readCorpusInventory(corpusRoot,corpus.files);
-  fs.writeFileSync(path.join(output,"corpus-pre.json"),`${canonical(pre)}\n`,{flag:"wx",mode:0o400});
+  fs.writeFileSync(path.join(canonicalOutput,"corpus-pre.json"),`${canonical(pre)}\n`,{flag:"wx",mode:0o400});
   return profile;
 }
 
@@ -671,6 +674,19 @@ function secureRead(file, root) {
   ensure(info.isFile() && !info.isSymbolicLink() && info.uid === process.getuid() && !(info.mode & 0o022), "journal_permissions");
   return fs.readFileSync(resolved);
 }
+function secureCorpusParent(root, manifestPath) {
+  const parent = path.dirname(path.resolve(root, manifestPath));
+  ensure(inside(root, parent), "corpus_inventory");
+  let current = root;
+  for (const part of path.relative(root, parent).split(path.sep).filter(Boolean)) {
+    ensure(part !== "..", "corpus_inventory");
+    current = path.join(current, part);
+    const info = fs.lstatSync(current);
+    ensure(info.isDirectory() && !info.isSymbolicLink() && info.uid === process.getuid() && !(info.mode & 0o077), "corpus_inventory");
+  }
+  ensure(fs.realpathSync(parent) === parent, "corpus_inventory");
+  return parent;
+}
 
 
 // The pointer contains no authority. Only a separately operator-configured,
@@ -735,7 +751,10 @@ export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, p
       const actualBlock = materialText.slice(materialText.indexOf(READ_SOURCE_BEGIN),materialText.indexOf(READ_SOURCE_END)+READ_SOURCE_END.length);
       ensure(actualBlock === readCorpusManifestBlock(source), "source_not_in_launch_input");
       ensure(bytes("manifest").toString("utf8") === `${canonical(corpus.manifest)}\n`, "review_source_binding");
-      const corpusRoot = path.join(root,"corpus");
+      // The selected, hash-checked manifest identifies this packet's directory.
+      // Multiple Read entries can therefore share a registry without sharing a
+      // corpus or adding an unchecked path field to the entry.
+      const corpusRoot = path.join(secureCorpusParent(root,entry.artifacts.manifest.path),"corpus");
       ensure(start.cwd === corpusRoot && fs.realpathSync(corpusRoot) === corpusRoot, "corpus_inventory");
       const current = readCorpusInventory(corpusRoot,corpus.files);
       const pre = JSON.parse(bytes("corpusPre")), post = JSON.parse(bytes("corpusPost"));
