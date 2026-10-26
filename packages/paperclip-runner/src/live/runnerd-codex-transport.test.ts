@@ -4845,7 +4845,33 @@ it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
         const retired = rotations[0]!;
         const attachedEvent = retired.committedEvents.find(
           (entry) => entry.sourceEventId === heldEvent!.sourceEventId,
-        )!;
+        );
+        if (!attachedEvent) {
+          const persisted = await readRunner().catch(() => null);
+          const transition = core.store.state.warmTransition;
+          const completed = core.store.state.completedWarmTransition;
+          throw new Error(`missing committed run.attached: ${JSON.stringify({
+            mode,
+            oldRunId: oldIdentity.runId,
+            currentRunId: core.store.state.identity.runId,
+            heldSourceEventId: heldEvent!.sourceEventId,
+            retiredAckedSourceSeq: retired.ackedSourceSeq,
+            retiredCommitted: retired.committedEvents.map((entry) => ({
+              sourceEventId: entry.sourceEventId,
+              eventType: entry.eventType,
+              sourceSeq: entry.sourceSeq,
+            })),
+            receiptPhase: transition?.phase ?? (completed ? "completed" : null),
+            receiptOldAckedSourceSeq:
+              transition?.receipt.oldAckedSourceSeq ??
+              completed?.receipt.oldAckedSourceSeq ?? null,
+            currentAckedSourceSeq: core.store.state.ackedSourceSeq,
+            effectDeliveries:
+              effects.get(heldEvent!.sourceEventId)?.deliveries ?? null,
+            persistedRunId: persisted?.runId ?? null,
+            persistedAckedSourceSeq: persisted?.ackedSourceSeq ?? null,
+          })}`);
+        }
         expect(attachedEvent.logicalEffectCount).toBe(1);
         expect(retired.ackedSourceSeq).toBeGreaterThanOrEqual(
           attachedEvent.sourceSeq,

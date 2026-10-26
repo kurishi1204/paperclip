@@ -2778,6 +2778,211 @@ describe("DurablePrpControlPlane", () => {
     }
   });
 
+  it.each(["control", "lost-ack"] as const)(
+    "recovers a failed old event commit before warm result and activation across %s",
+    async (mode) => {
+      const root = mkdtempSync(resolve(tmpdir(), "paperclip-prp-event-result-order-"));
+      let releaseCommit!: () => void;
+      let enteredCommit!: () => void;
+      const commitGate = new Promise<void>((resolveCommit) => { releaseCommit = resolveCommit; });
+      const commitEntered = new Promise<void>((resolveEntered) => { enteredCommit = resolveEntered; });
+      let effectCount = 0;
+      let deliveryCount = 0;
+      const onCommittedEvent: NonNullable<ConstructorParameters<typeof DurablePrpControlPlane>[0]["onCommittedEvent"]> =
+        async (event) => {
+          if (event.sourceEventId !== "semantic-event-1") return;
+          deliveryCount += 1;
+          if (deliveryCount === 1) {
+            effectCount += 1;
+            enteredCommit();
+            await commitGate;
+            if (mode === "lost-ack") throw new Error("fixture lost ACK after external effect");
+          }
+        };
+      const makeCore = () => new DurablePrpControlPlane({
+        stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest, onCommittedEvent,
+      });
+      let core = makeCore();
+      const nextIdentity = {
+        ...identity,
+        runId: "00000000-0000-4000-8000-000000000002",
+        turnId: "turn-event-result-2",
+        itemId: "item-event-result-2",
+      };
+      let admittedFrames = 0;
+      const attachWire = core.attachWireConnection.bind(core);
+      const wireSpy = vi.spyOn(core, "attachWireConnection").mockImplementation((wire) =>
+        attachWire({
+          onJson: (listener) => wire.onJson((value) => { admittedFrames += 1; listener(value); }),
+          onClose: wire.onClose.bind(wire),
+          close: wire.close.bind(wire),
+          sendJson: wire.sendJson.bind(wire),
+        }),
+      );
+      let client: AuthenticatedClient | null = null;
+      let replay: AuthenticatedClient | null = null;
+      let eventReplay: AuthenticatedClient | null = null;
+      let successor: AuthenticatedClient | null = null;
+      try {
+        await core.start();
+        client = await authenticate(core, core.issueBootstrapTicket());
+        expect(client).not.toBeNull();
+        const leaseToken = client!.leaseToken!;
+        const command = core.queueCommand("run.attach", {
+          paperclipNextAuthority: {
+            identity: nextIdentity,
+            connection: { mode: "connect", connectUrl: core.connectUrl },
+          },
+        }, "command-event-result-order", true);
+        await expect(receiveSecure(client!)).resolves.toMatchObject({ kind: "command" });
+
+        const event = semanticInputEvent(1);
+        event.payload = {
+          ...(event.payload as Record<string, unknown>),
+          eventType: "item.delta",
+          priority: 2,
+          payload: { delta: "before attach result" },
+        };
+        expect(validatePrpEvent(event.payload)).toMatchObject({ ok: true });
+        const result = {
+          protocol: "paperclip.runner", version: 1, kind: "command_result",
+          payload: {
+            commandId: command.commandId,
+            commandType: command.type,
+            controllerSeq: command.controllerSeq,
+            status: "completed",
+            result: { attached: true },
+          },
+        };
+        const beforeFrames = admittedFrames;
+        sendSecure(client!, event);
+        await commitEntered;
+        sendSecure(client!, result);
+        await vi.waitFor(() => expect(admittedFrames).toBe(beforeFrames + 2));
+        expect(core.store.state.commands[0]?.status).toBe("pending");
+        if (mode === "lost-ack") core.disconnectActiveRunner();
+        releaseCommit();
+        await core.stop();
+        await core.drainPendingConnectionProcessing();
+
+        const beforeRotate = structuredClone(core.store.state);
+        core = makeCore();
+        await core.start();
+        expect(beforeRotate.identity).toEqual(identity);
+        if (mode === "lost-ack") {
+          expect(beforeRotate.commands[0]?.status).toBe("pending");
+          expect(beforeRotate.warmTransition).toBeUndefined();
+          expect(beforeRotate.ackedSourceSeq).toBe(0);
+          expect(beforeRotate.committedEvents).toEqual([]);
+        } else {
+          expect(beforeRotate.commands[0]?.status).toBe("completed");
+          expect(beforeRotate.warmTransition?.phase).toBe("prepared");
+          core.rotateRunIdentity(nextIdentity);
+        }
+
+        client!.socket.destroy();
+        replay = await authenticate(core, leaseToken, identity);
+        const replayAuthenticated = replay !== null;
+        let replayResultAck = false;
+        let replayEventAck = false;
+        if (replay) {
+          if (mode === "lost-ack") {
+            sendSecure(replay, event);
+            replayEventAck = (await receiveSecure(replay))?.kind === "ack";
+            sendSecure(replay, result);
+            replayResultAck = (await receiveSecure(replay))?.kind === "command_result_ack";
+          } else {
+            sendSecure(replay, result);
+            replayResultAck = (await receiveSecure(replay))?.kind === "command_result_ack";
+            sendSecure(replay, event);
+            replayEventAck = (await receiveSecure(replay))?.kind === "ack";
+          }
+          replay.socket.destroy();
+        }
+        let eventOnlyReplayAck: boolean | null = null;
+        if (mode === "control") {
+          eventReplay = await authenticate(core, leaseToken, identity);
+          if (eventReplay) {
+            sendSecure(eventReplay, event);
+            eventOnlyReplayAck = (await receiveSecure(eventReplay))?.kind === "ack";
+            eventReplay.socket.destroy();
+          }
+        }
+        const afterReplay = structuredClone(core.store.state);
+        if (mode === "lost-ack") core.rotateRunIdentity(nextIdentity);
+        const afterRotate = structuredClone(core.store.state);
+        const oldReceipt = afterRotate.warmTransition?.receipt;
+        expect(afterRotate.identity).toEqual(identity);
+        expect(oldReceipt).toBeDefined();
+
+        successor = await authenticate(core, leaseToken, nextIdentity,
+          expectedRunnerDigest, oldReceipt!.transitionId);
+        let activationAck = false;
+        if (successor) {
+          sendSecure(successor, {
+            protocol: "paperclip.runner", version: 1,
+            kind: "warm_transition_activated",
+            payload: { transitionId: oldReceipt!.transitionId },
+          });
+          activationAck = (await receiveSecure(successor))?.kind === "warm_transition_activated_ack";
+        }
+        const afterActivation = structuredClone(core.store.state);
+        const observation = {
+          mode,
+          preRotate: {
+            commandStatus: beforeRotate.commands[0]?.status,
+            phase: beforeRotate.warmTransition?.phase,
+            oldAckedSourceSeq: beforeRotate.warmTransition?.receipt.oldAckedSourceSeq ?? null,
+            ackedSourceSeq: beforeRotate.ackedSourceSeq,
+            committedSourceIds: beforeRotate.committedEvents.map((entry) => entry.sourceEventId),
+          },
+          afterReplay: {
+            authenticated: replayAuthenticated,
+            resultAck: replayResultAck,
+            eventAck: replayEventAck,
+            eventOnlyAuthenticated: eventReplay !== null,
+            eventOnlyAck: eventOnlyReplayAck,
+            oldAckedSourceSeq: afterReplay.warmTransition?.receipt.oldAckedSourceSeq ?? null,
+            ackedSourceSeq: afterReplay.ackedSourceSeq,
+            committedSourceIds: afterReplay.committedEvents.map((entry) => entry.sourceEventId),
+          },
+          afterActivation: {
+            authenticated: successor !== null,
+            activationAck,
+            phase: afterActivation.warmTransition?.phase ?? null,
+            completedReceipt: afterActivation.completedWarmTransition?.receipt.transitionId ?? null,
+            committedSourceIds: afterActivation.committedEvents.map((entry) => entry.sourceEventId),
+          },
+          effectCount,
+          deliveryCount,
+        };
+        console.log(`prp_event_result_order_observation ${JSON.stringify(observation)}`);
+        expect(effectCount).toBe(1);
+        expect(activationAck).toBe(true);
+        expect(replayResultAck).toBe(true);
+        if (mode === "control") {
+          expect(beforeRotate.committedEvents[0]?.sourceEventId).toBe("semantic-event-1");
+        } else {
+          expect(replayEventAck).toBe(true);
+          expect(deliveryCount).toBe(2);
+          expect(afterReplay.committedEvents[0]?.sourceEventId).toBe("semantic-event-1");
+          expect(afterReplay.ackedSourceSeq).toBe(1);
+        }
+        expect(oldReceipt?.oldAckedSourceSeq).toBe(1);
+      } finally {
+        releaseCommit();
+        client?.socket.destroy();
+        replay?.socket.destroy();
+        eventReplay?.socket.destroy();
+        successor?.socket.destroy();
+        wireSpy.mockRestore();
+        await core.stop();
+        await core.drainPendingConnectionProcessing();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it.each([
     "activate",
     "activate-v2",

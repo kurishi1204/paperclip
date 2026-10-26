@@ -44,9 +44,86 @@ interface TestContext {
 
 interface IssueRunLockState {
   companyId: string;
+  status: string | null;
   assigneeAgentId: string | null;
   checkoutRunId: string | null;
   executionRunId: string | null;
+  currentStageType: string | null;
+}
+
+function diagnosticRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+// Failure output may reach CI logs. Only fixed-shape identifiers, status codes,
+// timestamps, and issue-ID comparisons may cross this boundary.
+function diagnosticId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+    ? value : "<non-uuid>";
+}
+
+const DIAGNOSTIC_CODES = new Set([
+  "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
+  "review", "approval", "queued", "running", "succeeded", "failed",
+  "timed_out", "scheduled_retry", "claimed", "coalesced", "skipped",
+  "completed", "deferred_issue_execution", "legacy", "native",
+  "timer", "assignment", "on_demand", "automation", "other",
+  "issue_execution_deferred", "chat_task_completed", "issue_assigned",
+  "issue_blockers_resolved", "issue_commented", "issue_comment_mentioned",
+  "issue_dependencies_blocked", "issue_tree_hold_active", "missing_issue_comment",
+  "process_lost_retry", "run_liveness_continuation", "heartbeat.disabled",
+  "heartbeat.timer.no_actionable_work", "heartbeat.wakeOnDemand.disabled",
+]);
+
+function diagnosticCode(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  return DIAGNOSTIC_CODES.has(value) ? value : "<other>";
+}
+
+function diagnosticTime(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? new Date(time).toISOString() : null;
+}
+
+function issueRelation(value: unknown, issueId: string): "same" | "different" | "missing" {
+  return typeof value !== "string" ? "missing" : value === issueId ? "same" : "different";
+}
+
+function projectRunCandidate(lookupId: string, status: number, body: unknown, issueId: string) {
+  const run = diagnosticRecord(body);
+  const context = diagnosticRecord(run?.contextSnapshot);
+  const paperclipIssue = diagnosticRecord(context?.paperclipIssue);
+  return {
+    lookupId: diagnosticId(lookupId),
+    responseStatus: status,
+    id: diagnosticId(run?.id),
+    agentId: diagnosticId(run?.agentId),
+    status: diagnosticCode(run?.status),
+    runtimeMode: diagnosticCode(run?.runtimeMode),
+    wakeupRequestId: diagnosticId(run?.wakeupRequestId),
+    nativeIssueId: diagnosticId(run?.nativeIssueId),
+    nativeIssueRelation: issueRelation(run?.nativeIssueId, issueId),
+    contextIssueRelation: issueRelation(context?.issueId, issueId),
+    contextTaskRelation: issueRelation(context?.taskId, issueId),
+    contextTaskKeyRelation: issueRelation(context?.taskKey, issueId),
+    contextPaperclipIssueRelation: issueRelation(paperclipIssue?.id, issueId),
+    contextWakeReason: diagnosticCode(context?.wakeReason),
+    createdAt: diagnosticTime(run?.createdAt),
+  };
+}
+
+function projectIssueRunLock(lock: IssueRunLockState | null) {
+  return lock && {
+    status: diagnosticCode(lock.status),
+    assigneeAgentId: diagnosticId(lock.assigneeAgentId),
+    executionRunId: diagnosticId(lock.executionRunId),
+    checkoutRunId: diagnosticId(lock.checkoutRunId),
+    currentStageType: diagnosticCode(lock.currentStageType),
+  };
 }
 
 /** Create an authenticated APIRequestContext for an agent (token set, no run ID yet). */
@@ -63,6 +140,7 @@ async function invokeHeartbeat(
   agentId: string,
   issueId: string,
 ): Promise<string> {
+  const invokeStartedAt = Date.now();
   const res = await board.post(`${BASE_URL}/api/agents/${agentId}/heartbeat/invoke`, {
     data: {
       reason: "issue_assigned",
@@ -70,8 +148,29 @@ async function invokeHeartbeat(
     },
   });
   expect(res.ok()).toBe(true);
-  const run = await res.json();
-  if (typeof run.id === "string" && run.id.length > 0) return run.id;
+  const run = diagnosticRecord(await res.json());
+  if (typeof run?.id === "string" && run.id.length > 0) return run.id;
+
+  type CandidateObservation = ReturnType<typeof projectRunCandidate>;
+  const observedCandidates = new Map<string, { first: CandidateObservation; latest: CandidateObservation; reads: number }>();
+  const observeCandidate = (id: string, observation: CandidateObservation) => {
+    const previous = observedCandidates.get(id);
+    observedCandidates.set(id, {
+      first: previous?.first ?? observation,
+      latest: observation,
+      reads: (previous?.reads ?? 0) + 1,
+    });
+  };
+  const candidateOrigins = new Map<string, Set<string>>();
+  const markCandidateOrigin = (candidate: unknown, origin: string) => {
+    if (typeof candidate !== "string" || candidate.length === 0) return;
+    const origins = candidateOrigins.get(candidate) ?? new Set<string>();
+    origins.add(origin);
+    candidateOrigins.set(candidate, origins);
+  };
+  const recentListStatuses = new Set<number>();
+  let recentListInvalidShape = false;
+  let lockAtStart: IssueRunLockState | null = null;
 
   // A stage transition can already be replacing the previous executor's run
   // with the participant's queued run. If the legacy invoke is skipped and
@@ -80,6 +179,7 @@ async function invokeHeartbeat(
   const deadline = Date.now() + 3_000;
   do {
     const issueRunLock = await getIssueRunLockState(board, issueId);
+    lockAtStart ??= issueRunLock;
     if (issueRunLock.assigneeAgentId !== agentId) {
       // Negative authorization cases intentionally invoke a non-participant.
       // Preserve the server rejection instead of waiting for a run that must
@@ -87,27 +187,40 @@ async function invokeHeartbeat(
       return issueRunLock.executionRunId ?? issueRunLock.checkoutRunId ?? "";
     }
     const candidates = new Set<string>([
-      run.executionRunId,
+      run?.executionRunId,
       issueRunLock.executionRunId,
       issueRunLock.checkoutRunId,
-    ].filter((candidate): candidate is string => Boolean(candidate)));
+    ].filter((candidate): candidate is string => typeof candidate === "string" && candidate.length > 0));
+    markCandidateOrigin(run?.executionRunId, "invoke.executionRunId");
+    markCandidateOrigin(issueRunLock.executionRunId, "lock.executionRunId");
+    markCandidateOrigin(issueRunLock.checkoutRunId, "lock.checkoutRunId");
     const recentRunsRes = await board.get(
       `${BASE_URL}/api/companies/${issueRunLock.companyId}/heartbeat-runs?agentId=${agentId}&limit=20`,
     );
+    recentListStatuses.add(recentRunsRes.status());
     if (recentRunsRes.ok()) {
       const recentRuns = await recentRunsRes.json();
+      if (!Array.isArray(recentRuns)) recentListInvalidShape = true;
       for (const recentRun of Array.isArray(recentRuns) ? recentRuns : []) {
-        if (typeof recentRun.id === "string") candidates.add(recentRun.id);
+        const recentRunId = diagnosticRecord(recentRun)?.id;
+        if (typeof recentRunId === "string") {
+          candidates.add(recentRunId);
+          markCandidateOrigin(recentRunId, "reviewer.recentRuns");
+        }
       }
     }
     for (const candidate of candidates) {
       const runRes = await board.get(`${BASE_URL}/api/heartbeat-runs/${candidate}`);
-      if (!runRes.ok()) continue;
-      const candidateRun = await runRes.json();
-      const context = candidateRun.contextSnapshot ?? {};
+      if (!runRes.ok()) {
+        observeCandidate(candidate, projectRunCandidate(candidate, runRes.status(), null, issueId));
+        continue;
+      }
+      const candidateRun = diagnosticRecord(await runRes.json());
+      observeCandidate(candidate, projectRunCandidate(candidate, runRes.status(), candidateRun, issueId));
+      const context = diagnosticRecord(candidateRun?.contextSnapshot);
       if (
-        candidateRun.agentId === agentId &&
-        (context.issueId === issueId || context.taskId === issueId)
+        candidateRun?.agentId === agentId &&
+        (context?.issueId === issueId || context?.taskId === issueId)
       ) {
         return candidate;
       }
@@ -115,7 +228,66 @@ async function invokeHeartbeat(
     await new Promise((resolve) => setTimeout(resolve, 50));
   } while (Date.now() < deadline);
 
-  throw new Error(`No issue-bound heartbeat run became available for agent ${agentId}`);
+  let lockAtDeadline: IssueRunLockState | null = null;
+  try { lockAtDeadline = await getIssueRunLockState(board, issueId); } catch { /* Retain the original timeout failure. */ }
+  let wakeReceipt: Record<string, unknown> = { state: "unavailable", responseStatus: null };
+  try {
+    // This board-readable route is issue-scoped and returns a bounded,
+    // redacted projection. It does not expose raw wake payload.issueId.
+    const wakeRes = await board.get(`${BASE_URL}/api/issues/${issueId}/diagnostics/wakes`);
+    if (wakeRes.ok()) {
+      const diagnostic = diagnosticRecord(await wakeRes.json());
+      const events = Array.isArray(diagnostic?.events) ? diagnostic.events : [];
+      const caps = diagnosticRecord(diagnostic?.caps);
+      wakeReceipt = {
+        state: "read",
+        responseStatus: wakeRes.status(),
+        eventsShape: Array.isArray(diagnostic?.events) ? "array" : "missing_or_invalid",
+        wakeRequestCount: typeof diagnostic?.wakeRequestCount === "number" ? diagnostic.wakeRequestCount : null,
+        truncated: typeof diagnostic?.truncated === "boolean" ? diagnostic.truncated : null,
+        maxWakeRequests: typeof caps?.maxWakeRequests === "number" ? caps.maxWakeRequests : null,
+        lookbackDays: typeof caps?.lookbackDays === "number" ? caps.lookbackDays : null,
+        issueScope: "route_bound",
+        payloadIssueId: "not_exposed_by_route",
+        events: events.flatMap((value) => {
+          const event = diagnosticRecord(value);
+          if (event?.kind !== "wake_request") return [];
+          const requestedAt = diagnosticTime(event.requestedAt);
+          if (requestedAt && Date.parse(requestedAt) < invokeStartedAt) return [];
+          return [{
+            agentId: diagnosticId(event.agentId),
+            matchesInvokedAgent: event.agentId === agentId,
+            runId: diagnosticId(event.runId),
+            source: diagnosticCode(event.source),
+            status: diagnosticCode(event.status),
+            reason: diagnosticCode(event.reason),
+            requestedAt,
+            failureClass: diagnosticCode(event.failureClass),
+          }];
+        }),
+      };
+    } else wakeReceipt = { state: "http_error", responseStatus: wakeRes.status() };
+  } catch { wakeReceipt = { state: "request_failed", responseStatus: null }; }
+
+  throw new Error(`No issue-bound heartbeat run became available: ${JSON.stringify({
+    invokedAgentId: diagnosticId(agentId),
+    issueId: diagnosticId(issueId),
+    invoke: {
+      responseStatus: res.status(),
+      bodyId: diagnosticId(run?.id),
+      bodyStatus: diagnosticCode(run?.status),
+      bodyReason: diagnosticCode(run?.reason),
+      bodyExecutionRunId: diagnosticId(run?.executionRunId),
+    },
+    lockAtStart: projectIssueRunLock(lockAtStart),
+    lockAtDeadline: projectIssueRunLock(lockAtDeadline),
+    recentRunList: { responseStatuses: [...recentListStatuses], invalidShape: recentListInvalidShape },
+    candidates: [...observedCandidates].map(([id, observation]) => ({
+      ...observation,
+      origins: [...(candidateOrigins.get(id) ?? [])],
+    })),
+    wakeReceipt,
+  })}`);
 }
 
 async function getIssueRunLockState(board: APIRequestContext, issueId: string): Promise<IssueRunLockState> {
@@ -124,9 +296,11 @@ async function getIssueRunLockState(board: APIRequestContext, issueId: string): 
   const issue = await res.json();
   return {
     companyId: issue.companyId,
+    status: issue.status ?? null,
     assigneeAgentId: issue.assigneeAgentId ?? null,
     checkoutRunId: issue.checkoutRunId ?? null,
     executionRunId: issue.executionRunId ?? null,
+    currentStageType: issue.executionState?.currentStageType ?? null,
   };
 }
 

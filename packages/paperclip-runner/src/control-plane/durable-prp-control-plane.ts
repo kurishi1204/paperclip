@@ -1442,6 +1442,7 @@ class AuthorityConnection {
   warmTransitionVersion: 1 | null = null;
   identity: DurableRecoveryIdentity | null = null;
   replayOnly = false;
+  eventCommitFailed = false;
   activationReceipt: DurableWarmRunTransition | null = null;
   readonly wire: PrpWireConnection;
   #closed = false;
@@ -2082,6 +2083,9 @@ export class DurablePrpControlPlane {
     connection: AuthorityConnection,
     wire: unknown,
   ): Promise<void> {
+    // A failed external event commit closes this connection's delivery lane.
+    // Frames already queued on it must not admit a later command result.
+    if (connection.eventCommitFailed) return;
     this.#store.assertWritable();
     let envelope: Record<string, unknown>;
     try {
@@ -3204,6 +3208,7 @@ export class DurablePrpControlPlane {
     try {
       await this.#onCommittedEvent?.(event);
     } catch (error) {
+      connection.eventCommitFailed = true;
       if (error instanceof NativeSessionProtocolIntegrityError) {
         this.#failProtocolIntegrity(connection, error);
       } else {
