@@ -1,4 +1,5 @@
 import { test, expect, request as pwRequest, type APIRequestContext } from "@playwright/test";
+import { createHash } from "node:crypto";
 
 /**
  * E2E: Signoff execution policy flow.
@@ -78,9 +79,25 @@ const DIAGNOSTIC_CODES = new Set([
   "heartbeat.timer.no_actionable_work", "heartbeat.wakeOnDemand.disabled",
 ]);
 
-function diagnosticCode(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  return DIAGNOSTIC_CODES.has(value) ? value : "<other>";
+type DiagnosticCode =
+  | { classification: "classified"; value: string }
+  | { classification: "unclassified"; valueType: string; utf8Bytes?: number; sha256?: string }
+  | { classification: "missing" };
+
+function diagnosticCode(value: unknown, known = DIAGNOSTIC_CODES): DiagnosticCode {
+  if (value === null || value === undefined) return { classification: "missing" };
+  if (typeof value !== "string") {
+    return { classification: "unclassified", valueType: Array.isArray(value) ? "array" : typeof value };
+  }
+  // The route itself uses "other" for redacted codes. Do not count it as an
+  // identified reason or print unknown text merely because it looks like a code.
+  if (value !== "other" && known.has(value)) return { classification: "classified", value };
+  return {
+    classification: "unclassified",
+    valueType: "string",
+    utf8Bytes: Buffer.byteLength(value, "utf8"),
+    sha256: createHash("sha256").update(value, "utf8").digest("hex"),
+  };
 }
 
 function diagnosticTime(value: unknown): string | null {
@@ -91,6 +108,54 @@ function diagnosticTime(value: unknown): string | null {
 
 function issueRelation(value: unknown, issueId: string): "same" | "different" | "missing" {
   return typeof value !== "string" ? "missing" : value === issueId ? "same" : "different";
+}
+
+function diagnosticCounts(values: DiagnosticCode[]) {
+  const counts = { observed: values.length, classified: 0, unclassified: 0, missing: 0 };
+  for (const value of values) counts[value.classification] += 1;
+  return { ...counts, reconciled: counts.observed === counts.classified + counts.unclassified + counts.missing };
+}
+
+function projectWakeEvents(values: unknown[], invokedAgentId: string, invokeStartedAt: number) {
+  const knownKinds = new Set(["wake_request", "activity"]);
+  const timestamp = (value: unknown) => {
+    const at = diagnosticTime(value);
+    return {
+      at,
+      relationToInvoke: at === null ? "unknown"
+        : Date.parse(at) < invokeStartedAt ? "before" : "at_or_after",
+    };
+  };
+  // Preserve every row in the bounded route response, including malformed or
+  // unknown kinds. Server/client clock skew must not silently remove evidence.
+  const events = values.map((value, index) => {
+    const event = diagnosticRecord(value);
+    return {
+      index,
+      recordShape: event ? "object" : "missing_or_invalid",
+      kind: diagnosticCode(event?.kind, knownKinds),
+      agentId: diagnosticId(event?.agentId),
+      matchesInvokedAgent: typeof event?.agentId === "string" ? event.agentId === invokedAgentId : null,
+      runId: diagnosticId(event?.runId),
+      requestedAt: timestamp(event?.requestedAt),
+      createdAt: timestamp(event?.createdAt),
+      codes: {
+        source: diagnosticCode(event?.source),
+        status: diagnosticCode(event?.status),
+        reason: diagnosticCode(event?.reason),
+        failureClass: diagnosticCode(event?.failureClass),
+        action: diagnosticCode(event?.action),
+        entityType: diagnosticCode(event?.entityType),
+        requestedReason: diagnosticCode(event?.requestedReason),
+        previousReason: diagnosticCode(event?.previousReason),
+      },
+    };
+  });
+  return {
+    eventKinds: diagnosticCounts(events.map((event) => event.kind)),
+    codeFields: diagnosticCounts(events.flatMap((event) => Object.values(event.codes))),
+    events,
+  };
 }
 
 function projectRunCandidate(lookupId: string, status: number, body: unknown, issueId: string) {
@@ -244,27 +309,14 @@ async function invokeHeartbeat(
         responseStatus: wakeRes.status(),
         eventsShape: Array.isArray(diagnostic?.events) ? "array" : "missing_or_invalid",
         wakeRequestCount: typeof diagnostic?.wakeRequestCount === "number" ? diagnostic.wakeRequestCount : null,
+        activityRecordCount: typeof diagnostic?.activityRecordCount === "number" ? diagnostic.activityRecordCount : null,
         truncated: typeof diagnostic?.truncated === "boolean" ? diagnostic.truncated : null,
         maxWakeRequests: typeof caps?.maxWakeRequests === "number" ? caps.maxWakeRequests : null,
+        maxActivityRecords: typeof caps?.maxActivityRecords === "number" ? caps.maxActivityRecords : null,
         lookbackDays: typeof caps?.lookbackDays === "number" ? caps.lookbackDays : null,
         issueScope: "route_bound",
         payloadIssueId: "not_exposed_by_route",
-        events: events.flatMap((value) => {
-          const event = diagnosticRecord(value);
-          if (event?.kind !== "wake_request") return [];
-          const requestedAt = diagnosticTime(event.requestedAt);
-          if (requestedAt && Date.parse(requestedAt) < invokeStartedAt) return [];
-          return [{
-            agentId: diagnosticId(event.agentId),
-            matchesInvokedAgent: event.agentId === agentId,
-            runId: diagnosticId(event.runId),
-            source: diagnosticCode(event.source),
-            status: diagnosticCode(event.status),
-            reason: diagnosticCode(event.reason),
-            requestedAt,
-            failureClass: diagnosticCode(event.failureClass),
-          }];
-        }),
+        ...projectWakeEvents(events, agentId, invokeStartedAt),
       };
     } else wakeReceipt = { state: "http_error", responseStatus: wakeRes.status() };
   } catch { wakeReceipt = { state: "request_failed", responseStatus: null }; }

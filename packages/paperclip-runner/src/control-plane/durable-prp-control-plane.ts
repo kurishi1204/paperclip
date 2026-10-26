@@ -1245,7 +1245,14 @@ class DurableCoreStore {
 
   save(): void {
     this.assertWritable();
-    atomicPrivateWrite(this.path, `${JSON.stringify(this.#state, null, 2)}\n`);
+    try {
+      atomicPrivateWrite(this.path, `${JSON.stringify(this.#state, null, 2)}\n`);
+    } catch (error) {
+      // A parent-directory fsync may fail after rename. This in-memory state
+      // cannot authorize a later frame until the durable file is reloaded.
+      this.#writeIndeterminate = true;
+      throw error;
+    }
   }
 
   assertWritable(): void {
@@ -1491,6 +1498,7 @@ export class DurablePrpControlPlane {
   #server: Server | null = null;
   #connections = new Set<AuthorityConnection>();
   #connectionProcessing = new Map<AuthorityConnection, Promise<void>>();
+  #eventCommitTail: Promise<void> = Promise.resolve();
   #pendingSemanticCalls = new Set<string>();
   #semanticResultPersistenceFailed = false;
   #semanticResultFailures: Array<{
@@ -2143,13 +2151,8 @@ export class DurablePrpControlPlane {
       return;
     }
     if (kind === "event") {
-      if (this.#store.state.warmTransition?.phase === "awaiting_result")
-        connection.replayOnly = true;
-      if (connection.replayOnly) {
-        connection.close();
-        return;
-      }
-      await this.#event(connection, envelope);
+      if (this.#eventPreflight(connection, envelope) === null) return;
+      await this.#serializeEventCommit(connection, envelope);
       return;
     }
     if (kind === "command_result") {
@@ -2215,6 +2218,39 @@ export class DurablePrpControlPlane {
     if (kind !== "pong") {
       connection.close();
     }
+  }
+
+  async #serializeEventCommit(
+    connection: AuthorityConnection,
+    envelope: Record<string, unknown>,
+  ): Promise<void> {
+    // Per-connection wire queues do not order callbacks across a reconnect.
+    // Do not let two callbacks inspect the same cursor before either commits.
+    const current = this.#eventCommitTail.then(async () => {
+      // This frame may have entered before an earlier event's durable save
+      // became indeterminate. Admission must be rechecked at execution time.
+      this.#store.assertWritable();
+      if (connection.eventCommitFailed) return;
+      if (
+        connection.lease === null ||
+        canonicalJson(this.#store.state.leases[connection.lease.credentialId]) !==
+          canonicalJson(connection.lease) ||
+        connection.lease.revokedAt !== null ||
+        connection.lease.expiresAtUnixMs <= Date.now()
+      ) {
+        connection.close();
+        return;
+      }
+      if (this.#store.state.warmTransition?.phase === "awaiting_result")
+        connection.replayOnly = true;
+      if (connection.replayOnly) {
+        connection.close();
+        return;
+      }
+      await this.#event(connection, envelope);
+    });
+    this.#eventCommitTail = current.catch(() => undefined);
+    await current;
   }
 
   #renewLease(
@@ -3072,13 +3108,13 @@ export class DurablePrpControlPlane {
     }
   }
 
-  async #event(
+  #eventPreflight(
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
-  ): Promise<void> {
+  ) {
     if (this.#protocolIntegrityError !== null) {
       connection.close();
-      return;
+      return null;
     }
     // Authentication binds the channel, but an authenticated sender can still
     // submit an envelope for another run. Such frames must not poison this
@@ -3092,12 +3128,12 @@ export class DurablePrpControlPlane {
       envelope.itemId !== this.#identity.itemId
     ) {
       connection.close();
-      return;
+      return null;
     }
     const validated = validatePrpEvent(envelope.payload);
     if (!validated.ok) {
       connection.close();
-      return;
+      return null;
     }
     const event = validated.event;
     const sourceSeq = event?.sourceSeq;
@@ -3116,7 +3152,7 @@ export class DurablePrpControlPlane {
       event.itemId !== this.#identity.itemId
     ) {
       connection.close();
-      return;
+      return null;
     }
     const semantic = (event.payload as Record<string, unknown> | undefined)
       ?.semantic_tool as Record<string, unknown> | undefined;
@@ -3140,9 +3176,10 @@ export class DurablePrpControlPlane {
         semanticCorrelation.itemId !== this.#identity.itemId)
     ) {
       connection.close();
-      return;
+      return null;
     }
-    const existing = this.#store.state.committedEvents.find(
+    const identityAtAdmission = canonicalJson(this.#identity);
+    let existing = this.#store.state.committedEvents.find(
       (candidate) => candidate.sourceEventId === sourceEventId,
     );
     if (
@@ -3151,7 +3188,7 @@ export class DurablePrpControlPlane {
         : sourceSeq !== existing.sourceSeq
     ) {
       connection.close();
-      return;
+      return null;
     }
     if (
       isSemanticInput &&
@@ -3171,7 +3208,7 @@ export class DurablePrpControlPlane {
           "semantic_input_digest_mismatch",
         ),
       );
-      return;
+      return null;
     }
     if (existing !== undefined) {
       if (canonicalJson(existing.envelope) !== canonicalJson(envelope)) {
@@ -3181,9 +3218,23 @@ export class DurablePrpControlPlane {
             "source_event_replay_conflict",
           ),
         );
-        return;
+        return null;
       }
     }
+
+    return { event, sourceSeq, sourceEventId, eventType, priority,
+      semantic, isSemanticInput, existing, identityAtAdmission };
+  }
+
+  async #event(
+    connection: AuthorityConnection,
+    envelope: Record<string, unknown>,
+  ): Promise<void> {
+    const preflight = this.#eventPreflight(connection, envelope);
+    if (preflight === null) return;
+    const { event, sourceSeq, sourceEventId, eventType, priority,
+      semantic, isSemanticInput, identityAtAdmission } = preflight;
+    let { existing } = preflight;
 
     // Keep every unpaired semantic input as a durable close/restart fence.
     // Decide capacity before the business callback: exhaustion cannot commit
@@ -3223,6 +3274,36 @@ export class DurablePrpControlPlane {
       connection.close();
       return;
     }
+
+    // An awaited external commit may outlive a replacement or a run rotation.
+    // Re-read durable state before publishing its local receipt; never restore
+    // a stale cursor or append a second row for the same source event.
+    if (canonicalJson(this.#identity) !== identityAtAdmission) {
+      connection.close();
+      return;
+    }
+    const currentExisting = this.#store.state.committedEvents.find(
+      (candidate) => candidate.sourceEventId === sourceEventId,
+    );
+    if (
+      currentExisting === undefined
+        ? sourceSeq !== this.#store.state.ackedSourceSeq + 1
+        : sourceSeq !== currentExisting.sourceSeq
+    ) {
+      connection.close();
+      return;
+    }
+    if (
+      currentExisting !== undefined &&
+      canonicalJson(currentExisting.envelope) !== canonicalJson(envelope)
+    ) {
+      this.#failProtocolIntegrity(
+        connection,
+        new NativeSessionProtocolIntegrityError("source_event_replay_conflict"),
+      );
+      return;
+    }
+    existing = currentExisting;
 
     if (existing !== undefined) {
       existing.deliveryCount += 1;

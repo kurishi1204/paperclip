@@ -2786,14 +2786,12 @@ describe("DurablePrpControlPlane", () => {
       let enteredCommit!: () => void;
       const commitGate = new Promise<void>((resolveCommit) => { releaseCommit = resolveCommit; });
       const commitEntered = new Promise<void>((resolveEntered) => { enteredCommit = resolveEntered; });
-      let effectCount = 0;
       let deliveryCount = 0;
       const onCommittedEvent: NonNullable<ConstructorParameters<typeof DurablePrpControlPlane>[0]["onCommittedEvent"]> =
         async (event) => {
           if (event.sourceEventId !== "semantic-event-1") return;
           deliveryCount += 1;
           if (deliveryCount === 1) {
-            effectCount += 1;
             enteredCommit();
             await commitGate;
             if (mode === "lost-ack") throw new Error("fixture lost ACK after external effect");
@@ -2953,19 +2951,25 @@ describe("DurablePrpControlPlane", () => {
             completedReceipt: afterActivation.completedWarmTransition?.receipt.transitionId ?? null,
             committedSourceIds: afterActivation.committedEvents.map((entry) => entry.sourceEventId),
           },
-          effectCount,
           deliveryCount,
         };
         console.log(`prp_event_result_order_observation ${JSON.stringify(observation)}`);
-        expect(effectCount).toBe(1);
         expect(activationAck).toBe(true);
         expect(replayResultAck).toBe(true);
         if (mode === "control") {
           expect(beforeRotate.committedEvents[0]?.sourceEventId).toBe("semantic-event-1");
+          expect(replayEventAck).toBe(false);
+          expect(eventOnlyReplayAck).toBe(false);
+          expect(deliveryCount).toBe(1);
+          expect(afterReplay.committedEvents[0]).toMatchObject({
+            sourceEventId: "semantic-event-1", deliveryCount: 1, logicalEffectCount: 1,
+          });
         } else {
           expect(replayEventAck).toBe(true);
           expect(deliveryCount).toBe(2);
-          expect(afterReplay.committedEvents[0]?.sourceEventId).toBe("semantic-event-1");
+          expect(afterReplay.committedEvents[0]).toMatchObject({
+            sourceEventId: "semantic-event-1", deliveryCount: 1, logicalEffectCount: 1,
+          });
           expect(afterReplay.ackedSourceSeq).toBe(1);
         }
         expect(oldReceipt?.oldAckedSourceSeq).toBe(1);
@@ -2982,6 +2986,162 @@ describe("DurablePrpControlPlane", () => {
       }
     },
   );
+
+  it("leaves a queued suspension pending after its connection's event commit fails", async () => {
+    const root = mkdtempSync(resolve(tmpdir(), "paperclip-prp-suspend-after-event-failure-"));
+    let entered!: () => void;
+    let rejectCommit!: (error: Error) => void;
+    const commitEntered = new Promise<void>((resolveEntered) => { entered = resolveEntered; });
+    const commitGate = new Promise<void>((_resolveCommit, reject) => { rejectCommit = reject; });
+    const core = new DurablePrpControlPlane({
+      stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest,
+      onCommittedEvent: async () => { entered(); await commitGate; },
+    });
+    let client: AuthenticatedClient | null = null;
+    let admittedFrames = 0;
+    const attachWire = core.attachWireConnection.bind(core);
+    const wireSpy = vi.spyOn(core, "attachWireConnection").mockImplementation((wire) =>
+      attachWire({
+        onJson: (listener) => wire.onJson((value) => { admittedFrames += 1; listener(value); }),
+        onClose: wire.onClose.bind(wire),
+        close: wire.close.bind(wire),
+        sendJson: wire.sendJson.bind(wire),
+      }),
+    );
+    try {
+      await core.start();
+      const command = core.queueCommand("runner.suspend", {}, "suspend-after-event-failure");
+      client = await authenticate(core, core.issueBootstrapTicket(), identity,
+        expectedRunnerDigest, undefined, false, 2);
+      expect(client?.welcome.version).toBe(2);
+      const event = semanticInputEvent(1);
+      event.version = 2;
+      event.payload = {
+        ...(event.payload as Record<string, unknown>),
+        eventType: "item.delta", priority: 2,
+        payload: { delta: "pending-suspend" },
+      };
+      const beforeFrames = admittedFrames;
+      sendSecure(client!, event);
+      await commitEntered;
+      sendSecure(client!, {
+        protocol: "paperclip.runner", version: 2, kind: "command_result",
+        payload: {
+          commandId: command.commandId, commandType: command.type,
+          controllerSeq: command.controllerSeq, status: "completed",
+          result: { suspended: true },
+        },
+      });
+      await vi.waitFor(() => expect(admittedFrames).toBe(beforeFrames + 2));
+      expect(core.store.state.commands[0]?.status).toBe("pending");
+      rejectCommit(new Error("fixture event persistence failed"));
+      expect(await client!.reader.next()).toBeNull();
+      await core.stop();
+      await core.drainPendingConnectionProcessing();
+      expect(core.store.state.ackedSourceSeq).toBe(0);
+      expect(core.store.state.commands[0]?.status).toBe("pending");
+      expect(core.store.state.commands[0]?.result).toBeNull();
+    } finally {
+      rejectCommit(new Error("fixture cleanup"));
+      client?.socket.destroy();
+      wireSpy.mockRestore();
+      await core.stop();
+      await core.drainPendingConnectionProcessing();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not duplicate or rewind an event committed across replacement connections", async () => {
+    const root = mkdtempSync(resolve(tmpdir(), "paperclip-prp-cross-connection-"));
+    let releaseFirst!: () => void;
+    let enteredFirst!: () => void;
+    const firstGate = new Promise<void>((resolveCommit) => { releaseFirst = resolveCommit; });
+    const firstEntered = new Promise<void>((resolveEntered) => { enteredFirst = resolveEntered; });
+    const callbackSeqs: number[] = [];
+    const core = new DurablePrpControlPlane({
+      stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest,
+      onCommittedEvent: async (event) => {
+        callbackSeqs.push(event.sourceSeq);
+        if (callbackSeqs.length === 1) {
+          enteredFirst();
+          await firstGate;
+        }
+      },
+    });
+    let admittedFrames = 0;
+    const attachWire = core.attachWireConnection.bind(core);
+    const wireSpy = vi.spyOn(core, "attachWireConnection").mockImplementation((wire) =>
+      attachWire({
+        onJson: (listener) => wire.onJson((value) => { admittedFrames += 1; listener(value); }),
+        onClose: wire.onClose.bind(wire),
+        close: wire.close.bind(wire),
+        sendJson: wire.sendJson.bind(wire),
+      }),
+    );
+    let old: AuthenticatedClient | null = null;
+    let replacement: AuthenticatedClient | null = null;
+    try {
+      await core.start();
+      old = await authenticate(core, core.issueBootstrapTicket(), identity,
+        expectedRunnerDigest, undefined, false, 2);
+      expect(old).not.toBeNull();
+      expect(old!.welcome.version).toBe(2);
+      const event = (sourceSeq: number) => {
+        const value = semanticInputEvent(sourceSeq);
+        value.version = 2;
+        value.payload = {
+          ...(value.payload as Record<string, unknown>),
+          eventType: "item.delta", priority: 2,
+          payload: { delta: `event-${sourceSeq}` },
+        };
+        expect(validatePrpEvent(value.payload)).toMatchObject({ ok: true });
+        return value;
+      };
+      sendSecure(old!, event(1));
+      await firstEntered;
+      replacement = await authenticate(core, old!.leaseToken!, identity,
+        expectedRunnerDigest, undefined, false, 2);
+      expect(replacement).not.toBeNull();
+      expect(replacement!.welcome.version).toBe(2);
+      const beforeReplayFrame = admittedFrames;
+      sendSecure(replacement!, event(1));
+      await vi.waitFor(() => expect(admittedFrames).toBe(beforeReplayFrame + 1));
+      await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+      const replayStartedBeforeFirstCommit = callbackSeqs.length > 1;
+      if (!replayStartedBeforeFirstCommit) releaseFirst();
+      expect(await receiveSecure(replacement!)).toMatchObject({
+        kind: "ack", payload: { ackedSourceSeq: 1 },
+      });
+      sendSecure(replacement!, event(2));
+      expect(await receiveSecure(replacement!)).toMatchObject({
+        kind: "ack", payload: { ackedSourceSeq: 2 },
+      });
+      releaseFirst();
+      await core.stop();
+      await core.drainPendingConnectionProcessing();
+      const stored = JSON.parse(readFileSync(resolve(root, "control-plane-state.json"), "utf8")) as {
+        ackedSourceSeq: number;
+        committedEvents: Array<{ sourceSeq: number; sourceEventId: string; deliveryCount: number; logicalEffectCount: number }>;
+      };
+      console.log(`prp_cross_connection_observation ${JSON.stringify({
+        replayStartedBeforeFirstCommit, callbackSeqs,
+        ackedSourceSeq: stored.ackedSourceSeq,
+        committedEvents: stored.committedEvents.map(({ sourceSeq, sourceEventId, deliveryCount, logicalEffectCount }) =>
+          ({ sourceSeq, sourceEventId, deliveryCount, logicalEffectCount })),
+      })}`);
+      expect(stored.ackedSourceSeq).toBe(2);
+      expect(stored.committedEvents.map(({ sourceSeq }) => sourceSeq)).toEqual([1, 2]);
+      expect(stored.committedEvents[0]).toMatchObject({ deliveryCount: 2, logicalEffectCount: 1 });
+    } finally {
+      releaseFirst();
+      old?.socket.destroy();
+      replacement?.socket.destroy();
+      wireSpy.mockRestore();
+      await core.stop();
+      await core.drainPendingConnectionProcessing();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 
   it.each([
     "activate",
@@ -3490,6 +3650,107 @@ describe("DurablePrpControlPlane", () => {
       vi.restoreAllMocks();
       peer?.socket.destroy();
       successor?.socket.destroy();
+      await core.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("requires reload after an event receipt rename with failed parent fsync", async () => {
+    const root = mkdtempSync(resolve(tmpdir(), "paperclip-prp-event-fsync-"));
+    const rootInode = nodeFs.statSync(root).ino;
+    let releaseFirst!: () => void;
+    let enteredFirst!: () => void;
+    const firstGate = new Promise<void>((resolveCommit) => { releaseFirst = resolveCommit; });
+    const firstEntered = new Promise<void>((resolveEntered) => { enteredFirst = resolveEntered; });
+    let callbacks = 0;
+    const makeCore = () => new DurablePrpControlPlane({
+      stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest,
+      onCommittedEvent: async () => {
+        callbacks += 1;
+        if (callbacks === 1) { enteredFirst(); await firstGate; }
+      },
+    });
+    const event = (sourceSeq: number) => {
+      const value = semanticInputEvent(sourceSeq);
+      value.payload = {
+        ...(value.payload as Record<string, unknown>),
+        eventType: "item.delta", priority: 2,
+        payload: { delta: `event-${sourceSeq}` },
+      };
+      expect(validatePrpEvent(value.payload)).toMatchObject({ ok: true });
+      return value;
+    };
+    let core = makeCore();
+    let client: AuthenticatedClient | null = null;
+    let replacement: AuthenticatedClient | null = null;
+    let replay: AuthenticatedClient | null = null;
+    let syncSpy: { mockRestore(): void } | undefined;
+    let admittedFrames = 0;
+    const attachWire = core.attachWireConnection.bind(core);
+    const wireSpy = vi.spyOn(core, "attachWireConnection").mockImplementation((wire) =>
+      attachWire({
+        onJson: (listener) => wire.onJson((value) => { admittedFrames += 1; listener(value); }),
+        onClose: wire.onClose.bind(wire),
+        close: wire.close.bind(wire),
+        sendJson: wire.sendJson.bind(wire),
+      }),
+    );
+    try {
+      await core.start();
+      client = await authenticate(core, core.issueBootstrapTicket());
+      expect(client).not.toBeNull();
+      const token = client!.leaseToken!;
+      const sync = nodeFs.fsyncSync;
+      let injected = false;
+      syncSpy = vi.spyOn(nodeFs, "fsyncSync").mockImplementation((fd) => {
+        const metadata = nodeFs.fstatSync(fd);
+        if (
+          !injected && metadata.isDirectory() && metadata.ino === rootInode &&
+          JSON.parse(readFileSync(core.store.path, "utf8")).ackedSourceSeq === 1
+        ) {
+          injected = true;
+          throw new Error("fixture parent fsync failure after event rename");
+        }
+        sync(fd);
+      });
+      syncBuiltinESMExports();
+      sendSecure(client!, event(1));
+      await firstEntered;
+      replacement = await authenticate(core, token);
+      expect(replacement).not.toBeNull();
+      const beforeReplayFrame = admittedFrames;
+      sendSecure(replacement!, event(1));
+      await vi.waitFor(() => expect(admittedFrames).toBe(beforeReplayFrame + 1));
+      releaseFirst();
+      expect(await replacement!.reader.next()).toBeNull();
+      expect(injected).toBe(true);
+      expect(callbacks).toBe(1);
+      const disk = readFileSync(core.store.path, "utf8");
+      expect(JSON.parse(disk).ackedSourceSeq).toBe(1);
+      expect(() => core.queueCommand("turn.start", {})).toThrow("indeterminate; reload");
+      expect(() => core.issueBootstrapTicket()).toThrow("indeterminate; reload");
+      expect(readFileSync(core.store.path, "utf8")).toBe(disk);
+      syncSpy.mockRestore();
+      syncSpy = undefined;
+      syncBuiltinESMExports();
+      await core.stop();
+      core = makeCore();
+      await core.start();
+      replay = await authenticate(core, token);
+      expect(replay?.welcome.payload).toMatchObject({ ackedSourceSeq: 1 });
+      sendSecure(replay!, event(2));
+      expect(await receiveSecure(replay!)).toMatchObject({
+        kind: "ack", payload: { ackedSourceSeq: 2 },
+      });
+      expect(callbacks).toBe(2);
+    } finally {
+      releaseFirst();
+      syncSpy?.mockRestore();
+      syncBuiltinESMExports();
+      client?.socket.destroy();
+      replacement?.socket.destroy();
+      replay?.socket.destroy();
+      wireSpy.mockRestore();
       await core.stop();
       rmSync(root, { recursive: true, force: true });
     }
