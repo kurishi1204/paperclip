@@ -760,7 +760,7 @@ function readJournalFixture({tempRoot=os.tmpdir(),dependencyContent="export cons
  f.data.attempts={schema:"paperclip.review-attempts/v1",attempts:[{sessionID:f.data.start.sessionID,state:"completed"}]};
  f.data.material=`Review all corpus files.\n${readCorpusManifestBlock(f.source)}`;
  const combined=Buffer.concat([Buffer.from(f.data.system),Buffer.from([0]),Buffer.from(f.data.material)]);
- f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(combined);f.data.start.combinedBytes=combined.length;f.data.start.cwd=cwd;f.data.start.home=path.join(f.directory,"synthetic-home");
+ f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(combined);f.data.start.combinedBytes=combined.length;f.data.start.cwd=cwd;f.data.start.home=path.join(realpathSync(f.directory),"synthetic-home");mkdirSync(f.data.start.home,{mode:0o700});
  const argv=f.data.start.argv;argv[argv.indexOf("--max-turns")+1]="64";argv[argv.indexOf("--output-format")+1]="stream-json";argv.splice(argv.indexOf("--output-format")+2,0,"--verbose");argv[argv.indexOf("--tools")+1]="Read,Glob,Grep";argv[argv.indexOf("--settings")+1]=readReviewSettings(f.data.start,corpus);
  const sid=f.data.start.sessionID;
  const events=[{type:"system",subtype:"init",cwd,original_cwd:cwd,session_id:sid,model:"claude-opus-5-5",tools:["Glob","Grep","Read"],permissionMode:"dontAsk",per_turn_effort_active:true,
@@ -1025,11 +1025,23 @@ test("reported CLI turn counter is validated independently of configured 64-turn
    assert.equal(accepted.status,"valid",JSON.stringify(accepted));
    assert.equal(accepted.configuredMaxTurns,64);
    assert.equal(accepted.reportedNumTurns,89);
-   for(const invalid of [0,-1,1.5,"89",null,NaN,Infinity]){
+   for(const invalid of [0,-1,1.5,"89",null]){
      events.at(-1).num_turns=invalid;x.refresh();
      assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
        {status:"invalid",code:"independent_review_invalid",subcode:"provider_terminal"});
    }
+ }finally{f.close();}
+});
+test("reported CLI turn counter rejects a raw JSON non-finite overflow",()=>{
+ const x=readJournalFixture(),{f,events}=x;try{
+   events.at(-1).num_turns=89;x.refresh();
+   const before='"num_turns":89',after='"num_turns":1e400';
+   assert.equal(f.data.stream.split(before).length-1,1);
+   f.data.stream=f.data.stream.replace(before,after);
+   f.data.terminal.streamSHA256=digest(f.data.stream);f.seal();
+   assert.equal(JSON.parse(f.data.stream.trim().split("\n").at(-1)).num_turns,Infinity);
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"provider_terminal"});
  }finally{f.close();}
 });
 test("Grep searches literal path-like regex within the corpus without counting as source delivery",async()=>{
@@ -1072,20 +1084,59 @@ test("read corpus fails closed on unmeasured text encodings and empty or untermi
  }}finally{f.close();}
 });
 test("read corpus maps instruction and tool-config source paths to inert physical asset names",()=>{
- const f=forkFixture();try{
+ const f=forkFixture(),root=realpathSync(mkdtempSync(path.join(os.tmpdir(),"read-settings-")));try{
    const file=f.source.changedFiles[0];file.path=file.before.path=file.after.path="AGENTS.md";
    const dep="{\"mcpServers\":{}}\n";f.source.dependencyFiles.push({path:".mcp.json",blobSha:hashBlob(dep),content:dep});
    const corpus=readCorpusManifest(f.source);
    assert.deepEqual(new Set(corpus.manifest.files.map(row=>row.role)),new Set(["after","reverse","deps"]));
    assert.deepEqual(new Set(corpus.manifest.files.map(row=>row.sourcePath)),new Set(["AGENTS.md",".mcp.json"]));
    assert.ok(corpus.manifest.files.every(row=>/^assets\/[0-9a-f]{64}\.txt$/.test(row.path)));
-   const settings=JSON.parse(readReviewSettings({cwd:"/private/tmp/isolated/corpus",home:"/private/tmp/isolated/home"},corpus));
+   const cwd=path.join(root,"corpus"),home=path.join(root,"home");mkdirSync(cwd);mkdirSync(home);
+   const settings=JSON.parse(readReviewSettings({cwd,home},corpus));
    assert.equal(settings.pluginConfigs["cc-plugin-agents-md@builtin"].options.instructionFiles,"managed-only");
    assert.equal(settings.autoMemoryEnabled,false);
-   assert.ok(settings.claudeMdExcludes.includes("/private/tmp/isolated/CLAUDE.md"));
-   assert.ok(settings.claudeMdExcludes.includes("/private/tmp/isolated/corpus/assets/.claude/rules/**"));
-   assert.ok(settings.claudeMdExcludes.includes("/private/tmp/isolated/home/.claude/rules/**"));
-   assert.ok(settings.claudeMdExcludes.includes("/private/tmp/isolated/home/.claude/CLAUDE.md"));
+   assert.ok(settings.claudeMdExcludes.includes(path.join(root,"CLAUDE.md")));
+   assert.ok(settings.claudeMdExcludes.includes(path.join(cwd,"assets/.claude/rules/**")));
+   assert.ok(settings.claudeMdExcludes.includes(path.join(home,".claude/rules/**")));
+   assert.ok(settings.claudeMdExcludes.includes(path.join(home,".claude/CLAUDE.md")));
+ }finally{f.close();rmSync(root,{recursive:true,force:true});}
+});
+test("Read settings reject aliased physical roots",()=>{
+ const f=forkFixture(),root=realpathSync(mkdtempSync(path.join(os.tmpdir(),"read-settings-links-")));try{
+   const corpus=readCorpusManifest(f.source),cwd=path.join(root,"corpus"),home=path.join(root,"home");
+   mkdirSync(cwd);mkdirSync(home);
+   const homeAlias=path.join(root,"home-alias"),cwdAlias=path.join(root,"corpus-alias");
+   symlinkSync(home,homeAlias);symlinkSync(cwd,cwdAlias);
+   assert.throws(()=>readReviewSettings({cwd,home:homeAlias},corpus),/unsupported_launch_shape/);
+   assert.throws(()=>readReviewSettings({cwd:cwdAlias,home},corpus),/unsupported_launch_shape/);
+ }finally{f.close();rmSync(root,{recursive:true,force:true});}
+});
+test("Read settings exclude regular instructions below nested symlinks",()=>{
+ const f=forkFixture(),root=realpathSync(mkdtempSync(path.join(os.tmpdir(),"read-settings-nested-")));try{
+   const corpus=readCorpusManifest(f.source),cwd=path.join(root,"corpus"),home=path.join(root,"home");
+   mkdirSync(cwd);mkdirSync(home);
+   const physicalClaude=path.join(root,"physical-claude"),physicalRules=path.join(root,"physical-rules");
+   mkdirSync(physicalClaude);mkdirSync(physicalRules);
+   writeFileSync(path.join(physicalClaude,"CLAUDE.md"),"synthetic instruction\n");
+   writeFileSync(path.join(physicalClaude,"AGENTS.md"),"synthetic instruction\n");
+   symlinkSync(physicalRules,path.join(physicalClaude,"rules"));
+   symlinkSync(physicalClaude,path.join(home,".claude"));
+   const excludes=JSON.parse(readReviewSettings({cwd,home},corpus)).claudeMdExcludes;
+   assert.ok(excludes.includes(path.join(home,".claude/CLAUDE.md")));
+   assert.ok(excludes.includes(path.join(physicalClaude,"CLAUDE.md")));
+   assert.ok(excludes.includes(path.join(physicalClaude,"AGENTS.md")));
+   assert.ok(excludes.includes(path.join(physicalRules,"**")));
+ }finally{f.close();rmSync(root,{recursive:true,force:true});}
+});
+test("Read admission rejects a newly resolved instruction path absent from pinned argv",()=>{
+ const x=readJournalFixture(),{f}=x;try{
+   assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
+   const physicalClaude=path.join(realpathSync(f.directory),"physical-claude");
+   mkdirSync(physicalClaude);writeFileSync(path.join(physicalClaude,"CLAUDE.md"),"synthetic instruction\n");
+   symlinkSync(physicalClaude,path.join(f.data.start.home,".claude"));
+   x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"unsupported_launch_shape"});
  }finally{f.close();}
 });
 test("read reverse asset is deterministic multiline text with complete before reconstruction",()=>{

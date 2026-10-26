@@ -446,7 +446,12 @@ function recommendedReadRanges(files) {
 
 export function readReviewSettings(start, corpus) {
   ensure(typeof start.home === "string" && path.isAbsolute(start.home) && path.normalize(start.home) === start.home &&
-    typeof start.cwd === "string" && path.isAbsolute(start.cwd), "unsupported_launch_shape");
+    typeof start.cwd === "string" && path.isAbsolute(start.cwd) && path.normalize(start.cwd) === start.cwd, "unsupported_launch_shape");
+  const physicalDirectory = (directory) => {
+    try { return fs.realpathSync(directory) === directory && fs.statSync(directory).isDirectory(); }
+    catch { return false; }
+  };
+  ensure(physicalDirectory(start.cwd) && physicalDirectory(start.home), "unsupported_launch_shape");
   const bases = new Set();
   const addAncestors = (leaf) => {
     for (let directory = leaf;; directory = path.dirname(directory)) {
@@ -458,14 +463,23 @@ export function readReviewSettings(start, corpus) {
   for (const file of corpus.files) addAncestors(path.dirname(path.join(start.cwd,file.path)));
   bases.add(start.home);
   const excludes = [];
+  const addPhysicalExclusion = (candidate,suffix="") => {
+    try { fs.lstatSync(candidate); }
+    catch (error) { ensure(error.code === "ENOENT", "unsupported_launch_shape"); return; }
+    let physical;
+    try { physical = fs.realpathSync(candidate); }
+    catch { throw new Error("unsupported_launch_shape"); }
+    if (physical !== candidate) excludes.push(suffix ? path.join(physical,suffix) : physical);
+  };
   for (const directory of [...bases].sort()) {
     for (const name of ["CLAUDE.md","CLAUDE.local.md",".claude/CLAUDE.md",".claude/CLAUDE.local.md","AGENTS.md",".claude/AGENTS.md"]) {
       const candidate = path.join(directory,name);
       excludes.push(candidate);
-      try { if (fs.lstatSync(candidate).isSymbolicLink()) excludes.push(fs.realpathSync(candidate)); }
-      catch (error) { ensure(error.code === "ENOENT", "unsupported_launch_shape"); }
+      addPhysicalExclusion(candidate);
     }
-    excludes.push(path.join(directory,".claude/rules/**"));
+    const rules = path.join(directory,".claude/rules");
+    excludes.push(path.join(rules,"**"));
+    addPhysicalExclusion(rules,"**");
   }
   return canonical({pluginConfigs:{"cc-plugin-agents-md@builtin":{options:{instructionFiles:"managed-only"}}},
     autoMemoryEnabled:false,claudeMdExcludes:excludes,disableAllHooks:true,enabledPlugins:{}});
