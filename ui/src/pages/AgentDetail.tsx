@@ -862,6 +862,15 @@ export function AgentDetail() {
     && lookupCompanyId === retryScope.companyId
     && urlRunId === retryScope.runId
     && (!companyPrefix || routeCompanyId === retryScope.companyId));
+  // A transiently unavailable company list must not erase feedback for the
+  // rendered agent/run. Keep navigation stricter: it waits for route identity.
+  const retryFeedbackScope = Boolean(retryScope && agent && !knownDifferentRetryScope
+    && agent.id === retryScope.agentId && agent.companyId === retryScope.companyId
+    && urlRunId === retryScope.runId
+    && (!routeCompanyId || routeCompanyId === retryScope.companyId)
+    && (routeCompanyId || !selectedCompanyId || selectedCompanyId === retryScope.companyId));
+  const retryRouteReady = Boolean(agent && lookupCompanyId === agent.companyId
+    && (!companyPrefix || routeCompanyId === agent.companyId));
   useEffect(() => {
     if (knownDifferentRetryScope) retryRun.reset();
   }, [knownDifferentRetryScope, retryRun.reset]);
@@ -1545,7 +1554,8 @@ export function AgentDetail() {
           adapterType={agent.adapterType}
           adapterConfig={agent.adapterConfig}
           retryRun={retryRun}
-          currentRetryScope={currentRetryScope}
+          retryFeedbackScope={retryFeedbackScope}
+          retryRouteReady={retryRouteReady}
         />
       )}
 
@@ -3365,7 +3375,8 @@ function RunsTab({
   adapterType,
   adapterConfig,
   retryRun,
-  currentRetryScope,
+  retryFeedbackScope,
+  retryRouteReady,
 }: {
   runs: HeartbeatRun[];
   companyId: string;
@@ -3375,7 +3386,8 @@ function RunsTab({
   adapterType: string;
   adapterConfig: Record<string, unknown>;
   retryRun: RetryRunAction;
-  currentRetryScope: boolean;
+  retryFeedbackScope: boolean;
+  retryRouteReady: boolean;
 }) {
   const { isMobile } = useSidebar();
 
@@ -3404,7 +3416,7 @@ function RunsTab({
             <ArrowLeft className="h-3.5 w-3.5" />
             Back to runs
           </Link>
-          <RunDetail key={selectedRun.id} run={selectedRun} agentRouteId={agentRouteId} adapterType={adapterType} adapterConfig={adapterConfig} retryRun={retryRun} currentRetryScope={currentRetryScope} />
+          <RunDetail key={selectedRun.id} run={selectedRun} agentRouteId={agentRouteId} adapterType={adapterType} adapterConfig={adapterConfig} retryRun={retryRun} retryFeedbackScope={retryFeedbackScope} retryRouteReady={retryRouteReady} />
         </div>
       );
     }
@@ -3435,7 +3447,7 @@ function RunsTab({
       {/* Right: run detail — natural height, page scrolls */}
       {selectedRun && (
         <div className="flex-1 min-w-0 pl-4">
-          <RunDetail key={selectedRun.id} run={selectedRun} agentRouteId={agentRouteId} adapterType={adapterType} adapterConfig={adapterConfig} retryRun={retryRun} currentRetryScope={currentRetryScope} />
+          <RunDetail key={selectedRun.id} run={selectedRun} agentRouteId={agentRouteId} adapterType={adapterType} adapterConfig={adapterConfig} retryRun={retryRun} retryFeedbackScope={retryFeedbackScope} retryRouteReady={retryRouteReady} />
         </div>
       )}
     </div>
@@ -3458,7 +3470,7 @@ export function AgentFileRunNotice({ resultJson }: { resultJson: HeartbeatRun["r
   </>;
 }
 
-function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig, retryRun, currentRetryScope }: { run: HeartbeatRun; agentRouteId: string; adapterType: string; adapterConfig: Record<string, unknown>; retryRun: RetryRunAction; currentRetryScope: boolean }) {
+function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig, retryRun, retryFeedbackScope, retryRouteReady }: { run: HeartbeatRun; agentRouteId: string; adapterType: string; adapterConfig: Record<string, unknown>; retryRun: RetryRunAction; retryFeedbackScope: boolean; retryRouteReady: boolean }) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const { data: hydratedRun } = useQuery({
@@ -3573,7 +3585,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig, 
     return payload;
   }, [run.contextSnapshot]);
   const retryScope = { companyId: run.companyId, agentId: run.agentId, runId: run.id };
-  const retryBelongsToRun = currentRetryScope && sameRetryRunScope(retryRun.variables, retryScope);
+  const retryBelongsToRun = retryFeedbackScope && sameRetryRunScope(retryRun.variables, retryScope);
 
   const rerunWithTrace = useMutation({
     mutationFn: async () => {
@@ -3702,9 +3714,9 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig, 
                   size="sm"
                   className="text-xs h-6 px-2"
                   onClick={() => {
-                    if (!retryBelongsToRun || !retryRun.isPending) retryRun.mutate(retryScope);
+                    if (retryRouteReady && (!retryBelongsToRun || !retryRun.isPending)) retryRun.mutate(retryScope);
                   }}
-                  disabled={retryBelongsToRun && retryRun.isPending}
+                  disabled={!retryRouteReady || (retryBelongsToRun && retryRun.isPending)}
                 >
                   <RotateCcw className="h-3.5 w-3.5 mr-1" />
                   {retryBelongsToRun && retryRun.isPending ? "Retrying…" : "Retry"}

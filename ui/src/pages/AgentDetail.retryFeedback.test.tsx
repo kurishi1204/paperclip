@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { act, useSyncExternalStore } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryRouter, RouterProvider } from "react-router-dom";
@@ -11,6 +11,12 @@ import { AgentDetail } from "./AgentDetail";
 const navigation = vi.hoisted(() => ({ holdCanonical: false, queued: [] as Array<() => void> }));
 const agentsApiMock = vi.hoisted(() => ({ get: vi.fn(), retryFailedRun: vi.fn() }));
 const heartbeatsApiMock = vi.hoisted(() => ({ list: vi.fn(), get: vi.fn() }));
+const companyView = vi.hoisted(() => ({
+  companies: [{ id: "company-1", issuePrefix: "PAP" }, { id: "company-2", issuePrefix: "BBB" }],
+  selectedCompanyId: "company-1" as string | null,
+  version: 0,
+  listeners: new Set<() => void>(),
+}));
 
 vi.mock("@/lib/router", async (importOriginal) => {
   const original = await importOriginal<typeof import("@/lib/router")>();
@@ -33,12 +39,18 @@ vi.mock("../api/heartbeats", () => ({ heartbeatsApi: heartbeatsApiMock }));
 vi.mock("../api/access", () => ({ accessApi: { getCurrentBoardAccess: vi.fn(async () => ({})) } }));
 vi.mock("../api/instanceSettings", () => ({ instanceSettingsApi: { getExperimental: vi.fn(async () => ({})) } }));
 vi.mock("../context/CompanyContext", () => ({
-  useCompany: () => ({
-    companies: [{ id: "company-1", issuePrefix: "PAP" }, { id: "company-2", issuePrefix: "BBB" }],
-    selectedCompanyId: "company-1",
-    setSelectedCompanyId: vi.fn(),
-    selectedCompany: { id: "company-1", issuePrefix: "PAP" },
-  }),
+  useCompany: () => {
+    useSyncExternalStore(
+      (listener) => { companyView.listeners.add(listener); return () => { companyView.listeners.delete(listener); }; },
+      () => companyView.version,
+    );
+    return {
+      companies: companyView.companies,
+      selectedCompanyId: companyView.selectedCompanyId,
+      setSelectedCompanyId: vi.fn(),
+      selectedCompany: { id: "company-1", issuePrefix: "PAP" },
+    };
+  },
 }));
 vi.mock("../context/PanelContext", () => ({ usePanel: () => ({ closePanel: vi.fn() }) }));
 vi.mock("../context/SidebarContext", () => ({ useSidebar: () => ({ isMobile: false }) }));
@@ -103,6 +115,9 @@ beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   navigation.holdCanonical = true;
   navigation.queued = [];
+  companyView.companies = [{ id: "company-1", issuePrefix: "PAP" }, { id: "company-2", issuePrefix: "BBB" }];
+  companyView.selectedCompanyId = "company-1";
+  companyView.version = 0;
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
@@ -123,6 +138,8 @@ describe("AgentDetail retry feedback across canonical navigation", () => {
   function makeRouter(initialPath = `/agents/${agentId}/runs/${runId}`) {
     return createMemoryRouter([
       { path: "/:companyPrefix?/agents/:agentId/runs/:runId", element: <AgentDetail /> },
+      { path: "/:companyPrefix?/agents/:agentId/:tab", element: <AgentDetail /> },
+      { path: "/:companyPrefix?/activity/runs", element: <p>Run history</p> },
       { path: "/:companyPrefix?/issues/:issueId", element: <p>Issue destination</p> },
       { path: "/outside", element: <p>Outside agent detail</p> },
     ], { initialEntries: [initialPath] });
@@ -133,9 +150,28 @@ describe("AgentDetail retry feedback across canonical navigation", () => {
     await waitFor(() => expect(retryButton()).toBeTruthy());
   }
 
+  async function updateCompanies(companies: typeof companyView.companies) {
+    await act(async () => {
+      companyView.companies = companies;
+      companyView.version++;
+      companyView.listeners.forEach((listener) => listener());
+    });
+  }
+
   function retryButton() {
     return Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Retry");
   }
+
+  it("redirects a run-less agent runs URL to run history without showing a retry action", async () => {
+    navigation.holdCanonical = false;
+    const router = makeRouter("/PAP/agents/maya/runs");
+    await act(async () => { root.render(<QueryClientProvider client={queryClient}><RouterProvider router={router} /></QueryClientProvider>); });
+    await waitFor(() => expect(router.state.location.pathname).toBe("/PAP/activity/runs"));
+    expect(router.state.location.search).toBe(`?agentId=${agentId}`);
+    expect(container.textContent).toContain("Run history");
+    expect(retryButton()).toBeUndefined();
+    expect(agentsApiMock.retryFailedRun).not.toHaveBeenCalled();
+  });
 
   async function clickRetry() {
     const button = retryButton();
@@ -178,6 +214,36 @@ describe("AgentDetail retry feedback across canonical navigation", () => {
     await clickRetry();
     await waitFor(() => expect(container.textContent).toContain("steady denial"));
     expect(agentsApiMock.retryFailedRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps pending and denial for the same run while company prefix lookup is temporarily unknown", async () => {
+    navigation.holdCanonical = false;
+    const retry = deferred<never>();
+    agentsApiMock.retryFailedRun.mockReturnValue(retry.promise);
+    const router = makeRouter(`/PAP/agents/maya/runs/${runId}`);
+    await renderRouter(router);
+    await clickRetry();
+    expect(agentsApiMock.retryFailedRun).toHaveBeenCalledTimes(1);
+
+    await updateCompanies([]);
+    const pendingButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "Retrying…");
+    expect(pendingButton?.disabled).toBe(true);
+    await act(async () => { pendingButton?.click(); });
+    expect(agentsApiMock.retryFailedRun).toHaveBeenCalledTimes(1);
+
+    await act(async () => { retry.reject(new Error("unknown-prefix denial")); });
+    await waitFor(() => expect(container.textContent).toContain("unknown-prefix denial"));
+    expect(retryButton()?.disabled).toBe(true); // Unknown route identity cannot start a fresh request.
+    companyView.selectedCompanyId = "company-2";
+    await updateCompanies([]);
+    expect(container.textContent).not.toContain("unknown-prefix denial");
+    expect(!retryButton() || retryButton()?.disabled).toBe(true);
+    await act(async () => { retryButton()?.click(); });
+    expect(agentsApiMock.retryFailedRun).toHaveBeenCalledTimes(1);
+    companyView.selectedCompanyId = "company-1";
+    await updateCompanies([{ id: "company-1", issuePrefix: "PAP" }, { id: "company-2", issuePrefix: "BBB" }]);
+    expect(container.textContent).toContain("unknown-prefix denial");
   });
 
   it("retains a denial that arrives before canonical navigation", async () => {
