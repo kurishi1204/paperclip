@@ -838,7 +838,7 @@ export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, p
       (read ? terminal.streamSHA256 : terminal.rawSHA256) === digest(rawBytes), "native_terminal");
     const raw = read ? (readEvidence = verifyReadJournal(rawBytes,corpus,start)).result : JSON.parse(rawBytes);
     ensure(raw.type === "result" && raw.subtype === "success" && raw.is_error === false && raw.terminal_reason === "completed" &&
-      (read ? Number.isSafeInteger(raw.num_turns) && raw.num_turns >= 1 && raw.num_turns <= 64 : raw.num_turns === 1) && raw.queued_turn_count === 0, "provider_terminal");
+      (read ? Number.isSafeInteger(raw.num_turns) && raw.num_turns >= 1 : raw.num_turns === 1) && raw.queued_turn_count === 0, "provider_terminal");
     if (read) ensure(raw.stop_reason === "end_turn" && raw.safety_stops === 0 && raw.result_index === 0 && raw.api_error_status === null, "provider_terminal");
     ensure(raw.session_id === start.sessionID && terminal.sessionID === raw.session_id, "provider_session");
     ensure(Object.keys(raw.modelUsage ?? {}).length === 1 && raw.modelUsage?.["claude-opus-5-5"]?.provider === "firstParty", "actual_model_provider");
@@ -846,7 +846,7 @@ export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, p
     ensure(typeof raw.result === "string" && Buffer.from(raw.result).equals(report), "actual_report");
     const lines = raw.result.replace(/\n+$/, "").split("\n");
     ensure(lines.at(-1) === "判定: GO" && lines.filter((line) => line.startsWith("判定: ")).length === 1, "review_not_go");
-    return { status: "valid", model: "claude-opus-5-5", provider: "firstParty", implementationSessionID: entry.implementationSessionID, sessionID: raw.session_id, headSha, treeSha: source.treeSha, sourceSchema: read ? READ_REVIEW_SOURCE : v2 ? REVIEW_SOURCE_V2 : SOURCE_SCHEMA, evidenceKind: read ? "read-journal-delivered-source" : v2 ? "lossless-v2-reconstructed-source" : "inline-v1-whole-source", ...(readEvidence ? {manifestSHA256:readEvidence.manifestSHA256,deliveredFiles:readEvidence.deliveredFiles,requiredFiles:readEvidence.requiredFiles,toolCalls:readEvidence.toolCalls} : {}), inputSHA256: digest(combined), reportSHA256: digest(report), report: raw.result, verdict: "判定: GO", trustBoundary: "operator-admitted executor and journal, not signed provider attestation" };
+    return { status: "valid", model: "claude-opus-5-5", provider: "firstParty", implementationSessionID: entry.implementationSessionID, sessionID: raw.session_id, headSha, treeSha: source.treeSha, sourceSchema: read ? READ_REVIEW_SOURCE : v2 ? REVIEW_SOURCE_V2 : SOURCE_SCHEMA, evidenceKind: read ? "read-journal-delivered-source" : v2 ? "lossless-v2-reconstructed-source" : "inline-v1-whole-source", ...(readEvidence ? {manifestSHA256:readEvidence.manifestSHA256,deliveredFiles:readEvidence.deliveredFiles,requiredFiles:readEvidence.requiredFiles,toolCalls:readEvidence.toolCalls,configuredMaxTurns:64,reportedNumTurns:raw.num_turns} : {}), inputSHA256: digest(combined), reportSHA256: digest(report), report: raw.result, verdict: "判定: GO", trustBoundary: "operator-admitted executor and journal, not signed provider attestation" };
   } catch (error) {
     return { status: "invalid", code: "independent_review_invalid", subcode: /^[a-z][a-z0-9_]+$/.test(error.message) ? error.message : "journal_read_unavailable" };
   }

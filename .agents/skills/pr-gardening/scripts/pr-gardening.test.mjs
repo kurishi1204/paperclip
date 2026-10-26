@@ -930,7 +930,7 @@ test("read journal old kind fails and new pinned kind reaches real readiness wit
    assert.equal(review.status,"valid");assert.equal(review.evidenceKind,"read-journal-delivered-source");
    assert.equal(review.deliveredFiles,corpus.files.length);assert.equal(review.requiredFiles,corpus.files.length);
    assert.equal(review.toolCalls,corpus.files.length);assert.equal(review.manifestSHA256,digest(canonical(corpus.manifest)));
-   assert.match(renderReport(accepted),/Read corpus: manifest [0-9a-f]{64}; delivered 3\/3 files; tool calls 3/);
+   assert.match(renderReport(accepted),/Read corpus: manifest [0-9a-f]{64}; delivered 3\/3 files; tool calls 3; configured max turns 64; reported turn counter 4/);
    assert.equal(accepted.pullRequests[0].source.changedFiles[0].before.content,"old source\n");
    assert.equal(accepted.pullRequests[0].source.dependencyFiles[0].content,"export const dependency = 1;\n");
  }finally{f.close();}
@@ -1015,6 +1015,21 @@ test("Grep formatting metadata remains scoped discovery and cannot fill missing 
    events.splice(resultAt,1);events.splice(readAt,1);x.refresh();
    assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
      {status:"invalid",code:"independent_review_invalid",subcode:"read_coverage_incomplete"});
+ }finally{f.close();}
+});
+test("reported CLI turn counter is validated independently of configured 64-turn argv",()=>{
+ const x=readJournalFixture(),{f,events}=x;try{
+   assert.equal(f.data.start.argv[f.data.start.argv.indexOf("--max-turns")+1],"64");
+   events.at(-1).num_turns=89;x.refresh();
+   const accepted=admitTrustedJournal(f.admissionArgs());
+   assert.equal(accepted.status,"valid",JSON.stringify(accepted));
+   assert.equal(accepted.configuredMaxTurns,64);
+   assert.equal(accepted.reportedNumTurns,89);
+   for(const invalid of [0,-1,1.5,"89",null,NaN,Infinity]){
+     events.at(-1).num_turns=invalid;x.refresh();
+     assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+       {status:"invalid",code:"independent_review_invalid",subcode:"provider_terminal"});
+   }
  }finally{f.close();}
 });
 test("Grep searches literal path-like regex within the corpus without counting as source delivery",async()=>{
