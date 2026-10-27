@@ -63,7 +63,7 @@ import { nativeToolContractFingerprintForTarget } from "./native-session-resume.
 import { buildNativeHeartbeatPreparationSpans } from "./native-run-trace.js";
 import { NativeRunnerOwnershipUnverifiedError } from "./native-runner-ownership.js";
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
-import { NativeGoalDeliveryHeldError, NativeSessionLeaseNotOwnedError, NativeSessionStartupBusyError } from "./native-goal-delivery-hold.js";
+import { NativeGoalDeliveryHeldError, NativeSessionLeaseNotOwnedError, NativeSessionStartupBusyError, NativeWarmSessionRetirementPendingError } from "./native-goal-delivery-hold.js";
 import { dispatchLiveRunnerGoalControl, registerLiveRunnerGoalController, runnerGoalControlBrokerInternals } from "../runner-goal-control-broker.js";
 import { settleNativeSessionStartupBusy } from "../heartbeat-run-execution.js";
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
@@ -11903,6 +11903,17 @@ function ownedGoalDeliveryDb(options: { loseHoldCas?: boolean; execution?: Nativ
           Object.assign(coordinator, values);
           returned = [{ runId: coordinator.runId }];
         }
+      } else if (table === nativeRunFinalizations && values.phase === undefined &&
+          values.failureDetail !== undefined && values.failureDetail !== null) {
+        for (const column of ["phase", "failure_code", "attempt", "controller_boot_id", "controller_pid",
+          "controller_process_started_at", "result_id", "resourceRetirementDeferred"]) {
+          if (!sql.includes(column)) throw new Error(`retirement proof missing ${column}`);
+        }
+        if (coordinator.phase === "terminal_failure" && coordinator.resultId === null &&
+            coordinator.failureDetail?.resourceRetirementDeferred === true) {
+          coordinator.failureDetail = { ...coordinator.failureDetail, resourceRetirementDeferred: false };
+          returned = [{ runId: coordinator.runId }];
+        }
       } else if (table === heartbeatRuns) {
         if (values.status !== "failed" || run.status === "running") {
           Object.assign(run, values);
@@ -12206,7 +12217,7 @@ describe("owned goal delivery admission", () => {
         inspectGoalDelivery: async () => ({ state: "ready", receiptRelation: "no_valid_receipt",
           claimOwnerRunId: null, claimId: null }),
         claimGoalDelivery: async () => unknownReceipt(),
-      })).rejects.toMatchObject({ settled: false });
+      })).rejects.toMatchObject({ settled: true, resourceRetirementDeferred: true });
       expect(heldDb.run.status).toBe("failed");
       expect(session.close).not.toHaveBeenCalled();
     } finally {
@@ -12214,21 +12225,30 @@ describe("owned goal delivery admission", () => {
     }
   });
 
-  it("defers environment teardown when a settled goal HOLD cannot close its warm session", async () => {
-    const name = "goal-hold-warm-close-failure";
+  it.each(["same", "different"] as const)("retries retirement after a settled goal HOLD close failure for a %s warm scope", async nextScope => {
+    const name = `goal-hold-warm-close-failure-${nextScope}`;
     const first = { ...execution,
       binding: { ...execution.binding, runId: `${name}-first`, executionWorkspaceId: name },
       session: { ...execution.session, normalizedSessionId: name,
         lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
     } as NativeExecutionInputV1;
     const second = { ...first, binding: { ...first.binding, runId: `${name}-second` } };
+    const third = { ...first,
+      binding: { ...first.binding, runId: `${name}-${nextScope}-third` },
+      session: { ...first.session,
+        normalizedSessionId: nextScope === "same" ? name : `${name}-replacement`,
+      },
+    } as NativeExecutionInputV1;
     const closeFailure = new Error("warm checkpoint refused");
-    const session = { close: vi.fn(async () => { throw closeFailure; }) };
+    const session = { close: vi.fn().mockRejectedValueOnce(closeFailure).mockResolvedValue(undefined) };
     const completed = { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" },
       turnId: name, normalizedSessionId: name, providerSessionId: name,
       driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1 };
     state.execute.mockReset().mockImplementationOnce(async options => {
       await options.onSession?.(session);
+      return completed;
+    }).mockImplementationOnce(async options => {
+      expect(options.existingSession).toBeUndefined();
       return completed;
     });
     await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: name });
@@ -12242,13 +12262,59 @@ describe("owned goal delivery admission", () => {
       });
     } catch (error) { caught = error; }
     expect(caught).toBeInstanceOf(NativeGoalDeliveryHeldError);
-    expect((caught as NativeGoalDeliveryHeldError).settled).toBe(false);
+    expect((caught as NativeGoalDeliveryHeldError).settled).toBe(true);
+    expect((caught as NativeGoalDeliveryHeldError).resourceRetirementDeferred).toBe(true);
     expect((caught as Error & { cause?: unknown }).cause).toBe(closeFailure);
     expect(heldDb.coordinator.phase).toBe("terminal_failure");
     expect(heldDb.run.status).toBe("failed");
+    expect(heldDb.coordinator.failureDetail?.resourceRetirementDeferred).toBe(true);
     expect(session.close).toHaveBeenCalledOnce();
-    expect(await closeIdleWarmNativeSessionsForRestart()).toMatchObject({ busy: 1, closed: 0 });
-    expect(state.execute).toHaveBeenCalledOnce();
+    await expect(executePaperclipNativeSession({ db: leaseDb(third), execution: third,
+      runnerInstanceId: name })).resolves.toMatchObject({ exitCode: 0 });
+    expect(session.close).toHaveBeenCalledTimes(2);
+    // Retirement of the transport does not by itself prove that the old
+    // environment lease can be stopped while this new Run uses the sandbox.
+    expect(heldDb.coordinator.failureDetail?.resourceRetirementDeferred).toBe(true);
+    expect(heldDb.coordinator.failureDetail).toMatchObject({
+      claimState: "indeterminate", receiptRelation: "no_valid_receipt",
+    });
+    expect(state.execute).toHaveBeenCalledTimes(2);
+    await closeIdleWarmNativeSessionsForRestart();
+  });
+
+  it("fences a fresh owned Run when warm retirement fails again before provider admission", async () => {
+    const name = "goal-hold-warm-retirement-pending";
+    const first = { ...execution,
+      binding: { ...execution.binding, runId: `${name}-first`, executionWorkspaceId: name },
+      session: { ...execution.session, normalizedSessionId: name,
+        lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    const second = { ...first, binding: { ...first.binding, runId: `${name}-second` } };
+    const third = { ...first, binding: { ...first.binding, runId: `${name}-third` } };
+    const closeFailure = new Error("warm checkpoint unavailable");
+    const session = { close: vi.fn().mockRejectedValueOnce(closeFailure).mockRejectedValueOnce(closeFailure).mockResolvedValue(undefined) };
+    const completed = { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" },
+      turnId: name, normalizedSessionId: name, providerSessionId: name,
+      driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1 };
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onSession?.(session);
+      return completed;
+    });
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: name });
+      await expect(executePaperclipNativeSession({ db: ownedGoalDeliveryDb({ execution: second }).db,
+        execution: second, runnerInstanceId: name, sessionGoalControl: control,
+        inspectGoalDelivery: async () => unknownReceipt(),
+        claimGoalDelivery: async () => { throw new Error("must not claim"); },
+      })).rejects.toMatchObject({ settled: true, resourceRetirementDeferred: true });
+      const thirdDb = leaseDb(third);
+      await expect(executePaperclipNativeSession({ db: thirdDb, execution: third,
+        runnerInstanceId: name })).rejects.toBeInstanceOf(NativeWarmSessionRetirementPendingError);
+      expect(session.close).toHaveBeenCalledTimes(2);
+      expect(state.execute).toHaveBeenCalledOnce();
+    } finally {
+      await closeIdleWarmNativeSessionsForRestart();
+    }
   });
 
   it("removes a held warm attempt's broker before a different Run reuses its idle session", async () => {

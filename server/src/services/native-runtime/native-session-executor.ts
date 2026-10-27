@@ -183,7 +183,7 @@ import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
 import { applyRunnerGoalPrpEvent } from "../runner-goals.js";
 import type { RunnerGoalDeliveryClaim, RunnerGoalDeliveryInspection } from "../runner-goals.js";
-import { NativeGoalDeliveryHeldError, NativeSessionLeaseNotOwnedError, NativeSessionStartupBusyError } from "./native-goal-delivery-hold.js";
+import { NativeGoalDeliveryHeldError, NativeSessionLeaseNotOwnedError, NativeSessionStartupBusyError, NativeWarmSessionRetirementPendingError } from "./native-goal-delivery-hold.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import {
   NativeRunnerOwnershipUnverifiedError,
@@ -421,6 +421,8 @@ type WarmNativeSession = {
   environmentId: string | null;
   busy: boolean;
   closeOnReleaseReason?: string;
+  /** A settled goal HOLD whose provider could not be checkpointed yet. */
+  retirementProtected?: boolean;
   idleTimer: ReturnType<typeof setTimeout> | null;
   lastActivityAt: string;
 };
@@ -536,17 +538,24 @@ async function closeIdleWarmNativeSessions(input: {
       continue;
     }
     if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
-    // Remove ownership before awaiting close so a racing continuation cannot
-    // adopt a session whose transport is already shutting down.
-    warmNativeSessions.delete(sessionId);
+    // Retain the exact entry while closing. A failed checkpoint is a live
+    // provider, not an absent owner; busy fences a racing continuation.
+    if (entry.retirementProtected) {
+      entry.idleTimer = null;
+      entry.busy = true;
+    } else {
+      warmNativeSessions.delete(sessionId);
+    }
     const closing = Promise.resolve().then(() =>
       closeWarmNativeSession(entry, input.reason),
     );
     closingWarmNativeSessions.set(sessionId, closing);
     try {
       await closing;
+      if (warmNativeSessions.get(sessionId) === entry) warmNativeSessions.delete(sessionId);
       closed += 1;
     } catch {
+      if (entry.retirementProtected) entry.busy = false;
       failed += 1;
     } finally {
       if (closingWarmNativeSessions.get(sessionId) === closing) {
@@ -1634,15 +1643,22 @@ async function retireSupersededWarmNativeSessions(
   for (const [scope, entry] of warmNativeSessions) {
     if (scope === nextSessionScope || entry.ownerScope !== ownerScope) continue;
     if (entry.busy || executingRunnerdSessionScopes.has(scope)) {
-      throw new Error("native_session_supervisor_busy");
+      throw entry.retirementProtected
+        ? new NativeWarmSessionRetirementPendingError(null, new Error("warm native session retirement busy"))
+        : new Error("native_session_supervisor_busy");
     }
     if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
     entry.idleTimer = null;
     entry.busy = true;
-    entry.closeOnReleaseReason = "warm native session identity changed";
+    entry.closeOnReleaseReason ??= "warm native session identity changed";
     try {
       await closeWarmNativeSession(entry, entry.closeOnReleaseReason);
-      if (warmNativeSessions.get(scope) === entry) warmNativeSessions.delete(scope);
+      if (warmNativeSessions.get(scope) === entry) {
+        warmNativeSessions.delete(scope);
+      }
+    } catch (error) {
+      if (entry.retirementProtected) throw new NativeWarmSessionRetirementPendingError(null, error);
+      throw error;
     } finally {
       // A failed close retains the owner and prevents launch. A later attempt
       // must retry retirement, never adopt this partially closed transport.
@@ -6021,13 +6037,22 @@ async function releaseWarmNativeSession(
   entry.lastActivityAt = new Date().toISOString();
   if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
   if (failed || entry.closeOnReleaseReason !== undefined) {
-    warmNativeSessions.delete(sessionId);
+    if (entry.retirementProtected) entry.busy = true;
+    else warmNativeSessions.delete(sessionId);
     const closing = closeWarmNativeSession(entry,
       entry.closeOnReleaseReason ?? "warm native session failed");
     // Restart checkpointing is required to restore this successful session.
     // Surface failure instead of reporting a clean release without authority.
-    if (entry.closeOnReleaseReason !== undefined) await closing;
-    else await closing.catch(() => undefined);
+    try {
+      await closing;
+      if (warmNativeSessions.get(sessionId) === entry) warmNativeSessions.delete(sessionId);
+    } catch (error) {
+      if (entry.retirementProtected) {
+        entry.busy = false;
+        throw error;
+      }
+      if (entry.closeOnReleaseReason !== undefined) throw error;
+    }
     return;
   }
   entry.idleTimer = setTimeout(() => {
@@ -6035,9 +6060,17 @@ async function releaseWarmNativeSession(
     // clearTimeout cannot revoke an already-queued callback. The entry object
     // is the idle timer's ownership fence across a later warm acquisition.
     if (current !== entry || current.busy) return;
-    warmNativeSessions.delete(sessionId);
-    void closeWarmNativeSession(current, "warm native session idle timeout")
-      .catch(() => undefined);
+    if (current.retirementProtected) {
+      current.busy = true;
+      current.idleTimer = null;
+      void closeWarmNativeSession(current, current.closeOnReleaseReason ?? "warm native session idle timeout")
+        .then(() => { if (warmNativeSessions.get(sessionId) === current) warmNativeSessions.delete(sessionId); })
+        .catch(() => { current.busy = false; });
+    } else {
+      warmNativeSessions.delete(sessionId);
+      void closeWarmNativeSession(current, "warm native session idle timeout")
+        .catch(() => undefined);
+    }
   }, idleTimeoutMs);
   entry.idleTimer.unref();
 }
@@ -8238,7 +8271,13 @@ async function executePaperclipNativeSessionWithinScope(
     if (warmSessionId === null || warmConfigDigest === null) return;
     const entry = warmNativeSessions.get(warmSessionId);
     if (entry) {
-      if (entry.preparingRunId && entry.preparingRunId !== input.execution.binding.runId) throw new Error("native_session_supervisor_busy");
+      if (entry.preparingRunId && entry.preparingRunId !== input.execution.binding.runId) {
+        if (entry.retirementProtected) throw new NativeWarmSessionRetirementPendingError({
+          owner: leaseOwner, attempt, controllerBootId: controller.bootId,
+          controllerPid: controller.pid, controllerProcessStartedAt: controller.processStartedAt,
+        }, new Error("warm native session retirement busy"));
+        throw new Error("native_session_supervisor_busy");
+      }
       entry.preparingRunId = undefined;
       // Old run-scoped environments still require process replacement. A
       // session-owned broker can change run authority without replacing it.
@@ -8264,20 +8303,47 @@ async function executePaperclipNativeSessionWithinScope(
           (input.runnerEnvironment?.PAPERCLIP_RUNNER_NETWORK_ACCESS ===
             "enabled")
       ) {
-        if (entry.busy) throw new Error("native_session_supervisor_busy");
+        if (entry.busy) {
+          if (entry.retirementProtected) throw new NativeWarmSessionRetirementPendingError({
+            owner: leaseOwner, attempt, controllerBootId: controller.bootId,
+            controllerPid: controller.pid, controllerProcessStartedAt: controller.processStartedAt,
+          }, new Error("warm native session retirement busy"));
+          throw new Error("native_session_supervisor_busy");
+        }
         if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
-        warmNativeSessions.delete(warmSessionId);
+        entry.idleTimer = null;
+        if (entry.retirementProtected) entry.busy = true;
+        else warmNativeSessions.delete(warmSessionId);
+        entry.closeOnReleaseReason ??= "warm native session configuration changed";
         // Preparation may already have handed this directory to the incoming
         // run. Retiring the old transport must not delete the new run's root;
         // its own stop callback owns collection from this point forward.
-        await closeWarmNativeSession(entry, "warm native session configuration changed", input.execution.binding.runId);
+        try {
+          await closeWarmNativeSession(entry, entry.closeOnReleaseReason, input.execution.binding.runId);
+        } catch (error) {
+          if (entry.retirementProtected) {
+            entry.busy = false;
+            throw new NativeWarmSessionRetirementPendingError({
+              owner: leaseOwner, attempt, controllerBootId: controller.bootId,
+              controllerPid: controller.pid, controllerProcessStartedAt: controller.processStartedAt,
+            }, error);
+          }
+          throw error;
+        }
+        if (warmNativeSessions.get(warmSessionId) === entry) warmNativeSessions.delete(warmSessionId);
         persistedWarmSession = loadWarmNativeCheckpoint(
           input.execution,
           warmConfigDigest,
           input.runnerExecutionTarget?.kind ?? "local",
         );
       } else {
-        if (entry.busy) throw new Error("native_session_supervisor_busy");
+        if (entry.busy) {
+          if (entry.retirementProtected) throw new NativeWarmSessionRetirementPendingError({
+            owner: leaseOwner, attempt, controllerBootId: controller.bootId,
+            controllerPid: controller.pid, controllerProcessStartedAt: controller.processStartedAt,
+          }, new Error("warm native session retirement busy"));
+          throw new Error("native_session_supervisor_busy");
+        }
         entry.busy = true;
         entry.ownerToken = warmSessionOwnerToken;
         entry.environmentId =
@@ -8835,6 +8901,14 @@ async function executePaperclipNativeSessionWithinScope(
       // with a retry or release the still-live runner's lease.
       throw new NativeControllerDetachedForRestartError();
     }
+    if (error instanceof NativeWarmSessionRetirementPendingError) {
+      // No provider was admitted. The new Run owns a lease, but the prior
+      // provider remains physically unretired. Let heartbeat settle only this
+      // exact new lease; generic adapter failure would stop the old sandbox.
+      await leaseRenewal.stop().catch(() => undefined);
+      await trace.finish("failed").catch(() => undefined);
+      throw error;
+    }
     if (consumeRecoveredSessionGoalOnly && (
       error instanceof NativeSessionGoalConsumeOnlyError ||
       (consumeRecoveredSessionGoalOwned &&
@@ -8923,7 +8997,10 @@ async function executePaperclipNativeSessionWithinScope(
           phase: "terminal_failure",
           recoveryState: "blocked",
           failureCode: held.code,
-          failureDetail: { claimState: held.claimState, receiptRelation: held.receiptRelation },
+          // Persist the physical hold before attempting close. A crash between
+          // Run settlement and checkpoint cannot authorize the orphan sweep.
+          failureDetail: { claimState: held.claimState, receiptRelation: held.receiptRelation,
+            resourceRetirementDeferred: true },
           nextAttemptAt: null,
           controlDeadlineAt: null,
           leaseOwner: null,
@@ -9003,7 +9080,8 @@ async function executePaperclipNativeSessionWithinScope(
               // A failed close is not evidence that checkpointing completed.
               // Quarantine this owner and keep its environment alive for
               // operator reconciliation instead of reporting safe teardown.
-              ownedWarmEntry.busy = true;
+              ownedWarmEntry.busy = false;
+              ownedWarmEntry.retirementProtected = true;
               warmResourceReleased = false;
               warmCloseFailure = closeError;
             }
@@ -9015,11 +9093,33 @@ async function executePaperclipNativeSessionWithinScope(
             lifecyclePolicy.idleTimeoutMs, false).catch(() => undefined);
         }
       }
+      if (settled && warmResourceReleased) {
+        // Clear the durable hold only after close and exact map ownership are
+        // proven. An unknown write outcome remains a physical HOLD.
+        const [retired] = await input.db.update(nativeRunFinalizations).set({
+          failureDetail: { claimState: held.claimState, receiptRelation: held.receiptRelation,
+            resourceRetirementDeferred: false },
+          updatedAt: new Date(),
+        }).where(and(
+          eq(nativeRunFinalizations.runId, binding.runId),
+          eq(nativeRunFinalizations.companyId, binding.companyId),
+          eq(nativeRunFinalizations.issueId, binding.issueId),
+          eq(nativeRunFinalizations.phase, "terminal_failure"),
+          eq(nativeRunFinalizations.failureCode, held.code),
+          eq(nativeRunFinalizations.attempt, attempt),
+          eq(nativeRunFinalizations.controllerBootId, controller.bootId),
+          eq(nativeRunFinalizations.controllerPid, controller.pid),
+          eq(nativeRunFinalizations.controllerProcessStartedAt, controller.processStartedAt),
+          isNull(nativeRunFinalizations.resultId),
+          sql`${nativeRunFinalizations.failureDetail}->>'resourceRetirementDeferred' = 'true'`,
+        )).returning({ runId: nativeRunFinalizations.runId }).catch(() => []);
+        if (!retired) warmResourceReleased = false;
+      }
       await trace.finish("failed").catch(() => undefined);
       // A zero-row CAS, changed warm owner, or unverified close is unresolved
       // resource ownership. None authorizes generic failure teardown.
-      const outcome = new NativeGoalDeliveryHeldError(settled && warmResourceReleased,
-        held.claimState, held.receiptRelation);
+      const outcome = new NativeGoalDeliveryHeldError(settled,
+        held.claimState, held.receiptRelation, settled && !warmResourceReleased);
       if (warmCloseFailure !== undefined) {
         Object.defineProperty(outcome, "cause", { value: warmCloseFailure, configurable: true });
       }

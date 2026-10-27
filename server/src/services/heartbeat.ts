@@ -5,7 +5,7 @@ import { classifySessionGoalRecoveryAction } from "./session-goal-recovery-polic
 import { canSettleNativeSessionStartupBusy, releaseRejectedNativeStartupRunLeases, settleNativeSessionStartupBusy, withHeartbeatRunExecution } from "./heartbeat-run-execution.js";
 import { runnerGoalActionRequestSchema } from "@paperclipai/shared";
 import { GOAL_DELIVERY_INDETERMINATE_CODE } from "./runner-goal-delivery-policy.js";
-import { NativeGoalDeliveryHeldError, NativeSessionLeaseNotOwnedError, NativeSessionStartupBusyError } from "./native-runtime/native-goal-delivery-hold.js";
+import { NativeGoalDeliveryHeldError, NativeSessionLeaseNotOwnedError, NativeSessionStartupBusyError, NativeWarmSessionRetirementPendingError } from "./native-runtime/native-goal-delivery-hold.js";
 import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
 import { agentIdentityService, supportsManagedAgentIdentity } from "./agent-identity.js";
 import { buildAgentIdentityEnv } from "@paperclipai/adapter-utils/server-utils";
@@ -18743,6 +18743,26 @@ export function heartbeatService(
       );
   }
 
+  async function hasUnretiredNativeProvider(lease: typeof environmentLeases.$inferSelect): Promise<boolean> {
+    if (!lease.heartbeatRunId) return false;
+    const [coordinator] = await db.select({
+      phase: nativeRunFinalizations.phase,
+      failureCode: nativeRunFinalizations.failureCode,
+      failureDetail: nativeRunFinalizations.failureDetail,
+      resultId: nativeRunFinalizations.resultId,
+    }).from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.runId, lease.heartbeatRunId),
+      eq(nativeRunFinalizations.companyId, lease.companyId),
+    )).limit(1);
+    if (!coordinator || coordinator.phase !== "terminal_failure" || coordinator.resultId !== null ||
+        (coordinator.failureCode !== GOAL_DELIVERY_INDETERMINATE_CODE &&
+          coordinator.failureCode !== "native_warm_session_retirement_pending")) return false;
+    // Older records without the explicit receipt are UNKNOWN. A durable false
+    // is written only after the provider close and owner check have succeeded.
+    const detail = coordinator.failureDetail as { resourceRetirementDeferred?: unknown } | null;
+    return detail?.resourceRetirementDeferred !== false;
+  }
+
   // An active lease is reachable only while its heartbeat run keeps the
   // running status. The reaper writes the run status and the lease release as
   // two separate statements, so a restart between them can leave a terminal
@@ -18782,6 +18802,10 @@ export function heartbeatService(
 
     let recovered = 0;
     for (const { lease } of rows) {
+      if (await hasUnretiredNativeProvider(lease)) {
+        await deferOrphanedActiveLease(lease.id);
+        continue;
+      }
       // A provider resource id names one physical sandbox. A different lease
       // row can still hold that same resource in a live status, so this sweep
       // must not tear down a sandbox that a different lease still owns.
@@ -18899,6 +18923,10 @@ export function heartbeatService(
     let destroyed = 0;
     let capped = 0;
     for (const row of rows) {
+      if (await hasUnretiredNativeProvider(row)) {
+        await deferPendingCleanupLease(row.id);
+        continue;
+      }
       if (pendingCleanupAttemptsInFlight.has(row.id)) continue;
       const metadata = { ...(row.metadata ?? {}) } as Record<string, unknown>;
       const attempts = readPendingCleanupRetryAttempts(metadata);
@@ -20530,7 +20558,7 @@ export function heartbeatService(
       // lease release), and a timeout must not be repeated in outer teardown.
       // Another executor may still own this Run after a goal-delivery HOLD.
       // Releasing its run-scoped working copy here would retire shared state.
-      if (instructionCleanupDeferred || nativeGoalDeliveryOwnershipDeferred) return;
+      if (instructionCleanupDeferred || nativeGoalDeliveryOwnershipDeferred || nativeProviderRetirementDeferred) return;
       try {
         await instructionCopies.release(instructionCleanupRun.companyId, instructionCleanupRun.id);
       } catch (err) {
@@ -20647,6 +20675,9 @@ export function heartbeatService(
     let nativeSessionResumeScheduled = false;
     let nativeOwnershipHeld = false;
     let nativeGoalDeliveryOwnershipDeferred = false;
+    // A terminal Run can still have an unretired live provider. This flag
+    // defers only provider-coupled teardown, never durable Run/agent settlement.
+    let nativeProviderRetirementDeferred = false;
     let nativeStartupBusyRejected = false;
     let nativeStartupBusyPendingClassification = false;
     let nativeInstructionReservation: Awaited<ReturnType<typeof reserveWarmNativeInstructionDirectory>> = null;
@@ -25505,6 +25536,11 @@ export function heartbeatService(
             || adapterErr instanceof NativeSessionLeaseNotOwnedError) {
             if (adapterErr instanceof NativeSessionStartupBusyError) nativeStartupBusyPendingClassification = true;
             nativeGoalDeliveryOwnershipDeferred = !(adapterErr instanceof NativeGoalDeliveryHeldError && adapterErr.settled);
+            if (adapterErr instanceof NativeGoalDeliveryHeldError) {
+              nativeProviderRetirementDeferred = adapterErr.resourceRetirementDeferred;
+            } else if (adapterErr instanceof NativeWarmSessionRetirementPendingError) {
+              nativeProviderRetirementDeferred = true;
+            }
             throw adapterErr;
           }
           if (adapterErr instanceof NativeSessionStartupBusyError) {
@@ -25513,6 +25549,7 @@ export function heartbeatService(
             // coordinator is proved under the issue/coordinator/run locks.
             nativeStartupBusyPendingClassification = true;
             nativeGoalDeliveryOwnershipDeferred = true;
+            if (adapterErr instanceof NativeWarmSessionRetirementPendingError) nativeProviderRetirementDeferred = true;
             throw adapterErr;
           }
           if (adapterErr instanceof NativeCancellationPendingRecoveryError) {
@@ -26451,6 +26488,10 @@ export function heartbeatService(
                   attempt: nativeRunFinalizations.attempt,
                   leaseOwner: nativeRunFinalizations.leaseOwner,
                   resultId: nativeRunFinalizations.resultId,
+                  controllerBootId: nativeRunFinalizations.controllerBootId,
+                  controllerPid: nativeRunFinalizations.controllerPid,
+                  controllerProcessStartedAt: nativeRunFinalizations.controllerProcessStartedAt,
+                  leaseExpiresAt: nativeRunFinalizations.leaseExpiresAt,
                 }).from(nativeRunFinalizations).where(and(
                   eq(nativeRunFinalizations.runId, run.id),
                   eq(nativeRunFinalizations.companyId, run.companyId),
@@ -26464,20 +26505,31 @@ export function heartbeatService(
                   !canSettleNativeSessionStartupBusy({
                     scope: err.scope,
                     isRestartRecovery: Boolean(runOptions.nativeLeaseOwner || runOptions.nativeRestartRecovery),
+                    ownedLease: err instanceof NativeWarmSessionRetirementPendingError ? err.ownedLease : null,
                     coordinator: coordinator ?? null,
                   })) return null;
                 const [failedCoordinator] = await tx.update(nativeRunFinalizations).set({
                   phase: "terminal_failure", recoveryState: "blocked",
                   failureCode: err.code,
-                  failureDetail: { scope: err.scope, providerWorkStarted: false },
+                  failureDetail: { scope: err.scope, providerWorkStarted: false,
+                    resourceRetirementDeferred: err instanceof NativeWarmSessionRetirementPendingError },
                   nextAttemptAt: null, controlDeadlineAt: null, updatedAt: now,
+                  ...(err instanceof NativeWarmSessionRetirementPendingError && err.ownedLease
+                    ? { leaseOwner: null, leaseExpiresAt: null } : {}),
                 }).where(and(
                   eq(nativeRunFinalizations.runId, run.id),
                   eq(nativeRunFinalizations.companyId, run.companyId),
                   eq(nativeRunFinalizations.issueId, issueRef.id),
                   eq(nativeRunFinalizations.phase, "observed"),
-                  eq(nativeRunFinalizations.attempt, 0),
-                  isNull(nativeRunFinalizations.leaseOwner),
+                  eq(nativeRunFinalizations.attempt,
+                    err instanceof NativeWarmSessionRetirementPendingError && err.ownedLease ? err.ownedLease.attempt : 0),
+                  ...(err instanceof NativeWarmSessionRetirementPendingError && err.ownedLease
+                    ? [eq(nativeRunFinalizations.leaseOwner, err.ownedLease.owner),
+                      eq(nativeRunFinalizations.controllerBootId, err.ownedLease.controllerBootId),
+                      eq(nativeRunFinalizations.controllerPid, err.ownedLease.controllerPid),
+                      eq(nativeRunFinalizations.controllerProcessStartedAt, err.ownedLease.controllerProcessStartedAt),
+                      gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`)]
+                    : [isNull(nativeRunFinalizations.leaseOwner)]),
                   isNull(nativeRunFinalizations.resultId),
                 )).returning({ runId: nativeRunFinalizations.runId });
                 if (!failedCoordinator) return null;
@@ -26501,6 +26553,7 @@ export function heartbeatService(
               if (!updated) return false;
               // From here this executor owns a terminal, effect-free Run.
               nativeGoalDeliveryOwnershipDeferred = false;
+              if (err instanceof NativeWarmSessionRetirementPendingError) nativeProviderRetirementDeferred = true;
               nativeStartupBusyRejected = true;
               failedBusyRun = updated;
               publishLiveEvent({ companyId: updated.companyId, type: "heartbeat.run.status",
@@ -26879,7 +26932,7 @@ export function heartbeatService(
         });
       }
     } catch (outerErr) {
-      if (nativeGoalDeliveryOwnershipDeferred || outerErr instanceof NativeGoalDeliveryHeldError
+      if (nativeGoalDeliveryOwnershipDeferred || (outerErr instanceof NativeGoalDeliveryHeldError && !outerErr.settled)
         || (outerErr instanceof NativeSessionStartupBusyError && outerErr.scope === "same_run")
         || outerErr instanceof NativeSessionLeaseNotOwnedError) {
         nativeGoalDeliveryOwnershipDeferred = true;
@@ -27156,7 +27209,7 @@ export function heartbeatService(
         if (adapterExecutionControls.get(run.id) === executionControl) adapterExecutionControls.delete(run.id);
         return;
       }
-      if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
+      if (managedAiRuntime && !nativeProviderRetirementDeferred) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
       try {
         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
@@ -27228,7 +27281,7 @@ export function heartbeatService(
           // Keep launchers during same-run recovery. At a terminal boundary all
           // operations have settled; clean before the remote lease can be stopped.
           if (
-            githubLauncherLocation &&
+            !nativeProviderRetirementDeferred && githubLauncherLocation &&
             latestRun &&
             isHeartbeatRunTerminalStatus(latestRun.status)
           ) {
@@ -27243,7 +27296,8 @@ export function heartbeatService(
           }
           // A retained or unverified process stays above this release boundary.
           // If no stopped-copy capture occurred, preserve an explicit loss report.
-          const uncapturedInstructions = await instructionCopies.reportUnavailable(run.companyId, run.id);
+          const uncapturedInstructions = nativeProviderRetirementDeferred ? null :
+            await instructionCopies.reportUnavailable(run.companyId, run.id);
           if (uncapturedInstructions?.state === "unavailable") {
             await appendRunEvent(run, { eventType: "instruction_save", stream: "system", level: "warn",
               message: "Instruction edits could not be recovered before environment release. No instruction save is claimed.",
@@ -27251,6 +27305,7 @@ export function heartbeatService(
           }
           await withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy);
           await withAdapterExecutionPhase(executionPhaseContext, "lease_release", async () => {
+            if (nativeProviderRetirementDeferred) return;
             if (nativeStartupBusyRejected) {
               // The rejected Run may have acquired an environment lease before
               // the winner took this native session scope. Release only this
@@ -27291,10 +27346,10 @@ export function heartbeatService(
               nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
             });
           });
-          await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          if (!nativeProviderRetirementDeferred) await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
         }
         if (
-          runScratch &&
+          !nativeProviderRetirementDeferred && runScratch &&
           latestRun &&
           isHeartbeatRunTerminalStatus(latestRun.status)
         ) {

@@ -55,6 +55,22 @@ describe("native startup contention after a run was claimed", () => {
       coordinator: null })).toBe(false);
   });
 
+  it("settles a post-lease retirement refusal only for its exact fresh lease", () => {
+    const startedAt = new Date(Date.now() - 1000);
+    const ownedLease = { owner: "new-run-owner", attempt: 1, controllerBootId: "boot",
+      controllerPid: 42, controllerProcessStartedAt: startedAt };
+    const coordinator = { phase: "observed", resultId: null, leaseOwner: ownedLease.owner,
+      attempt: ownedLease.attempt, controllerBootId: ownedLease.controllerBootId,
+      controllerPid: ownedLease.controllerPid, controllerProcessStartedAt: startedAt,
+      leaseExpiresAt: new Date(Date.now() + 60_000) };
+    const input = { scope: "owner_scope" as const, isRestartRecovery: false, ownedLease, coordinator };
+    expect(canSettleNativeSessionStartupBusy(input)).toBe(true);
+    expect(canSettleNativeSessionStartupBusy({ ...input, coordinator: { ...coordinator, leaseOwner: "winner" } })).toBe(false);
+    expect(canSettleNativeSessionStartupBusy({ ...input, coordinator: { ...coordinator, resultId: "receipt" } })).toBe(false);
+    expect(canSettleNativeSessionStartupBusy({ ...input, coordinator: { ...coordinator, leaseExpiresAt: new Date(0) } })).toBe(false);
+    expect(canSettleNativeSessionStartupBusy({ ...input, isRestartRecovery: true })).toBe(false);
+  });
+
   it("defers a duplicate of the same run while releasing only its local reservation", async () => {
     const calls = {
       failCurrentRun: vi.fn(async () => true),

@@ -1,16 +1,31 @@
-import type { NativeSessionStartupBusyError } from "./native-runtime/native-goal-delivery-hold.js";
+import type { NativeSessionStartupBusyError, NativeWarmSessionRetirementPendingError } from "./native-runtime/native-goal-delivery-hold.js";
 
 export function canSettleNativeSessionStartupBusy(input: {
   scope: NativeSessionStartupBusyError["scope"];
   isRestartRecovery: boolean;
+  ownedLease?: NativeWarmSessionRetirementPendingError["ownedLease"];
   coordinator: {
     phase: string;
     attempt: number;
     leaseOwner: string | null;
     resultId: string | null;
+    controllerBootId?: string | null;
+    controllerPid?: number | null;
+    controllerProcessStartedAt?: Date | null;
+    leaseExpiresAt?: Date | null;
   } | null;
 }): boolean {
   const { coordinator } = input;
+  if (input.ownedLease) {
+    const owner = input.ownedLease;
+    return !input.isRestartRecovery && input.scope !== "same_run" &&
+      coordinator?.phase === "observed" && coordinator.resultId === null &&
+      coordinator.leaseOwner === owner.owner && coordinator.attempt === owner.attempt &&
+      coordinator.controllerBootId === owner.controllerBootId &&
+      coordinator.controllerPid === owner.controllerPid &&
+      coordinator.controllerProcessStartedAt?.getTime() === owner.controllerProcessStartedAt.getTime() &&
+      Boolean(coordinator.leaseExpiresAt && coordinator.leaseExpiresAt > new Date());
+  }
   return input.scope !== "same_run" && !input.isRestartRecovery &&
     coordinator?.phase === "observed" && coordinator.attempt === 0 &&
     coordinator.leaseOwner === null && coordinator.resultId === null;

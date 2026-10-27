@@ -10,6 +10,8 @@ import {
   createDb,
   environmentLeases,
   environments,
+  issues,
+  nativeRunFinalizations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -73,7 +75,9 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     await db.delete(activityLog);
     await db.delete(environmentLeases);
     await db.delete(costEvents);
+    await db.delete(nativeRunFinalizations);
     await db.delete(heartbeatRuns);
+    await db.delete(issues);
     await db.delete(environments);
     await db.delete(agents);
     await db.delete(companies);
@@ -202,6 +206,53 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
       .where(eq(environmentLeases.id, leaseId))
       .then((rows) => rows[0]?.status);
     expect(status).toBe("expired");
+  });
+
+  it.each([
+    { caseName: "exact goal hold", marker: true, failureCode: "session_goal_control_delivery_indeterminate", otherRun: false, protected: true },
+    { caseName: "legacy goal hold without a marker", marker: undefined, failureCode: "session_goal_control_delivery_indeterminate", otherRun: false, protected: true },
+    { caseName: "exact warm retirement hold", marker: true, failureCode: "native_warm_session_retirement_pending", otherRun: false, protected: true },
+    { caseName: "explicitly retired provider", marker: false, failureCode: "session_goal_control_delivery_indeterminate", otherRun: false, protected: false },
+    { caseName: "hold belonging to another run", marker: true, failureCode: "session_goal_control_delivery_indeterminate", otherRun: true, protected: false },
+    { caseName: "unrelated terminal failure", marker: true, failureCode: "adapter_failed", otherRun: false, protected: false },
+  ])("keeps only an unretired native provider out of pending cleanup: $caseName", async ({ marker, failureCode, otherRun, protected: shouldProtect }) => {
+    const { companyId, environmentId } = await seedCompanyAndEnvironment();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(agents).values({ id: agentId, companyId, name: "Native cleanup owner", role: "engineer", status: "idle", adapterType: "paperclip_runner" });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Native lease owner", status: "blocked", assigneeAgentId: agentId });
+    const insertFailedRun = async () => {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId,
+        runtimeMode: "native", status: "failed" });
+      return runId;
+    };
+    const runId = await insertFailedRun();
+    const coordinatorRunId = otherRun ? await insertFailedRun() : runId;
+    await db.insert(nativeRunFinalizations).values({
+      runId: coordinatorRunId, companyId, issueId, phase: "terminal_failure",
+      recoveryState: "blocked", failureCode,
+      failureDetail: marker === undefined ? { claimState: "indeterminate" } : { resourceRetirementDeferred: marker },
+    });
+    const leaseId = await insertPendingCleanupLease({ companyId, environmentId,
+      updatedAt: new Date(Date.now() - 60 * 60 * 1000) });
+    await db.update(environmentLeases).set({ heartbeatRunId: runId }).where(eq(environmentLeases.id, leaseId));
+    const destroyRunLease = vi.fn(async ({ lease }: { lease: { id: string } }) => db
+      .update(environmentLeases)
+      .set({ status: "expired", cleanupStatus: "success" })
+      .where(eq(environmentLeases.id, lease.id))
+      .returning()
+      .then(rows => rows[0] ?? null));
+    const heartbeat = heartbeatService(db, {
+      environmentRuntime: fakeRuntime(destroyRunLease as HeartbeatEnvironmentRuntime["destroyRunLease"]),
+    });
+
+    expect(await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 })).toMatchObject({
+      swept: shouldProtect ? 0 : 1, destroyed: shouldProtect ? 0 : 1,
+    });
+    expect(destroyRunLease).toHaveBeenCalledTimes(shouldProtect ? 0 : 1);
+    const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(row?.status).toBe(shouldProtect ? "pending_cleanup" : "expired");
   });
 
   it("test_pending_cleanup_sweep_respects_backoff_and_page_size", async () => {

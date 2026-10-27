@@ -9,6 +9,8 @@ import {
   environmentLeases,
   environments,
   heartbeatRuns,
+  issues,
+  nativeRunFinalizations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -64,7 +66,9 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
   afterEach(async () => {
     await db.delete(environmentLeases);
     await db.delete(costEvents);
+    await db.delete(nativeRunFinalizations);
     await db.delete(heartbeatRuns);
+    await db.delete(issues);
     await db.delete(environments);
     await db.delete(agents);
     await db.delete(companies);
@@ -110,6 +114,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     companyId: string;
     agentId: string;
     status: string;
+    nativeIssueId?: string;
   }): Promise<string> {
     const id = randomUUID();
     await db.insert(heartbeatRuns).values({
@@ -118,6 +123,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
       agentId: input.agentId,
       invocationSource: "on_demand",
       status: input.status,
+      ...(input.nativeIssueId ? { nativeIssueId: input.nativeIssueId, runtimeMode: "native" as const } : {}),
       nextEventSeq: 1,
     });
     return id;
@@ -210,6 +216,45 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     expect(result).toEqual({ recovered: 1 });
     const row = await leaseRow(leaseId);
     expect(row?.status).toBe("pending_cleanup");
+  });
+
+  it.each([
+    { caseName: "exact goal hold", marker: true, failureCode: "session_goal_control_delivery_indeterminate", otherRun: false, protected: true },
+    { caseName: "legacy goal hold without a marker", marker: undefined, failureCode: "session_goal_control_delivery_indeterminate", otherRun: false, protected: true },
+    { caseName: "exact warm retirement hold", marker: true, failureCode: "native_warm_session_retirement_pending", otherRun: false, protected: true },
+    { caseName: "explicitly retired provider", marker: false, failureCode: "session_goal_control_delivery_indeterminate", otherRun: false, protected: false },
+    { caseName: "hold belonging to another run", marker: true, failureCode: "session_goal_control_delivery_indeterminate", otherRun: true, protected: false },
+    { caseName: "unrelated terminal failure", marker: true, failureCode: "adapter_failed", otherRun: false, protected: false },
+  ])("keeps only an unretired native provider out of active-lease teardown: $caseName", async ({ marker, failureCode, otherRun, protected: shouldProtect }) => {
+    const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Native lease owner", status: "blocked", assigneeAgentId: agentId });
+    const runId = await insertHeartbeatRun({ companyId, agentId, status: "failed", nativeIssueId: issueId });
+    const coordinatorRunId = otherRun
+      ? await insertHeartbeatRun({ companyId, agentId, status: "failed", nativeIssueId: issueId })
+      : runId;
+    await db.insert(nativeRunFinalizations).values({
+      runId: coordinatorRunId, companyId, issueId, phase: "terminal_failure",
+      recoveryState: "blocked", failureCode,
+      failureDetail: marker === undefined ? { claimState: "indeterminate" } : { resourceRetirementDeferred: marker },
+    });
+    const leaseId = await insertActiveLease({ companyId, environmentId, heartbeatRunId: runId, updatedAt: oldEnough() });
+    const destroyRunLease = vi.fn(async ({ lease }: { lease: { id: string } }) => db
+      .update(environmentLeases)
+      .set({ status: "expired", cleanupStatus: "success" })
+      .where(eq(environmentLeases.id, lease.id))
+      .returning()
+      .then(rows => rows[0] ?? null));
+    const heartbeat = heartbeatService(db, {
+      environmentRuntime: { destroyRunLease } as unknown as HeartbeatEnvironmentRuntime,
+    });
+
+    expect(await heartbeat.sweepOrphanedActiveLeases({ backoffMs: 5 * 60 * 1000 }))
+      .toEqual({ recovered: shouldProtect ? 0 : 1 });
+    expect((await leaseRow(leaseId))?.status).toBe(shouldProtect ? "active" : "pending_cleanup");
+    await heartbeat.reapOrphanedRuns({ staleThresholdMs: 0 });
+    expect(destroyRunLease).toHaveBeenCalledTimes(shouldProtect ? 0 : 1);
+    expect((await leaseRow(leaseId))?.status).toBe(shouldProtect ? "active" : "expired");
   });
 
   it("test_keeps_an_active_lease_when_its_run_is_running", async () => {
