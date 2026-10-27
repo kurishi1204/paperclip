@@ -55,7 +55,7 @@ describe("native startup contention after a run was claimed", () => {
       coordinator: null })).toBe(false);
   });
 
-  it("defers only a duplicate of the same run, without settling or cleaning the winner", async () => {
+  it("defers a duplicate of the same run while releasing only its local reservation", async () => {
     const calls = {
       failCurrentRun: vi.fn(async () => true),
       failCurrentWakeup: vi.fn(async () => undefined),
@@ -65,7 +65,9 @@ describe("native startup contention after a run was claimed", () => {
     };
     expect(await settleNativeSessionStartupBusy(new NativeSessionStartupBusyError("same_run"), calls))
       .toBe("deferred");
-    for (const call of Object.values(calls)) expect(call).not.toHaveBeenCalled();
+    for (const [name, call] of Object.entries(calls)) {
+      expect(call).toHaveBeenCalledTimes(name === "releaseCurrentReservation" ? 1 : 0);
+    }
   });
 
   it("retains a reusable lease before releasing this run's other lease", async () => {
@@ -131,7 +133,7 @@ describe("native startup contention after a run was claimed", () => {
     },
   );
 
-  it("defers all cleanup when the current-run ownership check loses", async () => {
+  it("releases local preparation but defers shared cleanup when the current-run ownership check loses", async () => {
     const calls = {
       failCurrentRun: vi.fn(async () => false),
       failCurrentWakeup: vi.fn(async () => undefined),
@@ -145,7 +147,7 @@ describe("native startup contention after a run was claimed", () => {
     expect(calls.failCurrentWakeup).not.toHaveBeenCalled();
     expect(calls.releaseCurrentIssue).not.toHaveBeenCalled();
     expect(calls.finalizeAgent).not.toHaveBeenCalled();
-    expect(calls.releaseCurrentReservation).not.toHaveBeenCalled();
+    expect(calls.releaseCurrentReservation).toHaveBeenCalledOnce();
   });
 
   it("continues the rejected run's issue and reservation cleanup when wake settlement fails", async () => {

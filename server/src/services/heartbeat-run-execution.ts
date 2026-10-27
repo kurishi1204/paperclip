@@ -42,11 +42,11 @@ export async function settleNativeSessionStartupBusy(
     releaseCurrentReservation: () => Promise<void>;
   },
 ): Promise<"deferred" | "settled"> {
-  if (error.scope === "same_run") return "deferred";
-  // A failed ownership CAS can mean another controller acquired this same
-  // Run after the busy rejection. It cannot authorize local/shared teardown.
-  if (!(await actions.failCurrentRun())) return "deferred";
   try {
+    if (error.scope === "same_run") return "deferred";
+    // A failed ownership CAS can mean another controller acquired this same
+    // Run after the busy rejection. It cannot authorize shared teardown.
+    if (!(await actions.failCurrentRun())) return "deferred";
     let firstError: unknown;
     let failed = false;
     for (const action of [actions.failCurrentWakeup, actions.releaseCurrentIssue, actions.finalizeAgent]) {
@@ -60,6 +60,9 @@ export async function settleNativeSessionStartupBusy(
     if (failed) throw firstError;
     return "settled";
   } finally {
+    // The reservation closure checks the exact in-process warm entry and its
+    // preparing Run. It is this attempt's local preparation, even if the
+    // durable Run is now owned by another executor.
     await actions.releaseCurrentReservation();
   }
 }

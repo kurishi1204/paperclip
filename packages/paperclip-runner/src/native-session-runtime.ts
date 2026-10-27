@@ -2101,15 +2101,39 @@ export async function executeNativeSession(
         ),
     });
   }
-  if (options.consumeRecoveredSessionGoalOnly && recovered) {
-    const recoveredIdentity = session.identity();
-    if (Object.entries(identity).some(([key, value]) =>
-      recoveredIdentity[key as keyof typeof identity] !== value)) {
-      throw new NativeSessionGoalConsumeOnlyError("recovery_failed");
+  // A checkpoint recovery creates a controller attachment owned by this
+  // attempt. Every path that preserves the live provider after a failed
+  // attempt must release that attachment without closing the provider.
+  // Warm existingSession attachments remain owned by their caller.
+  let recoveredControllerDetach: Promise<void> | null = null;
+  const releaseRecoveredControllerOnHold = async (failure: unknown): Promise<unknown> => {
+    if (!recoveredByThisAttempt || session === null) return failure;
+    const recoveredSession = session;
+    recoveredControllerDetach ??= Promise.resolve().then(() => {
+      if (!recoveredSession.detachControllerForRestart) {
+        throw new Error("native_session_controller_detach_unavailable");
+      }
+      return recoveredSession.detachControllerForRestart();
+    });
+    try {
+      await recoveredControllerDetach;
+      return failure;
+    } catch (detachFailure) {
+      return new AggregateError([failure, detachFailure],
+        "native session hold and controller detach failed");
     }
-    options.onConsumeRecoveredSessionGoalOwned?.();
-  }
+  };
+  let runAdmissionAttempted = false;
   try {
+    if (options.consumeRecoveredSessionGoalOnly && recovered) {
+      const recoveredIdentity = session.identity();
+      if (Object.entries(identity).some(([key, value]) =>
+        recoveredIdentity[key as keyof typeof identity] !== value)) {
+        throw new NativeSessionGoalConsumeOnlyError("recovery_failed");
+      }
+      options.onConsumeRecoveredSessionGoalOwned?.();
+    }
+    runAdmissionAttempted = true;
     await options.controlPlane.openRun({
       identity,
       backendKind: descriptor.kind,
@@ -2119,20 +2143,11 @@ export async function executeNativeSession(
     if (options.consumeRecoveredSessionGoalOnly && recovered) {
       // Run admission failed after exact recovery. It says nothing about the
       // provider's live goal; closing it would revoke an accepted control.
-      // A newly recovered controller attachment belongs to this attempt.
-      // Relinquish that attachment without stopping the live provider. A warm
-      // existingSession belongs to its caller and must remain attached.
-      if (recoveredByThisAttempt) {
-        try {
-          if (!session.detachControllerForRestart) {
-            throw new Error("native_session_controller_detach_unavailable");
-          }
-          await session.detachControllerForRestart();
-        } catch (detachError) {
-          throw new AggregateError([error, detachError],
-            "native session admission and controller detach failed");
-        }
-      }
+      const holdFailure = await releaseRecoveredControllerOnHold(error);
+      if (holdFailure !== error) throw holdFailure;
+      // Validation and the ownership callback also run within this attempt's
+      // attachment lifetime. Their original error identity is authoritative.
+      if (!runAdmissionAttempted) throw error;
       if (error instanceof Error && error.name !== "Error") throw error;
       throw new NativeSessionGoalConsumeOnlyError("recovery_failed");
     }
@@ -2931,8 +2946,11 @@ export async function executeNativeSession(
     return { ...durableExecutionResult, ...enrichment };
   } catch (error) {
     if (options.consumeRecoveredSessionGoalOnly) preserveRecoveredSessionOnHold = recovered;
-    executionFailure = { error };
-    throw error;
+    const holdFailure = preserveRecoveredSessionOnHold
+      ? await releaseRecoveredControllerOnHold(error)
+      : error;
+    executionFailure = { error: holdFailure };
+    throw holdFailure;
   } finally {
     const shouldClose =
       !preserveRecoveredSessionOnHold &&

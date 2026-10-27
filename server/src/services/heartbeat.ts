@@ -27140,6 +27140,12 @@ export function heartbeatService(
         }
       }
     } finally {
+      // This closure owns only this attempt's warm preparation. Its release
+      // checks the entry identity and preparing Run, so a successor that has
+      // already attached is left intact even when durable ownership is held.
+      const localReservation = nativeInstructionReservation;
+      await localReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
+      if (nativeInstructionReservation === localReservation) nativeInstructionReservation = null;
       if (nativeGoalDeliveryOwnershipDeferred) {
         // No durable ownership receipt authorizes per-run cleanup: the same
         // run may still belong to another executor. Settle only local handles.
@@ -27148,7 +27154,6 @@ export function heartbeatService(
         if (adapterExecutionControls.get(run.id) === executionControl) adapterExecutionControls.delete(run.id);
         return;
       }
-      await nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
       if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
       try {

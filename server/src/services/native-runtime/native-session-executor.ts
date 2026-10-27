@@ -8850,6 +8850,15 @@ async function executePaperclipNativeSessionWithinScope(
       Object.defineProperty(held, "cause", { value: error, configurable: true });
       error = held;
     }
+    if (recoveredGoalDeliveryHold && !(error instanceof NativeGoalDeliveryHeldError)) {
+      // Detaching this attempt's recovered controller can fail after the
+      // command-boundary claim was refused. The physical provider remains
+      // live; retain the full error, but never route it through generic Run
+      // failure settlement or infer anything about action delivery.
+      const held = new NativeGoalDeliveryHeldError(false, "indeterminate", "no_valid_receipt");
+      Object.defineProperty(held, "cause", { value: error, configurable: true });
+      error = held;
+    }
     if (error instanceof NativeGoalDeliveryHeldError) {
       // A HOLD preserves the provider and durable owner, but this attempt no
       // longer supervises it. Drop only its own local controller/listeners.
