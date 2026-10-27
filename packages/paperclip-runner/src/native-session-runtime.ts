@@ -2115,6 +2115,12 @@ export async function executeNativeSession(
       sourceInstanceId: options.runnerInstanceId,
     });
   } catch (error) {
+    if (options.consumeRecoveredSessionGoalOnly && recovered) {
+      // Run admission failed after exact recovery. It says nothing about the
+      // provider's live goal; closing it would revoke an accepted control.
+      if (error instanceof Error && error.name !== "Error") throw error;
+      throw new NativeSessionGoalConsumeOnlyError("recovery_failed");
+    }
     if (session) {
       // Attachment and recovery both establish provider-side authority before
       // durable admission. If admission then fails, the prepared session must

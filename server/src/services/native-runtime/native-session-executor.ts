@@ -8189,6 +8189,7 @@ async function executePaperclipNativeSessionWithinScope(
   );
   let native: Awaited<ReturnType<typeof executeNativeSession>>;
   let releaseGoalController: (() => void) | null = null;
+  let publishedActiveNativeSession: ActiveNativeSession | null = null;
   const releaseRegisteredGoalController = () => {
     // The controller is assigned from the asynchronous onSession callback.
     // Keep release idempotent without relying on TypeScript's synchronous
@@ -8196,6 +8197,19 @@ async function executePaperclipNativeSessionWithinScope(
     const release: unknown = releaseGoalController;
     if (typeof release === "function") release();
     releaseGoalController = null;
+  };
+  const releasePublishedNativeSessionHandles = () => {
+    releaseRegisteredGoalController();
+    liveQuestions.close();
+    const active = publishedActiveNativeSession;
+    // A later controller can publish a successor for this Run while this
+    // attempt unwinds. Never clear its session or run-scoped deliveries.
+    if (active && activeNativeSessions.get(input.execution.binding.runId) === active) {
+      activeNativeSessions.delete(input.execution.binding.runId);
+      clearSteeringDeliveries(input.execution.binding.runId);
+      clearNativeRuntimeRequestResolutions(input.execution.binding.runId);
+    }
+    publishedActiveNativeSession = null;
   };
   const lifecyclePolicy = input.execution.session?.lifecyclePolicy ?? {
     mode: "per_turn" as const,
@@ -8386,6 +8400,7 @@ async function executePaperclipNativeSessionWithinScope(
   });
   let consumeRecoveredSessionGoalOnly = false;
   let consumeRecoveredSessionGoalOwned = false;
+  let completedGoalReconciliation = false;
   try {
     await prepareWarmSession();
     const reattachingGoalRunner = Boolean(
@@ -8408,11 +8423,16 @@ async function executePaperclipNativeSessionWithinScope(
         Boolean(inspection.claimId);
       if (reattachingGoalRunner && (sameHeartbeatOwner || inspection.state === "completed")) {
         consumeRecoveredSessionGoalOnly = true;
+      } else if (inspection.state === "completed" && !reattachingGoalRunner) {
+        // The action is durably complete. Reconcile the recovered goal state
+        // without replaying its create/edit/pause/clear control.
+        completedGoalReconciliation = true;
       } else if (inspection.state !== "ready" || reattachingGoalRunner) {
         throw new NativeGoalDeliveryHeldError(false, inspection.state, inspection.receiptRelation);
       }
     }
-    if (!consumeRecoveredSessionGoalOnly && (input.sessionGoalControl || input.claimGoalDelivery || input.inspectGoalDelivery) &&
+    if (!consumeRecoveredSessionGoalOnly && !completedGoalReconciliation &&
+        (input.sessionGoalControl || input.claimGoalDelivery || input.inspectGoalDelivery) &&
         (!input.sessionGoalControl || !input.claimGoalDelivery)) {
       // A missing control or claim authority cannot enter a provider. In
       // particular, null control must never fall through to a fresh turn.
@@ -8541,13 +8561,14 @@ async function executePaperclipNativeSessionWithinScope(
             existingSession: existingWarmSession,
             persistedSession: persistedWarmSession,
             keepSessionOpen: warmSessionId !== null,
-            sessionGoalControl: consumeRecoveredSessionGoalOnly ? null : input.sessionGoalControl,
-            resumeSessionGoalHeartbeat: consumeRecoveredSessionGoalOnly ? false : input.resumeSessionGoalHeartbeat,
+            sessionGoalControl: consumeRecoveredSessionGoalOnly || completedGoalReconciliation ? null : input.sessionGoalControl,
+            resumeSessionGoalHeartbeat: consumeRecoveredSessionGoalOnly ? false :
+              completedGoalReconciliation ? true : input.resumeSessionGoalHeartbeat,
             consumeRecoveredSessionGoalOnly,
             onConsumeRecoveredSessionGoalOwned: () => {
               consumeRecoveredSessionGoalOwned = true;
             },
-            beforeSessionGoalControl: input.claimGoalDelivery && !consumeRecoveredSessionGoalOnly
+            beforeSessionGoalControl: input.claimGoalDelivery && !consumeRecoveredSessionGoalOnly && !completedGoalReconciliation
               ? async (control: NativeSessionGoalControl) => {
                   if (!input.sessionGoalControl || !isDeepStrictEqual(control, input.sessionGoalControl)) {
                     throw new NativeGoalDeliveryHeldError(false, "claim_unavailable", "no_claim");
@@ -8703,6 +8724,7 @@ async function executePaperclipNativeSessionWithinScope(
               }
               if (session) {
                 const active: ActiveNativeSession = { session, cancelRequested: false };
+                publishedActiveNativeSession = active;
                 activeNativeSessions.set(input.execution.binding.runId, active);
                 const startup = nativeSessionStartups.get(input.execution.binding.runId);
                 startup?.resolve(active);
@@ -8744,12 +8766,7 @@ async function executePaperclipNativeSessionWithinScope(
                 }
                 if (active.cancelRequested) throw new NativeCancellationPendingRecoveryError();
               } else {
-                liveQuestions.close();
-                activeNativeSessions.delete(input.execution.binding.runId);
-                clearSteeringDeliveries(input.execution.binding.runId);
-                clearNativeRuntimeRequestResolutions(
-                  input.execution.binding.runId,
-                );
+                releasePublishedNativeSessionHandles();
               }
             },
           }),
@@ -8830,6 +8847,11 @@ async function executePaperclipNativeSessionWithinScope(
       error = held;
     }
     if (error instanceof NativeGoalDeliveryHeldError) {
+      // A HOLD preserves the provider and durable owner, but this attempt no
+      // longer supervises it. Drop only its own local controller/listeners.
+      // The broker release is generation-bound and the active map is checked
+      // by object identity, so a successor remains registered on a lost CAS.
+      releasePublishedNativeSessionHandles();
       await leaseRenewal.stop().catch(() => undefined);
       const held = error;
       const reattachingLiveRunner = input.restartRecovery?.kind === "reattach_existing_runner" ||

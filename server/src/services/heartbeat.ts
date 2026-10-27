@@ -25097,7 +25097,7 @@ export function heartbeatService(
                       }
                       : undefined,
                     resumeSessionGoalHeartbeat:
-                      context.resumeSessionGoalHeartbeat === true && !completedGoalControl,
+                      context.resumeSessionGoalHeartbeat === true || completedGoalControl,
                     onGoalCheckpoint: async (snapshot) => {
                       if (!taskKey) return;
                       const params =

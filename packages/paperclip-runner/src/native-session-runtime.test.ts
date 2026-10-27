@@ -841,6 +841,79 @@ describe("executeNativeSession recovery", () => {
     expect(openRun).not.toHaveBeenCalled();
   });
 
+  it("preserves an owned recovered provider when run admission rejects", async () => {
+    const snapshot: PersistedNativeSession = { backendKind: "mock", sessionId: "driver-recovery", identity,
+      providerSessionId: "provider-recovery", cursor: null, activeTurnId: "turn-recovery",
+      pendingRuntimeRequests: [], goal: null, lineage: [] };
+    const startTurn = vi.fn(async () => ({ turnId: "forbidden" }));
+    const goal = vi.fn(async () => null);
+    const cancel = vi.fn(() => ({ cleanup: Promise.resolve() }));
+    const close = vi.fn(async () => {});
+    const session: NativeSession = { identity: () => identity,
+      async capabilities() { return { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true }; },
+      async *events() { throw new Error("events_must_not_start"); },
+      startTurn, goal, cancel, async result() { return null; }, async snapshot() { return snapshot; }, close,
+    };
+    const openSession = vi.fn(async () => session);
+    const backend: NativeSessionBackend = { async descriptor() { return { kind: "mock", name: "consume-admission", version: "1", capabilities: { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true } }; },
+      openSession, async recoverSession() { return { recovered: true, session }; } };
+    const openRun = vi.fn(async () => { throw new Error("run_admission_failed"); });
+    const checkpointSession = vi.fn(async () => {});
+    const port: ControlPlanePort = { openRun, checkpointSession,
+      async appendEvent(event) { return { cursor: event.sourceSeq, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" }; },
+      async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; }, async completeRun() {} };
+    const owned = vi.fn();
+    const failure = await executeNativeSession({ input, backend, controlPlane: port,
+      runnerInstanceId: "runner-admission", controlPlaneInstanceId: "control-admission",
+      persistedSession: snapshot, consumeRecoveredSessionGoalOnly: true,
+      onConsumeRecoveredSessionGoalOwned: owned,
+      requireSessionCloseBeforeReturn: true }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(NativeSessionGoalConsumeOnlyError);
+    expect((failure as NativeSessionGoalConsumeOnlyError).reason).toBe("recovery_failed");
+    expect(owned).toHaveBeenCalledOnce();
+    expect(openRun).toHaveBeenCalledOnce();
+    expect(openSession).not.toHaveBeenCalled();
+    expect(checkpointSession).not.toHaveBeenCalled();
+    expect(startTurn).not.toHaveBeenCalled();
+    expect(goal).not.toHaveBeenCalled();
+    expect(cancel).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it.each(["active", "paused"] as const)("reconciles a completed-control %s goal without replaying the old control", async (status) => {
+    const providerGoal = { threadId: "provider-recovery", objective: "Keep existing goal",
+      status, tokenBudget: null, tokensUsed: 1, timeUsedSeconds: 1,
+      createdAt: 1, updatedAt: 1 };
+    const snapshot: PersistedNativeSession = { backendKind: "mock", sessionId: "driver-recovery", identity,
+      providerSessionId: providerGoal.threadId, cursor: null, activeTurnId: null,
+      pendingRuntimeRequests: [], goal: providerGoal, lineage: [] };
+    const goal = vi.fn(async () => providerGoal);
+    const startTurn = vi.fn(async () => ({ turnId: "forbidden" }));
+    const session: NativeSession = { identity: () => identity,
+      async capabilities() { return { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true }; },
+      async *events() { yield runnerEvent(1, "session.goal.updated", {
+        requestId: `recovery_${input.binding.runId}`,
+        goal: { objective: providerGoal.objective, status: status === "active" ? "complete" : "paused" },
+        workingNow: false,
+      }); },
+      startTurn, goal, async result() { return null; }, async snapshot() { return snapshot; }, async close() {},
+    };
+    const backend: NativeSessionBackend = { async descriptor() { return { kind: "mock", name: "completed-control", version: "1", capabilities: { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true } }; },
+      async openSession() { throw new Error("fresh_open_forbidden"); },
+      async recoverSession() { return { recovered: true, session }; } };
+    const port: ControlPlanePort = { async openRun() {}, async checkpointSession() {},
+      async appendEvent(event) { return { cursor: event.sourceSeq, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" }; },
+      async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; }, async completeRun() {} };
+    const completed = await executeNativeSession({ input, backend, controlPlane: port,
+      runnerInstanceId: "runner-completed-control", controlPlaneInstanceId: "control-completed-control",
+      persistedSession: snapshot, sessionGoalControl: null, resumeSessionGoalHeartbeat: true });
+    expect(goal).toHaveBeenCalledTimes(1);
+    expect(goal).toHaveBeenCalledWith({ action: status === "active" ? "resume" : "get",
+      requestId: `recovery_${input.binding.runId}` });
+    expect(startTurn).not.toHaveBeenCalled();
+    expect(completed.result.reportedWorkDisposition).toBe(status === "active" ? "done" : "yielded");
+  });
+
   it("classifies consume-only stream failure while preserving callback error identity", async () => {
     const snapshot: PersistedNativeSession = { backendKind: "mock", sessionId: "driver-recovery", identity,
       providerSessionId: "provider-recovery", cursor: null, activeTurnId: "turn-recovery",

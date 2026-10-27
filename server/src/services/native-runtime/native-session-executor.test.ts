@@ -64,6 +64,7 @@ import { buildNativeHeartbeatPreparationSpans } from "./native-run-trace.js";
 import { NativeRunnerOwnershipUnverifiedError } from "./native-runner-ownership.js";
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { NativeGoalDeliveryHeldError, NativeSessionLeaseNotOwnedError, NativeSessionStartupBusyError } from "./native-goal-delivery-hold.js";
+import { dispatchLiveRunnerGoalControl, registerLiveRunnerGoalController, runnerGoalControlBrokerInternals } from "../runner-goal-control-broker.js";
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -12018,6 +12019,89 @@ describe("owned goal delivery admission", () => {
     }
   });
 
+  it("removes a held warm attempt's broker before a different Run reuses its idle session", async () => {
+    const name = "goal-held-warm-broker";
+    const first = { ...execution,
+      binding: { ...execution.binding, runId: `${name}-first`, executionWorkspaceId: name },
+      session: { ...execution.session, normalizedSessionId: name,
+        lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    const second = { ...first, binding: { ...first.binding, runId: `${name}-second` } };
+    const third = { ...first, binding: { ...first.binding, runId: `${name}-third` } };
+    const goal = vi.fn(async () => ({}));
+    const session = { close: vi.fn(async () => undefined), goal };
+    const completed = { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" },
+      turnId: name, normalizedSessionId: name, providerSessionId: name,
+      driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1 };
+    const binding = { companyId: first.binding.companyId, issueId: first.binding.issueId,
+      agentId: first.binding.agentId };
+    const claim = vi.fn(async () => ({ state: "indeterminate" as const,
+      receiptRelation: "no_valid_receipt" as const, claimOwnerRunId: null, claimId: null }));
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onSession?.(session);
+      return completed;
+    }).mockImplementationOnce(async options => {
+      expect(options.existingSession).toBe(session);
+      await options.onSession?.(session);
+      await options.beforeSessionGoalControl?.(control);
+      throw new Error("claim boundary did not reject");
+    }).mockImplementationOnce(async options => {
+      expect(options.existingSession).toBe(session);
+      expect(dispatchLiveRunnerGoalControl(binding, control)).toBeNull();
+      return completed;
+    });
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: name });
+      runnerGoalControlBrokerInternals.resetForTests();
+      await expect(executePaperclipNativeSession({ db: leaseDb(second), execution: second,
+        runnerInstanceId: name, sessionGoalControl: control,
+        inspectGoalDelivery: async () => ({ state: "ready", receiptRelation: "no_valid_receipt", claimOwnerRunId: null, claimId: null }),
+        claimGoalDelivery: claim,
+      })).rejects.toBeInstanceOf(NativeGoalDeliveryHeldError);
+      expect(claim).toHaveBeenCalledOnce();
+      expect(dispatchLiveRunnerGoalControl(binding, control)).toBeNull();
+      await expect(executePaperclipNativeSession({ db: leaseDb(third), execution: third,
+        runnerInstanceId: name })).resolves.toMatchObject({ exitCode: 0 });
+      expect(goal).not.toHaveBeenCalled();
+      expect(session.close).not.toHaveBeenCalled();
+    } finally {
+      runnerGoalControlBrokerInternals.resetForTests();
+      await closeIdleWarmNativeSessionsForRestart();
+    }
+  });
+
+  it("does not remove a successor goal broker when an older held callback unwinds", async () => {
+    const binding = { companyId: execution.binding.companyId, issueId: execution.binding.issueId,
+      agentId: execution.binding.agentId };
+    const oldSession = { goal: vi.fn(async () => ({})) };
+    const successorControl = vi.fn(async () => undefined);
+    const successorRegistration = { release: null as (() => void) | null };
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onSession?.(oldSession);
+      await options.beforeSessionGoalControl?.(control);
+      throw new Error("claim boundary did not reject");
+    });
+    try {
+      await expect(executePaperclipNativeSession({ db: leaseDb(execution), execution,
+        runnerInstanceId: "goal-held-old-broker", sessionGoalControl: control,
+        inspectGoalDelivery: async () => ({ state: "ready", receiptRelation: "no_valid_receipt", claimOwnerRunId: null, claimId: null }),
+        claimGoalDelivery: async () => {
+          successorRegistration.release = registerLiveRunnerGoalController(
+            { ...binding, runId: "successor-run" }, { control: successorControl });
+          return { state: "indeterminate", receiptRelation: "no_valid_receipt", claimOwnerRunId: null, claimId: null };
+        },
+      })).rejects.toBeInstanceOf(NativeGoalDeliveryHeldError);
+      const delivery = dispatchLiveRunnerGoalControl(binding, control);
+      expect(delivery?.runId).toBe("successor-run");
+      await delivery?.completion;
+      expect(successorControl).toHaveBeenCalledOnce();
+      expect(oldSession.goal).not.toHaveBeenCalled();
+    } finally {
+      successorRegistration.release?.();
+      runnerGoalControlBrokerInternals.resetForTests();
+    }
+  });
+
   it("claims only at the runtime send boundary", async () => {
     const claim = vi.fn(async () => ({ state: "claimed" as const, receiptRelation: "same_owner" as const,
       claimOwnerRunId: execution.binding.runId, claimId: "claim" }));
@@ -12075,13 +12159,34 @@ describe("owned goal delivery admission", () => {
     expect(claim).toHaveBeenCalledOnce();
   });
 
-  it("does not turn a completed action into a new resume or turn", async () => {
-    state.execute.mockClear();
-    await expect(executePaperclipNativeSession({ db: ownedGoalDeliveryDb().db, execution,
-      runnerInstanceId: "owned-goal-completed", sessionGoalControl: null,
+  it("reconciles a completed goal on resume_dead_runner without claiming or replaying control", async () => {
+    const controller = await currentNativeControllerIdentity();
+    const leaseOwner = "completed-resume-owner";
+    const claim = vi.fn(async () => { throw new Error("must not claim"); });
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      expect(options.sessionGoalControl).toBeNull();
+      expect(options.resumeSessionGoalHeartbeat).toBe(true);
+      expect(options.consumeRecoveredSessionGoalOnly).toBe(false);
+      expect(options.beforeSessionGoalControl).toBeUndefined();
+      return { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" },
+        turnId: "completed-reconcile", normalizedSessionId: execution.session.normalizedSessionId,
+        providerSessionId: null, driverKind: "test", driverVersion: "1",
+        nativeEventCount: 1, highestContiguousSourceSeq: 1 };
+    });
+    await expect(executePaperclipNativeSession({
+      db: leaseDb(execution, { attempt: 1, leaseOwner, leaseExpiresAt: new Date(Date.now() + 60_000),
+        controllerBootId: controller.bootId, controllerPid: controller.pid,
+        controllerProcessStartedAt: controller.processStartedAt, controllerGeneration: 1 } as never),
+      execution, runnerInstanceId: "owned-goal-completed", leaseOwner,
+      restartRecovery: { kind: "resume_dead_runner", runId: execution.binding.runId,
+        leaseOwner, controllerGeneration: 1, providerAttempt: 1,
+        restartKind: "hard", recoveryRequestId: null },
+      sessionGoalControl: null, resumeSessionGoalHeartbeat: true,
       inspectGoalDelivery: async () => ({ state: "completed", receiptRelation: "no_valid_receipt", claimOwnerRunId: null, claimId: null }),
-    })).rejects.toBeInstanceOf(NativeGoalDeliveryHeldError);
-    expect(state.execute).not.toHaveBeenCalled();
+      claimGoalDelivery: claim,
+    })).resolves.toMatchObject({ exitCode: 0 });
+    expect(state.execute).toHaveBeenCalledOnce();
+    expect(claim).not.toHaveBeenCalled();
   });
 
   it.each([control, null])("holds an unknown receipt after claiming the native lease with control %j", async (goalControl) => {
@@ -12234,11 +12339,14 @@ describe("owned goal delivery admission", () => {
       controllerPid: controller.pid, controllerProcessStartedAt: controller.processStartedAt,
       controllerGeneration: 1 } });
     const observationFailure = new Error("recovered event observation failed");
+    const recoveredGoal = vi.fn(async () => ({}));
+    const recoveredClose = vi.fn(async () => undefined);
     state.execute.mockReset().mockImplementationOnce(async options => {
       expect(options.consumeRecoveredSessionGoalOnly).toBe(true);
       expect(options.sessionGoalControl).toBeNull();
       expect(options.resumeSessionGoalHeartbeat).toBe(false);
       expect(options.beforeSessionGoalControl).toBeUndefined();
+      await options.onSession?.({ goal: recoveredGoal, close: recoveredClose });
       options.onConsumeRecoveredSessionGoalOwned?.();
       throw observationFailure;
     });
@@ -12263,5 +12371,9 @@ describe("owned goal delivery admission", () => {
     expect(fixture.coordinator.leaseOwner).toBe(leaseOwner);
     expect(fixture.run.status).toBe("running");
     expect(fixture.issue.executionRunId).toBe(execution.binding.runId);
+    expect(dispatchLiveRunnerGoalControl({ companyId: execution.binding.companyId,
+      issueId: execution.binding.issueId, agentId: execution.binding.agentId }, control)).toBeNull();
+    expect(recoveredGoal).not.toHaveBeenCalled();
+    expect(recoveredClose).not.toHaveBeenCalled();
   });
 });
