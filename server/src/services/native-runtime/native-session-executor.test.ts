@@ -12087,8 +12087,9 @@ describe("owned goal delivery admission", () => {
     }
   });
 
-  it("releases a reused warm session after a pre-provider HOLD", async () => {
-    const sessionName = "goal-hold-warm-reuse";
+  it.each(["inspection", "claim"] as const)(
+    "retires a reused warm session after a settled %s HOLD", async mode => {
+    const sessionName = `goal-hold-warm-reuse-${mode}`;
     const first = { ...execution,
       binding: { ...execution.binding, runId: `${sessionName}-first`, executionWorkspaceId: sessionName },
       session: { ...execution.session, normalizedSessionId: sessionName,
@@ -12103,23 +12104,151 @@ describe("owned goal delivery admission", () => {
     state.execute.mockReset().mockImplementationOnce(async options => {
       await options.onSession?.(session);
       return completed;
+    });
+    if (mode === "claim") state.execute.mockImplementationOnce(async options => {
+      expect(options.existingSession).toBe(session);
+      await options.beforeSessionGoalControl?.(control);
+      throw new Error("claim boundary did not reject");
+    });
+    state.execute.mockImplementationOnce(async options => {
+      expect(options.existingSession).toBeUndefined();
+      return completed;
+    });
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: sessionName });
+      const heldDb = ownedGoalDeliveryDb({ execution: second });
+      const claim = vi.fn(async () => unknownReceipt());
+      await expect(executePaperclipNativeSession({ db: heldDb.db, execution: second,
+        runnerInstanceId: sessionName, sessionGoalControl: control,
+        claimGoalDelivery: claim,
+        inspectGoalDelivery: async () => mode === "claim"
+          ? { state: "ready" as const, receiptRelation: "no_valid_receipt" as const,
+              claimOwnerRunId: null, claimId: null }
+          : unknownReceipt(),
+      })).rejects.toMatchObject({ settled: true });
+      expect(heldDb.run.status).toBe("failed");
+      expect(session.close).toHaveBeenCalledOnce();
+      expect(claim).toHaveBeenCalledTimes(mode === "claim" ? 1 : 0);
+      await expect(executePaperclipNativeSession({ db: leaseDb(third), execution: third,
+        runnerInstanceId: sessionName })).resolves.toMatchObject({ exitCode: 0 });
+      expect(state.execute).toHaveBeenCalledTimes(mode === "claim" ? 3 : 2);
+    } finally {
+      await closeIdleWarmNativeSessionsForRestart();
+    }
+  });
+
+  it("keeps a caller-owned warm session when the goal HOLD CAS loses", async () => {
+    const name = "goal-hold-warm-cas-loser";
+    const first = { ...execution,
+      binding: { ...execution.binding, runId: `${name}-first`, executionWorkspaceId: name },
+      session: { ...execution.session, normalizedSessionId: name,
+        lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    const second = { ...first, binding: { ...first.binding, runId: `${name}-second` } };
+    const successor = { ...first, binding: { ...first.binding, runId: `${name}-successor` } };
+    const session = { close: vi.fn(async () => undefined) };
+    const completed = { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" },
+      turnId: name, normalizedSessionId: name, providerSessionId: name,
+      driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1 };
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onSession?.(session);
+      return completed;
     }).mockImplementationOnce(async options => {
       expect(options.existingSession).toBe(session);
       return completed;
     });
     try {
-      await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: sessionName });
-      await expect(executePaperclipNativeSession({ db: leaseDb(second), execution: second,
-        runnerInstanceId: sessionName, sessionGoalControl: control,
-        claimGoalDelivery: async () => { throw new Error("must not claim"); },
+      await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: name });
+      const heldDb = ownedGoalDeliveryDb({ execution: second, loseHoldCas: true });
+      await expect(executePaperclipNativeSession({ db: heldDb.db, execution: second,
+        runnerInstanceId: name, sessionGoalControl: control,
         inspectGoalDelivery: async () => unknownReceipt(),
-      })).rejects.toBeInstanceOf(NativeGoalDeliveryHeldError);
-      await expect(executePaperclipNativeSession({ db: leaseDb(third), execution: third,
-        runnerInstanceId: sessionName })).resolves.toMatchObject({ exitCode: 0 });
+        claimGoalDelivery: async () => { throw new Error("must not claim"); },
+      })).rejects.toMatchObject({ settled: false });
+      expect(heldDb.coordinator.phase).toBe("observed");
+      expect(heldDb.run.status).toBe("running");
+      expect(session.close).not.toHaveBeenCalled();
+      await expect(executePaperclipNativeSession({ db: leaseDb(successor), execution: successor,
+        runnerInstanceId: name })).resolves.toMatchObject({ exitCode: 0 });
       expect(state.execute).toHaveBeenCalledTimes(2);
+      expect(session.close).not.toHaveBeenCalled();
     } finally {
       await closeIdleWarmNativeSessionsForRestart();
     }
+  });
+
+  it("does not authorize sandbox teardown when a borrowed warm handle disappears before a settled HOLD", async () => {
+    const name = "goal-hold-warm-lost-handle";
+    const first = { ...execution,
+      binding: { ...execution.binding, runId: `${name}-first`, executionWorkspaceId: name },
+      session: { ...execution.session, normalizedSessionId: name,
+        lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    const second = { ...first, binding: { ...first.binding, runId: `${name}-second` } };
+    const session = { close: vi.fn(async () => undefined) };
+    const completed = { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" },
+      turnId: name, normalizedSessionId: name, providerSessionId: name,
+      driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1 };
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onSession?.(session);
+      return completed;
+    }).mockImplementationOnce(async options => {
+      expect(options.existingSession).toBe(session);
+      await options.onSession?.(null);
+      await options.beforeSessionGoalControl?.(control);
+      throw new Error("claim boundary did not reject");
+    });
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: name });
+      const heldDb = ownedGoalDeliveryDb({ execution: second });
+      await expect(executePaperclipNativeSession({ db: heldDb.db, execution: second,
+        runnerInstanceId: name, sessionGoalControl: control,
+        inspectGoalDelivery: async () => ({ state: "ready", receiptRelation: "no_valid_receipt",
+          claimOwnerRunId: null, claimId: null }),
+        claimGoalDelivery: async () => unknownReceipt(),
+      })).rejects.toMatchObject({ settled: false });
+      expect(heldDb.run.status).toBe("failed");
+      expect(session.close).not.toHaveBeenCalled();
+    } finally {
+      await closeIdleWarmNativeSessionsForRestart();
+    }
+  });
+
+  it("defers environment teardown when a settled goal HOLD cannot close its warm session", async () => {
+    const name = "goal-hold-warm-close-failure";
+    const first = { ...execution,
+      binding: { ...execution.binding, runId: `${name}-first`, executionWorkspaceId: name },
+      session: { ...execution.session, normalizedSessionId: name,
+        lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    const second = { ...first, binding: { ...first.binding, runId: `${name}-second` } };
+    const closeFailure = new Error("warm checkpoint refused");
+    const session = { close: vi.fn(async () => { throw closeFailure; }) };
+    const completed = { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" },
+      turnId: name, normalizedSessionId: name, providerSessionId: name,
+      driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1 };
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onSession?.(session);
+      return completed;
+    });
+    await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: name });
+    const heldDb = ownedGoalDeliveryDb({ execution: second });
+    let caught: unknown;
+    try {
+      await executePaperclipNativeSession({ db: heldDb.db, execution: second,
+        runnerInstanceId: name, sessionGoalControl: control,
+        inspectGoalDelivery: async () => unknownReceipt(),
+        claimGoalDelivery: async () => { throw new Error("must not claim"); },
+      });
+    } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(NativeGoalDeliveryHeldError);
+    expect((caught as NativeGoalDeliveryHeldError).settled).toBe(false);
+    expect((caught as Error & { cause?: unknown }).cause).toBe(closeFailure);
+    expect(heldDb.coordinator.phase).toBe("terminal_failure");
+    expect(heldDb.run.status).toBe("failed");
+    expect(session.close).toHaveBeenCalledOnce();
+    expect(await closeIdleWarmNativeSessionsForRestart()).toMatchObject({ busy: 1, closed: 0 });
+    expect(state.execute).toHaveBeenCalledOnce();
   });
 
   it("removes a held warm attempt's broker before a different Run reuses its idle session", async () => {

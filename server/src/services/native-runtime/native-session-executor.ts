@@ -8869,30 +8869,26 @@ async function executePaperclipNativeSessionWithinScope(
       const held = error;
       const reattachingLiveRunner = input.restartRecovery?.kind === "reattach_existing_runner" ||
         input.restartRecovery?.kind === "reattach_remote_runner";
-      if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
-        const ownedWarmEntry = warmNativeSessions.get(warmSessionId);
-        if (ownedWarmEntry?.ownerToken === warmSessionOwnerToken &&
-            (reattachingLiveRunner || recoveredGoalDeliveryHold) &&
-            ownedWarmEntry.session !== existingWarmSession) {
-          // This attempt published a checkpoint-recovered session, then gave
-          // up its controller without closing the provider. The detached
-          // handle cannot be reused as an in-process warm session. Remove
-          // exactly this generation so a later admission reloads the durable
-          // checkpoint. The finally block retires its inactive GitHub broker.
-          if (ownedWarmEntry.idleTimer !== null) clearTimeout(ownedWarmEntry.idleTimer);
-          warmNativeSessions.delete(warmSessionId);
-        } else {
-          // A caller-owned warm session has not detached. Return only this
-          // generation to idle, retaining the session for its next owner.
-          await releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken,
-            lifecyclePolicy.idleTimeoutMs, false).catch(() => undefined);
-        }
-      }
       if (reattachingLiveRunner || recoveredGoalDeliveryHold) {
         // The old process may still be executing a control accepted before
         // controller loss. A newly recovered provider may also remain live
         // after the command-boundary claim fails. Neither state authorizes
         // failing its Run or releasing its lease without a completion receipt.
+        if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
+          const ownedWarmEntry = warmNativeSessions.get(warmSessionId);
+          if (ownedWarmEntry?.ownerToken === warmSessionOwnerToken &&
+              ownedWarmEntry.session !== existingWarmSession) {
+            // Only this attempt's checkpoint-recovered controller detached.
+            // Drop its handle without closing the still-live provider.
+            if (ownedWarmEntry.idleTimer !== null) clearTimeout(ownedWarmEntry.idleTimer);
+            warmNativeSessions.delete(warmSessionId);
+          } else {
+            // A caller-owned warm session was never detached. Return only
+            // this generation to idle for its current durable owner.
+            await releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken,
+              lifecyclePolicy.idleTimeoutMs, false).catch(() => undefined);
+          }
+        }
         await trace.finish("failed").catch(() => undefined);
         throw held;
       }
@@ -8973,10 +8969,61 @@ async function executePaperclipNativeSessionWithinScope(
         }
         return true;
       }).catch(() => false);
+      let warmResourceReleased = true;
+      let warmCloseFailure: unknown;
+      if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
+        const ownedWarmEntry = warmNativeSessions.get(warmSessionId);
+        if (settled && !ownedWarmEntry && existingWarmSession) {
+          // This attempt borrowed a live transport, but no longer owns its
+          // map entry. Its retirement is unproven; retain the environment.
+          warmResourceReleased = false;
+        } else if (settled && ownedWarmEntry) {
+          if (ownedWarmEntry.ownerToken !== warmSessionOwnerToken) {
+            // The durable CAS won for this Run, but a newer local controller
+            // now owns the transport. Never stop its environment underneath it.
+            warmResourceReleased = false;
+          } else {
+            // Heartbeat stops a failed Run's sandbox. Close and checkpoint the
+            // warm transport while that environment is still live, only after
+            // the exact owner/result-null CAS has committed.
+            if (ownedWarmEntry.idleTimer !== null) clearTimeout(ownedWarmEntry.idleTimer);
+            ownedWarmEntry.idleTimer = null;
+            ownedWarmEntry.closeOnReleaseReason = "settled goal delivery hold";
+            try {
+              await closeWarmNativeSession(ownedWarmEntry, ownedWarmEntry.closeOnReleaseReason);
+              if (warmNativeSessions.get(warmSessionId) === ownedWarmEntry) {
+                warmNativeSessions.delete(warmSessionId);
+              } else {
+                // A successor replaced the entry while close was pending.
+                // Closing the old handle cannot authorize stopping its sandbox.
+                warmResourceReleased = false;
+              }
+              if (githubAccess === ownedWarmEntry.githubAccess) githubAccess = undefined;
+            } catch (closeError) {
+              // A failed close is not evidence that checkpointing completed.
+              // Quarantine this owner and keep its environment alive for
+              // operator reconciliation instead of reporting safe teardown.
+              ownedWarmEntry.busy = true;
+              warmResourceReleased = false;
+              warmCloseFailure = closeError;
+            }
+          }
+        } else if (!settled) {
+          // Lost CAS or transaction failure: the provider may belong to the
+          // winner. Do not close it; only release this attempt's warm token.
+          await releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken,
+            lifecyclePolicy.idleTimeoutMs, false).catch(() => undefined);
+        }
+      }
       await trace.finish("failed").catch(() => undefined);
-      // A zero-row CAS or transaction failure is unresolved ownership, never
-      // permission to run the generic failure path against a possible winner.
-      throw new NativeGoalDeliveryHeldError(settled, held.claimState, held.receiptRelation);
+      // A zero-row CAS, changed warm owner, or unverified close is unresolved
+      // resource ownership. None authorizes generic failure teardown.
+      const outcome = new NativeGoalDeliveryHeldError(settled && warmResourceReleased,
+        held.claimState, held.receiptRelation);
+      if (warmCloseFailure !== undefined) {
+        Object.defineProperty(outcome, "cause", { value: warmCloseFailure, configurable: true });
+      }
+      throw outcome;
     }
     const protocolIntegrityFailure =
       error instanceof NativeSessionProtocolIntegrityError ? error : null;
