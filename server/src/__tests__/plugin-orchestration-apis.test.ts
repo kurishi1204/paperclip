@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
+import type { Issue, IssueComment } from "@paperclipai/plugin-sdk";
 import {
   activityLog,
   agentWakeupRequests,
@@ -23,6 +25,7 @@ import {
   issueThreadInteractions,
   issues,
   pluginManagedResources,
+  pluginMigrations,
   plugins,
   projects,
 } from "@paperclipai/db";
@@ -31,8 +34,11 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
+import { derivePluginDatabaseNamespace, pluginDatabaseService } from "../services/plugin-database.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import wikiManifest from "../../../packages/plugins/plugin-llm-wiki/src/manifest.js";
+import { captureOwnerCommentRaw, readOwnerCommentRaw } from "../../../packages/plugins/plugin-llm-wiki/src/wiki/owner-comment-raw.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -56,6 +62,15 @@ if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres plugin orchestration API tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
+}
+
+// This new SQL receipt is a required CI acceptance test. Keep the older suite's
+// local unsupported-host skip policy, but fail CI rather than report zero SQL
+// assertions as a successful run when the embedded engine cannot start.
+if (process.env.CI && process.env.CI !== "false" && !embeddedPostgresSupport.supported) {
+  it("requires embedded PostgreSQL for the owner comment raw SQL contract in CI", () => {
+    throw new Error(`Owner comment raw SQL contract did not run: ${embeddedPostgresSupport.reason ?? "embedded PostgreSQL unsupported"}`);
+  });
 }
 
 describeEmbeddedPostgres("plugin orchestration APIs", () => {
@@ -434,6 +449,124 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       companyId: randomUUID(), folderKey: "wiki-root", relativePath: "raw/other.txt", contents: "other",
     })).rejects.toThrow();
   });
+
+  it("applies owner raw migration and enforces real SQL capture, readback, and tenant constraints", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({
+      id: otherCompanyId, name: "Other synthetic company", issuePrefix: issuePrefix(otherCompanyId),
+      requireBoardApprovalForNewAgents: false,
+    });
+    const pluginId = randomUUID();
+    await db.insert(plugins).values({
+      id: pluginId, pluginKey: wikiManifest.id, packageName: "@paperclipai/plugin-llm-wiki",
+      version: wikiManifest.version, apiVersion: wikiManifest.apiVersion,
+      categories: wikiManifest.categories, manifestJson: wikiManifest, status: "installed", installOrder: 1,
+    });
+    const repoRoot = path.basename(process.cwd()) === "server" ? path.resolve(process.cwd(), "..") : process.cwd();
+    const pluginRoot = path.join(repoRoot, "packages/plugins/plugin-llm-wiki");
+    const pluginDb = pluginDatabaseService(db);
+    const applied = await pluginDb.applyMigrations(pluginId, wikiManifest, pluginRoot);
+    const namespace = derivePluginDatabaseNamespace(wikiManifest.id, wikiManifest.database?.namespaceSlug);
+    expect(applied?.namespaceName).toBe(namespace);
+    expect((await db.select().from(pluginMigrations).where(eq(pluginMigrations.pluginId, pluginId)))
+      .map((row) => row.migrationKey)).toContain("004_owner_comment_raw.sql");
+
+    const issueId = randomUUID(), commentId = randomUUID(), spaceId = randomUUID(), otherSpaceId = randomUUID();
+    const owner = "synthetic-owner", body = "Synthetic owner note for SQL receipt verification.";
+    const occurredAt = new Date().toISOString();
+    const ingestionProfile = { version: 1, enabled: true,
+      sourceScopes: [{ kind: "root_issues", issueIds: [issueId] }],
+      sourceKinds: { issues: false, comments: true, documents: false, attachments: "off", workProducts: "off" },
+      cursor: { maxWindowCharacters: 60000, maxCharactersPerSource: 12000, minSourceAgeMinutes: 15,
+        maxWindowsPerRun: 6, staleAfterHours: 72 }, backfill: { requireManualQueue: true } };
+    for (const [spaceCompanyId, id] of [[companyId, spaceId], [otherCompanyId, otherSpaceId]] as const) {
+      await db.execute(sql`INSERT INTO ${sql.raw(`"${namespace}"."wiki_spaces"`)}
+        (id, company_id, wiki_id, slug, display_name, settings)
+        VALUES (${id}, ${spaceCompanyId}, 'default', 'owner-notes', 'Owner notes',
+          ${JSON.stringify({ paperclipIngestion: ingestionProfile })}::jsonb)`);
+    }
+    const issue = { id: issueId, companyId, originKind: null } as Issue;
+    const comment = { id: commentId, companyId, issueId, authorType: "user", authorUserId: owner,
+      authorAgentId: null, onBehalfOfUserId: null, createdByRunId: null, derivedAuthorAgentId: null,
+      derivedCreatedByRunId: null, derivedAuthorSource: null, deletedAt: null, sourceTrust: null,
+      metadata: null, presentation: null, createdAt: new Date(occurredAt), updatedAt: new Date(occurredAt),
+      body } as IssueComment;
+    const harness = createTestHarness({ manifest: wikiManifest,
+      config: { ownerCommentRawCapture: { version: 1, enabled: true, spaceSlug: "owner-notes",
+        ownerUserId: owner, issueIds: [issueId], maxBodyBytes: 250000, allowCompanyReaders: true,
+        classification: { label: "internal", decidedByUserId: owner, decidedAt: occurredAt,
+          decisionRef: "synthetic-sql-receipt" } } } });
+    harness.seed({ issues: [issue], issueComments: [comment] });
+    harness.ctx.db.namespace = namespace;
+    harness.ctx.db.query = <T,>(statement: string, params?: unknown[]) => pluginDb.query<T>(pluginId, statement, params);
+    harness.ctx.db.execute = (statement, params) => pluginDb.execute(pluginId, statement, params);
+    const files = new Map<string, string>();
+    let creates = 0;
+    harness.ctx.localFolders.status = async () => ({ folderKey: "wiki-root", configured: true,
+      path: "/synthetic/wiki", realPath: "/synthetic/wiki", access: "readWrite", readable: true,
+      writable: true, requiredDirectories: [], requiredFiles: [], missingDirectories: [], missingFiles: [],
+      healthy: true, problems: [], checkedAt: occurredAt });
+    harness.ctx.localFolders.createTextExclusive = async (_company, _folder, relativePath, contents) => {
+      if (files.has(relativePath)) return { created: false, status: {} as never };
+      creates += 1;
+      files.set(relativePath, contents);
+      return { created: true, status: {} as never };
+    };
+    harness.ctx.localFolders.readText = async (_company, _folder, relativePath) => {
+      const content = files.get(relativePath);
+      if (content === undefined) throw new Error("synthetic missing file");
+      return content;
+    };
+    const event = { eventId: randomUUID(), eventType: "issue.comment.created" as const,
+      companyId, entityId: issueId, entityType: "issue", actorType: "user" as const,
+      actorId: owner, occurredAt,
+      payload: { commentId, agentId: null, runId: null, responsibleUserId: null } };
+    expect(await captureOwnerCommentRaw(harness.ctx, event)).toBe("verified");
+    expect(await captureOwnerCommentRaw(harness.ctx, event)).toBe("verified");
+    expect(creates).toBe(1);
+    expect((await readOwnerCommentRaw(harness.ctx, companyId, commentId)).source).toBe(body);
+    await expect(readOwnerCommentRaw(harness.ctx, otherCompanyId, commentId))
+      .rejects.toThrow("owner_comment_raw_reader_row");
+
+    const table = sql.raw(`"${namespace}"."paperclip_owner_raw_captures"`);
+    const rows = await db.execute(sql`SELECT company_id, space_id, comment_id, status,
+      body_sha256, policy_sha256,
+      to_char(comment_updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS comment_updated_at
+      FROM ${table} WHERE company_id=${companyId}`);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ company_id: companyId, space_id: spaceId, comment_id: commentId,
+      status: "verified", comment_updated_at: occurredAt });
+    await expect(db.execute(sql`UPDATE ${table} SET status='invalid' WHERE company_id=${companyId}`)).rejects.toThrow();
+    await expect(db.execute(sql`INSERT INTO ${table}
+      (company_id,space_id,comment_id,issue_id,owner_user_id,body_sha256,comment_updated_at,raw_path,policy_sha256,status)
+      SELECT company_id,space_id,comment_id,issue_id,owner_user_id,body_sha256,comment_updated_at,
+        raw_path,policy_sha256,status FROM ${table} WHERE company_id=${companyId}`)).rejects.toThrow();
+    await db.execute(sql`UPDATE ${table} SET status='pending' WHERE company_id=${companyId}`);
+    const guardedUpdate = `UPDATE "${namespace}"."paperclip_owner_raw_captures"
+      SET status='verified',updated_at=now() WHERE company_id=$1 AND space_id=$2 AND comment_id=$3
+      AND body_sha256=$4 AND policy_sha256=$5 AND status='pending'`;
+    const wrongPredicate = await pluginDb.execute(pluginId, guardedUpdate,
+      [companyId, spaceId, commentId, "0".repeat(64), rows[0]!.policy_sha256]);
+    expect(wrongPredicate.rowCount).toBe(0);
+    expect((await db.execute(sql`SELECT status FROM ${table} WHERE company_id=${companyId}`))[0]?.status).toBe("pending");
+    const rightPredicate = await pluginDb.execute(pluginId, guardedUpdate,
+      [companyId, spaceId, commentId, rows[0]!.body_sha256, rows[0]!.policy_sha256]);
+    expect(rightPredicate.rowCount).toBe(1);
+    expect((await readOwnerCommentRaw(harness.ctx, companyId, commentId)).source).toBe(body);
+
+    const otherCommentId = randomUUID();
+    await db.execute(sql`INSERT INTO ${table}
+      (company_id,space_id,comment_id,issue_id,owner_user_id,body_sha256,comment_updated_at,raw_path,policy_sha256,status)
+      SELECT ${otherCompanyId}, ${otherSpaceId}, ${otherCommentId}, issue_id, owner_user_id,
+        body_sha256,comment_updated_at,raw_path,policy_sha256,status
+      FROM ${table} WHERE company_id=${companyId}`);
+    expect(await db.execute(sql`SELECT comment_id FROM ${table} WHERE company_id=${otherCompanyId}`)).toHaveLength(1);
+    await db.execute(sql`DELETE FROM ${sql.raw(`"${namespace}"."wiki_spaces"`)} WHERE id=${otherSpaceId}`);
+    expect(await db.execute(sql`SELECT comment_id FROM ${table} WHERE company_id=${otherCompanyId}`)).toHaveLength(0);
+    await db.delete(companies).where(eq(companies.id, companyId));
+    expect(await db.execute(sql`SELECT comment_id FROM ${table} WHERE company_id=${companyId}`)).toHaveLength(0);
+  }, 90_000);
 
   it("rejects worker local-folder access for undeclared manifest keys", async () => {
     const { companyId } = await seedCompanyAndAgent();

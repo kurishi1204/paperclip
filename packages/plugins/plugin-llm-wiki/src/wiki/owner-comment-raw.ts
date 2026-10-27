@@ -43,7 +43,7 @@ function parseConfig(raw: Record<string, unknown>): Config | null {
   if (input.version !== 1 || !opaqueUserId(input.ownerUserId) || typeof input.spaceSlug !== "string"
     || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(input.spaceSlug) || input.spaceSlug.length > 64
     || !Array.isArray(ids) || ids.length < 1 || ids.length > MAX_ISSUES || !ids.every(uuid)
-    || new Set(ids).size !== ids.length || input.allowCompanyReaders !== true
+    || new Set((ids as string[]).map((id) => id.toLowerCase())).size !== ids.length || input.allowCompanyReaders !== true
     || !Number.isSafeInteger(input.maxBodyBytes) || (input.maxBodyBytes as number) < 1
     || (input.maxBodyBytes as number) > maxGlobal
     || classification?.label !== "internal" || classification.decidedByUserId !== input.ownerUserId
@@ -54,7 +54,7 @@ function parseConfig(raw: Record<string, unknown>): Config | null {
   }
   const ownerUserId = input.ownerUserId as string;
   const spaceSlug = input.spaceSlug as string;
-  const issueIds = ids as string[];
+  const issueIds = (ids as string[]).map((id) => id.toLowerCase());
   return {
     ownerUserId, spaceSlug, issueIds,
     maxBodyBytes: input.maxBodyBytes as number,
@@ -154,9 +154,9 @@ export async function captureOwnerCommentRaw(ctx: PluginContext, event: PluginEv
   }
   if (!config) return "disabled";
   if (!config.issueIds.includes(event.entityId)) return "skipped";
+  if (event.actorType !== "user" || event.actorId !== config.ownerUserId) return "skipped";
   try {
-    if (!uuid(commentId) || event.actorType !== "user" || event.actorId !== config.ownerUserId
-      || payload?.agentId !== null || payload.runId !== null
+    if (!uuid(commentId) || payload?.agentId !== null || payload.runId !== null
       || (payload.responsibleUserId !== null && payload.responsibleUserId !== config.ownerUserId)) hold("event_attribution");
     const occurredAt = dateMs(event.occurredAt);
     if (occurredAt === null) hold("event_time");

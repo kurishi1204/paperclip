@@ -7,7 +7,7 @@ import plugin from "../src/worker.js";
 
 const company = "11111111-1111-4111-8111-111111111111";
 const owner = "fixture-owner-not-a-uuid-01";
-const issueId = "33333333-3333-4333-8333-333333333333";
+const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const commentId = "44444444-4444-4444-8444-444444444444";
 const spaceId = "55555555-5555-4555-8555-555555555555";
 const now = "2026-10-27T10:00:00.000Z";
@@ -169,8 +169,22 @@ describe("owner comment raw receipt through exported plugin",()=>{
     string,
     {actorType?: string; actorId?: string; payload?: Record<string,unknown>}
   ]>([
-    ["agent actor",{actorType:"agent"}],
+    ["agent actor",{actorType:"agent",payload:{commentId,agentId:"agent-1",runId:null,responsibleUserId:null}}],
     ["other actor",{actorId:"99999999-9999-4999-8999-999999999999"}],
+  ])("skips in-scope %s without raw health or DB effects",async(_label,change)=>{
+    const s=setup();await plugin.definition.setup(s.harness.ctx);
+    await s.harness.emit("issue.comment.created",change.payload ?? {commentId,agentId:null,runId:null,responsibleUserId:null},
+      {companyId:company,entityId:issueId,entityType:"issue",actorId:change.actorId ?? owner,
+        actorType:(change.actorType ?? "user") as "user"|"agent",occurredAt:now});
+    expect(s.files.size).toBe(0);expect(s.row()).toBeNull();
+    expect(s.harness.getState({scopeKind:"company",scopeId:company,namespace:"owner-comment-raw-capture",stateKey:commentId})).toBeUndefined();
+    expect(s.observedQueries.some((sql)=>sql.includes("paperclip_owner_raw_captures"))).toBe(false);
+  });
+  it.each<[
+    string,
+    {actorType?: string; actorId?: string; payload?: Record<string,unknown>}
+  ]>([
+    ["agent marker on owner event",{payload:{commentId,agentId:"agent-1",runId:null,responsibleUserId:null}}],
     ["run marker",{payload:{commentId,agentId:null,runId:"run-1",responsibleUserId:null}}],
     ["missing exact comment",{payload:{commentId:"99999999-9999-4999-8999-999999999999",agentId:null,runId:null,responsibleUserId:null}}],
   ])("fails closed for %s",async(_label,change)=>{
@@ -179,6 +193,19 @@ describe("owner comment raw receipt through exported plugin",()=>{
       {companyId:company,entityId:issueId,entityType:"issue",actorId:change.actorId ?? owner,
         actorType:(change.actorType ?? "user") as "user"|"agent",occurredAt:now})).rejects.toThrow();
     expect(s.files.size).toBe(0);expect(s.row()).toBeNull();
+  });
+  it("normalizes case-insensitive configured issue IDs for capture and current reads",async()=>{
+    const s=setup();s.harness.setConfig({ownerCommentRawCapture:{...config.ownerCommentRawCapture,issueIds:[issueId.toUpperCase()]}});
+    await plugin.definition.setup(s.harness.ctx);await s.emit();
+    expect((s.row() as Record<string,unknown>).status).toBe("verified");
+    const result=await s.harness.getData<{source:string}>("owner-comment-raw-source",{companyId:company,commentId});
+    expect(result.source).toBe(body);
+  });
+  it("rejects configured issue IDs duplicated only by letter case",async()=>{
+    const s=setup();s.harness.setConfig({ownerCommentRawCapture:{...config.ownerCommentRawCapture,issueIds:[issueId,issueId.toUpperCase()]}});
+    await plugin.definition.setup(s.harness.ctx);
+    await expect(s.emit()).rejects.toThrow("owner_comment_raw_invalid_config");
+    expect(s.row()).toBeNull();expect(s.files.size).toBe(0);
   });
   it("rejects a missing classification before any DB or file effect",async()=>{
     const s=setup();s.harness.setConfig({ownerCommentRawCapture:{...config.ownerCommentRawCapture,classification:null}});

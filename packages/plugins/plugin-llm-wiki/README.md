@@ -34,7 +34,12 @@ list of at most 25 exact `issueIds`, `allowCompanyReaders: true`, a bounded
 `maxBodyBytes`, and an `internal` classification decision by the same user with
 an ISO decision time and reference. The event must be attributed to that user,
 have no agent/run markers, and identify exactly one unchanged comment. This
-does not prove that the user typed the comment in the UI.
+does not prove that the user typed the comment in the UI. The administrator's
+classification input declares an owner decision; it is not authenticated
+evidence of the owner's consent. Configured issue UUIDs are normalized to
+lowercase; duplicates after normalization are rejected. Only exact issue IDs
+are in scope. Events attributed to other users or agents are skipped; an
+owner-attributed event with contradictory agent/run markers is held.
 
 Accepted bytes are the complete comment body. A separate
 `paperclip_owner_raw_captures` row claims its version; the file lives under
@@ -80,9 +85,14 @@ plugin-tool boundary, not a filesystem sandbox: an agent with direct wiki-root
 filesystem access can still reach the file. The starter `gitignore.template`
 does not exclude `.paperclip/`; verify the actual root's ignore/retention and
 agent filesystem reachability before use. Shared-space reader authorization
-is not a filesystem access restriction. Company/space row deletion cascades in
-the plugin database, but orphaned raw files and retention/deletion are not
-implemented in this slice.
+is not a filesystem access restriction. The board data handler is available to
+company-access viewers and does not enforce issue-level ACLs. The secret
+detector may reject harmless text that resembles a token. Create-only writes
+rely on filesystem hard-link support; a filesystem without it cannot complete
+this receipt. The added SDK local-folder method is required by the host/plugin
+interface and must be versioned with external implementations. Company/space
+row deletion cascades in the plugin database, but orphaned raw files and
+retention/deletion are not implemented in this slice.
 
 Paperclip-derived text ingestion stays limited to issue titles/descriptions, issue comments, and issue documents.
 
