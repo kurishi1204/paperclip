@@ -8400,6 +8400,7 @@ async function executePaperclipNativeSessionWithinScope(
   });
   let consumeRecoveredSessionGoalOnly = false;
   let consumeRecoveredSessionGoalOwned = false;
+  let recoveredGoalDeliveryHold = false;
   let completedGoalReconciliation = false;
   try {
     await prepareWarmSession();
@@ -8567,6 +8568,9 @@ async function executePaperclipNativeSessionWithinScope(
             consumeRecoveredSessionGoalOnly,
             onConsumeRecoveredSessionGoalOwned: () => {
               consumeRecoveredSessionGoalOwned = true;
+            },
+            onRecoveredGoalDeliveryHold: () => {
+              recoveredGoalDeliveryHold = true;
             },
             beforeSessionGoalControl: input.claimGoalDelivery && !consumeRecoveredSessionGoalOnly && !completedGoalReconciliation
               ? async (control: NativeSessionGoalControl) => {
@@ -8856,10 +8860,11 @@ async function executePaperclipNativeSessionWithinScope(
       const held = error;
       const reattachingLiveRunner = input.restartRecovery?.kind === "reattach_existing_runner" ||
         input.restartRecovery?.kind === "reattach_remote_runner";
-      if (reattachingLiveRunner) {
+      if (reattachingLiveRunner || recoveredGoalDeliveryHold) {
         // The old process may still be executing a control accepted before
-        // controller loss. No new command is admitted here, and absence of a
-        // completion receipt cannot authorize failing its Run or releasing it.
+        // controller loss. A newly recovered provider may also remain live
+        // after the command-boundary claim fails. Neither state authorizes
+        // failing its Run or releasing its lease without a completion receipt.
         await trace.finish("failed").catch(() => undefined);
         throw held;
       }

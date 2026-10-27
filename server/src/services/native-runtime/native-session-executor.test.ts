@@ -12376,4 +12376,165 @@ describe("owned goal delivery admission", () => {
     expect(recoveredGoal).not.toHaveBeenCalled();
     expect(recoveredClose).not.toHaveBeenCalled();
   });
+
+  it("reconciles an idle completed reattach through the real runtime with read-only goal control", async () => {
+    const actual = await vi.importActual<typeof import("../../vendor/paperclip-runner/index.js")>(
+      "../../vendor/paperclip-runner/index.js",
+    );
+    const controller = await currentNativeControllerIdentity();
+    const leaseOwner = "goal-completed-idle-reattach";
+    const db = leaseDb(execution, { attempt: 1, leaseOwner,
+      leaseExpiresAt: new Date(Date.now() + 60_000), controllerBootId: controller.bootId,
+      controllerPid: controller.pid, controllerProcessStartedAt: controller.processStartedAt,
+      controllerGeneration: 1 } as never);
+    const identity = { runId: execution.binding.runId,
+      sessionId: execution.session.normalizedSessionId!,
+      companyId: execution.binding.companyId, issueId: execution.binding.issueId,
+      agentId: execution.binding.agentId };
+    const goalState = { threadId: "provider-completed-reattach", objective: "Finish native work",
+      status: "complete" as const, tokenBudget: null, tokensUsed: 1,
+      timeUsedSeconds: 1, createdAt: 1, updatedAt: 1 };
+    const snapshot: NonNullable<Parameters<typeof actual.executeNativeSession>[0]["persistedSession"]> = {
+      backendKind: "mock", sessionId: "driver-completed-reattach",
+      identity, providerSessionId: goalState.threadId, cursor: null,
+      activeTurnId: null, pendingRuntimeRequests: [], goal: goalState, lineage: [] };
+    const startTurn = vi.fn(async () => ({ turnId: "forbidden" }));
+    const goal = vi.fn(async () => {
+      return goalState;
+    });
+    const close = vi.fn(async () => undefined);
+    const cancel = vi.fn(() => ({ cleanup: Promise.resolve() }));
+    const event: PrpEvent = { schema: "paperclip.prp.event.v1",
+      sourceEventId: `runner-completed-reattach:${identity.runId}:1`, sourceSeq: 1,
+      sourceInstanceId: "runner-completed-reattach", sourceKind: "runner",
+      runId: identity.runId, normalizedSessionId: identity.sessionId,
+      turnId: "turn-completed-reattach", eventType: "session.goal.snapshot",
+      schemaVersion: 1, priority: 0, emittedAt: "2026-08-09T00:00:00.000Z",
+      payload: { goal: { objective: goalState.objective, status: "complete" }, workingNow: false } };
+    const session: NonNullable<Parameters<typeof actual.executeNativeSession>[0]["existingSession"]> = {
+      identity: () => identity,
+      async capabilities() { return { resume: true, typedEvents: true, steering: false,
+        interruption: true, structuredResult: true }; },
+      async *events() { yield event; },
+      startTurn, goal, cancel, async result() { return null; },
+      async snapshot() { return snapshot; }, close,
+    };
+    const backend: Parameters<typeof actual.executeNativeSession>[0]["backend"] = {
+      async descriptor() { return { kind: "mock", name: "completed-reattach", version: "1",
+        capabilities: await session.capabilities() }; },
+      async openSession() { throw new Error("fresh_open_forbidden"); },
+      async recoverSession() { return { recovered: true, session }; },
+    };
+    const completeRun = vi.fn(async () => undefined);
+    const controlPlane: Parameters<typeof actual.executeNativeSession>[0]["controlPlane"] = {
+      async openRun() {}, async checkpointSession() {},
+      async appendEvent(appended) { const sourceSeq = "sourceSeq" in appended ? appended.sourceSeq : 1;
+        return { cursor: sourceSeq, highestContiguousSourceSeq: sourceSeq, disposition: "committed" }; },
+      async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; },
+      completeRun,
+    };
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      expect(options.consumeRecoveredSessionGoalOnly).toBe(true);
+      expect(options.sessionGoalControl).toBeNull();
+      expect(options.resumeSessionGoalHeartbeat).toBe(false);
+      expect(options.beforeSessionGoalControl).toBeUndefined();
+      return actual.executeNativeSession({ ...options, backend, controlPlane,
+        persistedSession: snapshot });
+    });
+    const claim = vi.fn(async () => { throw new Error("must not claim"); });
+    const execute = executePaperclipNativeSession({ db, execution,
+      backend, runnerInstanceId: "runner-completed-reattach", leaseOwner,
+      sessionGoalControl: control,
+      restartRecovery: { kind: "reattach_existing_runner", runId: execution.binding.runId,
+        leaseOwner, controllerGeneration: 1, providerAttempt: 1, restartKind: "hot",
+        recoveryRequestId: null, process: { pid: controller.pid, processGroupId: null,
+          startedAt: controller.processStartedAt.toISOString() } },
+      inspectGoalDelivery: async () => ({ state: "completed", receiptRelation: "no_valid_receipt",
+        consumeOnlyEligible: false, claimOwnerRunId: null, claimId: null }),
+      claimGoalDelivery: claim,
+    });
+    await expect(execute).resolves.toMatchObject({ exitCode: 0 });
+    expect(state.execute).toHaveBeenCalledOnce();
+    expect(goal).toHaveBeenCalledExactlyOnceWith({ action: "get" });
+    expect(startTurn).not.toHaveBeenCalled();
+    expect(cancel).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+    expect(claim).not.toHaveBeenCalled();
+    expect(completeRun).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a recovered per-turn provider and its Run owned when the command-boundary claim fails", async () => {
+    const actual = await vi.importActual<typeof import("../../vendor/paperclip-runner/index.js")>(
+      "../../vendor/paperclip-runner/index.js",
+    );
+    const controller = await currentNativeControllerIdentity();
+    const leaseOwner = "goal-recovered-claim-hold";
+    const fixture = ownedGoalDeliveryDb({ coordinator: { attempt: 1, leaseOwner,
+      leaseExpiresAt: new Date(Date.now() + 60_000), controllerBootId: controller.bootId,
+      controllerPid: controller.pid, controllerProcessStartedAt: controller.processStartedAt,
+      controllerGeneration: 1 } });
+    const identity = { runId: execution.binding.runId,
+      sessionId: execution.session.normalizedSessionId!,
+      companyId: execution.binding.companyId, issueId: execution.binding.issueId,
+      agentId: execution.binding.agentId };
+    const snapshot: NonNullable<Parameters<typeof actual.executeNativeSession>[0]["persistedSession"]> = {
+      backendKind: "mock", sessionId: "driver-recovered-claim-hold",
+      identity, providerSessionId: "provider-recovered-claim-hold", cursor: null,
+      activeTurnId: "turn-recovered-claim-hold", pendingRuntimeRequests: [], goal: null,
+      lineage: [] };
+    const goal = vi.fn(async () => null);
+    const startTurn = vi.fn(async () => ({ turnId: "forbidden" }));
+    const close = vi.fn(async () => undefined);
+    const cancel = vi.fn(() => ({ cleanup: Promise.resolve() }));
+    const session: NonNullable<Parameters<typeof actual.executeNativeSession>[0]["existingSession"]> = {
+      identity: () => identity,
+      async capabilities() { return { resume: true, typedEvents: true, steering: false,
+        interruption: true, structuredResult: true }; },
+      async *events() { await new Promise<void>(() => {}); },
+      startTurn, goal, cancel, async result() { return null; },
+      async snapshot() { return snapshot; }, close,
+    };
+    const backend: Parameters<typeof actual.executeNativeSession>[0]["backend"] = {
+      async descriptor() { return { kind: "mock", name: "recovered-claim-hold", version: "1",
+        capabilities: await session.capabilities() }; },
+      async openSession() { throw new Error("fresh_open_forbidden"); },
+      async recoverSession() { return { recovered: true, session }; },
+    };
+    const controlPlane: Parameters<typeof actual.executeNativeSession>[0]["controlPlane"] = {
+      async openRun() {}, async checkpointSession() {},
+      async appendEvent(appended) { const sourceSeq = "sourceSeq" in appended ? appended.sourceSeq : 1;
+        return { cursor: sourceSeq, highestContiguousSourceSeq: sourceSeq, disposition: "committed" }; },
+      async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; },
+      async completeRun() {},
+    };
+    state.execute.mockReset().mockImplementationOnce(async options =>
+      actual.executeNativeSession({ ...options, backend, controlPlane,
+        persistedSession: snapshot }));
+    const claim = vi.fn(async () => ({ state: "indeterminate" as const,
+      receiptRelation: "no_valid_receipt" as const, claimOwnerRunId: null, claimId: null }));
+    let caught: unknown;
+    try {
+      await executePaperclipNativeSession({ db: fixture.db, execution,
+        backend, runnerInstanceId: "runner-recovered-claim-hold", leaseOwner,
+        restartRecovery: { kind: "resume_dead_runner", runId: execution.binding.runId,
+          leaseOwner, controllerGeneration: 1, providerAttempt: 1,
+          restartKind: "hard", recoveryRequestId: null },
+        sessionGoalControl: control,
+        inspectGoalDelivery: async () => ({ state: "ready", receiptRelation: "no_valid_receipt",
+          claimOwnerRunId: null, claimId: null }),
+        claimGoalDelivery: claim,
+      });
+    } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(NativeGoalDeliveryHeldError);
+    expect((caught as NativeGoalDeliveryHeldError).settled).toBe(false);
+    expect(claim).toHaveBeenCalledOnce();
+    expect(goal).not.toHaveBeenCalled();
+    expect(startTurn).not.toHaveBeenCalled();
+    expect(cancel).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+    expect(fixture.coordinator.phase).toBe("observed");
+    expect(fixture.coordinator.leaseOwner).toBe(leaseOwner);
+    expect(fixture.run.status).toBe("running");
+    expect(fixture.issue.executionRunId).toBe(execution.binding.runId);
+  });
 });

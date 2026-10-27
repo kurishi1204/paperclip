@@ -251,6 +251,8 @@ export interface ExecuteNativeSessionOptions {
   consumeRecoveredSessionGoalOnly?: boolean;
   /** Synchronous ownership signal after exact provider recovery, before run admission. */
   onConsumeRecoveredSessionGoalOwned?: () => void;
+  /** A newly checkpoint-recovered provider was preserved after a send-bound claim failed. */
+  onRecoveredGoalDeliveryHold?: () => void;
   /** Resume the active durable session goal after a bounded heartbeat rollover. */
   resumeSessionGoalHeartbeat?: boolean;
   /**
@@ -1215,9 +1217,6 @@ async function consumeTurn(
                 ),
             };
           }
-          if (consumeRecoveredSessionGoalOnly) {
-            throw new NativeSessionGoalConsumeOnlyError("result_unavailable");
-          }
           if (!session.goal) throw new Error("native_session_goal_unavailable");
           const authoritativeGoal = await session.goal({ action: "get" });
           // `goal(get)` emits an authoritative goal snapshot. Keep consuming
@@ -1933,6 +1932,7 @@ export async function executeNativeSession(
     agentId: input.binding.agentId,
   };
   let recovered = false;
+  let recoveredByThisAttempt = false;
   let session: NativeSession | null = null;
   let continuityBreak: {
     reason: string;
@@ -2070,6 +2070,7 @@ export async function executeNativeSession(
     } else {
       session = recovery.session;
       recovered = true;
+      recoveredByThisAttempt = true;
     }
   }
   if (session === null) {
@@ -2118,6 +2119,20 @@ export async function executeNativeSession(
     if (options.consumeRecoveredSessionGoalOnly && recovered) {
       // Run admission failed after exact recovery. It says nothing about the
       // provider's live goal; closing it would revoke an accepted control.
+      // A newly recovered controller attachment belongs to this attempt.
+      // Relinquish that attachment without stopping the live provider. A warm
+      // existingSession belongs to its caller and must remain attached.
+      if (recoveredByThisAttempt) {
+        try {
+          if (!session.detachControllerForRestart) {
+            throw new Error("native_session_controller_detach_unavailable");
+          }
+          await session.detachControllerForRestart();
+        } catch (detachError) {
+          throw new AggregateError([error, detachError],
+            "native session admission and controller detach failed");
+        }
+      }
       if (error instanceof Error && error.name !== "Error") throw error;
       throw new NativeSessionGoalConsumeOnlyError("recovery_failed");
     }
@@ -2464,11 +2479,14 @@ export async function executeNativeSession(
             !checkpointedDispositionTerminal &&
             !dispositionRecoveryStillOwned);
         if (options.consumeRecoveredSessionGoalOnly && shouldStartFreshTurn) {
-          preserveRecoveredSessionOnHold = true;
-          preserveProviderOnFailure.value = true;
-          throw new NativeSessionGoalConsumeOnlyError("fresh_turn_forbidden");
-        }
-        if (options.sessionGoalControl) {
+          // An idle recovered goal can be completed, paused, or between turns.
+          // Read its current state without replaying the delivered control or
+          // starting a new turn; goal(get) emits a durable snapshot for the
+          // already-running consumer to reconcile.
+          if (!session.goal) throw new NativeSessionGoalConsumeOnlyError("result_unavailable");
+          await session.goal({ action: "get" });
+          await checkpoint();
+        } else if (options.sessionGoalControl) {
           // Explicit controls remain authoritative after controller loss. In
           // particular, pause/clear/edit must reach a recovered session even
           // while its provider turn is still active.
@@ -2479,8 +2497,17 @@ export async function executeNativeSession(
             // A failed claim has no authority to stop a recovered live owner.
             preserveRecoveredSessionOnHold = recovered;
             preserveProviderOnFailure.value = recovered;
+            let claimFailure: unknown = error;
+            if (recovered && !options.existingSession) {
+              try {
+                options.onRecoveredGoalDeliveryHold?.();
+              } catch (callbackError) {
+                claimFailure = new AggregateError([error, callbackError],
+                  "native goal claim and recovered-provider hold signal failed");
+              }
+            }
             rejectGoalControlEvents?.(error);
-            throw error;
+            throw claimFailure;
           }
           await applyNativeSessionGoalControl(session, options.sessionGoalControl);
           await checkpoint();
