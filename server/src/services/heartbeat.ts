@@ -20528,7 +20528,9 @@ export function heartbeatService(
       // Cleanup is retried from the durable working-copy receipt by the
       // recovery sweep. It must not replace the provider result (or prevent
       // lease release), and a timeout must not be repeated in outer teardown.
-      if (instructionCleanupDeferred) return;
+      // Another executor may still own this Run after a goal-delivery HOLD.
+      // Releasing its run-scoped working copy here would retire shared state.
+      if (instructionCleanupDeferred || nativeGoalDeliveryOwnershipDeferred) return;
       try {
         await instructionCopies.release(instructionCleanupRun.companyId, instructionCleanupRun.id);
       } catch (err) {

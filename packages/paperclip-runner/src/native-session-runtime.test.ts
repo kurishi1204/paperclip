@@ -5920,7 +5920,11 @@ describe("executeNativeSession recovery", () => {
     }
   });
 
-  it("bounds provider recovery and closes a session returned after timeout", async () => {
+  it.each([
+    { consumeOnly: false, detachFails: false },
+    { consumeOnly: true, detachFails: false },
+    { consumeOnly: true, detachFails: true },
+  ])("bounds provider recovery after timeout (consume-only: $consumeOnly, detach fails: $detachFails)", async ({ consumeOnly, detachFails }) => {
     vi.useFakeTimers();
     try {
       const checkpoint: PersistedNativeSession = {
@@ -5955,6 +5959,14 @@ describe("executeNativeSession recovery", () => {
       const close = vi.fn(async () => {
         markCloseStarted();
       });
+      let markDetachStarted = () => {};
+      const detachStarted = new Promise<void>((resolve) => {
+        markDetachStarted = resolve;
+      });
+      const detachControllerForRestart = vi.fn(async () => {
+        markDetachStarted();
+        if (detachFails) throw new Error("late_controller_detach_failed");
+      });
       const lateSession: NativeSession = {
         identity: () => identity,
         async capabilities() {
@@ -5976,6 +5988,7 @@ describe("executeNativeSession recovery", () => {
           return structuredClone(checkpoint);
         },
         close,
+        detachControllerForRestart,
       };
       let recoverySignal: AbortSignal | undefined;
       const recoverSession = vi.fn(
@@ -5999,7 +6012,7 @@ describe("executeNativeSession recovery", () => {
         async descriptor() {
           return {
             kind: "mock",
-            name: "recovery-backend",
+            name: detachFails ? "recovery-backend-detach-failure" : "recovery-backend",
             version: "1",
             capabilities: {
               resume: true,
@@ -6034,6 +6047,7 @@ describe("executeNativeSession recovery", () => {
         persistedSession: structuredClone(checkpoint),
         timeoutMs: 5,
         onSession,
+        consumeRecoveredSessionGoalOnly: consumeOnly,
       });
       const rejection = expect(execution).rejects.toThrow(
         "native session provider recovery timed out after 5ms",
@@ -6047,10 +6061,27 @@ describe("executeNativeSession recovery", () => {
       expect(openRun).not.toHaveBeenCalled();
       expect(onSession).not.toHaveBeenCalled();
 
-      await closeStarted;
-      expect(close).toHaveBeenCalledWith({
-        reason: "native session provider recovery timed out",
-      });
+      await Promise.race([closeStarted, detachStarted]);
+      if (consumeOnly) {
+        expect(detachControllerForRestart).toHaveBeenCalledOnce();
+        expect(close).not.toHaveBeenCalled();
+        if (detachFails) {
+          await vi.advanceTimersByTimeAsync(0);
+          await expect(executeNativeSession({
+            input, backend, controlPlane: port,
+            runnerInstanceId: "runner-recovery-again",
+            controlPlaneInstanceId: "control-recovery-again",
+            persistedSession: structuredClone(checkpoint),
+            consumeRecoveredSessionGoalOnly: true,
+          })).rejects.toThrow(NativeSessionCleanupQuarantinedError);
+          expect(close).not.toHaveBeenCalled();
+        }
+      } else {
+        expect(close).toHaveBeenCalledWith({
+          reason: "native session provider recovery timed out",
+        });
+        expect(detachControllerForRestart).not.toHaveBeenCalled();
+      }
       expect(onSession).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();

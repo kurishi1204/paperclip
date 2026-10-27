@@ -8869,6 +8869,25 @@ async function executePaperclipNativeSessionWithinScope(
       const held = error;
       const reattachingLiveRunner = input.restartRecovery?.kind === "reattach_existing_runner" ||
         input.restartRecovery?.kind === "reattach_remote_runner";
+      if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
+        const ownedWarmEntry = warmNativeSessions.get(warmSessionId);
+        if (ownedWarmEntry?.ownerToken === warmSessionOwnerToken &&
+            (reattachingLiveRunner || recoveredGoalDeliveryHold) &&
+            ownedWarmEntry.session !== existingWarmSession) {
+          // This attempt published a checkpoint-recovered session, then gave
+          // up its controller without closing the provider. The detached
+          // handle cannot be reused as an in-process warm session. Remove
+          // exactly this generation so a later admission reloads the durable
+          // checkpoint. The finally block retires its inactive GitHub broker.
+          if (ownedWarmEntry.idleTimer !== null) clearTimeout(ownedWarmEntry.idleTimer);
+          warmNativeSessions.delete(warmSessionId);
+        } else {
+          // A caller-owned warm session has not detached. Return only this
+          // generation to idle, retaining the session for its next owner.
+          await releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken,
+            lifecyclePolicy.idleTimeoutMs, false).catch(() => undefined);
+        }
+      }
       if (reattachingLiveRunner || recoveredGoalDeliveryHold) {
         // The old process may still be executing a control accepted before
         // controller loss. A newly recovered provider may also remain live
@@ -8876,12 +8895,6 @@ async function executePaperclipNativeSessionWithinScope(
         // failing its Run or releasing its lease without a completion receipt.
         await trace.finish("failed").catch(() => undefined);
         throw held;
-      }
-      if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
-        // This attempt never entered the provider. Return only its own warm
-        // session reservation to idle so later ordinary work can proceed.
-        await releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken,
-          lifecyclePolicy.idleTimeoutMs, false).catch(() => undefined);
       }
       const now = new Date();
       const binding = input.execution.binding;

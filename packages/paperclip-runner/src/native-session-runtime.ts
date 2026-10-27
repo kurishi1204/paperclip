@@ -488,6 +488,31 @@ async function disposeUnadmittedSession(
   );
 }
 
+async function detachLateRecoveredGoalSession(
+  session: NativeSession,
+  cleanupDomain: NativeSessionCleanupDomain,
+): Promise<void> {
+  // A timed-out recovery may still resolve to an already-working provider.
+  // It was never admitted, but this attempt owns the returned controller
+  // attachment. Retire that attachment without closing the live goal.
+  const cleanup = Promise.resolve()
+    .then(() => {
+      if (!session.detachControllerForRestart) {
+        throw new Error("native_session_controller_detach_unavailable");
+      }
+      return session.detachControllerForRestart();
+    })
+    .catch((error) => {
+      // The late-resolution callback is intentionally observed after the
+      // caller has timed out. Retain this process's admission gate if detachment
+      // fails; never fall back to provider close or silently allow reuse.
+      quarantineSessionCleanup(session, cleanupDomain, true);
+      throw error;
+    });
+  retainFailedSessionCleanupOwner(cleanup, cleanupDomain);
+  await cleanup;
+}
+
 function retainUnadmittedSessionCleanup(
   session: NativeSession,
   reason: string,
@@ -2017,11 +2042,15 @@ export async function executeNativeSession(
               }),
             onLateResolution: async (lateRecovery) => {
               if (lateRecovery.session) {
-                await disposeUnadmittedSession(
-                  lateRecovery.session,
-                  "native session provider recovery timed out",
-                  cleanupDomain,
-                );
+                if (options.consumeRecoveredSessionGoalOnly) {
+                  await detachLateRecoveredGoalSession(lateRecovery.session, cleanupDomain);
+                } else {
+                  await disposeUnadmittedSession(
+                    lateRecovery.session,
+                    "native session provider recovery timed out",
+                    cleanupDomain,
+                  );
+                }
               }
             },
           })
