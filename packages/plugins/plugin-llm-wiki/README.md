@@ -36,9 +36,11 @@ an ISO decision time and reference. The event must be attributed to that user,
 have no agent/run markers, and identify exactly one unchanged comment. This
 does not prove that the user typed the comment in the UI. The administrator's
 classification input declares an owner decision; it is not authenticated
-evidence of the owner's consent. Configured issue UUIDs are normalized to
-lowercase; duplicates after normalization are rejected. Only exact issue IDs
-are in scope. Events attributed to other users or agents are skipped; an
+evidence of the owner's consent. Configured issue UUIDs and incoming company,
+issue, and comment UUIDs are normalized to lowercase, as are reader lookup
+UUIDs; duplicate configured issue IDs after normalization are rejected. User
+identities remain opaque, case-sensitive strings. Only exact issue IDs are
+in scope. Events attributed to other users or agents are skipped; an
 owner-attributed event with contradictory agent/run markers is held.
 
 Accepted bytes are the complete comment body. A separate

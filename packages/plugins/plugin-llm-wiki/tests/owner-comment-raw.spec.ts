@@ -5,10 +5,10 @@ import type { Issue, IssueComment } from "@paperclipai/plugin-sdk";
 import manifest from "../src/manifest.js";
 import plugin from "../src/worker.js";
 
-const company = "11111111-1111-4111-8111-111111111111";
+const company = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const owner = "fixture-owner-not-a-uuid-01";
 const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-const commentId = "44444444-4444-4444-8444-444444444444";
+const commentId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const spaceId = "55555555-5555-4555-8555-555555555555";
 const now = "2026-10-27T10:00:00.000Z";
 const body = "Synthetic owner note for local verification.";
@@ -100,6 +100,21 @@ describe("owner comment raw receipt through exported plugin",()=>{
     s.harness.seed({issueComments:[{...comment,body:"Edited",updatedAt:new Date("2026-10-27T10:01:00Z")}]});
     await expect(s.harness.getData("owner-comment-raw-source",{companyId:company,commentId})).rejects.toThrow();
   });
+  it("normalizes incoming UUID case without changing the opaque owner identity",async()=>{
+    const s=setup(); await plugin.definition.setup(s.harness.ctx);
+    await s.harness.emit("issue.comment.created",{commentId:commentId.toUpperCase(),agentId:null,runId:null,responsibleUserId:null},
+      {companyId:company.toUpperCase(),entityId:issueId.toUpperCase(),entityType:"issue",actorId:owner,actorType:"user",occurredAt:now});
+    expect(s.row()).toMatchObject({company_id:company,issue_id:issueId,comment_id:commentId,owner_user_id:owner,status:"verified"});
+    expect(s.files.size).toBe(1);
+    expect([...s.files.keys()][0]).toBe(`spaces/owner-notes/.paperclip/owner-comment-raw/${spaceId}/${commentId}/${bodyHash}.txt`);
+  });
+  it("reads the canonical receipt for uppercase company and comment UUIDs",async()=>{
+    const s=setup(); await plugin.definition.setup(s.harness.ctx); await s.emit();
+    const result=await s.harness.getData<{source:string;commentId:string;companyId:string}>("owner-comment-raw-source",
+      {companyId:company.toUpperCase(),commentId:commentId.toUpperCase()});
+    expect(result).toMatchObject({source:body,commentId,companyId:company});
+    expect(s.creates()).toBe(1);
+  });
   it("is default-off and never writes a raw file",async()=>{
     const s=setup(); s.harness.setConfig({}); await plugin.definition.setup(s.harness.ctx); await s.emit();
     expect(s.files.size).toBe(0); expect(s.row()).toBeNull();
@@ -164,6 +179,20 @@ describe("owner comment raw receipt through exported plugin",()=>{
     expect((s.row() as Record<string,unknown>).status).toBe("verified");
     expect(s.creates()).toBe(1);
     expect(s.harness.getState({scopeKind:"company",scopeId:company,namespace:"owner-comment-raw-capture",stateKey:commentId})).toMatchObject({status:"verified",reason:null});
+  });
+  it("holds a body race even when the comment timestamp is unchanged",async()=>{
+    const s=setup(); await plugin.definition.setup(s.harness.ctx);
+    const get=s.harness.ctx.issues.listComments;
+    let calls=0;
+    s.harness.ctx.issues.listComments=async (...args)=>{
+      const comments=await get(...args); calls++;
+      return calls===2 ? [{...comments[0]!,body:"Changed within the same timestamp."}] : comments;
+    };
+    await expect(s.emit()).rejects.toThrow("owner_comment_raw_version_race");
+    expect((s.row() as Record<string,unknown>).status).toBe("pending");
+    expect(s.files.size).toBe(1);
+    expect(s.harness.getState({scopeKind:"company",scopeId:company,namespace:"owner-comment-raw-capture",stateKey:commentId})).toMatchObject({status:"hold",reason:"version_race"});
+    await expect(s.harness.getData("owner-comment-raw-source",{companyId:company,commentId})).rejects.toThrow("owner_comment_raw_reader_row");
   });
   it.each<[
     string,

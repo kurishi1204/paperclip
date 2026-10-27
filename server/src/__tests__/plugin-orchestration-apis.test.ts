@@ -37,7 +37,9 @@ import { buildHostServices } from "../services/plugin-host-services.js";
 import { derivePluginDatabaseNamespace, pluginDatabaseService } from "../services/plugin-database.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
-import wikiManifest from "../../../packages/plugins/plugin-llm-wiki/src/manifest.js";
+import wikiManifest, { WIKI_ROOT_FOLDER_KEY } from "../../../packages/plugins/plugin-llm-wiki/src/manifest.js";
+import { issueService } from "../services/issues.js";
+import { logActivity, type ActivityPublication } from "../services/activity-log.js";
 import { captureOwnerCommentRaw, readOwnerCommentRaw } from "../../../packages/plugins/plugin-llm-wiki/src/wiki/owner-comment-raw.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -578,6 +580,114 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     expect(await db.execute(sql`SELECT comment_id FROM ${table} WHERE company_id=${companyId}`)).toHaveLength(1);
     await db.delete(companies).where(eq(companies.id, companyId));
     expect(await db.execute(sql`SELECT comment_id FROM ${table} WHERE company_id=${companyId}`)).toHaveLength(0);
+  }, 90_000);
+
+  it("captures a real board-user comment through activity, host file, and PostgreSQL receipt", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const owner = "synthetic-owner";
+    const issueId = randomUUID();
+    const spaceId = randomUUID();
+    const body = "A synthetic owner note with no external data.";
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Synthetic owner capture", status: "todo", priority: "medium",
+    });
+    const pluginId = randomUUID();
+    await db.insert(plugins).values({
+      id: pluginId, pluginKey: wikiManifest.id, packageName: "@paperclipai/plugin-llm-wiki",
+      version: wikiManifest.version, apiVersion: wikiManifest.apiVersion,
+      categories: wikiManifest.categories, manifestJson: wikiManifest, status: "installed", installOrder: 1,
+    });
+    const repoRoot = path.basename(process.cwd()) === "server" ? path.resolve(process.cwd(), "..") : process.cwd();
+    const pluginRoot = path.join(repoRoot, "packages/plugins/plugin-llm-wiki");
+    const pluginDb = pluginDatabaseService(db);
+    await pluginDb.applyMigrations(pluginId, wikiManifest, pluginRoot);
+    const namespace = derivePluginDatabaseNamespace(wikiManifest.id, wikiManifest.database?.namespaceSlug);
+    const profile = { version: 1, enabled: true,
+      sourceScopes: [{ kind: "root_issues", issueIds: [issueId] }],
+      sourceKinds: { issues: false, comments: true, documents: false, attachments: "off", workProducts: "off" },
+      cursor: { maxWindowCharacters: 60000, maxCharactersPerSource: 12000, minSourceAgeMinutes: 15,
+        maxWindowsPerRun: 6, staleAfterHours: 72 }, backfill: { requireManualQueue: true } };
+    await db.execute(sql`INSERT INTO ${sql.raw(`"${namespace}"."wiki_spaces"`)}
+      (id, company_id, wiki_id, slug, display_name, path_prefix, settings)
+      VALUES (${spaceId}, ${companyId}, 'default', 'owner-notes', 'Owner notes',
+        'spaces/owner-notes',
+        ${JSON.stringify({ paperclipIngestion: profile })}::jsonb)`);
+
+    const root = await makeLocalRoot();
+    const folder = wikiManifest.localFolders?.find((item) => item.folderKey === WIKI_ROOT_FOLDER_KEY);
+    if (!folder) throw new Error("Wiki root declaration missing");
+    for (const directory of folder.requiredDirectories ?? []) {
+      await fs.mkdir(path.join(root, directory), { recursive: true });
+    }
+    for (const file of folder.requiredFiles ?? []) {
+      const absolute = path.join(root, file);
+      await fs.mkdir(path.dirname(absolute), { recursive: true });
+      await fs.writeFile(absolute, "# Synthetic fixture\n");
+    }
+    const host = buildHostServices(db, pluginId, wikiManifest.id, createEventBusStub(), undefined,
+      { manifest: wikiManifest });
+    const configured = await host.localFolders.configure({
+      companyId, folderKey: WIKI_ROOT_FOLDER_KEY, path: root, access: "readWrite",
+      requiredDirectories: folder.requiredDirectories, requiredFiles: folder.requiredFiles,
+    });
+    expect(configured.healthy).toBe(true);
+    const comment = await issueService(db).addComment(issueId, body, { userId: owner });
+    const savedComment = (await host.issues.listComments({ issueId, companyId }))
+      .find((item) => item.id === comment.id);
+    expect(savedComment).toMatchObject({
+      id: comment.id, companyId, issueId, authorType: "user", authorUserId: owner,
+      authorAgentId: null, createdByRunId: null, metadata: null, presentation: null,
+      sourceTrust: null, body,
+    });
+    expect(new Date(savedComment!.createdAt).getTime()).toBe(new Date(savedComment!.updatedAt).getTime());
+    const publications: ActivityPublication[] = [];
+    await logActivity(db, {
+      companyId, actorType: "user", actorId: owner, action: "issue.comment_added",
+      entityType: "issue", entityId: issueId, details: { commentId: comment.id },
+    }, publications);
+    expect(publications).toHaveLength(1);
+    const event = publications[0]!.pluginEvent;
+    expect(event).toMatchObject({ eventType: "issue.comment.created", companyId,
+      entityType: "issue", entityId: issueId, actorType: "user", actorId: owner,
+      payload: { commentId: comment.id, agentId: null, runId: null, responsibleUserId: owner },
+    });
+    if (!event) throw new Error("Activity did not create a plugin event");
+
+    const harness = createTestHarness({ manifest: wikiManifest, config: {
+      ownerCommentRawCapture: { version: 1, enabled: true, spaceSlug: "owner-notes",
+        ownerUserId: owner, issueIds: [issueId], maxBodyBytes: 250000, allowCompanyReaders: true,
+        classification: { label: "internal", decidedByUserId: owner,
+          decidedAt: event.occurredAt, decisionRef: "synthetic-real-path" } },
+    } });
+    harness.ctx.db.namespace = namespace;
+    harness.ctx.db.query = <T,>(statement: string, params?: unknown[]) => pluginDb.query<T>(pluginId, statement, params);
+    harness.ctx.db.execute = (statement, params) => pluginDb.execute(pluginId, statement, params);
+    harness.ctx.issues.get = (id, company) => host.issues.get({ issueId: id, companyId: company });
+    harness.ctx.issues.listComments = (id, company) => host.issues.listComments({ issueId: id, companyId: company });
+    harness.ctx.localFolders.status = (company, folderKey) => host.localFolders.status({ companyId: company, folderKey });
+    harness.ctx.localFolders.createTextExclusive = (company, folderKey, relativePath, contents) =>
+      host.localFolders.createTextExclusive({ companyId: company, folderKey, relativePath, contents });
+    harness.ctx.localFolders.readText = (company, folderKey, relativePath) =>
+      host.localFolders.readText({ companyId: company, folderKey, relativePath });
+
+    expect(await Promise.all([
+      captureOwnerCommentRaw(harness.ctx, event),
+      captureOwnerCommentRaw(harness.ctx, event),
+    ])).toEqual(["verified", "verified"]);
+    const received = await readOwnerCommentRaw(harness.ctx, companyId, comment.id);
+    expect(received.source).toBe(body);
+    expect(received.receipt.status).toBe("verified");
+    expect(received.receipt.rawPath).toBe(
+      `spaces/owner-notes/.paperclip/owner-comment-raw/${spaceId}/${comment.id}/${received.receipt.bodySha256}.txt`,
+    );
+    const leaf = path.join(root, received.receipt.rawPath);
+    expect(await fs.readFile(leaf, "utf8")).toBe(body);
+    expect((await fs.stat(leaf)).mode & 0o777).toBe(0o600);
+    const rows = await db.execute(sql`SELECT status, comment_id FROM
+      ${sql.raw(`"${namespace}"."paperclip_owner_raw_captures"`)} WHERE company_id=${companyId}`);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: "verified", comment_id: comment.id });
+    expect(await fs.readdir(path.dirname(leaf))).toEqual([path.basename(leaf)]);
   }, 90_000);
 
   it("rejects worker local-folder access for undeclared manifest keys", async () => {

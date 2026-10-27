@@ -134,9 +134,14 @@ async function notePending(ctx: PluginContext, event: PluginEvent, commentId: st
 
 export async function captureOwnerCommentRaw(ctx: PluginContext, event: PluginEvent): Promise<"disabled" | "skipped" | "verified"> {
   if (event.eventType !== "issue.comment.created") return "skipped";
+  event = {
+    ...event,
+    companyId: uuid(event.companyId) ? event.companyId.toLowerCase() : event.companyId,
+    entityId: uuid(event.entityId) ? event.entityId.toLowerCase() : event.entityId,
+  };
   if (!uuid(event.companyId) || event.entityType !== "issue" || !uuid(event.entityId)) return "skipped";
   const payload = record(event.payload);
-  const commentId = payload?.commentId;
+  const commentId = uuid(payload?.commentId) ? payload.commentId.toLowerCase() : payload?.commentId;
   let config: Config | null;
   let rawConfig: Record<string, unknown>;
   try { rawConfig = await ctx.config.get(event.companyId); }
@@ -220,6 +225,8 @@ export async function captureOwnerCommentRaw(ctx: PluginContext, event: PluginEv
 
 export async function readOwnerCommentRaw(ctx: PluginContext, companyId: string, commentId: string) {
   if (!uuid(companyId) || !uuid(commentId)) hold("reader_identity");
+  companyId = companyId.toLowerCase();
+  commentId = commentId.toLowerCase();
   const config = parseConfig(await ctx.config.get(companyId));
   if (!config) hold("reader_disabled");
   const space = await ownerCommentRawSpacePolicy(ctx, companyId, config.spaceSlug, config.issueIds)
