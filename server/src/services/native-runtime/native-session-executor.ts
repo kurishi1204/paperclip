@@ -457,19 +457,30 @@ export async function reserveWarmNativeInstructionDirectory(input: {
 }): Promise<{ reuseRunId: string; adopt: (root: string, collectStopped: () => Promise<void>) => void; release: () => Promise<void> } | null> {
   for (const [id, entry] of warmNativeSessions) {
     if (entry.companyId !== input.companyId || entry.agentId !== input.agentId || entry.instructionCopy?.runId !== input.previousRunId) continue;
-    if (entry.busy || entry.preparingRunId) throw new Error("native_session_supervisor_busy");
+    if (entry.busy || entry.preparingRunId) {
+      if (entry.retirementProtected) throw new NativeWarmSessionRetirementPendingError(
+        null, new Error("warm native session retirement busy"));
+      throw new Error("native_session_supervisor_busy");
+    }
     if (entry.idleTimer) clearTimeout(entry.idleTimer);
     entry.idleTimer = null;
     entry.preparingRunId = input.runId;
     const retire = async (reason: string) => {
       entry.closeOnReleaseReason = reason;
+      // The reservation owns this exact entry until retirement finishes.
+      // A restart sweep or another reservation must not close it concurrently.
+      entry.busy = true;
       try {
         await closeWarmNativeSession(entry, reason);
         if (warmNativeSessions.get(id) === entry) warmNativeSessions.delete(id);
+      } catch (error) {
+        if (entry.retirementProtected) throw new NativeWarmSessionRetirementPendingError(null, error);
+        throw error;
       } finally {
         // Failed containment remains registered and cannot be adopted. The next
         // admission retries retirement instead of launching over a live owner.
-        entry.preparingRunId = undefined;
+        if (entry.preparingRunId === input.runId) entry.preparingRunId = undefined;
+        entry.busy = false;
       }
     };
     let reusable = false;
@@ -6075,6 +6086,24 @@ async function releaseWarmNativeSession(
   entry.idleTimer.unref();
 }
 
+async function releaseUnsettledWarmNativeSession(
+  sessionId: string,
+  ownerToken: symbol,
+  idleTimeoutMs: number,
+): Promise<void> {
+  const entry = warmNativeSessions.get(sessionId);
+  if (!entry || entry.ownerToken !== ownerToken) return;
+  if (entry.closeOnReleaseReason !== undefined) {
+    // A lost durable CAS grants this attempt no authority to act on a restart
+    // or retirement request. Abandon only its local map generation, preserving
+    // the potentially live provider for the winner to reconcile.
+    if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
+    warmNativeSessions.delete(sessionId);
+    return;
+  }
+  await releaseWarmNativeSession(sessionId, ownerToken, idleTimeoutMs, false);
+}
+
 /** Classify only a committed provider terminal, never model prose or tool output. */
 export function nativeProviderUsageLimitFromEvent(
   event: Pick<PrpEvent, "sourceKind" | "eventType" | "payload">,
@@ -8957,10 +8986,11 @@ async function executePaperclipNativeSessionWithinScope(
             if (ownedWarmEntry.idleTimer !== null) clearTimeout(ownedWarmEntry.idleTimer);
             warmNativeSessions.delete(warmSessionId);
           } else {
-            // A caller-owned warm session was never detached. Return only
-            // this generation to idle for its current durable owner.
-            await releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken,
-              lifecyclePolicy.idleTimeoutMs, false).catch(() => undefined);
+            // A caller-owned warm session was never detached. Release only
+            // this generation; a pending close request cannot be executed by
+            // an unverified controller.
+            await releaseUnsettledWarmNativeSession(warmSessionId, warmSessionOwnerToken,
+              lifecyclePolicy.idleTimeoutMs).catch(() => undefined);
           }
         }
         await trace.finish("failed").catch(() => undefined);
@@ -9089,8 +9119,8 @@ async function executePaperclipNativeSessionWithinScope(
         } else if (!settled) {
           // Lost CAS or transaction failure: the provider may belong to the
           // winner. Do not close it; only release this attempt's warm token.
-          await releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken,
-            lifecyclePolicy.idleTimeoutMs, false).catch(() => undefined);
+          await releaseUnsettledWarmNativeSession(warmSessionId, warmSessionOwnerToken,
+            lifecyclePolicy.idleTimeoutMs).catch(() => undefined);
         }
       }
       if (settled && warmResourceReleased) {

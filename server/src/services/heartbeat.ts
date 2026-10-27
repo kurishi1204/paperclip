@@ -25538,8 +25538,6 @@ export function heartbeatService(
             nativeGoalDeliveryOwnershipDeferred = !(adapterErr instanceof NativeGoalDeliveryHeldError && adapterErr.settled);
             if (adapterErr instanceof NativeGoalDeliveryHeldError) {
               nativeProviderRetirementDeferred = adapterErr.resourceRetirementDeferred;
-            } else if (adapterErr instanceof NativeWarmSessionRetirementPendingError) {
-              nativeProviderRetirementDeferred = true;
             }
             throw adapterErr;
           }
@@ -25549,7 +25547,6 @@ export function heartbeatService(
             // coordinator is proved under the issue/coordinator/run locks.
             nativeStartupBusyPendingClassification = true;
             nativeGoalDeliveryOwnershipDeferred = true;
-            if (adapterErr instanceof NativeWarmSessionRetirementPendingError) nativeProviderRetirementDeferred = true;
             throw adapterErr;
           }
           if (adapterErr instanceof NativeCancellationPendingRecoveryError) {
@@ -26511,8 +26508,11 @@ export function heartbeatService(
                 const [failedCoordinator] = await tx.update(nativeRunFinalizations).set({
                   phase: "terminal_failure", recoveryState: "blocked",
                   failureCode: err.code,
+                  // This fresh rejected Run never owned the prior provider.
+                  // Its own lease may be released; the original HOLD remains
+                  // protected on the original Run's coordinator.
                   failureDetail: { scope: err.scope, providerWorkStarted: false,
-                    resourceRetirementDeferred: err instanceof NativeWarmSessionRetirementPendingError },
+                    resourceRetirementDeferred: false },
                   nextAttemptAt: null, controlDeadlineAt: null, updatedAt: now,
                   ...(err instanceof NativeWarmSessionRetirementPendingError && err.ownedLease
                     ? { leaseOwner: null, leaseExpiresAt: null } : {}),
@@ -26553,7 +26553,6 @@ export function heartbeatService(
               if (!updated) return false;
               // From here this executor owns a terminal, effect-free Run.
               nativeGoalDeliveryOwnershipDeferred = false;
-              if (err instanceof NativeWarmSessionRetirementPendingError) nativeProviderRetirementDeferred = true;
               nativeStartupBusyRejected = true;
               failedBusyRun = updated;
               publishLiveEvent({ companyId: updated.companyId, type: "heartbeat.run.status",
@@ -27311,7 +27310,8 @@ export function heartbeatService(
               // the winner took this native session scope. Release only this
               // Run's lease and keep any reusable shared provider alive.
               const leaseResult = await releaseRejectedNativeStartupRunLeases({
-                listCurrentRunLeases: () => db.select({ leasePolicy: environmentLeases.leasePolicy })
+                listCurrentRunLeases: () => db.select({ leasePolicy: environmentLeases.leasePolicy,
+                  acquisitionOutcome: sql<string | null>`${environmentLeases.metadata}->'sandboxLeaseAcquisition'->>'outcome'` })
                   .from(environmentLeases).where(and(
                     eq(environmentLeases.heartbeatRunId, run.id),
                     inArray(environmentLeases.status, ["active", "pending_cleanup"]),

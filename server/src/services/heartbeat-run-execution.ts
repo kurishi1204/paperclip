@@ -82,18 +82,28 @@ export async function settleNativeSessionStartupBusy(
   }
 }
 
-/** Release the rejected Run's leases without stopping a shared reusable owner. */
+/** Release a rejected Run's new sandbox while retaining a proven or unknown
+ * shared reusable lease. Acquisition outcomes are written by the environment
+ * runtime; policy alone does not prove that a provider was reused. */
 export async function releaseRejectedNativeStartupRunLeases(actions: {
-  listCurrentRunLeases: () => Promise<Array<{ leasePolicy: string }>>;
+  listCurrentRunLeases: () => Promise<Array<{ leasePolicy: string; acquisitionOutcome?: string | null }>>;
   retainReusableLeases: () => Promise<void>;
   releaseNonReusableLeases: () => Promise<void>;
 }): Promise<"released" | "shared_lease_unresolved"> {
   const current = await actions.listCurrentRunLeases();
-  if (current.some(lease => lease.leasePolicy === "reuse_by_environment")) {
+  const sharedReusable = current.filter(lease => lease.leasePolicy === "reuse_by_environment" &&
+    !["created", "replacement"].includes(lease.acquisitionOutcome ?? ""));
+  const freshReusable = current.filter(lease => lease.leasePolicy === "reuse_by_environment" &&
+    ["created", "replacement"].includes(lease.acquisitionOutcome ?? ""));
+  // The run-level release API cannot split a mixed shared/fresh reusable set.
+  // Leave it observable instead of stopping the shared provider or retaining
+  // a newly created sandbox under a false release receipt.
+  if (sharedReusable.length > 0 && freshReusable.length > 0) return "shared_lease_unresolved";
+  if (sharedReusable.length > 0) {
     await actions.retainReusableLeases();
   }
   const remaining = await actions.listCurrentRunLeases();
-  if (remaining.some(lease => lease.leasePolicy === "reuse_by_environment")) {
+  if (sharedReusable.length > 0 && remaining.some(lease => lease.leasePolicy === "reuse_by_environment")) {
     return "shared_lease_unresolved";
   }
   if (remaining.length > 0) await actions.releaseNonReusableLeases();

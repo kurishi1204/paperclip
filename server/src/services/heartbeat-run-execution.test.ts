@@ -116,6 +116,37 @@ describe("native startup contention after a run was claimed", () => {
     expect(releaseOther).not.toHaveBeenCalled();
   });
 
+  it.each(["created", "replacement"] as const)(
+    "releases a rejected Run's own %s warm sandbox instead of retaining it", async outcome => {
+      const leases = new Map([["rejected-new", { leasePolicy: "reuse_by_environment", acquisitionOutcome: outcome }]]);
+      const retain = vi.fn(async () => { throw new Error("must not retain a fresh sandbox"); });
+      const release = vi.fn(async () => { leases.clear(); });
+      expect(await releaseRejectedNativeStartupRunLeases({
+        listCurrentRunLeases: async () => [...leases.values()],
+        retainReusableLeases: retain,
+        releaseNonReusableLeases: release,
+      })).toBe("released");
+      expect(retain).not.toHaveBeenCalled();
+      expect(release).toHaveBeenCalledOnce();
+      expect(leases.size).toBe(0);
+    },
+  );
+
+  it("does not issue a run-wide release across mixed shared and newly created warm leases", async () => {
+    const retain = vi.fn(async () => undefined);
+    const release = vi.fn(async () => undefined);
+    expect(await releaseRejectedNativeStartupRunLeases({
+      listCurrentRunLeases: async () => [
+        { leasePolicy: "reuse_by_environment", acquisitionOutcome: "resumed" },
+        { leasePolicy: "reuse_by_environment", acquisitionOutcome: "created" },
+      ],
+      retainReusableLeases: retain,
+      releaseNonReusableLeases: release,
+    })).toBe("shared_lease_unresolved");
+    expect(retain).not.toHaveBeenCalled();
+    expect(release).not.toHaveBeenCalled();
+  });
+
   it.each(["owner_scope", "session_scope"] as const)(
     "settles the rejected %s run in order and releases its reservation",
     async scope => {
