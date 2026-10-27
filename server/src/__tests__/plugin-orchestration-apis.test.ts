@@ -25,6 +25,7 @@ import {
   issueThreadInteractions,
   issues,
   pluginManagedResources,
+  pluginDatabaseNamespaces,
   pluginMigrations,
   plugins,
   projects,
@@ -111,8 +112,6 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
   }
 
   afterEach(async () => {
-    await Promise.all(tempRoots.map((root) => fs.rm(root, { recursive: true, force: true })));
-    tempRoots.length = 0;
     // Await every in-flight background heartbeat run to quiescence before the
     // deletes below. A createComment-triggered wakeup dispatches its run
     // fire-and-forget (void heartbeat.wakeup(...)), so a run or wakeup can still
@@ -121,6 +120,21 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     // promises in module state shared across service instances, so a fresh
     // instance here drains the runs the per-test host services dispatched.
     await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await Promise.all(tempRoots.map((root) => fs.rm(root, { recursive: true, force: true })));
+    tempRoots.length = 0;
+    // Installations are recreated per test. Removing their ledger rows alone
+    // leaves SQL objects behind and makes the next real migration collide.
+    // Enumerate registered namespaces in this isolated test database before
+    // deleting the installations that own them.
+    const namespaces = await db.select().from(pluginDatabaseNamespaces);
+    for (const { namespaceName } of namespaces) {
+      if (!/^plugin_[a-z0-9_]+$/.test(namespaceName)) {
+        throw new Error("Unexpected plugin test namespace");
+      }
+      await db.execute(sql`DROP SCHEMA IF EXISTS ${sql.identifier(namespaceName)} CASCADE`);
+    }
+    await db.delete(pluginMigrations);
+    await db.delete(pluginDatabaseNamespaces);
     await db.delete(costEvents);
     await deleteHeartbeatRunsWithDependents();
     await db.delete(agentWakeupRequests);
