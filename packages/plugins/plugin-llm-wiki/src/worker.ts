@@ -199,6 +199,15 @@ const plugin = definePlugin({
         if (raw.status === "fulfilled" && raw.value === "verified") {
           ctx.logger.info("Owner comment raw receipt verified", { companyId: event.companyId, eventId: event.eventId });
         }
+        if (cursor.status === "fulfilled" && cursor.value.status === "recorded") {
+          ctx.logger.info("LLM Wiki recorded Paperclip event for cursor discovery", {
+            eventType: event.eventType,
+            companyId: event.companyId,
+            sourceKind: cursor.value.sourceKind,
+            sourceId: cursor.value.sourceId,
+            cursorId: cursor.value.cursorId,
+          });
+        }
         if (cursor.status === "rejected" && raw.status === "rejected") {
           ctx.logger.error("Wiki cursor observation failed", { eventId: event.eventId, reason: "cursor_failed" });
           ctx.logger.error("Owner comment raw capture failed", { eventId: event.eventId,
@@ -208,16 +217,6 @@ const plugin = definePlugin({
         }
         if (cursor.status === "rejected") throw cursor.reason;
         if (raw.status === "rejected") throw raw.reason;
-        const result = cursor.value;
-        if (result.status === "recorded") {
-          ctx.logger.info("LLM Wiki recorded Paperclip event for cursor discovery", {
-            eventType: event.eventType,
-            companyId: event.companyId,
-            sourceKind: result.sourceKind,
-            sourceId: result.sourceId,
-            cursorId: result.cursorId,
-          });
-        }
       });
     }
 

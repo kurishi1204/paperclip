@@ -30,6 +30,7 @@ type Config = {
   issueIds: string[];
   maxBodyBytes: number;
   policySha256: string;
+  consentDecision: { label: "internal"; decidedByUserId: string; decidedAt: string; decisionRef: string };
 };
 
 function parseConfig(raw: Record<string, unknown>): Config | null {
@@ -58,8 +59,9 @@ function parseConfig(raw: Record<string, unknown>): Config | null {
     ownerUserId, spaceSlug, issueIds,
     maxBodyBytes: input.maxBodyBytes as number,
     policySha256: hash(JSON.stringify({version: 1, ownerUserId: input.ownerUserId, spaceSlug: input.spaceSlug,
-      issueIds: [...issueIds].sort(), allowCompanyReaders: true, maxBodyBytes: input.maxBodyBytes,
-      classification})),
+      allowCompanyReaders: true, classificationLabel: "internal"})),
+    consentDecision: {label:"internal",decidedByUserId:ownerUserId,
+      decidedAt:classification.decidedAt as string,decisionRef:classification.decisionRef as string},
   };
 }
 
@@ -90,7 +92,8 @@ type Row = { company_id: string; space_id: string; comment_id: string; issue_id:
 const table = (ctx: PluginContext) => `"${ctx.db.namespace}"."paperclip_owner_raw_captures"`;
 async function getRow(ctx: PluginContext, companyId: string, spaceId: string, commentId: string): Promise<Row | null> {
   const rows = await ctx.db.query<Row>(`SELECT company_id, space_id, comment_id, issue_id, owner_user_id, body_sha256,
-    comment_updated_at::text AS comment_updated_at, raw_path, policy_sha256, status FROM ${table(ctx)}
+    to_char(comment_updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS comment_updated_at,
+    raw_path, policy_sha256, status FROM ${table(ctx)}
     WHERE company_id=$1 AND space_id=$2 AND comment_id=$3`, [companyId, spaceId, commentId]);
   return rows[0] ?? null;
 }
@@ -131,30 +134,41 @@ async function notePending(ctx: PluginContext, event: PluginEvent, commentId: st
 
 export async function captureOwnerCommentRaw(ctx: PluginContext, event: PluginEvent): Promise<"disabled" | "skipped" | "verified"> {
   if (event.eventType !== "issue.comment.created") return "skipped";
+  if (!uuid(event.companyId) || event.entityType !== "issue" || !uuid(event.entityId)) return "skipped";
   const payload = record(event.payload);
   const commentId = payload?.commentId;
   let config: Config | null;
-  try { config = parseConfig(await ctx.config.get(event.companyId)); }
+  let rawConfig: Record<string, unknown>;
+  try { rawConfig = await ctx.config.get(event.companyId); }
   catch (error) {
-    if (error instanceof OwnerCommentRawHold && error.code === "state_write_failed") throw error;
-    if (error instanceof OwnerCommentRawHold) await noteHold(ctx, event, uuid(commentId) ? commentId : null, error.code);
-    else { await notePending(ctx, event, uuid(commentId) ? commentId : null); throw new Error("owner_comment_raw_io_pending"); }
+    ctx.logger.error("Owner comment raw config unavailable", { companyId: event.companyId, reason: "config_unavailable" });
+    hold("config_unavailable");
+  }
+  try { config = parseConfig(rawConfig); }
+  catch (error) {
+    if (error instanceof OwnerCommentRawHold && error.code === "invalid_config") {
+      await noteHold(ctx, event, "config", error.code);
+      throw error;
+    }
     throw error;
   }
   if (!config) return "disabled";
+  if (!config.issueIds.includes(event.entityId)) return "skipped";
   try {
-    if (!uuid(event.companyId) || !uuid(event.entityId) || event.entityType !== "issue" || !uuid(commentId)
-      || event.actorType !== "user" || event.actorId !== config.ownerUserId
+    if (!uuid(commentId) || event.actorType !== "user" || event.actorId !== config.ownerUserId
       || payload?.agentId !== null || payload.runId !== null
       || (payload.responsibleUserId !== null && payload.responsibleUserId !== config.ownerUserId)) hold("event_attribution");
     const occurredAt = dateMs(event.occurredAt);
     if (occurredAt === null) hold("event_time");
-    if (!config.issueIds.includes(event.entityId)) return "skipped";
     const issue = await ctx.issues.get(event.entityId, event.companyId);
     if (!issue || issue.companyId !== event.companyId || issue.id !== event.entityId
       || (typeof issue.originKind === "string" && issue.originKind.startsWith(`plugin:${PLUGIN_ID}:operation`))) hold("issue_identity");
     const space = await ownerCommentRawSpacePolicy(ctx, event.companyId, config.spaceSlug, config.issueIds)
       .catch(() => hold("space_policy"));
+    const folder = await ctx.localFolders.status(event.companyId, WIKI_ROOT_FOLDER_KEY);
+    if (!folder.configured || !folder.readable || !folder.writable || !folder.healthy || folder.access !== "readWrite") {
+      hold("folder_unhealthy");
+    }
     const first = exactComment(await ctx.issues.listComments(issue.id, event.companyId), commentId, event.companyId,
       issue, config.ownerUserId, occurredAt, config.maxBodyBytes);
     const rawPath = spaceRelativePath(space, `.paperclip/owner-comment-raw/${space.id}/${commentId}/${first.bodyHash}.txt`);
@@ -166,13 +180,19 @@ export async function captureOwnerCommentRaw(ctx: PluginContext, event: PluginEv
       ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10::jsonb)
       ON CONFLICT (company_id,space_id,comment_id) DO NOTHING`,
       [event.companyId, space.id, commentId, issue.id, config.ownerUserId, first.bodyHash, first.updatedAt,
-        rawPath, config.policySha256, JSON.stringify({attribution:"host_user_attributed_no_run_markers",eventId:event.eventId})]);
+        rawPath, config.policySha256, JSON.stringify({attribution:"host_user_attributed_no_run_markers",eventId:event.eventId,
+          consentSnapshot:{classification:config.consentDecision,
+            issueIds:config.issueIds,maxBodyBytes:config.maxBodyBytes,allowCompanyReaders:true}})]);
     let row = await getRow(ctx, event.companyId, space.id, commentId);
     if (!row || !rowMatches(row, identity)) hold("row_conflict");
     if (row.status === "pending") {
       await ctx.localFolders.createTextExclusive(event.companyId, WIKI_ROOT_FOLDER_KEY, rawPath, first.comment.body);
     }
-    await readExactFile(ctx, event.companyId, rawPath, first.comment.body, first.bodyHash);
+    try { await readExactFile(ctx, event.companyId, rawPath, first.comment.body, first.bodyHash); }
+    catch (error) {
+      if (row.status === "verified" && !(error instanceof OwnerCommentRawHold)) hold("verified_file_unavailable");
+      throw error;
+    }
     const second = exactComment(await ctx.issues.listComments(issue.id, event.companyId), commentId, event.companyId,
       issue, config.ownerUserId, occurredAt, config.maxBodyBytes);
     if (second.bodyHash !== first.bodyHash || second.updatedAt !== first.updatedAt) hold("version_race");
@@ -183,7 +203,11 @@ export async function captureOwnerCommentRaw(ctx: PluginContext, event: PluginEv
     }
     row = await getRow(ctx, event.companyId, space.id, commentId);
     if (!row || row.status !== "verified" || !rowMatches(row, identity)) hold("final_row");
-    await readExactFile(ctx, event.companyId, rawPath, first.comment.body, first.bodyHash);
+    try { await readExactFile(ctx, event.companyId, rawPath, first.comment.body, first.bodyHash); }
+    catch (error) {
+      if (!(error instanceof OwnerCommentRawHold)) hold("verified_file_unavailable");
+      throw error;
+    }
     await writeHealth(ctx, event, commentId, "verified", null);
     return "verified";
   } catch (error) {

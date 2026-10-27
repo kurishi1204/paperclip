@@ -1,6 +1,6 @@
 CREATE TABLE plugin_llm_wiki_8f50da974f.paperclip_owner_raw_captures (
-  company_id uuid NOT NULL,
-  space_id uuid NOT NULL,
+  company_id uuid NOT NULL REFERENCES public.companies(id) ON DELETE CASCADE,
+  space_id uuid NOT NULL REFERENCES plugin_llm_wiki_8f50da974f.wiki_spaces(id) ON DELETE CASCADE,
   comment_id uuid NOT NULL,
   issue_id uuid NOT NULL,
   owner_user_id text NOT NULL,
