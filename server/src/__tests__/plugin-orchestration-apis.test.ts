@@ -486,12 +486,22 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         VALUES (${id}, ${spaceCompanyId}, 'default', 'owner-notes', 'Owner notes',
           ${JSON.stringify({ paperclipIngestion: ingestionProfile })}::jsonb)`);
     }
-    const issue = { id: issueId, companyId, originKind: null } as Issue;
-    const comment = { id: commentId, companyId, issueId, authorType: "user", authorUserId: owner,
+    const issue: Issue = {
+      id: issueId, companyId, projectId: null, projectWorkspaceId: null, goalId: null, parentId: null,
+      title: "Synthetic owner note", description: null, status: "todo", workMode: "standard",
+      priority: "medium", reviewPolicy: null, assigneeAgentId: null, assigneeUserId: null,
+      checkoutRunId: null, executionRunId: null, executionAgentNameKey: null, executionLockedAt: null,
+      createdByAgentId: null, createdByUserId: null, responsibleUserId: null, issueNumber: null,
+      identifier: null, requestDepth: 0, billingCode: null, assigneeAdapterOverrides: null,
+      executionWorkspaceId: null, executionWorkspacePreference: null, executionWorkspaceSettings: null,
+      startedAt: null, completedAt: null, cancelledAt: null, hiddenAt: null,
+      createdAt: new Date(occurredAt), updatedAt: new Date(occurredAt),
+    };
+    const comment: IssueComment = { id: commentId, companyId, issueId, authorType: "user", authorUserId: owner,
       authorAgentId: null, onBehalfOfUserId: null, createdByRunId: null, derivedAuthorAgentId: null,
       derivedCreatedByRunId: null, derivedAuthorSource: null, deletedAt: null, sourceTrust: null,
       metadata: null, presentation: null, createdAt: new Date(occurredAt), updatedAt: new Date(occurredAt),
-      body } as IssueComment;
+      body };
     const harness = createTestHarness({ manifest: wikiManifest,
       config: { ownerCommentRawCapture: { version: 1, enabled: true, spaceSlug: "owner-notes",
         ownerUserId: owner, issueIds: [issueId], maxBodyBytes: 250000, allowCompanyReaders: true,
