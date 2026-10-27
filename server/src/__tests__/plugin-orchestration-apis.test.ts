@@ -421,6 +421,18 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await expect(fs.stat(path.join(root, "raw"))).resolves.toMatchObject({});
     await expect(fs.stat(path.join(root, "wiki/concepts"))).resolves.toMatchObject({});
     await expect(fs.readFile(path.join(root, "WIKI.md"), "utf8")).resolves.toBe("# Wiki\n");
+    const exclusiveFirst = await services.localFolders.createTextExclusive({
+      companyId, folderKey: "wiki-root", relativePath: "raw/capture.txt", contents: "first",
+    });
+    const exclusiveSecond = await services.localFolders.createTextExclusive({
+      companyId, folderKey: "wiki-root", relativePath: "raw/capture.txt", contents: "different",
+    });
+    expect([exclusiveFirst.created, exclusiveSecond.created]).toEqual([true, false]);
+    expect(exclusiveFirst.status.folderKey).toBe("wiki-root");
+    await expect(fs.readFile(path.join(root, "raw/capture.txt"), "utf8")).resolves.toBe("first");
+    await expect(services.localFolders.createTextExclusive({
+      companyId: randomUUID(), folderKey: "wiki-root", relativePath: "raw/other.txt", contents: "other",
+    })).rejects.toThrow();
   });
 
   it("rejects worker local-folder access for undeclared manifest keys", async () => {
@@ -489,6 +501,12 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await expect(services.localFolders.readText({ companyId, folderKey: "ssh", relativePath: "id_rsa" }))
       .rejects.toThrow("Local folder key is not declared");
     await expect(services.localFolders.writeTextAtomic({
+      companyId,
+      folderKey: "ssh",
+      relativePath: "id_rsa",
+      contents: "secret",
+    })).rejects.toThrow("Local folder key is not declared");
+    await expect(services.localFolders.createTextExclusive({
       companyId,
       folderKey: "ssh",
       relativePath: "id_rsa",

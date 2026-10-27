@@ -1562,6 +1562,10 @@ export interface WorkerToHostMethods {
     },
     result: PluginLocalFolderStatus,
   ];
+  "localFolders.createTextExclusive": [
+    params: { companyId: string; folderKey: string; relativePath: string; contents: string },
+    result: { created: boolean; status: PluginLocalFolderStatus },
+  ];
   "localFolders.deleteFile": [
     params: { companyId: string; folderKey: string; relativePath: string },
     result: PluginLocalFolderStatus,

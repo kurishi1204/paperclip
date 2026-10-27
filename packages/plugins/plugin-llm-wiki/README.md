@@ -25,6 +25,46 @@ The alpha surface includes:
 
 ## Phase 5 Security Gate
 
+### Opt-in owner comment raw capture (local implementation slice)
+
+The `ownerCommentRawCapture` company plugin config is off by default. Version 1
+requires `enabled: true`, a shared active `spaceSlug` with an enabled comments
+profile containing only `root_issues` scopes, one `ownerUserId`, an explicit
+list of at most 25 exact `issueIds`, `allowCompanyReaders: true`, a bounded
+`maxBodyBytes`, and an `internal` classification decision by the same user with
+an ISO decision time and reference. The event must be attributed to that user,
+have no agent/run markers, and identify exactly one unchanged comment. This
+does not prove that the user typed the comment in the UI.
+
+Accepted bytes are the complete comment body. A separate
+`paperclip_owner_raw_captures` row claims its version; the file lives under
+`.paperclip/owner-comment-raw/<space UUID>/<comment UUID>/<body SHA-256>.txt`
+within the space prefix. This path is outside ordinary `raw/` and `wiki/`
+readers and writers. A create-only local-folder operation prevents this plugin
+from overwriting an existing leaf; the receipt is `verified` only after file,
+comment, row, and final file readback. The `owner-comment-raw-source` data
+handler rechecks current policy and comment version before returning bytes.
+This is a raw receipt, not a normalized source or a published wiki page.
+
+The plugin table row is the receipt authority. Its `pending` state has no
+successful capture meaning; the currently unused `hold` enum does not itself
+authorize reads. Separate company-scoped plugin state records the latest
+attempt health (`pending`, `hold`, or `verified`) and is updated after successful
+final readback. A health write failure returns a fixed error and is logged
+without file path or body. A `verified` row is still insufficient for reading
+when the current comment is edited, deleted, or newly attributed to a run, or
+when the saved file no longer matches its exact bytes and hash.
+
+The Paperclip plugin event bus is in-process and has no durable redelivery.
+An event lost before delivery or a `pending` receipt with no later event has
+no automatic recovery in this slice. Database and filesystem writes are not
+one transaction; unknown I/O outcome remains pending or held and must never
+be reported as captured. Local tests do not establish a production receipt,
+UI origin, retention/deletion behavior, business QA, or permission to send
+these bytes to a model. Existing cursor dedup is independent of this raw
+receipt. Do not enable on a real company until those missing gates are
+separately accepted.
+
 Paperclip-derived text ingestion stays limited to issue titles/descriptions, issue comments, and issue documents.
 
 - Issue attachments/assets are **metadata-only** in Phase 5.

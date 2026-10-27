@@ -12,6 +12,7 @@ import {
   resolvePluginLocalFolderPath,
   deletePluginLocalFolderFile,
   writePluginLocalFolderTextAtomic,
+  createPluginLocalFolderTextExclusive,
 } from "../services/plugin-local-folders.js";
 
 describe("plugin local folders", () => {
@@ -225,6 +226,63 @@ describe("plugin local folders", () => {
     await writePluginLocalFolderTextAtomic(root, "cases/active/smoke/README.md", "hello");
 
     await expect(readPluginLocalFolderText(root, "cases/active/smoke/README.md")).resolves.toBe("hello");
+  });
+
+  it("creates a text leaf once and never replaces an existing regular leaf", async () => {
+    const root = await makeRoot();
+    const first = await createPluginLocalFolderTextExclusive(root, "raw/item.txt", "first");
+    const second = await createPluginLocalFolderTextExclusive(root, "raw/item.txt", "different");
+    const third = await createPluginLocalFolderTextExclusive(root, "raw/item.txt", "first");
+    expect([first.created, second.created, third.created]).toEqual([true, false, false]);
+    await expect(fs.readFile(path.join(root, "raw/item.txt"), "utf8")).resolves.toBe("first");
+    expect((await fs.stat(path.join(root, "raw/item.txt"))).mode & 0o777).toBe(0o600);
+    expect((await fs.readdir(path.join(root, "raw"))).sort()).toEqual(["item.txt"]);
+  });
+
+  it("lets exactly one concurrent create win for the same leaf", async () => {
+    const root = await makeRoot();
+    const contents = ["one", "two", "three", "four"];
+    const results = await Promise.all(contents.map((value) => createPluginLocalFolderTextExclusive(root, "raw/race.txt", value)));
+    expect(results.filter((result) => result.created)).toHaveLength(1);
+    const saved = await fs.readFile(path.join(root, "raw/race.txt"), "utf8");
+    expect(contents).toContain(saved);
+    expect((await fs.readdir(path.join(root, "raw"))).sort()).toEqual(["race.txt"]);
+  });
+
+  it("rejects traversal, existing symlinks, and non-regular leaves", async () => {
+    const root = await makeRoot();
+    const outside = await makeRoot();
+    await fs.writeFile(path.join(outside, "secret.txt"), "original");
+    await fs.symlink(path.join(outside, "secret.txt"), path.join(root, "linked.txt"));
+    await fs.mkdir(path.join(root, "directory"));
+    await expect(createPluginLocalFolderTextExclusive(root, "linked.txt", "new"))
+      .rejects.toThrow();
+    await expect(createPluginLocalFolderTextExclusive(root, "directory", "new"))
+      .rejects.toThrow("regular file");
+    await expect(createPluginLocalFolderTextExclusive(root, "../outside.txt", "new"))
+      .rejects.toMatchObject({ status: 403 });
+    await expect(fs.readFile(path.join(outside, "secret.txt"), "utf8")).resolves.toBe("original");
+  });
+
+  it("rejects a parent symlink swap before writing exclusive temp contents", async () => {
+    const root = await makeRoot();
+    const outside = await makeRoot();
+    const nested = path.join(root, "nested");
+    await fs.mkdir(nested);
+    const originalOpen = fs.open.bind(fs);
+    const openSpy = vi.spyOn(fs, "open");
+    openSpy.mockImplementationOnce(async (file, flags, mode) => {
+      await fs.rm(nested, { recursive: true, force: true });
+      await fs.symlink(outside, nested);
+      return originalOpen(file, flags, mode);
+    });
+    try {
+      await expect(createPluginLocalFolderTextExclusive(root, "nested/capture.txt", "secret"))
+        .rejects.toMatchObject({ status: 403 });
+      expect(await fs.readdir(outside)).toEqual([]);
+    } finally {
+      openSpy.mockRestore();
+    }
   });
 
   it("returns the real folder key after deleting a file", async () => {

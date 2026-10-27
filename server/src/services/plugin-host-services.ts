@@ -64,6 +64,7 @@ import {
   requireLocalFolderDeclaration,
   setStoredLocalFolder,
   writePluginLocalFolderTextAtomic,
+  createPluginLocalFolderTextExclusive,
 } from "./plugin-local-folders.js";
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
 import { logActivity } from "./activity-log.js";
@@ -1502,6 +1503,22 @@ export function buildHostServices(
         assertWritableConfiguredLocalFolder(status);
         await writePluginLocalFolderTextAtomic(status.realPath!, params.relativePath, params.contents);
         return inspectStoredLocalFolder(companyId, params.folderKey);
+      },
+
+      async createTextExclusive(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await preparePluginLocalFolder({
+          folderKey: params.folderKey,
+          declaration: getLocalFolderDeclaration(params.folderKey),
+          storedConfig: await getStoredLocalFolderConfig(companyId, params.folderKey),
+        });
+        const status = await inspectStoredLocalFolder(companyId, params.folderKey);
+        assertWritableConfiguredLocalFolder(status);
+        if (status.access !== "readWrite" || !status.writable) {
+          throw new Error("Local folder is not configured for writes");
+        }
+        const result = await createPluginLocalFolderTextExclusive(status.realPath!, params.relativePath, params.contents);
+        return { created: result.created, status: await inspectStoredLocalFolder(companyId, params.folderKey) };
       },
 
       async deleteFile(params) {

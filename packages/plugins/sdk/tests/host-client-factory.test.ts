@@ -9,6 +9,21 @@ import {
 import { PLUGIN_RPC_ERROR_CODES } from "../src/protocol.js";
 
 describe("createHostClientHandlers invocation company scope", () => {
+  it("gates exclusive local-folder creation by capability and invocation company", async () => {
+    const createTextExclusive = vi.fn(async () => ({ created: true, status: { folderKey: "raw" } }));
+    const services = { localFolders: { createTextExclusive } } as unknown as HostServices;
+    const params = { companyId: "company-a", folderKey: "raw", relativePath: "one.txt", contents: "one" };
+    const denied = createHostClientHandlers({ pluginId: "paperclip.test", capabilities: [], services });
+    await expect(denied["localFolders.createTextExclusive"](params, { invocationScope: { companyId: "company-a" } }))
+      .rejects.toBeInstanceOf(CapabilityDeniedError);
+    const allowed = createHostClientHandlers({ pluginId: "paperclip.test", capabilities: ["local.folders"], services });
+    await expect(allowed["localFolders.createTextExclusive"]({ ...params, companyId: "company-b" }, { invocationScope: { companyId: "company-a" } }))
+      .rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(createTextExclusive).not.toHaveBeenCalled();
+    await expect(allowed["localFolders.createTextExclusive"](params, { invocationScope: { companyId: "company-a" } }))
+      .resolves.toMatchObject({ created: true });
+    expect(createTextExclusive).toHaveBeenCalledTimes(1);
+  });
   it("rejects worker-selected config and secret company ids without a host invocation scope", async () => {
     const configGet = vi.fn(async () => ({ apiKeyRef: "unreachable" }));
     const secretsResolve = vi.fn(async () => "unreachable");
