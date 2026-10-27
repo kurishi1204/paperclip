@@ -5,6 +5,10 @@ const run = (errorCode: string | null) =>
   ({ errorCode } as unknown as Parameters<typeof classifyContinuationFailure>[0]);
 
 describe("pause durability: continuation retry classification", () => {
+  it("never retries a goal command with an indeterminate delivery", () => {
+    expect(classifyContinuationFailure(run("session_goal_control_delivery_indeterminate")))
+      .toMatchObject({ kind: "non_retryable", maxAttempts: 0 });
+  });
   it.each(["workspace_git_scan_timeout", "workspace_git_scan_saturated", "workspace_git_scan_failed", "workspace_git_scan_output_limit", "workspace_git_scan_cancelled"])("does not grant %s another recovery budget", (code) => {
     expect(classifyContinuationFailure(run(code))).toMatchObject({ kind: "non_retryable", maxAttempts: 0 });
   });

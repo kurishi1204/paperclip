@@ -349,8 +349,11 @@ describe("native issue approval stage", () => {
     expect(active.result?.isError).toBe(true);
     await server.db.update(agentTaskSessions).set({ goalJson: { objective: "Continue work", status: "complete" } })
       .where(eq(agentTaskSessions.id, session!.id));
-    await server.db.insert(agentSessionGoalActions).values({ companyId: fixture.companyId,
-      sessionId: session!.id, requestId: randomUUID(), action: "pause", payloadJson: {}, status: "pending" });
+    const [action] = await server.db.insert(agentSessionGoalActions).values({ companyId: fixture.companyId,
+      sessionId: session!.id, requestId: randomUUID(), action: "pause", payloadJson: {}, status: "ready" }).returning();
+    const ready = await rpc("goal-ready", "tools/call", { name: "decide_issue_approval_stage", arguments: args });
+    expect(ready.result?.isError).toBe(true);
+    await server.db.update(agentSessionGoalActions).set({ status: "pending" }).where(eq(agentSessionGoalActions.id, action!.id));
     const pending = await rpc("goal-pending", "tools/call", { name: "decide_issue_approval_stage", arguments: args });
     expect(pending.result?.isError).toBe(true);
     const [run] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));

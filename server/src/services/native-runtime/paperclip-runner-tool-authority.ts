@@ -932,7 +932,7 @@ export class PaperclipRunnerToolAuthority {
         const sessionGoal = record(session?.goalJson);
         const [openAction] = session ? await tx.select({ id: agentSessionGoalActions.id }).from(agentSessionGoalActions).where(and(
           eq(agentSessionGoalActions.sessionId, session.id),
-          sql`${agentSessionGoalActions.status} in ('pending', 'delivering', 'delivered')`,
+          sql`${agentSessionGoalActions.status} in ('ready', 'pending', 'delivering', 'delivered')`,
         )).limit(1) : [];
         if (!session || openAction || (typeof sessionGoal.objective === "string" && sessionGoal.status !== "complete")) {
           throw forbidden("Approval stage goal or control action is active");

@@ -37,6 +37,7 @@ import {
   EXECUTION_CONTROL_DEADLINE_MS,
 } from "../execution-control-deadline.js";
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
@@ -79,6 +80,7 @@ import type {
 } from "../../vendor/paperclip-runner/index.js";
 import {
   NativeProviderTerminalFailure,
+  NativeSessionGoalConsumeOnlyError,
   NativeSessionCleanupQuarantinedError,
   NativeSessionProtocolIntegrityError,
   completeRetainedNativeSessionCleanup,
@@ -180,6 +182,8 @@ import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
 import { applyRunnerGoalPrpEvent } from "../runner-goals.js";
+import type { RunnerGoalDeliveryClaim, RunnerGoalDeliveryInspection } from "../runner-goals.js";
+import { NativeGoalDeliveryHeldError, NativeSessionLeaseNotOwnedError, NativeSessionStartupBusyError } from "./native-goal-delivery-hold.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import {
   NativeRunnerOwnershipUnverifiedError,
@@ -7283,6 +7287,9 @@ function startNativeSessionExecutionLeaseRenewal(input: {
   };
 }
 
+/** The coordinator itself proved another claimant won before this caller acquired a lease. */
+class NativeSessionLeaseContentionError extends Error {}
+
 export async function executePaperclipNativeSession(input: {
   getFreshSessionHandoff?: () => Promise<string | null>;
   /** Retire a retained transport so recovery can replace provider tool declarations. */
@@ -7322,6 +7329,10 @@ export async function executePaperclipNativeSession(input: {
   /** Persist task-level continuity before a durable goal can outlive this run. */
   onGoalCheckpoint?: (snapshot: PersistedNativeSession) => Promise<void>;
   sessionGoalControl?: NativeSessionGoalControl | null;
+  /** Atomic reservation at the runtime's actual goal-command boundary. */
+  claimGoalDelivery?: () => Promise<RunnerGoalDeliveryClaim>;
+  /** Read-only receipt preflight for a live runner that must not be closed on HOLD. */
+  inspectGoalDelivery?: () => Promise<RunnerGoalDeliveryInspection>;
   resumeSessionGoalHeartbeat?: boolean;
   preparationSpans?: NativeRunHistoricalSpan[];
   /** Use a session-owned GitHub broker, rebound only after run ownership is acquired. */
@@ -7366,7 +7377,7 @@ export async function executePaperclipNativeSession(input: {
   }
   const runId = input.execution.binding.runId;
   if (nativeSessionStartups.has(runId)) {
-    throw new Error("native_session_supervisor_busy");
+    throw new NativeSessionStartupBusyError("same_run");
   }
   // Register before the first asynchronous operation on either backend path.
   // A duplicate execution must not replace the original startup handoff.
@@ -7389,7 +7400,7 @@ export async function executePaperclipNativeSession(input: {
   try {
     // Reserve across session identities before retiring or staging anything.
     if (executingNativeOwnerScopes.has(ownerScope)) {
-      throw new Error("native_session_supervisor_busy");
+      throw new NativeSessionStartupBusyError("owner_scope");
     }
     executingNativeOwnerScopes.set(ownerScope, ownerToken);
     await retireSupersededWarmNativeSessions(
@@ -7403,7 +7414,7 @@ export async function executePaperclipNativeSession(input: {
     // execution cannot truncate or replace the active turn's staging inode.
     sessionScopeId = nativeSessionScopeKey(input.execution);
     if (executingRunnerdSessionScopes.has(sessionScopeId)) {
-      throw new Error("native_session_supervisor_busy");
+      throw new NativeSessionStartupBusyError("session_scope");
     }
     executingRunnerdSessionScopes.set(
       sessionScopeId,
@@ -7621,6 +7632,7 @@ async function executePaperclipNativeSessionWithinScope(
   const leaseNow = new Date();
   const leaseExpiresAt = new Date(leaseNow.getTime() + 20 * 60_000);
   let attempt: number;
+  let nativeLeaseAcquired = false;
   try {
     attempt = await trace.measure(
       "native.coordinator.claim",
@@ -7716,7 +7728,7 @@ async function executePaperclipNativeSessionWithinScope(
             coordinator.leaseExpiresAt &&
             coordinator.leaseExpiresAt > leaseNow
           )
-            throw new Error("native_finalization_lease_busy");
+            throw new NativeSessionLeaseContentionError("native_finalization_lease_busy");
           const recovering = input.restartRecovery;
           if (
             recovering &&
@@ -7728,7 +7740,7 @@ async function executePaperclipNativeSessionWithinScope(
               coordinator.controllerGeneration !==
                 recovering.controllerGeneration)
           ) {
-            throw new Error("native_restart_recovery_claim_changed");
+            throw new NativeSessionLeaseContentionError("native_restart_recovery_claim_changed");
           }
           let incidentAttempts = coordinator.attempt;
           if (
@@ -7804,7 +7816,7 @@ async function executePaperclipNativeSessionWithinScope(
             )
             .returning({ runId: nativeRunFinalizations.runId })
             .then((rows) => rows[0] ?? null);
-          if (!claimed) throw new Error("native_session_lease_lost");
+          if (!claimed) throw new NativeSessionLeaseContentionError("native_session_lease_lost");
           await tx
             .update(heartbeatRuns)
             .set({
@@ -7814,13 +7826,20 @@ async function executePaperclipNativeSessionWithinScope(
             })
             .where(eq(heartbeatRuns.id, coordinator.runId));
           return nextAttempt;
+        }).then((claimedAttempt) => {
+          nativeLeaseAcquired = true;
+          return claimedAttempt;
         }),
       { parentName: "task.prepare" },
     );
     await trace.end(taskPrepareScope);
   } catch (error) {
-    await trace.end(taskPrepareScope, { outcome: "failed" });
-    await trace.finish("failed");
+    await trace.end(taskPrepareScope, { outcome: "failed" }).catch(() => undefined);
+    await trace.finish("failed").catch(() => undefined);
+    if (!nativeLeaseAcquired && error instanceof NativeSessionLeaseContentionError &&
+        (input.sessionGoalControl || input.claimGoalDelivery)) {
+      throw new NativeSessionLeaseNotOwnedError(error instanceof Error ? error.message : null);
+    }
     throw error;
   }
   const controlPlaneInstanceId = `${effectiveRunnerInstanceId}:control`;
@@ -8201,7 +8220,8 @@ async function executePaperclipNativeSessionWithinScope(
   let githubAccess: NativeGitHubAccess | undefined;
   let releaseGitHubRun: (() => void) | undefined;
   let persistedWarmSession: PersistedNativeSession | null | undefined;
-  if (warmSessionId !== null && warmConfigDigest !== null) {
+  async function prepareWarmSession() {
+    if (warmSessionId === null || warmConfigDigest === null) return;
     const entry = warmNativeSessions.get(warmSessionId);
     if (entry) {
       if (entry.preparingRunId && entry.preparingRunId !== input.execution.binding.runId) throw new Error("native_session_supervisor_busy");
@@ -8364,7 +8384,40 @@ async function executePaperclipNativeSessionWithinScope(
     attempt,
     controller,
   });
+  let consumeRecoveredSessionGoalOnly = false;
+  let consumeRecoveredSessionGoalOwned = false;
   try {
+    await prepareWarmSession();
+    const reattachingGoalRunner = Boolean(
+      (input.restartRecovery?.kind === "reattach_existing_runner" ||
+        input.restartRecovery?.kind === "reattach_remote_runner") &&
+      (input.sessionGoalControl || input.claimGoalDelivery || input.inspectGoalDelivery),
+    );
+    if (input.inspectGoalDelivery || reattachingGoalRunner) {
+      let inspection: RunnerGoalDeliveryInspection;
+      try {
+        if (!input.inspectGoalDelivery) throw new Error("goal_delivery_inspection_unavailable");
+        inspection = await input.inspectGoalDelivery();
+      } catch {
+        throw new NativeGoalDeliveryHeldError(false, "claim_unavailable", "no_claim");
+      }
+      const sameHeartbeatOwner = inspection.state === "indeterminate" &&
+        inspection.consumeOnlyEligible === true &&
+        inspection.receiptRelation === "same_owner" &&
+        inspection.claimOwnerRunId === input.execution.binding.runId &&
+        Boolean(inspection.claimId);
+      if (reattachingGoalRunner && (sameHeartbeatOwner || inspection.state === "completed")) {
+        consumeRecoveredSessionGoalOnly = true;
+      } else if (inspection.state !== "ready" || reattachingGoalRunner) {
+        throw new NativeGoalDeliveryHeldError(false, inspection.state, inspection.receiptRelation);
+      }
+    }
+    if (!consumeRecoveredSessionGoalOnly && (input.sessionGoalControl || input.claimGoalDelivery || input.inspectGoalDelivery) &&
+        (!input.sessionGoalControl || !input.claimGoalDelivery)) {
+      // A missing control or claim authority cannot enter a provider. In
+      // particular, null control must never fall through to a fresh turn.
+      throw new NativeGoalDeliveryHeldError(false, "claim_unavailable", "no_claim");
+    }
     if (input.managedGitHub) {
       githubAccess ??= await createNativeGitHubAccess({
         scope: input.execution.binding,
@@ -8488,8 +8541,30 @@ async function executePaperclipNativeSessionWithinScope(
             existingSession: existingWarmSession,
             persistedSession: persistedWarmSession,
             keepSessionOpen: warmSessionId !== null,
-            sessionGoalControl: input.sessionGoalControl,
-            resumeSessionGoalHeartbeat: input.resumeSessionGoalHeartbeat,
+            sessionGoalControl: consumeRecoveredSessionGoalOnly ? null : input.sessionGoalControl,
+            resumeSessionGoalHeartbeat: consumeRecoveredSessionGoalOnly ? false : input.resumeSessionGoalHeartbeat,
+            consumeRecoveredSessionGoalOnly,
+            onConsumeRecoveredSessionGoalOwned: () => {
+              consumeRecoveredSessionGoalOwned = true;
+            },
+            beforeSessionGoalControl: input.claimGoalDelivery && !consumeRecoveredSessionGoalOnly
+              ? async (control: NativeSessionGoalControl) => {
+                  if (!input.sessionGoalControl || !isDeepStrictEqual(control, input.sessionGoalControl)) {
+                    throw new NativeGoalDeliveryHeldError(false, "claim_unavailable", "no_claim");
+                  }
+                  let claim: RunnerGoalDeliveryClaim;
+                  try {
+                    claim = await input.claimGoalDelivery!();
+                  } catch {
+                    // A DB exception may follow a committed claim. Never
+                    // infer that the command can be sent or the claim retried.
+                    throw new NativeGoalDeliveryHeldError(false, "claim_unavailable", "no_claim");
+                  }
+                  if (claim.state !== "claimed") {
+                    throw new NativeGoalDeliveryHeldError(false, claim.state, claim.receiptRelation);
+                  }
+                }
+              : undefined,
             // Every durable runner must finish its bounded suspension before
             // the next run verifies and rotates the saved authority.
             requireSessionCloseBeforeReturn: runnerdBackend !== null || input.instructionWorkingCopy !== undefined,
@@ -8738,6 +8813,121 @@ async function executePaperclipNativeSessionWithinScope(
       // provider failure and must not overwrite the shutdown adoption record
       // with a retry or release the still-live runner's lease.
       throw new NativeControllerDetachedForRestartError();
+    }
+    if (consumeRecoveredSessionGoalOnly && (
+      error instanceof NativeSessionGoalConsumeOnlyError ||
+      (consumeRecoveredSessionGoalOwned &&
+        !(error instanceof NativeGoalDeliveryHeldError) &&
+        !(error instanceof NativeCancellationPendingRecoveryError) &&
+        !(error instanceof NativeResultPendingFinalizationError) &&
+        !(error instanceof NativeControllerDetachedForRestartError))
+    )) {
+      // A verified recovered owner can be observing an effect from before
+      // controller loss. Preserve the source failure as a non-enumerable cause
+      // while preventing the generic retry/release path from touching it.
+      const held = new NativeGoalDeliveryHeldError(false, "indeterminate", "same_owner");
+      Object.defineProperty(held, "cause", { value: error, configurable: true });
+      error = held;
+    }
+    if (error instanceof NativeGoalDeliveryHeldError) {
+      await leaseRenewal.stop().catch(() => undefined);
+      const held = error;
+      const reattachingLiveRunner = input.restartRecovery?.kind === "reattach_existing_runner" ||
+        input.restartRecovery?.kind === "reattach_remote_runner";
+      if (reattachingLiveRunner) {
+        // The old process may still be executing a control accepted before
+        // controller loss. No new command is admitted here, and absence of a
+        // completion receipt cannot authorize failing its Run or releasing it.
+        await trace.finish("failed").catch(() => undefined);
+        throw held;
+      }
+      if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
+        // This attempt never entered the provider. Return only its own warm
+        // session reservation to idle so later ordinary work can proceed.
+        await releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken,
+          lifecyclePolicy.idleTimeoutMs, false).catch(() => undefined);
+      }
+      const now = new Date();
+      const binding = input.execution.binding;
+      const settled = await input.db.transaction(async (tx) => {
+        // Keep the established Issue -> coordinator -> Run lock order. Only
+        // this exact owner may settle a result-less, pre-provider attempt.
+        const [issue] = await tx.select().from(issues).where(and(
+          eq(issues.id, binding.issueId), eq(issues.companyId, binding.companyId),
+        )).for("update").limit(1);
+        const [coordinator] = await tx.select().from(nativeRunFinalizations).where(and(
+          eq(nativeRunFinalizations.runId, binding.runId),
+          eq(nativeRunFinalizations.companyId, binding.companyId),
+          eq(nativeRunFinalizations.issueId, binding.issueId),
+        )).for("update").limit(1);
+        const [boundRun] = await tx.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, binding.runId),
+          eq(heartbeatRuns.companyId, binding.companyId),
+          eq(heartbeatRuns.agentId, binding.agentId),
+          eq(heartbeatRuns.nativeIssueId, binding.issueId),
+        )).for("update").limit(1);
+        if (!issue || !coordinator || !boundRun ||
+            coordinator.phase !== "observed" || coordinator.resultId !== null ||
+            coordinator.leaseOwner !== leaseOwner || coordinator.attempt !== attempt ||
+            coordinator.controllerBootId !== controller.bootId ||
+            coordinator.controllerPid !== controller.pid ||
+            coordinator.controllerProcessStartedAt?.getTime() !== controller.processStartedAt.getTime() ||
+            !coordinator.leaseExpiresAt || coordinator.leaseExpiresAt <= now ||
+            boundRun.status !== "running" || boundRun.runtimeMode !== "native") return false;
+        const [updated] = await tx.update(nativeRunFinalizations).set({
+          phase: "terminal_failure",
+          recoveryState: "blocked",
+          failureCode: held.code,
+          failureDetail: { claimState: held.claimState, receiptRelation: held.receiptRelation },
+          nextAttemptAt: null,
+          controlDeadlineAt: null,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          updatedAt: now,
+        }).where(and(
+          eq(nativeRunFinalizations.runId, binding.runId),
+          eq(nativeRunFinalizations.companyId, binding.companyId),
+          eq(nativeRunFinalizations.issueId, binding.issueId),
+          eq(nativeRunFinalizations.phase, "observed"),
+          eq(nativeRunFinalizations.leaseOwner, leaseOwner),
+          eq(nativeRunFinalizations.attempt, attempt),
+          eq(nativeRunFinalizations.controllerBootId, controller.bootId),
+          eq(nativeRunFinalizations.controllerPid, controller.pid),
+          eq(nativeRunFinalizations.controllerProcessStartedAt, controller.processStartedAt),
+          gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`),
+          isNull(nativeRunFinalizations.resultId),
+        )).returning({ runId: nativeRunFinalizations.runId });
+        if (!updated) return false;
+        const [updatedRun] = await tx.update(heartbeatRuns).set({
+          status: "failed", nativePhase: "terminal_failure", nativePhaseUpdatedAt: now,
+          error: held.code, errorCode: held.code, finishedAt: now,
+          executionStatusDeliveryId: randomUUID(), updatedAt: now,
+        }).where(and(
+          eq(heartbeatRuns.id, binding.runId),
+          eq(heartbeatRuns.companyId, binding.companyId),
+          eq(heartbeatRuns.agentId, binding.agentId),
+          eq(heartbeatRuns.nativeIssueId, binding.issueId),
+          eq(heartbeatRuns.runtimeMode, "native"),
+          eq(heartbeatRuns.status, "running"),
+        )).returning({ id: heartbeatRuns.id });
+        if (!updatedRun) throw new Error("native_goal_hold_run_changed");
+        if (issue.assigneeAgentId === binding.agentId &&
+            (issue.executionRunId === binding.runId || issue.checkoutRunId === binding.runId)) {
+          await tx.update(issues).set({
+            executionRunId: issue.executionRunId === binding.runId ? null : issue.executionRunId,
+            checkoutRunId: issue.checkoutRunId === binding.runId ? null : issue.checkoutRunId,
+            updatedAt: now,
+          }).where(and(
+            eq(issues.id, binding.issueId), eq(issues.companyId, binding.companyId),
+            eq(issues.assigneeAgentId, binding.agentId),
+          ));
+        }
+        return true;
+      }).catch(() => false);
+      await trace.finish("failed").catch(() => undefined);
+      // A zero-row CAS or transaction failure is unresolved ownership, never
+      // permission to run the generic failure path against a possible winner.
+      throw new NativeGoalDeliveryHeldError(settled, held.claimState, held.receiptRelation);
     }
     const protocolIntegrityFailure =
       error instanceof NativeSessionProtocolIntegrityError ? error : null;

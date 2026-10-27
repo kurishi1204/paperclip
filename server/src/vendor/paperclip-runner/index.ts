@@ -78,6 +78,8 @@ export const NativeSessionCleanupQuarantinedError =
   runner.NativeSessionCleanupQuarantinedError;
 export const NativeSessionProtocolIntegrityError =
   runner.NativeSessionProtocolIntegrityError;
+export const NativeSessionGoalConsumeOnlyError =
+  runner.NativeSessionGoalConsumeOnlyError;
 export const SemanticToolOutcomeUnknownError = runner.SemanticToolOutcomeUnknownError;
 export const PaperclipSemanticDispatcher = runner.PaperclipSemanticDispatcher;
 export const CAPABILITY_SEMANTIC_TOOL_CATALOG =

@@ -185,6 +185,33 @@ export interface NativeSessionGoalControl {
   tokenBudget?: number | null;
 }
 
+export class NativeSessionGoalConsumeOnlyError extends Error {
+  readonly code: string;
+
+  constructor(readonly reason:
+    | "conflicting_control"
+    | "recovery_required"
+    | "recovery_failed"
+    | "fresh_turn_forbidden"
+    | "observation_failed"
+    | "result_unavailable") {
+    const code = `native_session_goal_consume_only_${reason}`;
+    super(code);
+    this.name = "NativeSessionGoalConsumeOnlyError";
+    this.code = code;
+  }
+}
+
+function consumeOnlyObservationFailure(error: unknown): unknown {
+  // Preserve typed control-plane cancellation/detach/result errors. Only an
+  // untyped event transport failure or known provider terminal is a recovery
+  // HOLD; callbacks elsewhere retain their original error identity.
+  return error instanceof NativeProviderTerminalFailure ||
+    (error instanceof Error && error.name === "Error")
+    ? new NativeSessionGoalConsumeOnlyError("observation_failed")
+    : error;
+}
+
 export interface ExecuteNativeSessionOptions {
   /** The control plane proved the old local runner stopped and charged a recovery attempt. */
   resumeInterruptedTurn?: boolean;
@@ -218,6 +245,12 @@ export interface ExecuteNativeSessionOptions {
   keepSessionOpen?: boolean;
   /** Apply a structured session-goal control instead of starting an ordinary turn. */
   sessionGoalControl?: NativeSessionGoalControl | null;
+  /** Atomically claim an explicit control immediately before its provider send. */
+  beforeSessionGoalControl?: (control: NativeSessionGoalControl) => Promise<void>;
+  /** Observe an already-delivering recovered goal without issuing provider controls. */
+  consumeRecoveredSessionGoalOnly?: boolean;
+  /** Synchronous ownership signal after exact provider recovery, before run admission. */
+  onConsumeRecoveredSessionGoalOwned?: () => void;
   /** Resume the active durable session goal after a bounded heartbeat rollover. */
   resumeSessionGoalHeartbeat?: boolean;
   /**
@@ -870,7 +903,11 @@ async function consumeTurn(
   },
   initialGoal?: HarnessThreadGoal | null,
   resumeInterruptedTurn?: (event: PrpEvent, signal: AbortSignal) => Promise<boolean>,
+  consumeRecoveredSessionGoalOnly = false,
+  preserveProviderOnFailure?: { value: boolean },
+  goalControlClaimGate?: Promise<void>,
 ) {
+  const preserveProvider = () => consumeRecoveredSessionGoalOnly || preserveProviderOnFailure?.value === true;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const appendAbort = new AbortController();
   const governedCleanupOperations = new Set<Promise<unknown>>();
@@ -916,9 +953,9 @@ async function consumeTurn(
     let highestContiguousSourceSeq = 0;
     let governedResult: PrpStructuredRunResult | null = null;
     let semanticResultProposal: PrpStructuredRunResult | null = null;
-    let sessionGoalObserved = sessionGoal !== undefined;
+    let sessionGoalObserved = sessionGoal !== undefined || consumeRecoveredSessionGoalOnly;
     let previousGoal = initialGoal ?? null;
-    let goalControlObserved = false;
+    let goalControlObserved = consumeRecoveredSessionGoalOnly;
     let latestSessionGoal: HarnessThreadGoal | null = null;
     let resultSource: "semantic_result" | "governed_wait" | null = null;
     let providerFailure: NativeProviderTerminalFailure | null = null;
@@ -949,16 +986,27 @@ async function consumeTurn(
     };
     while (true) {
       const next = await eventIterator.next().catch((error) => {
-        throw providerFailure ?? error;
+        const observed = providerFailure ?? error;
+        throw consumeRecoveredSessionGoalOnly
+          ? consumeOnlyObservationFailure(observed)
+          : observed;
       });
       if (stopConsumer) throw new Error("native event consumer stopped");
       if (next.done) {
-        if (providerFailure) throw providerFailure;
+        if (providerFailure) throw consumeRecoveredSessionGoalOnly
+          ? consumeOnlyObservationFailure(providerFailure)
+          : providerFailure;
+        if (consumeRecoveredSessionGoalOnly) {
+          throw new NativeSessionGoalConsumeOnlyError("observation_failed");
+        }
         throw new Error(
           "native event stream closed before a turn terminal fact",
         );
       }
       const event = next.value;
+      // Subscribe before a control is sent, but do not append recovered events
+      // or start input handoff while its exact delivery claim is unresolved.
+      await goalControlClaimGate;
       const payload = event.payload as Record<string, unknown>;
       const settlingRequestId =
         [
@@ -1026,6 +1074,7 @@ async function consumeTurn(
           ? (payload.request as Record<string, unknown>)
           : null;
       if (
+        !consumeRecoveredSessionGoalOnly &&
         receipt.disposition === "committed" &&
         event.eventType === "runtime_request.created" &&
         request?.schema === "paperclip.runtime_request.v2" &&
@@ -1166,6 +1215,9 @@ async function consumeTurn(
                 ),
             };
           }
+          if (consumeRecoveredSessionGoalOnly) {
+            throw new NativeSessionGoalConsumeOnlyError("result_unavailable");
+          }
           if (!session.goal) throw new Error("native_session_goal_unavailable");
           const authoritativeGoal = await session.goal({ action: "get" });
           // `goal(get)` emits an authoritative goal snapshot. Keep consuming
@@ -1178,7 +1230,9 @@ async function consumeTurn(
         }
       }
       if (isTurnTerminal(event)) {
-        if (providerFailure) throw providerFailure;
+        if (providerFailure) throw consumeRecoveredSessionGoalOnly
+          ? consumeOnlyObservationFailure(providerFailure)
+          : providerFailure;
         if (semanticResultProposal === null && governedResult === null &&
             inputTimers.size === 0 && await resumeInterruptedTurn?.(event, appendAbort.signal)) continue;
         return {
@@ -1237,7 +1291,7 @@ async function consumeTurn(
         deferredGovernedCleanupSettlement = governedCleanupSettlement;
       }
     }
-    if (!governedCancellationCommitted) {
+    if (!governedCancellationCommitted && !preserveProvider()) {
       const deferredCancellation = await attemptOptionalSessionCancellation(
         session,
         "Native session event consumption failed.",
@@ -1301,7 +1355,7 @@ async function consumeTurn(
       // rejection observed after the bounded wait expires.
       const cleanupSettlement = Promise.allSettled([
         passiveTeardownSettlement,
-        Promise.resolve().then(closeFailedSession),
+        ...(preserveProvider() ? [] : [Promise.resolve().then(closeFailedSession)]),
       ]);
       await settlesWithin(
         cleanupSettlement,
@@ -1814,6 +1868,10 @@ function checkpointedResultlessDispositionFallback(input: {
 export async function executeNativeSession(
   options: ExecuteNativeSessionOptions,
 ): Promise<NativeSessionExecutionResult> {
+  if (options.consumeRecoveredSessionGoalOnly &&
+      (options.sessionGoalControl || options.resumeSessionGoalHeartbeat)) {
+    throw new NativeSessionGoalConsumeOnlyError("conflicting_control");
+  }
   const input = parseNativeExecutionInput(options.input);
   const descriptor = await options.backend.descriptor();
   const cleanupDomain = JSON.stringify([
@@ -1838,6 +1896,10 @@ export async function executeNativeSession(
     : (options.persistedSession ??
       (await options.controlPlane.loadSessionCheckpoint?.()) ??
       null);
+  if (options.consumeRecoveredSessionGoalOnly &&
+      !options.existingSession && !persistedSession) {
+    throw new NativeSessionGoalConsumeOnlyError("recovery_required");
+  }
   if (
     persistedSession &&
     (persistedSession.identity.runId !== input.binding.runId ||
@@ -1968,6 +2030,9 @@ export async function executeNativeSession(
             reason: "driver does not support recovery",
           };
     if (!recovery.recovered || !recovery.session) {
+      if (options.consumeRecoveredSessionGoalOnly) {
+        throw new NativeSessionGoalConsumeOnlyError("recovery_failed");
+      }
       if (!replacementAllowed) {
         throw new Error(
           `native_session_recovery_failed: ${recovery.reason ?? "unknown"}`,
@@ -2008,6 +2073,9 @@ export async function executeNativeSession(
     }
   }
   if (session === null) {
+    if (options.consumeRecoveredSessionGoalOnly) {
+      throw new NativeSessionGoalConsumeOnlyError("recovery_required");
+    }
     // A fresh provider session is part of admission. Prove that it exists
     // before opening durable run state because ControlPlanePort intentionally
     // exposes no rollback for an admitted run.
@@ -2031,6 +2099,14 @@ export async function executeNativeSession(
           cleanupDomain,
         ),
     });
+  }
+  if (options.consumeRecoveredSessionGoalOnly && recovered) {
+    const recoveredIdentity = session.identity();
+    if (Object.entries(identity).some(([key, value]) =>
+      recoveredIdentity[key as keyof typeof identity] !== value)) {
+      throw new NativeSessionGoalConsumeOnlyError("recovery_failed");
+    }
+    options.onConsumeRecoveredSessionGoalOwned?.();
   }
   try {
     await options.controlPlane.openRun({
@@ -2135,8 +2211,10 @@ export async function executeNativeSession(
     return activeClose;
   };
   let executionSucceeded = false;
+  let preserveRecoveredSessionOnHold = false;
   let goalCheckpointRequiresSuspension = Boolean(
-    options.sessionGoalControl || options.resumeSessionGoalHeartbeat || persistedSession?.goal,
+    options.sessionGoalControl || options.resumeSessionGoalHeartbeat ||
+    options.consumeRecoveredSessionGoalOnly || persistedSession?.goal,
   );
   let executionFailure: { error: unknown } | null = null;
   try {
@@ -2191,6 +2269,7 @@ export async function executeNativeSession(
     const resumeInterruptedTurn = async (event: PrpEvent, signal: AbortSignal) => {
       if (restartContinuationStarted || !recovered || !options.resumeInterruptedTurn ||
           input.provider.kind !== "codex" || options.sessionGoalControl || options.resumeSessionGoalHeartbeat ||
+          options.consumeRecoveredSessionGoalOnly ||
           recoveredSnapshot.goal || persistedSession?.semanticResult || persistedSession?.pendingRuntimeRequests?.length ||
           event.eventType !== "turn.failed" || !isNativeRestartInterruption(event.payload.error) ||
           event.turnId !== persistedSession?.activeTurnId) return false;
@@ -2320,6 +2399,16 @@ export async function executeNativeSession(
       const recoveryTerminal =
         replayedDisposition?.terminal ?? dispositionFallback;
       const consumptionAbort = new AbortController();
+      const preserveProviderOnFailure = { value: false };
+      let admitGoalControlEvents: (() => void) | undefined;
+      let rejectGoalControlEvents: ((error: unknown) => void) | undefined;
+      const goalControlClaimGate = options.sessionGoalControl && options.beforeSessionGoalControl
+        ? new Promise<void>((resolve, reject) => {
+            admitGoalControlEvents = resolve;
+            rejectGoalControlEvents = reject;
+          })
+        : undefined;
+      void goalControlClaimGate?.catch(() => undefined);
       const consuming =
         recoveryTerminal === null
           ? consumeTurn(
@@ -2334,7 +2423,7 @@ export async function executeNativeSession(
                 : FAILED_OPERATION_SETTLEMENT_GRACE_MS,
               closeSession,
               quarantineSession,
-              options.resolveGovernedWait,
+              options.consumeRecoveredSessionGoalOnly ? undefined : options.resolveGovernedWait,
               consumptionAbort.signal,
               options.sessionGoalControl || options.resumeSessionGoalHeartbeat
                 ? {
@@ -2344,6 +2433,9 @@ export async function executeNativeSession(
                 : undefined,
               recoveredSnapshot.goal,
               resumeInterruptedTurn,
+              options.consumeRecoveredSessionGoalOnly,
+              preserveProviderOnFailure,
+              goalControlClaimGate,
             )
           : Promise.resolve({
               event: recoveryTerminal,
@@ -2365,10 +2457,25 @@ export async function executeNativeSession(
             !adoptedProviderTerminal &&
             !checkpointedDispositionTerminal &&
             !dispositionRecoveryStillOwned);
+        if (options.consumeRecoveredSessionGoalOnly && shouldStartFreshTurn) {
+          preserveRecoveredSessionOnHold = true;
+          preserveProviderOnFailure.value = true;
+          throw new NativeSessionGoalConsumeOnlyError("fresh_turn_forbidden");
+        }
         if (options.sessionGoalControl) {
           // Explicit controls remain authoritative after controller loss. In
           // particular, pause/clear/edit must reach a recovered session even
           // while its provider turn is still active.
+          try {
+            await options.beforeSessionGoalControl?.(options.sessionGoalControl);
+            admitGoalControlEvents?.();
+          } catch (error) {
+            // A failed claim has no authority to stop a recovered live owner.
+            preserveRecoveredSessionOnHold = recovered;
+            preserveProviderOnFailure.value = recovered;
+            rejectGoalControlEvents?.(error);
+            throw error;
+          }
           await applyNativeSessionGoalControl(session, options.sessionGoalControl);
           await checkpoint();
         } else if (options.resumeSessionGoalHeartbeat && shouldStartFreshTurn) {
@@ -2790,11 +2897,13 @@ export async function executeNativeSession(
     executionSucceeded = true;
     return { ...durableExecutionResult, ...enrichment };
   } catch (error) {
+    if (options.consumeRecoveredSessionGoalOnly) preserveRecoveredSessionOnHold = recovered;
     executionFailure = { error };
     throw error;
   } finally {
     const shouldClose =
-      !options.keepSessionOpen || !executionSucceeded || sessionQuarantined || goalCheckpointRequiresSuspension;
+      !preserveRecoveredSessionOnHold &&
+      (!options.keepSessionOpen || !executionSucceeded || sessionQuarantined || goalCheckpointRequiresSuspension);
     if (shouldClose && options.requireSessionCloseBeforeReturn) {
       if (!failedCleanupDeferred) {
         closeSession(

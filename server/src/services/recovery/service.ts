@@ -511,6 +511,7 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
 ]);
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
+  "session_goal_control_delivery_indeterminate",
   "native_provider_model_rejected",
   "provider_tool_definition_invalid",
   "adapter_engine_unavailable",
