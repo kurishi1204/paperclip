@@ -3,6 +3,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
+import { createPluginBundlerPresets } from "@paperclipai/plugin-sdk/bundlers";
 import type { Agent, Issue, PluginManagedRoutineResolution, Project } from "@paperclipai/plugin-sdk";
 import manifest, {
   CURSOR_WINDOW_ROUTINE_KEY,
@@ -731,10 +732,15 @@ describe("LLM Wiki plugin scaffold", () => {
       routePath: "wiki",
     });
     expect(packageJson.dependencies).toBeUndefined();
-    expect(packageJson.devDependencies?.react).toBeUndefined();
+    expect(packageJson.devDependencies?.react).toBe("^19.2.8");
     expect(packageJson.devDependencies?.["react-dom"]).toBeDefined();
     expect(packageJson.devDependencies?.["@types/react-dom"]).toBeDefined();
     expect(packageJson.peerDependencies?.react).toBe(">=18");
+    const bundlers = createPluginBundlerPresets({ uiEntry: "src/ui/index.tsx" });
+    expect(bundlers.esbuild.worker.external).toContain("react");
+    expect(bundlers.esbuild.ui?.external).toEqual(expect.arrayContaining(["react", "react-dom", "react/jsx-runtime"]));
+    expect(bundlers.rollup.worker.external).toContain("react");
+    expect(bundlers.rollup.ui?.external).toEqual(expect.arrayContaining(["react", "react-dom", "react/jsx-runtime"]));
   });
 
   it("renders a host-aligned sidebar link with an open-book icon", () => {

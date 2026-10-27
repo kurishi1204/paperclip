@@ -451,7 +451,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
   });
 
   it("applies owner raw migration and enforces real SQL capture, readback, and tenant constraints", async () => {
-    const { companyId } = await seedCompanyAndAgent();
+    const { companyId, agentId } = await seedCompanyAndAgent();
     const otherCompanyId = randomUUID();
     await db.insert(companies).values({
       id: otherCompanyId, name: "Other synthetic company", issuePrefix: issuePrefix(otherCompanyId),
@@ -574,6 +574,8 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     expect(await db.execute(sql`SELECT comment_id FROM ${table} WHERE company_id=${otherCompanyId}`)).toHaveLength(1);
     await db.execute(sql`DELETE FROM ${sql.raw(`"${namespace}"."wiki_spaces"`)} WHERE id=${otherSpaceId}`);
     expect(await db.execute(sql`SELECT comment_id FROM ${table} WHERE company_id=${otherCompanyId}`)).toHaveLength(0);
+    await db.delete(agents).where(eq(agents.id, agentId));
+    expect(await db.execute(sql`SELECT comment_id FROM ${table} WHERE company_id=${companyId}`)).toHaveLength(1);
     await db.delete(companies).where(eq(companies.id, companyId));
     expect(await db.execute(sql`SELECT comment_id FROM ${table} WHERE company_id=${companyId}`)).toHaveLength(0);
   }, 90_000);

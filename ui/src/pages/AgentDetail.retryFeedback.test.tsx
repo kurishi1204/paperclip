@@ -189,8 +189,12 @@ describe("AgentDetail retry feedback across canonical navigation", () => {
     await clickRetry();
     expect(agentsApiMock.retryFailedRun).toHaveBeenCalledTimes(1);
     expect(navigation.queued.length).toBeGreaterThan(0);
-    const pendingButton = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Retrying…");
-    expect(pendingButton?.disabled).toBe(true);
+    // Mutation invocation and the observer's pending render are separate updates.
+    let pendingButton: HTMLButtonElement | undefined;
+    await waitFor(() => {
+      pendingButton = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Retrying…");
+      expect(pendingButton?.disabled).toBe(true);
+    });
     await act(async () => { pendingButton?.click(); });
     expect(agentsApiMock.retryFailedRun).toHaveBeenCalledTimes(1);
     await act(async () => { navigation.holdCanonical = false; navigation.queued.shift()?.(); });
@@ -226,9 +230,12 @@ describe("AgentDetail retry feedback across canonical navigation", () => {
     expect(agentsApiMock.retryFailedRun).toHaveBeenCalledTimes(1);
 
     await updateCompanies([]);
-    const pendingButton = Array.from(container.querySelectorAll("button"))
-      .find((button) => button.textContent?.trim() === "Retrying…");
-    expect(pendingButton?.disabled).toBe(true);
+    let pendingButton: HTMLButtonElement | undefined;
+    await waitFor(() => {
+      pendingButton = Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent?.trim() === "Retrying…");
+      expect(pendingButton?.disabled).toBe(true);
+    });
     await act(async () => { pendingButton?.click(); });
     expect(agentsApiMock.retryFailedRun).toHaveBeenCalledTimes(1);
 
