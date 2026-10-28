@@ -911,12 +911,17 @@ test("emitted Read packet rejects a writable packet parent",()=>{
      {status:"invalid",code:"independent_review_invalid",subcode:"corpus_inventory"});
  }finally{x.f.close();}
 });
-test("emitted Read packet through /tmp alias records canonical corpus root",()=>{
- assert.notEqual(realpathSync("/tmp"),"/tmp","this test requires a real /tmp symlink alias");
- const x=emittedReadJournalFixture({tempRoot:"/tmp"});try{
+test("emitted Read packet through a directory alias records canonical corpus root",()=>{
+ const root=realpathSync(mkdtempSync(path.join(os.tmpdir(),"read-corpus-alias-")));
+ const physical=path.join(root,"physical"),alias=path.join(root,"alias");
+ mkdirSync(physical,{mode:0o700});symlinkSync(physical,alias,"dir");
+ let x;try{
+   assert.notEqual(realpathSync(alias),alias);
+   x=emittedReadJournalFixture({tempRoot:alias});
    assert.equal(JSON.parse(readFileSync(path.join(x.output,"corpus-pre.json"),"utf8")).root,x.cwd);
+   assert.equal(x.profile.corpusRoot,x.cwd);
    const review=admitTrustedJournal(x.f.admissionArgs());assert.equal(review.status,"valid",JSON.stringify(review));
- }finally{x.f.close();}
+ }finally{x?.f.close();rmSync(alias);rmSync(root,{recursive:true,force:true});}
 });
 test("read journal old kind fails and new pinned kind reaches real readiness with full reconstructed source",async()=>{
  const x=readJournalFixture(),{f,corpus}=x;try{
