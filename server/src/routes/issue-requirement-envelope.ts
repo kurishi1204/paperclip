@@ -111,9 +111,12 @@ function assertSupportedAssignmentRunOrigin(run: {
 }
 
 // SHA-256 of the sorted SQL-content hashes for every migration in this fork
-// through 0314. A new or replaced migration requires an explicit canary review.
+// through 0315. A new or replaced migration requires an explicit canary review.
 // 0314 bumps Issue revision when QA-visible work product fields change.
-const APPROVED_MIGRATION_SET_SHA256 = "5ef2747cae31fa121edb3d40f0f3b4f5d98eb6afae3ced3f71099eb51f032aed";
+// 0315 adds only a QA wake-request flag to issue_execution_decisions; an
+// existing decision for this Issue still holds the projection via the Issue
+// reference inventory below.
+const APPROVED_MIGRATION_SET_SHA256 = "4fa2a5f412cfa50651f4117f86c00cf8e768ed451976c004d51dedaa567abdb3";
 
 function hold(reason: string): never {
   throw conflict(reason, { code: "requirement_projection_hold" });
