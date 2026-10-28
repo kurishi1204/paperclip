@@ -17,6 +17,7 @@ import {
 } from "../__tests__/helpers/embedded-postgres.js";
 import {
   applyRunnerGoalPrpEvent,
+  claimRunnerGoalActionDelivery,
   isRunnerGoalActionCompleted,
   blockRunnerGoalRecovery,
   failRunnerGoalAction,
@@ -81,6 +82,89 @@ describeEmbeddedPostgres("runner goal service", () => {
     return { companyId, agentId, issueId };
   }
 
+  it("claims a new action once and holds legacy or mismatched actions", async () => {
+    const binding = await seed();
+    const service = runnerGoalService(db);
+    const request = {
+      requestId: randomUUID(), agentId: binding.agentId, expectedRevision: 0,
+      action: "create" as const, objective: "Deliver once",
+    };
+    await service.act(binding.companyId, binding.issueId, request);
+    const [session] = await db.select().from(agentTaskSessions);
+    const claimBinding = { ...binding, adapterType: "paperclip_runner", sessionId: session!.id };
+    const owner = { kind: "heartbeat" as const, ownerRunId: randomUUID() };
+    const [created] = await db.select().from(agentSessionGoalActions);
+    expect(created?.status).toBe("ready");
+    expect((await claimRunnerGoalActionDelivery(db, claimBinding, request, owner)).state).toBe("claimed");
+    expect(await claimRunnerGoalActionDelivery(db, claimBinding, request, owner)).toMatchObject({
+      state: "indeterminate", receiptRelation: "same_owner", claimOwnerRunId: owner.ownerRunId,
+    });
+    expect((await db.select().from(agentSessionGoalActions))[0]?.status).toBe("delivering");
+
+    await db.update(agentSessionGoalActions).set({ status: "pending" });
+    expect((await claimRunnerGoalActionDelivery(db, claimBinding, request, owner)).state).toBe("indeterminate");
+    await db.update(agentSessionGoalActions).set({ status: "completed" });
+    expect((await claimRunnerGoalActionDelivery(db, claimBinding, request, owner)).state).toBe("completed");
+    await db.update(agentSessionGoalActions).set({ status: "ready" });
+    expect((await claimRunnerGoalActionDelivery(db, { ...claimBinding, companyId: randomUUID() }, request, owner)).state).toBe("missing");
+    expect((await claimRunnerGoalActionDelivery(db, { ...claimBinding, sessionId: randomUUID() }, request, owner)).state).toBe("indeterminate");
+    expect((await claimRunnerGoalActionDelivery(db, claimBinding, { ...request, objective: "Changed payload" }, owner)).state).toBe("indeterminate");
+    expect((await db.select().from(agentSessionGoalActions))[0]?.status).toBe("ready");
+    // Restoring only the status cannot erase the first delivery receipt.
+    expect((await claimRunnerGoalActionDelivery(db, claimBinding, request, owner)).state).toBe("indeterminate");
+    const newRequest = { ...request, requestId: randomUUID(), expectedRevision: 1,
+      objective: "Deliver a separate new action" };
+    await service.act(binding.companyId, binding.issueId, newRequest);
+    const concurrent = await Promise.all([
+      claimRunnerGoalActionDelivery(db, claimBinding, newRequest, owner),
+      claimRunnerGoalActionDelivery(db, claimBinding, newRequest, owner),
+    ]);
+    expect(concurrent.map((result) => result.state).sort()).toEqual(["claimed", "indeterminate"]);
+  });
+
+  it("does not downgrade a claim when offline enqueue dispatches before it returns", async () => {
+    const binding = await seed();
+    let claimResult: string | undefined;
+    const owner = { kind: "heartbeat" as const, ownerRunId: randomUUID() };
+    const service = runnerGoalService(db, {
+      enqueueOfflineControl: async ({ control }) => {
+        const [session] = await db.select().from(agentTaskSessions);
+        claimResult = (await claimRunnerGoalActionDelivery(db, {
+          ...binding, adapterType: "paperclip_runner", sessionId: session!.id,
+        }, control, owner)).state;
+      },
+    });
+    const request = {
+      requestId: randomUUID(), agentId: binding.agentId, expectedRevision: 0,
+      action: "create" as const, objective: "Dispatch during enqueue",
+    };
+    await service.act(binding.companyId, binding.issueId, request);
+    expect(claimResult).toBe("claimed");
+    expect((await db.select().from(agentSessionGoalActions))[0]?.status).toBe("delivering");
+  });
+
+  it("releases a queued Run's unreceived live claim and enqueues offline", async () => {
+    const binding = await seed();
+    await db.insert(heartbeatRuns).values({
+      companyId: binding.companyId, agentId: binding.agentId,
+      nativeIssueId: binding.issueId, status: "queued", invocationSource: "on_demand",
+    });
+    const offline = vi.fn(async () => {});
+    const service = runnerGoalService(db, {
+      dispatchLiveControl: () => null,
+      queueLiveCommand: () => null,
+      enqueueOfflineControl: offline,
+    });
+    await service.act(binding.companyId, binding.issueId, {
+      requestId: randomUUID(), agentId: binding.agentId, expectedRevision: 0,
+      action: "create", objective: "Queue when no live sink exists",
+    });
+    expect(offline).toHaveBeenCalledOnce();
+    const [action] = await db.select().from(agentSessionGoalActions);
+    expect(action?.status).toBe("ready");
+    expect((action?.resultJson as Record<string, unknown>)?.deliveryClaim).toBeUndefined();
+  });
+
   it.each(["codex_local", "claude_local"])("does not convert %s into another execution path for goals", async (adapterType) => {
     const binding = await seed();
     await db.update(agents).set({ adapterType, adapterConfig: { engine: "acp", mode: "persistent" } });
@@ -102,10 +186,7 @@ describeEmbeddedPostgres("runner goal service", () => {
 
   it("revisions failed goal starts and ignores repeated failure delivery", async () => {
     const binding = await seed();
-    const service = runnerGoalService(db, {
-      dispatchLiveControl: () => ({ runId: "run-live", completion: Promise.resolve() }),
-      queueLiveCommand: () => null,
-    });
+    const service = runnerGoalService(db);
     const requestId = randomUUID();
     const accepted = await service.act(binding.companyId, binding.issueId, {
       requestId,
@@ -611,6 +692,6 @@ describeEmbeddedPostgres("runner goal service", () => {
       db
         .select({ status: agentSessionGoalActions.status })
         .from(agentSessionGoalActions),
-    ).resolves.toEqual([{ status: "pending" }]);
+    ).resolves.toEqual([{ status: "ready" }]);
   });
 });

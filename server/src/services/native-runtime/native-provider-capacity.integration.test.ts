@@ -116,20 +116,6 @@ describe("native provider capacity failure persistence", () => {
         issueId,
         phase: "observed",
       });
-      // A real terminal follows provider session establishment. Keep the
-      // recovery evidence explicit; this must not be a bootstrap retry.
-      await db
-        .update(heartbeatRuns)
-        .set({
-          runnerProfileJson: {
-            sessionCheckpoint: {
-              providerSessionId: "capacity-test-provider-session",
-              providerIdentity: { threadId: "capacity-test-thread" },
-            },
-          },
-        })
-        .where(eq(heartbeatRuns.id, runId));
-
       const execution: NativeExecutionInputV1 = {
         schema: "paperclip.native-execution-input.v1",
         binding: {
@@ -224,6 +210,18 @@ describe("native provider capacity failure persistence", () => {
         .mockImplementation(
           async (options: { controlPlane: ControlPlanePort }) => {
             await options.controlPlane.openRun(openInput);
+            // The first Run is fresh at executor admission. Persist provider
+            // identity only after the provider has actually opened its Run;
+            // the ensuing terminal is therefore not a bootstrap retry.
+            const [openedRun] = await db.select({ runnerProfileJson: heartbeatRuns.runnerProfileJson })
+              .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).limit(1);
+            await db.update(heartbeatRuns).set({ runnerProfileJson: {
+              ...(openedRun?.runnerProfileJson ?? {}),
+              sessionCheckpoint: {
+                providerSessionId: "capacity-test-provider-session",
+                providerIdentity: { threadId: "capacity-test-thread" },
+              },
+            } }).where(eq(heartbeatRuns.id, runId));
             const appended = await options.controlPlane.appendEvent(event);
             expect(appended.disposition).toBe(
               replayed ? "duplicate" : "committed",

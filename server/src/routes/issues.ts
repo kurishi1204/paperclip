@@ -192,9 +192,11 @@ import {
 } from "../services/index.js";
 import {
   runnerGoalService,
+  failRunnerGoalAction,
   RunnerGoalActionError,
   RunnerGoalConflictError,
 } from "../services/runner-goals.js";
+import { GoalDeliveryIndeterminateError } from "../services/runner-goal-delivery-policy.js";
 import { queueLiveRunnerPrpCommand } from "../realtime/runner-prp-ws.js";
 import { questionResponseDeliveryService } from "../services/question-response-delivery.js";
 import { emitAgentTaskRunById } from "../services/agent-task-run-telemetry.js";
@@ -3627,7 +3629,7 @@ export function issueRoutes(
       deliverNativeQuestionResponse(db, interaction),
   });
   const runnerGoals = runnerGoalService(db, {
-    enqueueOfflineControl: async ({ issueId, agentId, requestId, control }) => {
+    enqueueOfflineControl: async ({ companyId, issueId, agentId, requestId, control }) => {
       const run = await heartbeat.wakeup(agentId, {
         source: "on_demand",
         triggerDetail: "manual",
@@ -3645,6 +3647,10 @@ export function issueRoutes(
         },
       });
       if (!run) {
+        const failed = await failRunnerGoalAction(db, {
+          companyId, issueId, agentId, adapterType: "paperclip_runner",
+        }, requestId, "goal_control_wake_skipped", control);
+        if (!failed) throw new GoalDeliveryIndeterminateError("Goal wakeup was skipped, but the action is no longer unclaimed.");
         throw new RunnerGoalActionError(
           "goal_control_wake_skipped",
           "Goal execution did not start. Check that task execution is enabled for this instance and agent, then retry.",
@@ -8524,6 +8530,10 @@ export function issueRoutes(
         );
         res.status(202).json(accepted);
       } catch (error) {
+        if (error instanceof GoalDeliveryIndeterminateError) {
+          res.status(409).json({ error: error.message, code: error.code });
+          return;
+        }
         if (error instanceof RunnerGoalConflictError) {
           res.status(409).json({
             error: error.code,
@@ -12941,7 +12951,7 @@ export function issueRoutes(
     const goal = readObject(session.goalJson);
     const [openAction] = await query.select({ id: agentSessionGoalActions.id }).from(agentSessionGoalActions).where(and(
       eq(agentSessionGoalActions.sessionId, session.id),
-      inArray(agentSessionGoalActions.status, ["pending", "delivering", "delivered"]),
+      inArray(agentSessionGoalActions.status, ["ready", "pending", "delivering", "delivered"]),
     )).limit(1);
     if (openAction || (typeof goal.objective === "string" && goal.status !== "complete")) {
       throw conflict("Finish the active goal and its control action before deciding this approval stage", { code: "native_approval_goal_active" });

@@ -7,13 +7,14 @@ import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { recordNativeLocalProcessStop, hasNativeLocalProcessStop, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { and, eq, sql } from "drizzle-orm";
 import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
 import {
   approvals, issueApprovals, issueThreadInteractions, chatConversations, chatEndpoints, toolApplications, toolConnections,
+  agentTaskSessions, agentSessionGoalActions,
   agentWakeupRequests, agents, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions,
   issues, nativeRunFinalizations, nativeRunResults, completionContracts, environmentLeases, environments, issueRelations, issueTreeHolds, issueTreeHoldMembers,
 } from "@paperclipai/db";
@@ -22,11 +23,27 @@ import { admitExplicitNativeContinuation } from "./explicit-native-continuation.
 import { adapterExecutionControls, createAdapterExecutionControl } from "./adapter-execution-control.js";
 import { CONVERSATION_CONTINUATION_POLICY } from "./conversation-continuation.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
-import { heartbeatService, persistHeartbeatRunProcessMetadata, type HeartbeatEnvironmentRuntime } from "./heartbeat.js";
+import { heartbeatService, persistHeartbeatRunProcessMetadata, shouldResetTaskSessionForWake, type HeartbeatEnvironmentRuntime } from "./heartbeat.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
+import type { NativeSession, NativeSessionBackend, PrpEvent } from "../vendor/paperclip-runner/index.js";
 import { createDurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { recordNativeFinalizationFailure } from "./native-runtime/native-run-finalizer.js";
 const support = await getEmbeddedPostgresTestSupport();
+// Only this test's mkdtemp HOME may be made removable. lstat prevents
+// following links out of it; protected production assets are never touched.
+async function makeOwnedHomeTreeWritable(root: string, target = root): Promise<void> {
+  const pathWithinRoot = relative(root, target);
+  if (pathWithinRoot === ".." || pathWithinRoot.startsWith(`..${sep}`) || isAbsolute(pathWithinRoot)) {
+    throw new Error("test_home_cleanup_outside_owned_root");
+  }
+  const entry = await lstat(target);
+  if (entry.isSymbolicLink()) return;
+  if (!entry.isDirectory()) return;
+  await chmod(target, 0o700);
+  for (const child of await readdir(target)) {
+    await makeOwnedHomeTreeWritable(root, join(target, child));
+  }
+}
 (support.supported ? describe : describe.skip)("explicit native conversation continuation", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
@@ -1404,6 +1421,172 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(envelope.interruptedRunId).toBe(f.sourceRunId);
     expect(envelope.objective).toBe("What happened?");
     expect(envelope.completedWork).toBe("Deployment completed.");
+  });
+
+  it("admits a new user comment without certifying or reusing an old UNKNOWN goal action", async () => {
+    const f = await seed();
+    const oldSessionId = randomUUID();
+    const requestId = `old-unknown-${randomUUID()}`;
+    const [taskSession] = await db.insert(agentTaskSessions).values({
+      companyId: f.companyId, agentId: f.agentId, adapterType: "paperclip_runner",
+      taskKey: f.issueId, lastRunId: f.sourceRunId,
+      sessionParamsJson: { sessionId: oldSessionId },
+    }).returning();
+    await db.update(heartbeatRuns).set({ nativeSessionId: oldSessionId,
+      runnerProfileJson: { nativeExecutionInput: { source: "old-unknown" } },
+      resultJson: { priorOutcome: "unknown" },
+    }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    const [oldAction] = await db.insert(agentSessionGoalActions).values({
+      companyId: f.companyId, sessionId: taskSession!.id, requestId,
+      action: "replace", payloadJson: { requestId, action: "replace", objective: "Old unconfirmed work" },
+      status: "pending",
+    }).returning();
+    const [sourceBefore] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    // Keep the agent slot occupied: this probes real Issue/comment admission and
+    // the resulting session-reset authority without launching a provider.
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const wake = await heartbeatService(db).wakeup(f.agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_commented",
+      requestedByActorType: "user", requestedByActorId: "board",
+      payload: { issueId: f.issueId, commentId: f.commentId },
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: f.commentId },
+    });
+    expect(wake).toMatchObject({ status: "queued", retryOfRunId: null,
+      contextSnapshot: { forceFreshSession: true, previousRunId: f.sourceRunId,
+        explicitUserContinuation: { commentId: f.commentId, previousRunId: f.sourceRunId } } });
+    expect(shouldResetTaskSessionForWake(wake!.contextSnapshot)).toBe(true);
+    expect(wake!.nativeSessionId).toBeNull();
+    expect(wake!.contextSnapshot?.runnerGoalControl).toBeUndefined();
+    expect(await db.select().from(agentSessionGoalActions).where(eq(agentSessionGoalActions.id, oldAction!.id))).toEqual([oldAction]);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId))).toEqual([sourceBefore]);
+    const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    expect(coordinator.failureDetail?.replacementDenied).toBe("explicit_user_continuation");
+  });
+
+  it("starts one fresh native turn for a new comment while leaving the old UNKNOWN goal unsent", async () => {
+    const f = await seed();
+    const oldSessionId = randomUUID();
+    const requestId = `old-unknown-${randomUUID()}`;
+    await db.update(agents).set({ adapterConfig: { provider: "codex", model: "gpt-5.6-luna" } })
+      .where(eq(agents.id, f.agentId));
+    const [taskSession] = await db.insert(agentTaskSessions).values({
+      companyId: f.companyId, agentId: f.agentId, adapterType: "paperclip_runner",
+      taskKey: f.issueId, lastRunId: f.sourceRunId,
+      sessionParamsJson: { sessionId: oldSessionId },
+    }).returning();
+    await db.update(heartbeatRuns).set({ nativeSessionId: oldSessionId,
+      resultJson: { priorOutcome: "unknown" },
+    }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    const [oldAction] = await db.insert(agentSessionGoalActions).values({
+      companyId: f.companyId, sessionId: taskSession!.id, requestId,
+      action: "replace", payloadJson: { requestId, action: "replace", objective: "Old unconfirmed work" },
+      status: "pending",
+    }).returning();
+    const [sourceBefore] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    const startTurn = vi.fn<NativeSession["startTurn"]>(async () => ({ turnId: "new-turn-1" }));
+    const goal = vi.fn(async () => null);
+    const openSession = vi.fn<NativeSessionBackend["openSession"]>(async ({ identity }) => {
+      const [boundRun] = await db.select({ runnerInstanceId: heartbeatRuns.runnerInstanceId })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, identity.runId));
+      if (!boundRun?.runnerInstanceId) throw new Error("native runner identity was not persisted before provider admission");
+      const event: PrpEvent = {
+        schema: "paperclip.prp.event.v1", sourceEventId: `new-comment:${identity.runId}:1`,
+        sourceSeq: 1, sourceInstanceId: boundRun.runnerInstanceId, sourceKind: "runner",
+        runId: identity.runId, normalizedSessionId: identity.sessionId, turnId: "new-turn-1",
+        eventType: "turn.completed", schemaVersion: 1, priority: 0,
+        emittedAt: "2026-09-11T11:00:01.000Z", payload: { status: "completed" },
+      };
+      return {
+        identity: () => identity,
+        async capabilities() { return { resume: true, typedEvents: true, steering: false,
+          interruption: true, structuredResult: true }; },
+        async *events() { await vi.waitFor(() => expect(startTurn).toHaveBeenCalledOnce()); yield event; },
+        startTurn, goal,
+        async result() { return { turnId: "new-turn-1", result: {
+          schema: "paperclip.run_result.v1" as const, reportedWorkDisposition: "blocked" as const,
+          summary: "New comment received.", completionClaim: { contractRevision: "1",
+            objectiveSatisfied: false, criteria: [], remainingWork: [] },
+          evidence: [], verification: [], attentionRequests: [], artifacts: [],
+        }, terminal: { schema: "paperclip.prp.terminal.v1" as const,
+          turnTerminalState: "completed" as const, runTerminalState: "succeeded" as const,
+          reportedWorkDisposition: "blocked" as const } }; },
+        async snapshot() { return { backendKind: "mock" as const, sessionId: "fresh-driver",
+          identity, cursor: null, activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }; },
+        async close() {},
+      };
+    });
+    const backend: NativeSessionBackend = {
+      async descriptor() { return { kind: "mock", name: "new-comment-test", version: "1",
+        runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" },
+        capabilities: { resume: true, typedEvents: true, steering: false,
+          interruption: true, structuredResult: true } }; },
+      openSession,
+      async recoverSession() { throw new Error("old session recovery forbidden"); },
+    };
+    const home = await mkdtemp(join(tmpdir(), "new-comment-native-"));
+    const previousHome = process.env.PAPERCLIP_HOME;
+    process.env.PAPERCLIP_HOME = home;
+    let heartbeat: ReturnType<typeof heartbeatService> | null = null;
+    try {
+      heartbeat = heartbeatService(db, { nativeSessionBackendFactory: () => backend });
+      const wake = await heartbeat.wakeup(f.agentId, {
+        source: "automation", triggerDetail: "system", reason: "issue_commented",
+        requestedByActorType: "user", requestedByActorId: "board",
+        payload: { issueId: f.issueId, commentId: f.commentId },
+        contextSnapshot: { issueId: f.issueId, wakeCommentId: f.commentId },
+      });
+      expect(wake).toMatchObject({ retryOfRunId: null,
+        contextSnapshot: { forceFreshSession: true, previousRunId: f.sourceRunId,
+          explicitUserContinuation: { commentId: f.commentId } } });
+      // wakeup has registered this agent's execution before resolving. A global
+      // queue scan would also start the deliberately queued fixtures above.
+      await heartbeat.drainActiveRunExecutions();
+      expect(openSession).toHaveBeenCalledOnce();
+      expect(openSession.mock.calls[0]![0].identity.sessionId).not.toBe(oldSessionId);
+      expect(startTurn).toHaveBeenCalledOnce();
+      expect(startTurn.mock.calls[0]![0].message.text).toContain("What happened?");
+      expect(goal).not.toHaveBeenCalled();
+      const [newRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake!.id));
+      expect(newRun).toMatchObject({ id: wake!.id, nativeSessionId: openSession.mock.calls[0]![0].identity.sessionId,
+        runnerInstanceId: expect.any(String) });
+      const acceptedTurn = await db.select().from(heartbeatRunEvents).where(and(
+        eq(heartbeatRunEvents.runId, wake!.id), eq(heartbeatRunEvents.eventType, "turn.completed"),
+        eq(heartbeatRunEvents.sourceInstanceId, newRun!.runnerInstanceId!),
+      ));
+      expect(acceptedTurn).toHaveLength(1);
+      expect(acceptedTurn[0]).toMatchObject({ sourceSeq: 1, sourceInstanceId: newRun!.runnerInstanceId });
+      expect(await db.select().from(agentSessionGoalActions).where(eq(agentSessionGoalActions.id, oldAction!.id))).toEqual([oldAction]);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId))).toEqual([sourceBefore]);
+    } finally {
+      try { await heartbeat?.drainActiveRunExecutions(); }
+      finally {
+        if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+        else process.env.PAPERCLIP_HOME = previousHome;
+        await makeOwnedHomeTreeWritable(home);
+        await rm(home, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("defers a new user comment while the old UNKNOWN run still owns an active lease", async () => {
+    const f = await seed();
+    await db.insert(environmentLeases).values({
+      companyId: f.companyId, heartbeatRunId: f.sourceRunId, issueId: f.issueId,
+      provider: "daytona", providerLeaseId: `old-provider-${f.sourceRunId}`,
+      status: "active", leasePolicy: "ephemeral",
+    });
+    const [sourceBefore] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    const wake = await heartbeatService(db).wakeup(f.agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_commented",
+      requestedByActorType: "user", requestedByActorId: "board",
+      payload: { issueId: f.issueId, commentId: f.commentId },
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: f.commentId },
+    });
+    expect(wake).toBeNull();
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(receipt).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId))).toEqual([sourceBefore]);
+    expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")))).toHaveLength(0);
   });
 
   it.each(["pause", "dependency", "state"])("keeps the existing %s gate on the actual user wake", async gate => {

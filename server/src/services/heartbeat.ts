@@ -1,6 +1,11 @@
 import {captureCommanderHermesClaim,completeCommanderHermesResult,pendingCommanderResultHandoffs} from "./commander-result.js";
 import { commanderReservesTodo,commanderPolicySchema, admissionMatches, commanderPrompt, parseCommanderSelection, type CommanderAdmission, type CommanderPolicy } from "./commander-cycle.js";
 import { activeIssueInteractionCondition, TASK_QUESTION_GUIDANCE } from "./issue-question-context.js";
+import { classifySessionGoalRecoveryAction } from "./session-goal-recovery-policy.js";
+import { canSettleNativeSessionStartupBusy, releaseRejectedNativeStartupRunLeases, settleNativeSessionStartupBusy, withHeartbeatRunExecution } from "./heartbeat-run-execution.js";
+import { runnerGoalActionRequestSchema } from "@paperclipai/shared";
+import { GOAL_DELIVERY_INDETERMINATE_CODE } from "./runner-goal-delivery-policy.js";
+import { NativeGoalDeliveryHeldError, NativeSessionLeaseNotOwnedError, NativeSessionStartupBusyError, NativeWarmSessionRetirementPendingError } from "./native-runtime/native-goal-delivery-hold.js";
 import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
 import { agentIdentityService, supportsManagedAgentIdentity } from "./agent-identity.js";
 import { buildAgentIdentityEnv } from "@paperclipai/adapter-utils/server-utils";
@@ -434,7 +439,9 @@ import {
 import { issueService } from "./issues.js";
 import {
   blockRunnerGoalRecovery,
+  claimRunnerGoalActionDelivery,
   failRunnerGoalAction,
+  inspectRunnerGoalActionDelivery,
   isRunnerGoalActionCompleted,
   runnerGoalService,
   settleLiveRunnerGoalBeforeInterrupt,
@@ -18736,6 +18743,26 @@ export function heartbeatService(
       );
   }
 
+  async function hasUnretiredNativeProvider(lease: typeof environmentLeases.$inferSelect): Promise<boolean> {
+    if (!lease.heartbeatRunId) return false;
+    const [coordinator] = await db.select({
+      phase: nativeRunFinalizations.phase,
+      failureCode: nativeRunFinalizations.failureCode,
+      failureDetail: nativeRunFinalizations.failureDetail,
+      resultId: nativeRunFinalizations.resultId,
+    }).from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.runId, lease.heartbeatRunId),
+      eq(nativeRunFinalizations.companyId, lease.companyId),
+    )).limit(1);
+    if (!coordinator || coordinator.phase !== "terminal_failure" || coordinator.resultId !== null ||
+        (coordinator.failureCode !== GOAL_DELIVERY_INDETERMINATE_CODE &&
+          coordinator.failureCode !== "native_warm_session_retirement_pending")) return false;
+    // Older records without the explicit receipt are UNKNOWN. A durable false
+    // is written only after the provider close and owner check have succeeded.
+    const detail = coordinator.failureDetail as { resourceRetirementDeferred?: unknown } | null;
+    return detail?.resourceRetirementDeferred !== false;
+  }
+
   // An active lease is reachable only while its heartbeat run keeps the
   // running status. The reaper writes the run status and the lease release as
   // two separate statements, so a restart between them can leave a terminal
@@ -18775,6 +18802,10 @@ export function heartbeatService(
 
     let recovered = 0;
     for (const { lease } of rows) {
+      if (await hasUnretiredNativeProvider(lease)) {
+        await deferOrphanedActiveLease(lease.id);
+        continue;
+      }
       // A provider resource id names one physical sandbox. A different lease
       // row can still hold that same resource in a live status, so this sweep
       // must not tear down a sandbox that a different lease still owns.
@@ -18892,6 +18923,10 @@ export function heartbeatService(
     let destroyed = 0;
     let capped = 0;
     for (const row of rows) {
+      if (await hasUnretiredNativeProvider(row)) {
+        await deferPendingCleanupLease(row.id);
+        continue;
+      }
       if (pendingCleanupAttemptsInFlight.has(row.id)) continue;
       const metadata = { ...(row.metadata ?? {}) } as Record<string, unknown>;
       const attempts = readPendingCleanupRetryAttempts(metadata);
@@ -19898,12 +19933,13 @@ export function heartbeatService(
 
   async function recoverPendingSessionGoalActions() {
     if ((await getSchedulingSuppression()).suppressed) {
-      return { scanned: 0, enqueued: 0, alreadyQueued: 0, invalid: 0 };
+      return { scanned: 0, enqueued: 0, alreadyQueued: 0, invalid: 0, held: 0 };
     }
     const pending = await db
       .select({
         id: agentSessionGoalActions.id,
         requestId: agentSessionGoalActions.requestId,
+        status: agentSessionGoalActions.status,
         payload: agentSessionGoalActions.payloadJson,
         companyId: agentTaskSessions.companyId,
         agentId: agentTaskSessions.agentId,
@@ -19925,6 +19961,7 @@ export function heartbeatService(
       )
       .where(
         inArray(agentSessionGoalActions.status, [
+          "ready",
           "pending",
           "delivering",
           "delivered",
@@ -19935,9 +19972,17 @@ export function heartbeatService(
     let enqueued = 0;
     let alreadyQueued = 0;
     let invalid = 0;
+    let held = 0;
     for (const action of pending) {
+      // These open statuses do not prove that a provider command was never
+      // sent. Preserve the action and make the hold visible to operators.
+      const recoveryState = classifySessionGoalRecoveryAction(action);
+      if (recoveryState === "held") {
+        held += 1;
+        continue;
+      }
       const control = parseNativeSessionGoalControl(action.payload);
-      if (!control || control.requestId !== action.requestId) {
+      if (recoveryState === "invalid" || !control) {
         invalid += 1;
         await failRunnerGoalAction(
           db,
@@ -19999,13 +20044,17 @@ export function heartbeatService(
           // completed goal from its retained widget).
           resumeIntent: true,
           goalControlRequestId: action.requestId,
-          runnerGoalControl: control,
+          runnerGoalControl: action.payload,
           skipIssueComment: true,
         },
       });
       if (run) enqueued += 1;
     }
-    return { scanned: pending.length, enqueued, alreadyQueued, invalid };
+    if (held > 0) {
+      logger.warn({ held, reason: "goal_delivery_indeterminate" },
+        "startup goal actions held because prior delivery cannot be disproved");
+    }
+    return { scanned: pending.length, enqueued, alreadyQueued, invalid, held };
   }
 
   async function reconcileCommanderResultHandoffs(){
@@ -20463,6 +20512,16 @@ export function heartbeatService(
       nativeRestartRecovery?: NativeRestartRecoveryClaim;
     } = {},
   ) {
+    return withHeartbeatRunExecution(activeRunExecutions, runId, () => executeRunOnce(runId, runOptions));
+  }
+
+  async function executeRunOnce(
+    runId: string,
+    runOptions: {
+      nativeLeaseOwner?: string;
+      nativeRestartRecovery?: NativeRestartRecoveryClaim;
+    },
+  ) {
     const attemptStartedAtMs = Date.now();
     let attestedQuestionResponseAtMs: number | null = null;
     if ((await getSchedulingSuppression()).suppressed) {
@@ -20497,7 +20556,9 @@ export function heartbeatService(
       // Cleanup is retried from the durable working-copy receipt by the
       // recovery sweep. It must not replace the provider result (or prevent
       // lease release), and a timeout must not be repeated in outer teardown.
-      if (instructionCleanupDeferred) return;
+      // Another executor may still own this Run after a goal-delivery HOLD.
+      // Releasing its run-scoped working copy here would retire shared state.
+      if (instructionCleanupDeferred || nativeGoalDeliveryOwnershipDeferred || nativeProviderRetirementDeferred) return;
       try {
         await instructionCopies.release(instructionCleanupRun.companyId, instructionCleanupRun.id);
       } catch (err) {
@@ -20602,7 +20663,6 @@ export function heartbeatService(
 
     if (run.runtimeMode === "legacy" && run.controllerBootId &&
         run.controllerBootId !== legacyControllerBootId) return;
-    activeRunExecutions.add(run.id);
     const executionControl = createAdapterExecutionControl();
     // This coarse scope also covers host finalization after the adapter returns.
     // Nested scopes refine the label without making any termination claim.
@@ -20614,6 +20674,12 @@ export function heartbeatService(
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
     let nativeSessionResumeScheduled = false;
     let nativeOwnershipHeld = false;
+    let nativeGoalDeliveryOwnershipDeferred = false;
+    // A terminal Run can still have an unretired live provider. This flag
+    // defers only provider-coupled teardown, never durable Run/agent settlement.
+    let nativeProviderRetirementDeferred = false;
+    let nativeStartupBusyRejected = false;
+    let nativeStartupBusyPendingClassification = false;
     let nativeInstructionReservation: Awaited<ReturnType<typeof reserveWarmNativeInstructionDirectory>> = null;
     let nativeDispatchStarted = false;
     let nativeWorkspaceFinalizeScheduled = false;
@@ -24976,9 +25042,6 @@ export function heartbeatService(
             let sessionGoalControl = parseNativeSessionGoalControl(
               context.runnerGoalControl,
             );
-            if (runGoalControlRequestId && !sessionGoalControl) {
-              throw new Error("session_goal_control_payload_invalid");
-            }
             // A hard restart replays the heartbeat context, not a new user
             // action. Do not repeat a completed create/replace/edit (which
             // could reactivate or clear a goal that finished while detached).
@@ -25038,9 +25101,36 @@ export function heartbeatService(
                     useRunnerd: agent.adapterType === "paperclip_runner",
                     adapterType: agent.adapterType,
                     sessionGoalControl,
+                    claimGoalDelivery: !completedGoalControl && (runGoalControlRequestId || sessionGoalControl)
+                      ? async () => {
+                        const request = runnerGoalActionRequestSchema.safeParse(context.runnerGoalControl);
+                        if (!request.success || !isDeepStrictEqual(request.data, context.runnerGoalControl)
+                          || request.data.requestId !== runGoalControlRequestId
+                          || request.data.agentId !== agent.id || !taskKey || !taskSession) {
+                          return { state: "indeterminate", receiptRelation: "no_valid_receipt", claimOwnerRunId: null, claimId: null };
+                        }
+                        return claimRunnerGoalActionDelivery(db, {
+                          companyId: agent.companyId, issueId: taskKey, agentId: agent.id,
+                          adapterType: agent.adapterType, sessionId: taskSession.id,
+                        }, request.data, { kind: "heartbeat", ownerRunId: run.id });
+                      }
+                      : undefined,
+                    inspectGoalDelivery: (runGoalControlRequestId || sessionGoalControl || completedGoalControl)
+                      ? async () => {
+                        const request = runnerGoalActionRequestSchema.safeParse(context.runnerGoalControl);
+                        if (!request.success || !isDeepStrictEqual(request.data, context.runnerGoalControl)
+                          || request.data.requestId !== runGoalControlRequestId
+                          || request.data.agentId !== agent.id || !taskKey || !taskSession) {
+                          return { state: "indeterminate", receiptRelation: "no_valid_receipt", claimOwnerRunId: null, claimId: null, consumeOnlyEligible: false };
+                        }
+                        return inspectRunnerGoalActionDelivery(db, {
+                          companyId: agent.companyId, issueId: taskKey, agentId: agent.id,
+                          adapterType: agent.adapterType, sessionId: taskSession.id,
+                        }, request.data, { kind: "heartbeat", ownerRunId: run.id });
+                      }
+                      : undefined,
                     resumeSessionGoalHeartbeat:
-                      context.resumeSessionGoalHeartbeat === true ||
-                      completedGoalControl,
+                      context.resumeSessionGoalHeartbeat === true || completedGoalControl,
                     onGoalCheckpoint: async (snapshot) => {
                       if (!taskKey) return;
                       const params =
@@ -25441,6 +25531,24 @@ export function heartbeatService(
             await completeWorkspace();
           }
         } catch (adapterErr) {
+          if (adapterErr instanceof NativeGoalDeliveryHeldError
+            || (adapterErr instanceof NativeSessionStartupBusyError && adapterErr.scope === "same_run")
+            || adapterErr instanceof NativeSessionLeaseNotOwnedError) {
+            if (adapterErr instanceof NativeSessionStartupBusyError) nativeStartupBusyPendingClassification = true;
+            nativeGoalDeliveryOwnershipDeferred = !(adapterErr instanceof NativeGoalDeliveryHeldError && adapterErr.settled);
+            if (adapterErr instanceof NativeGoalDeliveryHeldError) {
+              nativeProviderRetirementDeferred = adapterErr.resourceRetirementDeferred;
+            }
+            throw adapterErr;
+          }
+          if (adapterErr instanceof NativeSessionStartupBusyError) {
+            // A prior attempt of this same Run may already have sent provider
+            // work. Defer all cleanup until the current Run's untouched
+            // coordinator is proved under the issue/coordinator/run locks.
+            nativeStartupBusyPendingClassification = true;
+            nativeGoalDeliveryOwnershipDeferred = true;
+            throw adapterErr;
+          }
           if (adapterErr instanceof NativeCancellationPendingRecoveryError) {
             // Durable cancellation is settled by the outer recovery handler;
             // it does not imply a failed workspace or a persisted run result.
@@ -25596,7 +25704,7 @@ export function heartbeatService(
           }
           throw adapterErr;
         } finally {
-          try {
+          if (!nativeGoalDeliveryOwnershipDeferred) try {
             await revokeHeartbeatRunGatewayTokens({
               db,
               companyId: agent.companyId,
@@ -25608,8 +25716,13 @@ export function heartbeatService(
               "failed to revoke heartbeat-run MCP gateway tokens",
             );
           }
-          await nativeInstructionReservation?.release();
-          await withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy);
+          if (!nativeStartupBusyPendingClassification && nativeInstructionReservation) {
+            await nativeInstructionReservation.release();
+            nativeInstructionReservation = null;
+          }
+          if (!nativeStartupBusyPendingClassification) {
+            await withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy);
+          }
         }
         // Reconcile the referenced-project set against the real remote staging outcome. A referenced
         // project can pass authorization and clone locally at run prep, then fail to stage into the
@@ -26329,6 +26442,155 @@ export function heartbeatService(
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
       } catch (err) {
+        if (err instanceof NativeGoalDeliveryHeldError
+          || err instanceof NativeSessionLeaseNotOwnedError) {
+          const heldRun = err instanceof NativeGoalDeliveryHeldError && err.settled
+            ? await getRun(run.id).catch(() => null) : null;
+          if (!heldRun || heldRun.status !== "failed" || heldRun.errorCode !== GOAL_DELIVERY_INDETERMINATE_CODE) {
+            nativeGoalDeliveryOwnershipDeferred = true;
+            logger.warn({ runId: run.id, reason: err.code }, "native delivery ownership unresolved; winner and shared resources retained");
+            return;
+          }
+          await setWakeupStatus(heldRun.wakeupRequestId, "failed", {
+            finishedAt: new Date(), error: GOAL_DELIVERY_INDETERMINATE_CODE,
+          }).catch((error) => logger.warn({ err: error, runId: run.id }, "failed to settle held delivery wake"));
+          await appendRunEvent(heldRun, {
+            eventType: "error", stream: "system", level: "warn",
+            message: "Goal delivery is indeterminate; automatic replay stopped. The prior action and task session are unchanged.",
+            payload: { code: GOAL_DELIVERY_INDETERMINATE_CODE, deliveryHeld: true, retrySuppressed: true },
+          }).catch((error) => logger.warn({ err: error, runId: run.id }, "failed to record held goal delivery"));
+          await releaseIssueExecutionAndPromote(heldRun, { suppressImmediateRecovery: true })
+            .catch((error) => logger.warn({ err: error, runId: run.id }, "failed to release held delivery attempt"));
+          await finalizeAgentStatus(agent.id, "failed", GOAL_DELIVERY_INDETERMINATE_CODE, {
+            keepIdleOnFailure: true, wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+          }).catch((error) => logger.warn({ err: error, runId: run.id }, "failed to refresh agent after held delivery"));
+          return;
+        }
+        if (err instanceof NativeSessionStartupBusyError) {
+          nativeGoalDeliveryOwnershipDeferred = true;
+          let failedBusyRun: typeof run | null = null;
+          const disposition = await settleNativeSessionStartupBusy(err, {
+            failCurrentRun: async () => {
+              if (!issueRef) return false;
+              const now = new Date();
+              const updated = await db.transaction(async tx => {
+                // Match native HOLD's Issue -> coordinator -> Run lock order.
+                // The coordinator check and Run transition must share this
+                // transaction: a pre-read could race a same-Run lease claim.
+                const [issue] = await tx.select({ id: issues.id }).from(issues).where(and(
+                  eq(issues.id, issueRef.id), eq(issues.companyId, run.companyId),
+                )).for("update").limit(1);
+                const [coordinator] = await tx.select({
+                  phase: nativeRunFinalizations.phase,
+                  attempt: nativeRunFinalizations.attempt,
+                  leaseOwner: nativeRunFinalizations.leaseOwner,
+                  resultId: nativeRunFinalizations.resultId,
+                  controllerBootId: nativeRunFinalizations.controllerBootId,
+                  controllerPid: nativeRunFinalizations.controllerPid,
+                  controllerProcessStartedAt: nativeRunFinalizations.controllerProcessStartedAt,
+                  leaseExpiresAt: nativeRunFinalizations.leaseExpiresAt,
+                }).from(nativeRunFinalizations).where(and(
+                  eq(nativeRunFinalizations.runId, run.id),
+                  eq(nativeRunFinalizations.companyId, run.companyId),
+                  eq(nativeRunFinalizations.issueId, issueRef.id),
+                )).for("update").limit(1);
+                const [boundRun] = await tx.select().from(heartbeatRuns).where(and(
+                  eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+                  eq(heartbeatRuns.agentId, agent.id), eq(heartbeatRuns.nativeIssueId, issueRef.id),
+                )).for("update").limit(1);
+                if (!issue || !boundRun || boundRun.status !== "running" || boundRun.runtimeMode !== "native" ||
+                  !canSettleNativeSessionStartupBusy({
+                    scope: err.scope,
+                    isRestartRecovery: Boolean(runOptions.nativeLeaseOwner || runOptions.nativeRestartRecovery),
+                    ownedLease: err instanceof NativeWarmSessionRetirementPendingError ? err.ownedLease : null,
+                    coordinator: coordinator ?? null,
+                  })) return null;
+                const [failedCoordinator] = await tx.update(nativeRunFinalizations).set({
+                  phase: "terminal_failure", recoveryState: "blocked",
+                  failureCode: err.code,
+                  // This fresh rejected Run never owned the prior provider.
+                  // Its own lease may be released; the original HOLD remains
+                  // protected on the original Run's coordinator.
+                  failureDetail: { scope: err.scope, providerWorkStarted: false,
+                    resourceRetirementDeferred: false },
+                  nextAttemptAt: null, controlDeadlineAt: null, updatedAt: now,
+                  ...(err instanceof NativeWarmSessionRetirementPendingError && err.ownedLease
+                    ? { leaseOwner: null, leaseExpiresAt: null } : {}),
+                }).where(and(
+                  eq(nativeRunFinalizations.runId, run.id),
+                  eq(nativeRunFinalizations.companyId, run.companyId),
+                  eq(nativeRunFinalizations.issueId, issueRef.id),
+                  eq(nativeRunFinalizations.phase, "observed"),
+                  eq(nativeRunFinalizations.attempt,
+                    err instanceof NativeWarmSessionRetirementPendingError && err.ownedLease ? err.ownedLease.attempt : 0),
+                  ...(err instanceof NativeWarmSessionRetirementPendingError && err.ownedLease
+                    ? [eq(nativeRunFinalizations.leaseOwner, err.ownedLease.owner),
+                      eq(nativeRunFinalizations.controllerBootId, err.ownedLease.controllerBootId),
+                      eq(nativeRunFinalizations.controllerPid, err.ownedLease.controllerPid),
+                      eq(nativeRunFinalizations.controllerProcessStartedAt, err.ownedLease.controllerProcessStartedAt),
+                      gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`)]
+                    : [isNull(nativeRunFinalizations.leaseOwner)]),
+                  isNull(nativeRunFinalizations.resultId),
+                )).returning({ runId: nativeRunFinalizations.runId });
+                if (!failedCoordinator) return null;
+                const failedRun = await tx.update(heartbeatRuns).set({
+                  status: "failed", nativePhase: "terminal_failure", nativePhaseUpdatedAt: now,
+                  error: err.code, errorCode: err.code, finishedAt: now,
+                  executionStatusDeliveryId: randomUUID(), updatedAt: now,
+                  resultJson: mergeRunStopMetadataForAgent(agent, "failed", {
+                    errorCode: err.code,
+                    errorMessage: err.code,
+                    resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+                  }),
+                }).where(and(
+                  eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+                  eq(heartbeatRuns.agentId, agent.id), eq(heartbeatRuns.nativeIssueId, issueRef.id),
+                  eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "running"),
+                )).returning().then(rows => rows[0] ?? null);
+                if (!failedRun) throw new Error("native_startup_busy_run_changed");
+                return failedRun;
+              });
+              if (!updated) return false;
+              // From here this executor owns a terminal, effect-free Run.
+              nativeGoalDeliveryOwnershipDeferred = false;
+              nativeStartupBusyRejected = true;
+              failedBusyRun = updated;
+              publishLiveEvent({ companyId: updated.companyId, type: "heartbeat.run.status",
+                payload: buildHeartbeatRunStatusLiveEventPayload(updated) });
+              publishRunLifecyclePluginEvent(updated);
+              emitTerminalAgentTaskRun(updated, "running");
+              return true;
+            },
+            failCurrentWakeup: async () => {
+              await revokeHeartbeatRunGatewayTokens({ db, companyId: run.companyId, runId: run.id })
+                .catch(error => logger.warn({ err: error, runId: run.id }, "rejected run gateway token revocation failed"));
+              await setWakeupStatus(run.wakeupRequestId, "failed", {
+                finishedAt: new Date(), error: err.code,
+              });
+              if (failedBusyRun) await appendRunEvent(failedBusyRun, {
+                eventType: "error", stream: "system", level: "warn",
+                message: "Native session was busy before provider dispatch; this run stopped without replay.",
+                payload: { code: err.code, scope: err.scope, providerWorkStarted: false },
+              });
+            },
+            releaseCurrentIssue: async () => {
+              if (failedBusyRun) await releaseIssueExecutionAndPromote(failedBusyRun, { suppressImmediateRecovery: true });
+            },
+            finalizeAgent: () => finalizeAgentStatus(agent.id, "failed", err.code, {
+              keepIdleOnFailure: true,
+              wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+            }),
+            releaseCurrentReservation: async () => {
+              const reservation = nativeInstructionReservation;
+              await reservation?.release();
+              if (nativeInstructionReservation === reservation) nativeInstructionReservation = null;
+            },
+          });
+          if (disposition === "deferred") {
+            logger.warn({ runId: run.id, scope: err.scope }, "native startup busy ownership unresolved; existing run retained");
+          }
+          return;
+        }
         if (err instanceof NativeControllerDetachedForRestartError) {
           nativeSessionResumeScheduled = true;
           return;
@@ -26669,7 +26931,17 @@ export function heartbeatService(
         });
       }
     } catch (outerErr) {
-      if (
+      if (nativeGoalDeliveryOwnershipDeferred || (outerErr instanceof NativeGoalDeliveryHeldError && !outerErr.settled)
+        || (outerErr instanceof NativeSessionStartupBusyError && outerErr.scope === "same_run")
+        || outerErr instanceof NativeSessionLeaseNotOwnedError) {
+        nativeGoalDeliveryOwnershipDeferred = true;
+        logger.warn({ runId: run.id }, "native delivery ownership unresolved; generic failure settlement suppressed");
+      } else if (nativeStartupBusyRejected) {
+        // A current-run settlement step failed. Preserve that error and still
+        // release local preparation in finally; never run generic adapter
+        // failure writes against the active owner's shared session state.
+        logger.error({ err: outerErr, runId: run.id }, "native startup busy settlement incomplete");
+      } else if (
         nativeOwnershipHeld ||
         outerErr instanceof NativeRunnerOwnershipUnverifiedError
       ) {
@@ -26922,8 +27194,21 @@ export function heartbeatService(
         }
       }
     } finally {
-      await nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
-      if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
+      // This closure owns only this attempt's warm preparation. Its release
+      // checks the entry identity and preparing Run, so a successor that has
+      // already attached is left intact even when durable ownership is held.
+      const localReservation = nativeInstructionReservation;
+      await localReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
+      if (nativeInstructionReservation === localReservation) nativeInstructionReservation = null;
+      if (nativeGoalDeliveryOwnershipDeferred) {
+        // No durable ownership receipt authorizes per-run cleanup: the same
+        // run may still belong to another executor. Settle only local handles.
+        controllerLease.stop();
+        executionControl.finish();
+        if (adapterExecutionControls.get(run.id) === executionControl) adapterExecutionControls.delete(run.id);
+        return;
+      }
+      if (managedAiRuntime && !nativeProviderRetirementDeferred) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
       try {
         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
@@ -26995,7 +27280,7 @@ export function heartbeatService(
           // Keep launchers during same-run recovery. At a terminal boundary all
           // operations have settled; clean before the remote lease can be stopped.
           if (
-            githubLauncherLocation &&
+            !nativeProviderRetirementDeferred && githubLauncherLocation &&
             latestRun &&
             isHeartbeatRunTerminalStatus(latestRun.status)
           ) {
@@ -27010,26 +27295,61 @@ export function heartbeatService(
           }
           // A retained or unverified process stays above this release boundary.
           // If no stopped-copy capture occurred, preserve an explicit loss report.
-          const uncapturedInstructions = await instructionCopies.reportUnavailable(run.companyId, run.id);
+          const uncapturedInstructions = nativeProviderRetirementDeferred ? null :
+            await instructionCopies.reportUnavailable(run.companyId, run.id);
           if (uncapturedInstructions?.state === "unavailable") {
             await appendRunEvent(run, { eventType: "instruction_save", stream: "system", level: "warn",
               message: "Instruction edits could not be recovered before environment release. No instruction save is claimed.",
               payload: { state: "unavailable", code: uncapturedInstructions.errorCode } });
           }
           await withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy);
-          await withAdapterExecutionPhase(executionPhaseContext, "lease_release", () => releaseEnvironmentLeasesForRun({
-            runId: run.id,
-            companyId: run.companyId,
-            agentId: run.agentId,
-            status: latestRun?.status,
-            failureReason: latestRun?.error ?? undefined,
-            providerResourceDisposition: providerResourceDispositionForRun,
-            nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
-          }));
-          await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          await withAdapterExecutionPhase(executionPhaseContext, "lease_release", async () => {
+            if (nativeProviderRetirementDeferred) return;
+            if (nativeStartupBusyRejected) {
+              // The rejected Run may have acquired an environment lease before
+              // the winner took this native session scope. Release only this
+              // Run's lease and keep any reusable shared provider alive.
+              const leaseResult = await releaseRejectedNativeStartupRunLeases({
+                listCurrentRunLeases: () => db.select({ leasePolicy: environmentLeases.leasePolicy,
+                  acquisitionOutcome: sql<string | null>`${environmentLeases.metadata}->'sandboxLeaseAcquisition'->>'outcome'` })
+                  .from(environmentLeases).where(and(
+                    eq(environmentLeases.heartbeatRunId, run.id),
+                    inArray(environmentLeases.status, ["active", "pending_cleanup"]),
+                  )),
+                retainReusableLeases: async () => {
+                  await envOrchestrator.releaseForRun({
+                    heartbeatRunId: run.id, companyId: run.companyId, agentId: run.agentId,
+                    status: "failed", providerResourceDisposition: "keep_running",
+                  });
+                },
+                releaseNonReusableLeases: async () => {
+                  const result = await envOrchestrator.releaseForRun({
+                    heartbeatRunId: run.id, companyId: run.companyId, agentId: run.agentId,
+                    status: "failed",
+                  });
+                  for (const error of result.errors) logger.warn({ runId: run.id, leaseId: error.leaseId, err: error.error },
+                    "rejected run environment lease could not be released");
+                },
+              });
+              if (leaseResult === "shared_lease_unresolved") {
+                logger.warn({ runId: run.id }, "rejected run's shared environment lease remains for reconciliation");
+              }
+              return;
+            }
+            await releaseEnvironmentLeasesForRun({
+              runId: run.id,
+              companyId: run.companyId,
+              agentId: run.agentId,
+              status: latestRun?.status,
+              failureReason: latestRun?.error ?? undefined,
+              providerResourceDisposition: providerResourceDispositionForRun,
+              nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
+            });
+          });
+          if (!nativeProviderRetirementDeferred) await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
         }
         if (
-          runScratch &&
+          !nativeProviderRetirementDeferred && runScratch &&
           latestRun &&
           isHeartbeatRunTerminalStatus(latestRun.status)
         ) {
@@ -27105,7 +27425,6 @@ export function heartbeatService(
         }
       } finally {
         controllerLease.stop();
-        activeRunExecutions.delete(run.id);
         // A failed owned Stop remains visible until this exact executor settles,
         // including a graceful exit result arriving after the cancellation error.
         // It is never retained beyond the active execution's cleanup.
@@ -27141,6 +27460,7 @@ export function heartbeatService(
       if (
         !nativeSessionResumeScheduled &&
         !nativeWorkspaceFinalizeScheduled &&
+        !nativeStartupBusyRejected &&
         !shutdownInProgress
       ) {
         if (latestRun) await resumeRemoteStopComments(latestRun).catch(err => {

@@ -20,9 +20,10 @@ import type {
 import { queueLiveRunnerPrpCommand } from "../realtime/runner-prp-ws.js";
 import { dispatchLiveRunnerGoalControl } from "./runner-goal-control-broker.js";
 import { publishLiveEvent } from "./live-events.js";
+import { decideGoalDelivery, GoalDeliveryIndeterminateError } from "./runner-goal-delivery-policy.js";
 
 const ACTIVE_RUN_STATUSES = ["queued", "scheduled_retry", "running"] as const;
-const OPEN_ACTION_STATUSES = ["pending", "delivering", "delivered"] as const;
+const OPEN_ACTION_STATUSES = ["ready", "pending", "delivering", "delivered"] as const;
 
 type AgentBinding = Pick<typeof agents.$inferSelect, "id" | "companyId" | "adapterType" | "adapterConfig">;
 type TaskSession = typeof agentTaskSessions.$inferSelect;
@@ -208,6 +209,222 @@ function isSameGoalActionRequest(
     && stored.objective === request.objective
     && storedTokenBudget === request.tokenBudget
     && (stored.confirmReplace === true) === (request.confirmReplace === true);
+}
+
+export type RunnerGoalDeliveryOwner = { kind: "live" | "heartbeat"; ownerRunId: string };
+export type RunnerGoalDeliveryInspection = {
+  state: "ready" | "completed" | "indeterminate" | "failed" | "missing";
+  receiptRelation: "same_owner" | "other_owner" | "no_valid_receipt";
+  claimOwnerRunId: string | null;
+  claimId: string | null;
+  /** Only a canonically matched claimed/acknowledged row may be consumed. */
+  consumeOnlyEligible?: boolean;
+};
+export type RunnerGoalDeliveryClaim = {
+  state: "claimed" | "completed" | "indeterminate" | "failed" | "missing";
+  receiptRelation: "same_owner" | "other_owner" | "no_valid_receipt";
+  claimOwnerRunId: string | null;
+  claimId: string | null;
+};
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function deliveryClaimReceipt(value: unknown): {
+  version: 1; kind: "live" | "heartbeat"; ownerRunId: string; claimId: string;
+} | null {
+  const receipt = asRecord(asRecord(value)?.deliveryClaim);
+  if (!receipt || receipt.version !== 1 || !["live", "heartbeat"].includes(String(receipt.kind)) ||
+      typeof receipt.ownerRunId !== "string" || !UUID_RE.test(receipt.ownerRunId) ||
+      typeof receipt.claimId !== "string" || !UUID_RE.test(receipt.claimId)) return null;
+  return receipt as { version: 1; kind: "live" | "heartbeat"; ownerRunId: string; claimId: string };
+}
+
+function claimResult<State extends RunnerGoalDeliveryClaim["state"] | "ready">(
+  state: State,
+  owner: RunnerGoalDeliveryOwner,
+  resultJson?: unknown,
+): Omit<RunnerGoalDeliveryClaim, "state"> & { state: State } {
+  const receipt = deliveryClaimReceipt(resultJson);
+  return {
+    state,
+    receiptRelation: receipt
+      ? receipt.kind === owner.kind && receipt.ownerRunId === owner.ownerRunId ? "same_owner" : "other_owner"
+      : "no_valid_receipt",
+    claimOwnerRunId: receipt?.ownerRunId ?? null,
+    claimId: receipt?.claimId ?? null,
+  };
+}
+
+type GoalDeliveryBinding = { companyId: string; issueId: string; agentId: string; adapterType: string; sessionId: string };
+type GoalDeliveryStore = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+
+async function readGoalDeliveryAction(
+  store: GoalDeliveryStore,
+  binding: GoalDeliveryBinding,
+  request: RunnerGoalActionRequest,
+  deliveryOwner: RunnerGoalDeliveryOwner,
+  lockBinding: boolean,
+) {
+  if (request.agentId !== binding.agentId || !UUID_RE.test(deliveryOwner.ownerRunId)) {
+    return { result: claimResult("indeterminate", deliveryOwner), action: null };
+  }
+  const issueQuery = store.select({ assigneeAgentId: issues.assigneeAgentId })
+    .from(issues).where(and(eq(issues.id, binding.issueId), eq(issues.companyId, binding.companyId))).limit(1);
+  const [issue] = lockBinding ? await issueQuery.for("update") : await issueQuery;
+  if (!issue) return { result: claimResult("missing", deliveryOwner), action: null };
+  if (issue.assigneeAgentId !== binding.agentId) return { result: claimResult("indeterminate", deliveryOwner), action: null };
+  const [agent] = await store.select({ adapterType: agents.adapterType }).from(agents).where(and(
+    eq(agents.id, binding.agentId), eq(agents.companyId, binding.companyId),
+  )).limit(1);
+  if (!agent || agent.adapterType !== binding.adapterType) return { result: claimResult("indeterminate", deliveryOwner), action: null };
+  const sessionQuery = store.select({ id: agentTaskSessions.id }).from(agentTaskSessions).where(and(
+    eq(agentTaskSessions.id, binding.sessionId),
+    eq(agentTaskSessions.companyId, binding.companyId),
+    eq(agentTaskSessions.agentId, binding.agentId),
+    eq(agentTaskSessions.adapterType, binding.adapterType),
+    eq(agentTaskSessions.taskKey, binding.issueId),
+  )).limit(1);
+  const [session] = lockBinding ? await sessionQuery.for("update") : await sessionQuery;
+  if (!session) return { result: claimResult("indeterminate", deliveryOwner), action: null };
+  const [action] = await store.select().from(agentSessionGoalActions).where(and(
+    eq(agentSessionGoalActions.companyId, binding.companyId),
+    eq(agentSessionGoalActions.sessionId, session.id),
+    eq(agentSessionGoalActions.requestId, request.requestId),
+  )).limit(1);
+  if (!action) return { result: claimResult("missing", deliveryOwner), action: null };
+  const canonicalRequest = JSON.parse(JSON.stringify(request)) as Record<string, unknown>;
+  if (action.action !== request.action || !isDeepStrictEqual(action.payloadJson, canonicalRequest)) {
+    return { result: claimResult("indeterminate", deliveryOwner, action.resultJson), action: null };
+  }
+  const decision = decideGoalDelivery(action.status);
+  if (decision !== "claim") return {
+    result: claimResult(decision, deliveryOwner, action.resultJson), action: null,
+    consumeOnlyEligible: action.status === "delivering" || action.status === "delivered",
+  };
+  const priorResult = asRecord(action.resultJson);
+  if (!priorResult || Object.hasOwn(priorResult, "deliveryClaim")) {
+    return { result: claimResult("indeterminate", deliveryOwner, action.resultJson), action: null };
+  }
+  return { result: claimResult("ready", deliveryOwner), action: { row: action, sessionId: session.id, priorResult, canonicalRequest } };
+}
+
+/** Read-only admission preflight. A ready result is never authority to send. */
+export async function inspectRunnerGoalActionDelivery(
+  db: Db,
+  binding: GoalDeliveryBinding,
+  request: RunnerGoalActionRequest,
+  deliveryOwner: RunnerGoalDeliveryOwner,
+): Promise<RunnerGoalDeliveryInspection> {
+  const observed = await readGoalDeliveryAction(db, binding, request, deliveryOwner, false);
+  return { ...observed.result, consumeOnlyEligible: observed.consumeOnlyEligible === true };
+}
+
+/** A durable at-most-once reservation, scoped to the exact action and live binding. */
+export async function claimRunnerGoalActionDelivery(
+  db: Db,
+  binding: GoalDeliveryBinding,
+  request: RunnerGoalActionRequest,
+  deliveryOwner: RunnerGoalDeliveryOwner,
+): Promise<RunnerGoalDeliveryClaim> {
+  return db.transaction(async (tx) => {
+    const { result, action: ready } = await readGoalDeliveryAction(tx, binding, request, deliveryOwner, true);
+    if (!ready) return result as RunnerGoalDeliveryClaim;
+    const { row: action, sessionId, priorResult, canonicalRequest } = ready;
+    const claimId = randomUUID();
+    const nextResult = {
+      ...priorResult,
+      deliveryClaim: { version: 1, kind: deliveryOwner.kind, ownerRunId: deliveryOwner.ownerRunId, claimId },
+    };
+    const [claimed] = await tx.update(agentSessionGoalActions).set({
+      status: "delivering", resultJson: nextResult, updatedAt: new Date(),
+    }).where(and(
+      eq(agentSessionGoalActions.id, action.id),
+      eq(agentSessionGoalActions.companyId, binding.companyId),
+      eq(agentSessionGoalActions.sessionId, sessionId),
+      eq(agentSessionGoalActions.requestId, request.requestId),
+      eq(agentSessionGoalActions.payloadJson, canonicalRequest),
+      eq(agentSessionGoalActions.resultJson, priorResult),
+      eq(agentSessionGoalActions.status, "ready"),
+    )).returning({ id: agentSessionGoalActions.id });
+    return claimed
+      ? claimResult("claimed", deliveryOwner, nextResult) as RunnerGoalDeliveryClaim
+      : claimResult("indeterminate", deliveryOwner) as RunnerGoalDeliveryClaim;
+  });
+}
+
+/** Release only this live claim when every transport synchronously declined it. */
+export async function releaseUnsentRunnerGoalActionDelivery(
+  db: Db,
+  binding: { companyId: string; issueId: string; agentId: string; adapterType: string; sessionId: string },
+  request: RunnerGoalActionRequest,
+  claim: RunnerGoalDeliveryClaim,
+  originalResult: unknown,
+): Promise<boolean> {
+  if (claim.state !== "claimed" || !claim.claimId || !claim.claimOwnerRunId) return false;
+  const priorResult = asRecord(originalResult);
+  if (!priorResult || Object.hasOwn(priorResult, "deliveryClaim")) return false;
+  const claimedResult = {
+    ...priorResult,
+    deliveryClaim: { version: 1, kind: "live", ownerRunId: claim.claimOwnerRunId, claimId: claim.claimId },
+  };
+  const canonicalRequest = JSON.parse(JSON.stringify(request)) as Record<string, unknown>;
+  return db.transaction(async (tx) => {
+    const [issue] = await tx.select({ assigneeAgentId: issues.assigneeAgentId }).from(issues).where(and(
+      eq(issues.id, binding.issueId), eq(issues.companyId, binding.companyId),
+    )).limit(1).for("update");
+    if (issue?.assigneeAgentId !== binding.agentId) return false;
+    const [agent] = await tx.select({ adapterType: agents.adapterType }).from(agents).where(and(
+      eq(agents.id, binding.agentId), eq(agents.companyId, binding.companyId),
+    )).limit(1);
+    if (agent?.adapterType !== binding.adapterType) return false;
+    const [session] = await tx.select({ id: agentTaskSessions.id }).from(agentTaskSessions).where(and(
+      eq(agentTaskSessions.id, binding.sessionId), eq(agentTaskSessions.companyId, binding.companyId),
+      eq(agentTaskSessions.agentId, binding.agentId), eq(agentTaskSessions.adapterType, binding.adapterType),
+      eq(agentTaskSessions.taskKey, binding.issueId),
+    )).limit(1).for("update");
+    if (!session) return false;
+    const [action] = await tx.select().from(agentSessionGoalActions).where(and(
+      eq(agentSessionGoalActions.companyId, binding.companyId),
+      eq(agentSessionGoalActions.sessionId, session.id),
+      eq(agentSessionGoalActions.requestId, request.requestId),
+    )).limit(1);
+    if (!action || action.action !== request.action || action.status !== "delivering" ||
+        !isDeepStrictEqual(action.payloadJson, canonicalRequest) ||
+        !isDeepStrictEqual(action.resultJson, claimedResult)) return false;
+    const [released] = await tx.update(agentSessionGoalActions).set({
+      status: "ready", resultJson: priorResult, updatedAt: new Date(),
+    }).where(and(
+      eq(agentSessionGoalActions.id, action.id), eq(agentSessionGoalActions.companyId, binding.companyId),
+      eq(agentSessionGoalActions.sessionId, session.id), eq(agentSessionGoalActions.requestId, request.requestId),
+      eq(agentSessionGoalActions.payloadJson, canonicalRequest),
+      eq(agentSessionGoalActions.resultJson, claimedResult),
+      eq(agentSessionGoalActions.status, "delivering"),
+    )).returning({ id: agentSessionGoalActions.id });
+    return !!released;
+  });
+}
+
+/** A wake may have been queued before its promise rejected; fence restart replay. */
+async function holdRunnerGoalActionAfterUncertainEnqueue(
+  db: Db,
+  binding: { companyId: string; issueId: string; agentId: string; adapterType: string; sessionId: string },
+  request: RunnerGoalActionRequest,
+  originalResult: unknown,
+): Promise<void> {
+  const result = asRecord(originalResult);
+  if (!result || Object.hasOwn(result, "deliveryClaim")) return;
+  const canonicalRequest = JSON.parse(JSON.stringify(request)) as Record<string, unknown>;
+  await db.update(agentSessionGoalActions).set({
+    status: "delivering", updatedAt: new Date(),
+  }).where(and(
+    eq(agentSessionGoalActions.companyId, binding.companyId),
+    eq(agentSessionGoalActions.sessionId, binding.sessionId),
+    eq(agentSessionGoalActions.requestId, request.requestId),
+    eq(agentSessionGoalActions.action, request.action),
+    eq(agentSessionGoalActions.payloadJson, canonicalRequest),
+    eq(agentSessionGoalActions.resultJson, result),
+    eq(agentSessionGoalActions.status, "ready"),
+  ));
 }
 
 function commandSequence(request: RunnerGoalActionRequest) {
@@ -462,6 +679,7 @@ export function runnerGoalService(
         requestId: request.requestId,
         action: request.action,
         payloadJson: request,
+        status: "ready",
         resultJson: { projection: pendingProjection },
       }).returning();
       return {
@@ -491,13 +709,26 @@ export function runnerGoalService(
     const commands = commandSequence(request);
     let live = false;
     const liveCompletions: Array<Promise<unknown>> = [];
-    try {
+    {
       // Runner transports can retain a durable PRP authority while their
       // heartbeat is suspended. That authority is resumable, but it is not a
       // live command consumer. Only use either in-memory broker when the
       // projection proves a run is currently active; otherwise the outbox
       // resumes the provider session through the goal_control heartbeat.
-      const hasActiveRun = typeof originalProjection?.activeRunId === "string";
+      const activeRunId = originalProjection?.activeRunId;
+      const hasActiveRun = typeof activeRunId === "string";
+      let claim: RunnerGoalDeliveryClaim | null = null;
+      let anySinkAccepted = false;
+      if (hasActiveRun) {
+        claim = await claimRunnerGoalActionDelivery(db, {
+          companyId, issueId, agentId: request.agentId,
+          adapterType: binding.agent!.adapterType,
+          sessionId: accepted.session.id,
+        }, request, { kind: "live", ownerRunId: activeRunId });
+        if (claim.state !== "claimed") {
+          throw new GoalDeliveryIndeterminateError(`Goal control cannot be sent: ${claim.state}.`);
+        }
+      }
       const adapterControl = hasActiveRun
         ? dispatchLiveControl({
             companyId,
@@ -506,8 +737,9 @@ export function runnerGoalService(
           }, request)
         : null;
       if (adapterControl) {
-        live = true;
-        liveCompletions.push(adapterControl.completion);
+        anySinkAccepted = true;
+        liveCompletions.push(adapterControl.completion.catch(() => undefined));
+        live = adapterControl.runId === originalProjection?.activeRunId;
       } else if (hasActiveRun) {
         const queuedCommands = commands.map((command, index) => queueLiveCommand({
           companyId,
@@ -517,55 +749,69 @@ export function runnerGoalService(
           payload: command.payload,
           commandId: `goal_${request.requestId}_${index + 1}`,
         }));
-        live = queuedCommands.every((queued) => queued !== null);
+        live = queuedCommands.every((queued) => queued?.runId === originalProjection?.activeRunId);
         for (const queued of queuedCommands) {
-          if (queued) liveCompletions.push(queued.completion);
+          if (queued) {
+            anySinkAccepted = true;
+            liveCompletions.push(queued.completion.catch(() => undefined));
+          }
         }
       }
-      if (!live && options.enqueueOfflineControl) {
-        await options.enqueueOfflineControl({
-          companyId,
-          issueId,
-          agentId: request.agentId,
-          requestId: request.requestId,
-          control: request,
-        });
+      if (hasActiveRun && !live) {
+        if (!anySinkAccepted && claim && options.enqueueOfflineControl && await releaseUnsentRunnerGoalActionDelivery(db, {
+          companyId, issueId, agentId: request.agentId,
+          adapterType: binding.agent!.adapterType, sessionId: accepted.session.id,
+        }, request, claim, accepted.result)) {
+          try {
+            await options.enqueueOfflineControl({
+              companyId, issueId, agentId: request.agentId, requestId: request.requestId, control: request,
+            });
+          } catch (error) {
+            if (error instanceof RunnerGoalActionError && error.code === "goal_control_wake_skipped") throw error;
+            await holdRunnerGoalActionAfterUncertainEnqueue(db, {
+              companyId, issueId, agentId: request.agentId,
+              adapterType: binding.agent!.adapterType, sessionId: accepted.session.id,
+            }, request, accepted.result);
+            throw new GoalDeliveryIndeterminateError("Goal wakeup outcome is unknown; inspect the action before retrying.");
+          }
+        } else {
+          // A sink may have accepted part of a multi-command action, or may have
+          // lost its reply. Never turn this reservation into an offline retry.
+          void Promise.all(liveCompletions).catch(() => undefined);
+          throw new GoalDeliveryIndeterminateError(
+            "The live goal controller did not confirm acceptance. Inspect the reserved action before retrying.",
+          );
+        }
       }
-      await db.update(agentSessionGoalActions).set({
-        status: live ? "delivered" : "pending",
-        deliveredAt: live ? new Date() : null,
-        updatedAt: new Date(),
-      }).where(and(
-        eq(agentSessionGoalActions.sessionId, accepted.session.id),
-        eq(agentSessionGoalActions.requestId, request.requestId),
-        inArray(agentSessionGoalActions.status, ["pending", "delivering"]),
-      ));
+      if (!live && !hasActiveRun && options.enqueueOfflineControl) {
+        try {
+          await options.enqueueOfflineControl({
+            companyId, issueId, agentId: request.agentId,
+            requestId: request.requestId, control: request,
+          });
+        } catch (error) {
+          if (error instanceof RunnerGoalActionError && error.code === "goal_control_wake_skipped") throw error;
+          await holdRunnerGoalActionAfterUncertainEnqueue(db, {
+            companyId, issueId, agentId: request.agentId,
+            adapterType: binding.agent!.adapterType, sessionId: accepted.session.id,
+          }, request, accepted.result);
+          throw new GoalDeliveryIndeterminateError("Goal wakeup outcome is unknown; inspect the action before retrying.");
+        }
+      }
       if (live) {
-        void Promise.all(liveCompletions).catch((error) =>
-          failRunnerGoalAction(
-            db,
-            {
-              companyId,
-              issueId,
-              agentId: request.agentId,
-              adapterType: binding.agent!.adapterType,
-            },
-            request.requestId,
-            error instanceof Error ? error.message : "live_goal_control_failed",
-          )
-        ).catch(() => undefined);
+        await db.update(agentSessionGoalActions).set({
+          status: "delivered", deliveredAt: new Date(), updatedAt: new Date(),
+        }).where(and(
+          eq(agentSessionGoalActions.sessionId, accepted.session.id),
+          eq(agentSessionGoalActions.requestId, request.requestId),
+          eq(agentSessionGoalActions.status, "delivering"),
+        ));
       }
-    } catch (error) {
-      await db.update(agentSessionGoalActions).set({
-        status: "failed",
-        error: error instanceof Error ? error.name : "goal_control_dispatch_failed",
-        completedAt: new Date(),
-        updatedAt: new Date(),
-      }).where(and(
-        eq(agentSessionGoalActions.sessionId, accepted.session.id),
-        eq(agentSessionGoalActions.requestId, request.requestId),
-      ));
-      throw error;
+      if (live) {
+        // A rejected completion does not prove that the provider missed the
+        // command. Retain the delivery reservation for operator inspection.
+        void Promise.all(liveCompletions).catch(() => undefined);
+      }
     }
     const current = await projection(companyId, issueId, request.agentId);
     if (!current) throw new RunnerGoalActionError("issue_not_found", "Issue not found.");
@@ -852,6 +1098,7 @@ export async function failRunnerGoalAction(
   binding: { companyId: string; issueId: string; agentId: string; adapterType: string },
   requestId: string,
   errorCode: string,
+  expectedRequest?: RunnerGoalActionRequest,
 ): Promise<RunnerGoalProjection | null> {
   const changed = await db.transaction(async (tx) => {
     const [session] = await tx.select().from(agentTaskSessions).where(and(
@@ -861,6 +1108,13 @@ export async function failRunnerGoalAction(
       eq(agentTaskSessions.taskKey, binding.issueId),
     )).limit(1).for("update");
     if (!session) return false;
+    const [action] = await tx.select().from(agentSessionGoalActions).where(and(
+      eq(agentSessionGoalActions.sessionId, session.id),
+      eq(agentSessionGoalActions.requestId, requestId),
+    )).limit(1);
+    const result = asRecord(action?.resultJson);
+    if (!action || action.status !== "ready" || !result || Object.hasOwn(result, "deliveryClaim") ||
+        (expectedRequest && !isDeepStrictEqual(action.payloadJson, JSON.parse(JSON.stringify(expectedRequest))))) return false;
     const now = new Date();
     const failed = await tx.update(agentSessionGoalActions).set({
       status: "failed",
@@ -868,9 +1122,15 @@ export async function failRunnerGoalAction(
       completedAt: now,
       updatedAt: now,
     }).where(and(
+      eq(agentSessionGoalActions.id, action.id),
+      eq(agentSessionGoalActions.companyId, binding.companyId),
       eq(agentSessionGoalActions.sessionId, session.id),
       eq(agentSessionGoalActions.requestId, requestId),
-      inArray(agentSessionGoalActions.status, [...OPEN_ACTION_STATUSES]),
+      eq(agentSessionGoalActions.payloadJson, action.payloadJson),
+      eq(agentSessionGoalActions.resultJson, result),
+      // Only a new, unclaimed action can be declared failed by this helper.
+      // A transport error after the claim has an unknown provider outcome.
+      eq(agentSessionGoalActions.status, "ready"),
     )).returning({ id: agentSessionGoalActions.id });
     if (failed.length === 0) return false;
     // Pending-action transitions are part of the same revisioned projection as

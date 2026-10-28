@@ -11138,7 +11138,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const ownerRuntime = new FakeChatSdkRuntime();
     const owner = createService(ownerRuntime, providerFetch, {
       discordGatewayLeaseRenewalIntervalMs: 60_000,
-      discordGatewayLeaseTtlMs: 200,
+      discordGatewayLeaseTtlMs: 60_000,
       discordGatewayMessageAdmissionBarrier: async () => {
         if (!holdOldCallbacks) return;
         messageAdmissionEntered();
@@ -11275,7 +11275,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const standbyRuntime = new FakeChatSdkRuntime();
     const standby = createService(standbyRuntime, providerFetch);
     try {
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      const expired = await db.update(chatEndpointLeases)
+        .set({ expiresAt: new Date(Date.now() - 1_000) })
+        .where(and(eq(chatEndpointLeases.endpointId, endpoint.id),
+          eq(chatEndpointLeases.leaseKey, "discord_gateway_runtime"),
+          eq(chatEndpointLeases.token, leaseBeforeTakeover.token)))
+        .returning({ token: chatEndpointLeases.token });
+      expect(expired).toEqual([{ token: leaseBeforeTakeover.token }]);
       const reconciled = await standby.service.reconcileProviderRuntimes();
       expect(reconciled).toMatchObject({ ownedElsewhere: 0, failed: 0 });
       const freshCallbacks = standbyRuntime.configurations.get(
