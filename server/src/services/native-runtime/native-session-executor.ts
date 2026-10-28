@@ -119,6 +119,7 @@ import {
   inArray,
   isNull,
   like,
+  ne,
   notInArray,
   or,
   sql,
@@ -183,7 +184,7 @@ import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
 import { applyRunnerGoalPrpEvent } from "../runner-goals.js";
 import type { RunnerGoalDeliveryClaim, RunnerGoalDeliveryInspection } from "../runner-goals.js";
-import { NativeGoalDeliveryHeldError, NativeSessionLeaseNotOwnedError, NativeSessionStartupBusyError, NativeWarmSessionRetirementPendingError } from "./native-goal-delivery-hold.js";
+import { NativeGoalDeliveryHeldError, NativeOrdinaryResumeSourceUncommittedError, NativeSessionLeaseNotOwnedError, NativeSessionStartupBusyError, NativeWarmSessionRetirementPendingError } from "./native-goal-delivery-hold.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import {
   NativeRunnerOwnershipUnverifiedError,
@@ -406,6 +407,8 @@ function clearNativeRuntimeRequestResolutions(runId: string): void {
 
 type WarmNativeSession = {
   agentId: string;
+  runId: string;
+  issueId: string;
   instructionCopy?: { runId: string; root?: string; targetIdentity: string; collectStopped: () => Promise<void> };
   preparingRunId?: string;
   managedAiCredentialIdentity?: string;
@@ -7352,6 +7355,125 @@ function startNativeSessionExecutionLeaseRenewal(input: {
 /** The coordinator itself proved another claimant won before this caller acquired a lease. */
 class NativeSessionLeaseContentionError extends Error {}
 
+/** Read only: checkpoint lookup must not create a sessions directory before admission. */
+function ordinaryResumeDiskOrigin(execution: NativeExecutionInput): Record<string, unknown> | null {
+  const directory = resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "sessions");
+  const scopes = [nativeSessionScopeKey(execution), legacyCompanyNativeSessionScopeKey(execution), nativeSessionKey(execution)];
+  for (const scope of scopes) {
+    const path = resolve(directory, `${createHash("sha256").update(scope).digest("hex")}.json`);
+    if (!existsSync(path)) continue;
+    let envelope: Record<string, unknown>;
+    try {
+      envelope = record(JSON.parse(readBoundedNativeFile(
+        path, NATIVE_WARM_CHECKPOINT_MAX_BYTES, "native_session_supervisor_checkpoint_too_large",
+      ).toString("utf8")));
+    } catch (cause) {
+      // A malformed, oversized, or unreadable existing checkpoint is not proof
+      // of a fresh session. Do not rewrite or relabel it on this attempt.
+      throw new NativeOrdinaryResumeSourceUncommittedError(cause);
+    }
+    if (envelope.schema !== "paperclip.native-session-supervisor.v1") {
+      throw new NativeOrdinaryResumeSourceUncommittedError();
+    }
+    const identity = record(record(envelope.snapshot).identity);
+    if (typeof identity.runId !== "string" || typeof identity.issueId !== "string") {
+      throw new NativeOrdinaryResumeSourceUncommittedError();
+    }
+    return identity;
+  }
+  return null;
+}
+
+/** Ordinary cross-Run continuity needs an accepted durable source before any
+ * warm retirement, checkpoint relabel, backend construction, or provider send.
+ * A failed or unknown predecessor is deliberately held; retry/issue admission
+ * remains a separate caller decision. */
+async function assertOrdinaryNativeResumeSourceCommitted(input: {
+  db: Db;
+  execution: NativeExecutionInput;
+  restartRecovery?: NativeRestartRecoveryClaim;
+}): Promise<void> {
+  if (input.restartRecovery) return; // This is the existing same-Run restart protocol.
+  const execution = input.execution;
+  const sessionId = nativeSessionKey(execution);
+  const { companyId, agentId, issueId, runId } = execution.binding;
+  const warm = warmNativeSessions.get(nativeSessionScopeKey(execution));
+  const disk = ordinaryResumeDiskOrigin(execution);
+  if ((warm && (warm.companyId !== companyId || warm.agentId !== agentId || warm.issueId !== issueId ||
+      warm.runId === runId && disk && disk.runId !== runId)) ||
+      (disk && (disk.companyId !== companyId || disk.agentId !== agentId ||
+        disk.issueId !== issueId || disk.sessionId !== sessionId))) {
+    throw new NativeOrdinaryResumeSourceUncommittedError();
+  }
+  const origins = [warm && { runId: warm.runId, issueId: warm.issueId }, disk]
+    .filter((origin): origin is Record<string, unknown> => Boolean(origin && typeof origin.runId === "string"));
+  const previous = await input.db.select({
+    id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+    nativeIssueId: heartbeatRuns.nativeIssueId, nativeSessionId: heartbeatRuns.nativeSessionId,
+    runtimeMode: heartbeatRuns.runtimeMode, status: heartbeatRuns.status,
+    runnerProfileJson: heartbeatRuns.runnerProfileJson,
+  }).from(heartbeatRuns).where(and(
+    ne(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId),
+    eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.nativeIssueId, issueId),
+    // The persisted column is uuid, but a malformed/legacy string must not
+    // silently bypass source admission. A text comparison remains read-only.
+    sql`${heartbeatRuns.nativeSessionId}::text = ${sessionId}`,
+  )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
+  const [current] = await input.db.select({ runnerProfileJson: heartbeatRuns.runnerProfileJson })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId),
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
+      eq(heartbeatRuns.nativeIssueId, issueId))).limit(1);
+  if (!current) throw new NativeOrdinaryResumeSourceUncommittedError();
+  const checkpoint = record(current.runnerProfileJson).sessionCheckpoint;
+  const checkpointIdentity = record(record(checkpoint).identity);
+  if (checkpoint != null && (typeof checkpointIdentity.runId !== "string" ||
+      checkpointIdentity.companyId !== companyId || checkpointIdentity.agentId !== agentId ||
+      checkpointIdentity.issueId !== issueId || checkpointIdentity.sessionId !== sessionId)) {
+    throw new NativeOrdinaryResumeSourceUncommittedError();
+  }
+  if (previous.length === 0) {
+    if (checkpoint != null || origins.some(origin => origin.runId !== runId)) {
+      throw new NativeOrdinaryResumeSourceUncommittedError();
+    }
+    return;
+  }
+  const source = previous[0]; // Never fall through a newer unsafe source.
+  if ((checkpoint != null && checkpointIdentity.runId !== runId && checkpointIdentity.runId !== source.id) ||
+      origins.some(origin => origin.runId !== runId && origin.runId !== source.id) ||
+      source.runtimeMode !== "native" ||
+      !["succeeded", "failed", "interrupted", "cancelled", "timed_out"].includes(source.status)) {
+    throw new NativeOrdinaryResumeSourceUncommittedError();
+  }
+  const sourceCheckpoint = record(record(record(source.runnerProfileJson).sessionCheckpoint).identity);
+  if (sourceCheckpoint.runId !== source.id || sourceCheckpoint.companyId !== companyId ||
+      sourceCheckpoint.agentId !== agentId || sourceCheckpoint.issueId !== issueId ||
+      sourceCheckpoint.sessionId !== sessionId) {
+    throw new NativeOrdinaryResumeSourceUncommittedError();
+  }
+  const [finalization] = await input.db.select({
+    phase: nativeRunFinalizations.phase, resultId: nativeRunFinalizations.resultId,
+    runId: nativeRunFinalizations.runId, companyId: nativeRunFinalizations.companyId,
+    issueId: nativeRunFinalizations.issueId,
+  }).from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.runId, source.id),
+    eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.issueId, issueId))).limit(1);
+  if (!finalization || finalization.phase !== "committed" || !finalization.resultId ||
+      finalization.runId !== source.id || finalization.companyId !== companyId ||
+      finalization.issueId !== issueId) {
+    throw new NativeOrdinaryResumeSourceUncommittedError();
+  }
+  const [result] = await input.db.select({
+    id: nativeRunResults.id, runId: nativeRunResults.runId,
+    companyId: nativeRunResults.companyId, issueId: nativeRunResults.issueId,
+    schemaStatus: nativeRunResults.schemaStatus,
+  }).from(nativeRunResults).where(and(eq(nativeRunResults.id, finalization.resultId),
+    eq(nativeRunResults.runId, source.id), eq(nativeRunResults.companyId, companyId),
+    eq(nativeRunResults.issueId, issueId))).limit(1);
+  if (!result || result.id !== finalization.resultId || result.runId !== source.id ||
+      result.companyId !== companyId || result.issueId !== issueId || result.schemaStatus !== "accepted") {
+    throw new NativeOrdinaryResumeSourceUncommittedError();
+  }
+}
+
 export async function executePaperclipNativeSession(input: {
   getFreshSessionHandoff?: () => Promise<string | null>;
   /** Retire a retained transport so recovery can replace provider tool declarations. */
@@ -7465,6 +7587,7 @@ export async function executePaperclipNativeSession(input: {
       throw new NativeSessionStartupBusyError("owner_scope");
     }
     executingNativeOwnerScopes.set(ownerScope, ownerToken);
+    await assertOrdinaryNativeResumeSourceCommitted(input);
     await retireSupersededWarmNativeSessions(
       ownerScope, nativeSessionScopeKey(input.execution),
     );
@@ -8777,9 +8900,13 @@ async function executePaperclipNativeSessionWithinScope(
                     throw new Error("native_session_supervisor_busy");
                   }
                   existing.session = session;
+                  existing.runId = input.execution.binding.runId;
+                  existing.issueId = input.execution.binding.issueId;
                 } else
                   warmNativeSessions.set(warmSessionId, {
                     agentId: input.execution.binding.agentId,
+                    runId: input.execution.binding.runId,
+                    issueId: input.execution.binding.issueId,
                     managedAiCredentialIdentity: input.managedAiCredentialIdentity,
                     githubAuthenticationMode:
                       input.runnerEnvironment?.PAPERCLIP_GITHUB_AUTH_MODE,

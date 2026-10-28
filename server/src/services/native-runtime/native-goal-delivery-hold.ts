@@ -27,6 +27,19 @@ export class NativeSessionStartupBusyError extends Error {
   }
 }
 
+/** A different Run's durable native source is not safe to continue. Heartbeat
+ * may settle only the untouched current coordinator under its existing locks. */
+export class NativeOrdinaryResumeSourceUncommittedError extends NativeSessionStartupBusyError {
+  override readonly code = "native_ordinary_resume_source_uncommitted";
+
+  constructor(cause?: unknown) {
+    super("owner_scope");
+    this.name = "NativeOrdinaryResumeSourceUncommittedError";
+    this.message = this.code;
+    if (cause !== undefined) Object.defineProperty(this, "cause", { value: cause, configurable: true });
+  }
+}
+
 /** A fresh attempt acquired its own lease but could not retire a prior warm
  * transport. The exact lease identity is required before settling that new Run. */
 export class NativeWarmSessionRetirementPendingError extends NativeSessionStartupBusyError {

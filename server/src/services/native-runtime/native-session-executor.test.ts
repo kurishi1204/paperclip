@@ -344,6 +344,9 @@ import {
 beforeEach(() => {
   state.createAssignedMcpTools.mockReset();
   state.resolveRunnerBinary.mockReset().mockReturnValue("/tmp/paperclip-runnerd");
+  state.stageNativeRunnerWakeAttachments.mockReset().mockImplementation(async () => ({
+    attachments: [], cleanup: async () => undefined,
+  }));
   state.resolveCurrentWakeCommentsBinding.mockReset().mockResolvedValue(null);
   state.assertCurrentWakeCommentsRead.mockReset().mockResolvedValue(undefined);
 });
@@ -4858,6 +4861,12 @@ function leaseDb(
   runnerProfileJson: Record<string, unknown> = {},
   runStatus = "running",
   leaseProbe?: { owner: string | null; releaseMatched: boolean },
+  ordinaryResumeSource?: {
+    run: Record<string, unknown> & { id: string };
+    newerRun?: Record<string, unknown> & { id: string };
+    finalization: Record<string, unknown> | null;
+    result?: Record<string, unknown> | null;
+  },
 ): Db {
   const coordinator: LeaseCoordinator = {
     runId: boundExecution.binding.runId,
@@ -4906,7 +4915,7 @@ function leaseDb(
   });
   const select = () => ({
     from: (table: unknown) => {
-      const rows =
+      let rows: Array<Record<string, unknown>> =
         table === nativeRunFinalizations
           ? [coordinator]
           : table === heartbeatRuns
@@ -4935,8 +4944,29 @@ function leaseDb(
                 ]
               : [];
       const query = {
-        then: Promise.resolve(rows).then.bind(Promise.resolve(rows)),
-        where: () => query,
+        then: (resolve: (value: unknown[]) => unknown, reject?: (reason: unknown) => unknown) =>
+          Promise.resolve(rows).then(resolve, reject),
+        where: (predicate: Parameters<PgDialect["sqlToQuery"]>[0]) => {
+          const { sql, params } = new PgDialect().sqlToQuery(predicate);
+          if (table === heartbeatRuns && sql.includes("native_session_id") &&
+              params.includes(boundExecution.session.normalizedSessionId)) {
+            rows = ordinaryResumeSource
+              ? ordinaryResumeSource.newerRun
+                ? [ordinaryResumeSource.newerRun, ordinaryResumeSource.run]
+                : [ordinaryResumeSource.run]
+              : [];
+          } else if (ordinaryResumeSource) {
+            if (table === heartbeatRuns && params.includes(ordinaryResumeSource.run.id)) {
+              rows = [ordinaryResumeSource.run];
+            } else if (table === nativeRunFinalizations &&
+                params.includes(ordinaryResumeSource.run.id)) {
+              rows = ordinaryResumeSource.finalization ? [ordinaryResumeSource.finalization] : [];
+            } else if (table === nativeRunResults && params.includes(ordinaryResumeSource.run.id)) {
+              rows = ordinaryResumeSource.result ? [ordinaryResumeSource.result] : [];
+            }
+          }
+          return query;
+        },
         orderBy: () => query,
         for: () => query,
         limit: () => Promise.resolve(rows),
@@ -6025,6 +6055,12 @@ describe("native session same-turn steering", () => {
 });
 
 describe("native warm session supervision", () => {
+  afterEach(async () => {
+    const cleanup = await closeIdleWarmNativeSessionsForRestart();
+    expect(cleanup.busy).toBe(0);
+    expect(cleanup.failed).toBe(0);
+  });
+
   it.each([
     { runTerminalState: "failed", managedFiles: true },
     { runTerminalState: "cancelled", managedFiles: true },
@@ -6178,8 +6214,30 @@ describe("native warm session supervision", () => {
       const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId: name, remoteCwd: `/tmp/${name}`, sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId: name } };
       const copy = { runId: current.binding.runId, root: `/tmp/${name}/home`, collectStopped, checkpointWarm, hasChanges: vi.fn(async () => true) };
       state.execute.mockReset().mockImplementationOnce(async options => { await options.onSession?.(session); return result; });
-      const run = (next: NativeExecutionInputV1, nextCopy = copy) => executePaperclipNativeSession({
-        db: leaseDb(next), execution: next, runnerInstanceId: name, runnerExecutionTarget: target, instructionWorkingCopy: nextCopy });
+      const run = (next: NativeExecutionInputV1, nextCopy = copy) => {
+        const sourceRunId = current.binding.runId;
+        const sourceResultId = `${sourceRunId}-accepted-result`;
+        const priorCommittedSource = next.binding.runId === sourceRunId ? undefined : {
+          run: {
+            id: sourceRunId, companyId: current.binding.companyId,
+            agentId: current.binding.agentId, nativeIssueId: current.binding.issueId,
+            nativeSessionId: current.session.normalizedSessionId,
+            runtimeMode: "native", status: "succeeded",
+            runnerProfileJson: { sessionCheckpoint: { identity: {
+              runId: sourceRunId, companyId: current.binding.companyId,
+              agentId: current.binding.agentId, issueId: current.binding.issueId,
+              sessionId: current.session.normalizedSessionId,
+            } } },
+          },
+          finalization: { runId: sourceRunId, companyId: current.binding.companyId,
+            issueId: current.binding.issueId, phase: "committed", resultId: sourceResultId },
+          result: { id: sourceResultId, runId: sourceRunId,
+            companyId: current.binding.companyId, issueId: current.binding.issueId,
+            schemaStatus: "accepted" },
+        };
+        return executePaperclipNativeSession({ db: leaseDb(next, {}, {}, [], {}, "running", undefined, priorCommittedSource),
+          execution: next, runnerInstanceId: name, runnerExecutionTarget: target, instructionWorkingCopy: nextCopy });
+      };
       await run(current);
       const reserve = (canReuse: () => Promise<boolean>, nextTarget = target) => reserveWarmNativeInstructionDirectory({
         companyId: current.binding.companyId, agentId: current.binding.agentId, previousRunId: current.binding.runId,
@@ -6377,7 +6435,8 @@ describe("native warm session supervision", () => {
         return result;
       });
       await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner" });
-      await executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: "runner",
+      await executePaperclipNativeSession({ db: leaseDb(next, {}, {}, [], {}, "running", undefined,
+        committedOrdinarySource(base)), execution: next, runnerInstanceId: "runner",
         runnerEnvironment: { PAPERCLIP_AGENT_KEY_ID: "sha256:identity-key" } });
       expect(state.execute).toHaveBeenCalledTimes(2);
     });
@@ -6633,7 +6692,8 @@ describe("native warm session supervision", () => {
       const shutdown = order === "checkpoint first" ? closeIdleWarmNativeSessionsForRestart() : undefined;
       if (shutdown) await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
       const continuation = executePaperclipNativeSession({
-        db: leaseDb(second), execution: second,
+        db: leaseDb(second, {}, {}, [], {}, "running", undefined,
+          committedOrdinarySource(first)), execution: second,
         runnerInstanceId: "runner-close-race", useRunnerd: true,
       }).catch((error) => error);
       try {
@@ -6864,7 +6924,8 @@ describe("native warm session supervision", () => {
       runnerInstanceId: "runner",
     });
     await executePaperclipNativeSession({
-      db: leaseDb(second),
+      db: leaseDb(second, {}, {}, [], {}, "running", undefined,
+        committedOrdinarySource(base)),
       execution: second,
       runnerInstanceId: "runner",
     });
@@ -7229,22 +7290,29 @@ describe("native warm session supervision", () => {
           join(durableRoot, "runner", "runner-state.json"),
           JSON.stringify(durableRunnerState(durableIdentity, "ready")),
         );
-        const continuationDb = {
-          ...leaseDb(second),
-          select: () => ({
-            from: () => ({
-              where: () => ({
-                limit: () =>
-                  Promise.resolve([
-                    {
-                      status: "succeeded",
-                      runnerProfileJson: { nativeExecutionInput: first },
-                    },
-                  ]),
-              }),
-            }),
-          }),
-        } as unknown as Db;
+        const priorRunId = first.binding.runId;
+        const priorResultId = `${priorRunId}-accepted-result`;
+        const continuationDb = leaseDb(second, {}, {}, [], {}, "running", undefined, {
+          run: {
+            id: priorRunId, companyId: first.binding.companyId,
+            agentId: first.binding.agentId, nativeIssueId: first.binding.issueId,
+            nativeSessionId: first.session.normalizedSessionId,
+            runtimeMode: "native", status: "succeeded",
+            runnerProfileJson: {
+              nativeExecutionInput: first,
+              sessionCheckpoint: { identity: {
+                runId: priorRunId, companyId: first.binding.companyId,
+                agentId: first.binding.agentId, issueId: first.binding.issueId,
+                sessionId: first.session.normalizedSessionId,
+              } },
+            },
+          },
+          finalization: { runId: priorRunId, companyId: first.binding.companyId,
+            issueId: first.binding.issueId, phase: "committed", resultId: priorResultId },
+          result: { id: priorResultId, runId: priorRunId,
+            companyId: first.binding.companyId, issueId: first.binding.issueId,
+            schemaStatus: "accepted" },
+        });
         await executePaperclipNativeSession({
           db: continuationDb,
           execution: second,
@@ -7456,7 +7524,8 @@ describe("native warm session supervision", () => {
         runnerInstanceId: "runner",
       });
       await executePaperclipNativeSession({
-        db: leaseDb(lowered),
+        db: leaseDb(lowered, {}, {}, [], {}, "running", undefined,
+          committedOrdinarySource(base)),
         execution: lowered,
         managedAiCredentialIdentity: change === "managed credential" ? "second-identity" : "first-identity",
         runnerInstanceId: "runner",
@@ -7586,6 +7655,12 @@ describe("native session bounded recovery", () => {
           throw secondaryFailure;
         }
       });
+      // An ordinary Run can use an existing checkpoint only when its prior
+      // Run has a committed, accepted source with the same session binding.
+      const checkpointSourceRun = {
+        ...execution,
+        binding: { ...execution.binding, runId: `${execution.binding.runId}-checkpoint-source` },
+      };
       const db = leaseDb(
         execution,
         {},
@@ -7595,9 +7670,19 @@ describe("native session bounded recovery", () => {
           ? {
               sessionCheckpoint: {
                 providerSessionId: "provider-existing",
+                identity: {
+                  runId: checkpointSourceRun.binding.runId,
+                  companyId: execution.binding.companyId,
+                  agentId: execution.binding.agentId,
+                  issueId: execution.binding.issueId,
+                  sessionId: execution.session.normalizedSessionId,
+                },
               },
             }
           : {},
+        "running",
+        undefined,
+        checkpointExists ? committedOrdinarySource(checkpointSourceRun) : undefined,
       );
       const transact = db.transaction.bind(db);
       const recoveryWriteAttempt = vi.fn();
@@ -8738,22 +8823,29 @@ describe("runnerd provider runtime wiring", () => {
         nativeEventCount: 1,
         highestContiguousSourceSeq: 1,
       });
-      const continuationDb = {
-        ...leaseDb(continuation),
-        select: () => ({
-          from: () => ({
-            where: () => ({
-              limit: () =>
-                Promise.resolve([
-                  {
-                    status: "succeeded",
-                    runnerProfileJson: { nativeExecutionInput: prior },
-                  },
-                ]),
-            }),
-          }),
-        }),
-      } as unknown as Db;
+      const priorRunId = prior.binding.runId;
+      const priorResultId = `${priorRunId}-accepted-result`;
+      const continuationDb = leaseDb(continuation, {}, {}, [], {}, "running", undefined, {
+        run: {
+          id: priorRunId, companyId: prior.binding.companyId,
+          agentId: prior.binding.agentId, nativeIssueId: prior.binding.issueId,
+          nativeSessionId: prior.session.normalizedSessionId,
+          runtimeMode: "native", status: "succeeded",
+          runnerProfileJson: {
+            nativeExecutionInput: prior,
+            sessionCheckpoint: { identity: {
+              runId: priorRunId, companyId: prior.binding.companyId,
+              agentId: prior.binding.agentId, issueId: prior.binding.issueId,
+              sessionId: prior.session.normalizedSessionId,
+            } },
+          },
+        },
+        finalization: { runId: priorRunId, companyId: prior.binding.companyId,
+          issueId: prior.binding.issueId, phase: "committed", resultId: priorResultId },
+        result: { id: priorResultId, runId: priorRunId,
+          companyId: prior.binding.companyId, issueId: prior.binding.issueId,
+          schemaStatus: "accepted" },
+      });
 
       await executePaperclipNativeSession({
         db: continuationDb,
@@ -11845,8 +11937,44 @@ it.each([
   ).toBe("native_event_replay_conflict");
 });
 
+function committedOrdinarySource(prior: NativeExecutionInputV1) {
+  const { runId, companyId, agentId, issueId } = prior.binding;
+  const sessionId = prior.session.normalizedSessionId;
+  const resultId = `${runId}-accepted-result`;
+  return {
+    run: { id: runId, companyId, agentId, nativeIssueId: issueId,
+      nativeSessionId: sessionId, runtimeMode: "native", status: "succeeded",
+      runnerProfileJson: { sessionCheckpoint: { identity: {
+        runId, companyId, agentId, issueId, sessionId,
+      } } } },
+    finalization: { runId, companyId, issueId, phase: "committed", resultId },
+    result: { id: resultId, runId, companyId, issueId, schemaStatus: "accepted" },
+  };
+}
+
+function uncommittedOrdinarySource(
+  prior: NativeExecutionInputV1,
+  status: "running" | "failed",
+  phase: "observed" | "terminal_failure",
+) {
+  // Give the predecessor a valid checkpoint binding so rejection proves its
+  // unsettled outcome, even under the most favorable identity evidence.
+  const { runId, companyId, agentId, issueId } = prior.binding;
+  const sessionId = prior.session.normalizedSessionId;
+  return {
+    run: { id: runId, companyId, agentId, nativeIssueId: issueId,
+      nativeSessionId: sessionId, runtimeMode: "native", status,
+      runnerProfileJson: { sessionCheckpoint: { identity: {
+        runId, companyId, agentId, issueId, sessionId,
+      } } } },
+    finalization: { runId, companyId, issueId, phase, resultId: null },
+    result: null,
+  };
+}
+
 function ownedGoalDeliveryDb(options: { loseHoldCas?: boolean; execution?: NativeExecutionInputV1;
-  coordinator?: Record<string, unknown> } = {}) {
+  coordinator?: Record<string, unknown>;
+  ordinaryResumeSource?: ReturnType<typeof committedOrdinarySource> } = {}) {
   const boundExecution = options.execution ?? execution;
   const coordinator: Record<string, any> = {
     runId: boundExecution.binding.runId, companyId: boundExecution.binding.companyId,
@@ -11868,12 +11996,33 @@ function ownedGoalDeliveryDb(options: { loseHoldCas?: boolean; execution?: Nativ
   const dialect = new PgDialect();
   const select = () => ({
     from: (table: unknown) => {
-      const rows = table === nativeRunFinalizations ? [coordinator]
+      let rows: Array<Record<string, any>> = table === nativeRunFinalizations ? [coordinator]
         : table === heartbeatRuns ? [run]
         : table === issues ? [issue] : [];
       const query = {
-        then: Promise.resolve(rows).then.bind(Promise.resolve(rows)),
-        where: () => query,
+        then: (resolve: (value: Array<Record<string, any>>) => unknown,
+          reject?: (reason: unknown) => unknown) => Promise.resolve(rows).then(resolve, reject),
+        where: (predicate: Parameters<PgDialect["sqlToQuery"]>[0]) => {
+          const { sql, params } = dialect.sqlToQuery(predicate);
+          if (table === heartbeatRuns && sql.includes("native_session_id") && sql.includes("<>") &&
+              params.includes(boundExecution.binding.runId) &&
+              params.includes(boundExecution.session.normalizedSessionId)) {
+            // This is the actual cross-Run predecessor lookup. The current
+            // running Run can never satisfy its id <> currentRunId predicate.
+            rows = options.ordinaryResumeSource ? [options.ordinaryResumeSource.run] : [];
+          } else if (table === heartbeatRuns) {
+            rows = params.includes(boundExecution.binding.runId) ? [run] : [];
+          } else if (table === nativeRunFinalizations && options.ordinaryResumeSource &&
+              params.includes(options.ordinaryResumeSource.run.id)) {
+            rows = options.ordinaryResumeSource.finalization
+              ? [options.ordinaryResumeSource.finalization] : [];
+          } else if (table === nativeRunResults && options.ordinaryResumeSource &&
+              params.includes(options.ordinaryResumeSource.run.id)) {
+            rows = options.ordinaryResumeSource.result
+              ? [options.ordinaryResumeSource.result] : [];
+          }
+          return query;
+        },
         for: () => query,
         limit: () => Promise.resolve(rows),
         orderBy: () => query,
@@ -11891,7 +12040,8 @@ function ownedGoalDeliveryDb(options: { loseHoldCas?: boolean; execution?: Nativ
           Object.assign(coordinator, values);
           returned = [{ runId: coordinator.runId }];
         }
-      } else if (table === nativeRunFinalizations && values.phase === "terminal_failure") {
+      } else if (table === nativeRunFinalizations && values.phase === "terminal_failure" &&
+          typeof (values.failureDetail as Record<string, unknown> | undefined)?.claimState === "string") {
         // This double refuses a stale owner/result update and verifies that
         // production SQL carries the owner-bound, result-null CAS predicates.
         for (const column of ["lease_owner", "attempt", "controller_boot_id", "controller_pid", "controller_process_started_at", "lease_expires_at", "result_id"]) {
@@ -12025,7 +12175,8 @@ describe("owned goal delivery admission", () => {
       expect(oldReservation).not.toBeNull();
       const secondCopy = { ...copy, runId: second.binding.runId };
       oldReservation?.adopt(secondCopy.root, secondCopy.collectStopped);
-      await executePaperclipNativeSession({ db: leaseDb(second), execution: second,
+      await executePaperclipNativeSession({ db: leaseDb(second, {}, {}, [], {}, "running", undefined,
+        committedOrdinarySource(first)), execution: second,
         runnerInstanceId: name, instructionWorkingCopy: secondCopy });
       expect(await settleNativeSessionStartupBusy(new NativeSessionStartupBusyError("same_run"), {
         failCurrentRun: async () => { throw new Error("must not settle successor"); },
@@ -12080,7 +12231,8 @@ describe("owned goal delivery admission", () => {
       const claim = vi.fn(async () => { throw new Error("must not claim"); });
       const inspect = vi.fn(async () => ({ state: "ready" as const, receiptRelation: "no_valid_receipt" as const,
         claimOwnerRunId: null, claimId: null }));
-      await expect(executePaperclipNativeSession({ db: leaseDb(second, {}, {}, writes, {}, "running", leaseProbe), execution: second,
+      await expect(executePaperclipNativeSession({ db: leaseDb(second, {}, {}, writes, {}, "running", leaseProbe,
+        committedOrdinarySource(first)), execution: second,
         runnerInstanceId: name, sessionGoalControl: control, claimGoalDelivery: claim,
         inspectGoalDelivery: inspect,
       })).rejects.toThrow();
@@ -12099,7 +12251,7 @@ describe("owned goal delivery admission", () => {
   });
 
   it.each(["inspection", "claim"] as const)(
-    "retires a reused warm session after a settled %s HOLD", async mode => {
+    "retires a reused warm session and fences continuation after a settled %s HOLD", async mode => {
     const sessionName = `goal-hold-warm-reuse-${mode}`;
     const first = { ...execution,
       binding: { ...execution.binding, runId: `${sessionName}-first`, executionWorkspaceId: sessionName },
@@ -12121,13 +12273,10 @@ describe("owned goal delivery admission", () => {
       await options.beforeSessionGoalControl?.(control);
       throw new Error("claim boundary did not reject");
     });
-    state.execute.mockImplementationOnce(async options => {
-      expect(options.existingSession).toBeUndefined();
-      return completed;
-    });
     try {
       await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: sessionName });
-      const heldDb = ownedGoalDeliveryDb({ execution: second });
+      const heldDb = ownedGoalDeliveryDb({ execution: second,
+        ordinaryResumeSource: committedOrdinarySource(first) });
       const claim = vi.fn(async () => unknownReceipt());
       await expect(executePaperclipNativeSession({ db: heldDb.db, execution: second,
         runnerInstanceId: sessionName, sessionGoalControl: control,
@@ -12140,15 +12289,18 @@ describe("owned goal delivery admission", () => {
       expect(heldDb.run.status).toBe("failed");
       expect(session.close).toHaveBeenCalledOnce();
       expect(claim).toHaveBeenCalledTimes(mode === "claim" ? 1 : 0);
-      await expect(executePaperclipNativeSession({ db: leaseDb(third), execution: third,
-        runnerInstanceId: sessionName })).resolves.toMatchObject({ exitCode: 0 });
-      expect(state.execute).toHaveBeenCalledTimes(mode === "claim" ? 3 : 2);
+      state.createBackend.mockClear();
+      await expect(executePaperclipNativeSession({ db: leaseDb(third, {}, {}, [], {}, "running", undefined,
+        uncommittedOrdinarySource(second, "failed", "terminal_failure")), execution: third,
+        runnerInstanceId: sessionName })).rejects.toThrow("native_ordinary_resume_source_uncommitted");
+      expect(state.createBackend).not.toHaveBeenCalled();
+      expect(state.execute).toHaveBeenCalledTimes(mode === "claim" ? 2 : 1);
     } finally {
       await closeIdleWarmNativeSessionsForRestart();
     }
   });
 
-  it("keeps a caller-owned warm session when the goal HOLD CAS loses", async () => {
+  it("keeps a caller-owned warm session and fences a successor when the goal HOLD CAS loses", async () => {
     const name = "goal-hold-warm-cas-loser";
     const first = { ...execution,
       binding: { ...execution.binding, runId: `${name}-first`, executionWorkspaceId: name },
@@ -12164,13 +12316,11 @@ describe("owned goal delivery admission", () => {
     state.execute.mockReset().mockImplementationOnce(async options => {
       await options.onSession?.(session);
       return completed;
-    }).mockImplementationOnce(async options => {
-      expect(options.existingSession).toBe(session);
-      return completed;
     });
     try {
       await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: name });
-      const heldDb = ownedGoalDeliveryDb({ execution: second, loseHoldCas: true });
+      const heldDb = ownedGoalDeliveryDb({ execution: second, loseHoldCas: true,
+        ordinaryResumeSource: committedOrdinarySource(first) });
       await expect(executePaperclipNativeSession({ db: heldDb.db, execution: second,
         runnerInstanceId: name, sessionGoalControl: control,
         inspectGoalDelivery: async () => unknownReceipt(),
@@ -12179,9 +12329,14 @@ describe("owned goal delivery admission", () => {
       expect(heldDb.coordinator.phase).toBe("observed");
       expect(heldDb.run.status).toBe("running");
       expect(session.close).not.toHaveBeenCalled();
-      await expect(executePaperclipNativeSession({ db: leaseDb(successor), execution: successor,
-        runnerInstanceId: name })).resolves.toMatchObject({ exitCode: 0 });
-      expect(state.execute).toHaveBeenCalledTimes(2);
+      state.createBackend.mockClear();
+      await expect(executePaperclipNativeSession({ db: leaseDb(successor, {}, {}, [], {}, "running", undefined,
+        uncommittedOrdinarySource(second, "running", "observed")), execution: successor,
+        runnerInstanceId: name })).rejects.toThrow("native_ordinary_resume_source_uncommitted");
+      expect(state.createBackend).not.toHaveBeenCalled();
+      expect(state.execute).toHaveBeenCalledOnce();
+      expect(heldDb.coordinator.phase).toBe("observed");
+      expect(heldDb.run.status).toBe("running");
       expect(session.close).not.toHaveBeenCalled();
     } finally {
       await closeIdleWarmNativeSessionsForRestart();
@@ -12211,7 +12366,8 @@ describe("owned goal delivery admission", () => {
     });
     try {
       await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: name });
-      const heldDb = ownedGoalDeliveryDb({ execution: second, loseHoldCas: true });
+      const heldDb = ownedGoalDeliveryDb({ execution: second, loseHoldCas: true,
+        ordinaryResumeSource: committedOrdinarySource(first) });
       await expect(executePaperclipNativeSession({ db: heldDb.db, execution: second,
         runnerInstanceId: name, sessionGoalControl: control,
         inspectGoalDelivery: async () => ({ state: "ready", receiptRelation: "no_valid_receipt",
@@ -12248,7 +12404,8 @@ describe("owned goal delivery admission", () => {
     });
     try {
       await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: name });
-      const heldDb = ownedGoalDeliveryDb({ execution: second });
+      const heldDb = ownedGoalDeliveryDb({ execution: second,
+        ordinaryResumeSource: committedOrdinarySource(first) });
       await expect(executePaperclipNativeSession({ db: heldDb.db, execution: second,
         runnerInstanceId: name, sessionGoalControl: control,
         inspectGoalDelivery: async () => ({ state: "ready", receiptRelation: "no_valid_receipt",
@@ -12262,7 +12419,7 @@ describe("owned goal delivery admission", () => {
     }
   });
 
-  it.each(["same", "different"] as const)("retries retirement after a settled goal HOLD close failure for a %s warm scope", async nextScope => {
+  it.each(["same", "different"] as const)("fences or retires a %s warm scope after a settled goal HOLD close failure", async nextScope => {
     const name = `goal-hold-warm-close-failure-${nextScope}`;
     const first = { ...execution,
       binding: { ...execution.binding, runId: `${name}-first`, executionWorkspaceId: name },
@@ -12288,38 +12445,52 @@ describe("owned goal delivery admission", () => {
       expect(options.existingSession).toBeUndefined();
       return completed;
     });
-    await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: name });
-    const heldDb = ownedGoalDeliveryDb({ execution: second });
-    let caught: unknown;
     try {
-      await executePaperclipNativeSession({ db: heldDb.db, execution: second,
-        runnerInstanceId: name, sessionGoalControl: control,
-        inspectGoalDelivery: async () => unknownReceipt(),
-        claimGoalDelivery: async () => { throw new Error("must not claim"); },
+      await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: name });
+      const heldDb = ownedGoalDeliveryDb({ execution: second,
+        ordinaryResumeSource: committedOrdinarySource(first) });
+      let caught: unknown;
+      try {
+        await executePaperclipNativeSession({ db: heldDb.db, execution: second,
+          runnerInstanceId: name, sessionGoalControl: control,
+          inspectGoalDelivery: async () => unknownReceipt(),
+          claimGoalDelivery: async () => { throw new Error("must not claim"); },
+        });
+      } catch (error) { caught = error; }
+      expect(caught).toBeInstanceOf(NativeGoalDeliveryHeldError);
+      expect((caught as NativeGoalDeliveryHeldError).settled).toBe(true);
+      expect((caught as NativeGoalDeliveryHeldError).resourceRetirementDeferred).toBe(true);
+      expect((caught as Error & { cause?: unknown }).cause).toBe(closeFailure);
+      expect(heldDb.coordinator.phase).toBe("terminal_failure");
+      expect(heldDb.run.status).toBe("failed");
+      expect(heldDb.coordinator.failureDetail?.resourceRetirementDeferred).toBe(true);
+      expect(session.close).toHaveBeenCalledOnce();
+      if (nextScope === "same") {
+        state.createBackend.mockClear();
+        await expect(executePaperclipNativeSession({ db: leaseDb(third, {}, {}, [], {}, "running", undefined,
+          uncommittedOrdinarySource(second, "failed", "terminal_failure")), execution: third,
+          runnerInstanceId: name })).rejects.toThrow("native_ordinary_resume_source_uncommitted");
+        expect(state.createBackend).not.toHaveBeenCalled();
+        expect(session.close).toHaveBeenCalledOnce();
+        expect(state.execute).toHaveBeenCalledOnce();
+      } else {
+        await expect(executePaperclipNativeSession({ db: leaseDb(third), execution: third,
+          runnerInstanceId: name })).resolves.toMatchObject({ exitCode: 0 });
+        expect(session.close).toHaveBeenCalledTimes(2);
+        expect(state.execute).toHaveBeenCalledTimes(2);
+      }
+      // Provider retirement alone does not prove the old environment lease
+      // can be stopped; this failed Run keeps its durable pending receipt.
+      expect(heldDb.coordinator.failureDetail?.resourceRetirementDeferred).toBe(true);
+      expect(heldDb.coordinator.failureDetail).toMatchObject({
+        claimState: "indeterminate", receiptRelation: "no_valid_receipt",
       });
-    } catch (error) { caught = error; }
-    expect(caught).toBeInstanceOf(NativeGoalDeliveryHeldError);
-    expect((caught as NativeGoalDeliveryHeldError).settled).toBe(true);
-    expect((caught as NativeGoalDeliveryHeldError).resourceRetirementDeferred).toBe(true);
-    expect((caught as Error & { cause?: unknown }).cause).toBe(closeFailure);
-    expect(heldDb.coordinator.phase).toBe("terminal_failure");
-    expect(heldDb.run.status).toBe("failed");
-    expect(heldDb.coordinator.failureDetail?.resourceRetirementDeferred).toBe(true);
-    expect(session.close).toHaveBeenCalledOnce();
-    await expect(executePaperclipNativeSession({ db: leaseDb(third), execution: third,
-      runnerInstanceId: name })).resolves.toMatchObject({ exitCode: 0 });
-    expect(session.close).toHaveBeenCalledTimes(2);
-    // Retirement of the transport does not by itself prove that the old
-    // environment lease can be stopped while this new Run uses the sandbox.
-    expect(heldDb.coordinator.failureDetail?.resourceRetirementDeferred).toBe(true);
-    expect(heldDb.coordinator.failureDetail).toMatchObject({
-      claimState: "indeterminate", receiptRelation: "no_valid_receipt",
-    });
-    expect(state.execute).toHaveBeenCalledTimes(2);
-    await closeIdleWarmNativeSessionsForRestart();
+    } finally {
+      await closeIdleWarmNativeSessionsForRestart();
+    }
   });
 
-  it("fences a fresh owned Run when warm retirement fails again before provider admission", async () => {
+  it("fences a same-session Run before retrying retirement of an uncommitted warm source", async () => {
     const name = "goal-hold-warm-retirement-pending";
     const first = { ...execution,
       binding: { ...execution.binding, runId: `${name}-first`, executionWorkspaceId: name },
@@ -12339,18 +12510,27 @@ describe("owned goal delivery admission", () => {
     });
     try {
       await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: name });
-      await expect(executePaperclipNativeSession({ db: ownedGoalDeliveryDb({ execution: second }).db,
+      const heldDb = ownedGoalDeliveryDb({ execution: second,
+        ordinaryResumeSource: committedOrdinarySource(first) });
+      await expect(executePaperclipNativeSession({ db: heldDb.db,
         execution: second, runnerInstanceId: name, sessionGoalControl: control,
         inspectGoalDelivery: async () => unknownReceipt(),
         claimGoalDelivery: async () => { throw new Error("must not claim"); },
       })).rejects.toMatchObject({ settled: true, resourceRetirementDeferred: true });
-      const thirdDb = leaseDb(third);
+      const thirdDb = leaseDb(third, {}, {}, [], {}, "running", undefined,
+        uncommittedOrdinarySource(second, "failed", "terminal_failure"));
+      state.createBackend.mockClear();
       await expect(executePaperclipNativeSession({ db: thirdDb, execution: third,
-        runnerInstanceId: name })).rejects.toBeInstanceOf(NativeWarmSessionRetirementPendingError);
-      expect(session.close).toHaveBeenCalledTimes(2);
+        runnerInstanceId: name })).rejects.toThrow("native_ordinary_resume_source_uncommitted");
+      expect(state.createBackend).not.toHaveBeenCalled();
+      expect(session.close).toHaveBeenCalledOnce();
       expect(state.execute).toHaveBeenCalledOnce();
+      expect(heldDb.coordinator.failureDetail?.resourceRetirementDeferred).toBe(true);
     } finally {
-      await closeIdleWarmNativeSessionsForRestart();
+      const firstRetirement = await closeIdleWarmNativeSessionsForRestart();
+      const secondRetirement = await closeIdleWarmNativeSessionsForRestart();
+      expect(firstRetirement.failed).toBe(1);
+      expect(secondRetirement.closed).toBe(1);
     }
   });
 
@@ -12379,7 +12559,8 @@ describe("owned goal delivery admission", () => {
     try {
       await executePaperclipNativeSession({ db: leaseDb(first), execution: first,
         runnerInstanceId: name, instructionWorkingCopy: copy });
-      await expect(executePaperclipNativeSession({ db: ownedGoalDeliveryDb({ execution: second }).db,
+      await expect(executePaperclipNativeSession({ db: ownedGoalDeliveryDb({ execution: second,
+        ordinaryResumeSource: committedOrdinarySource(first) }).db,
         execution: second, runnerInstanceId: name, instructionWorkingCopy: { ...copy, runId: second.binding.runId },
         sessionGoalControl: control, inspectGoalDelivery: async () => unknownReceipt(),
         claimGoalDelivery: async () => { throw new Error("must not claim"); },
@@ -12402,7 +12583,7 @@ describe("owned goal delivery admission", () => {
     }
   });
 
-  it("removes a held warm attempt's broker before a different Run reuses its idle session", async () => {
+  it("removes a held warm attempt's broker and fences a same-session successor", async () => {
     const name = "goal-held-warm-broker";
     const first = { ...execution,
       binding: { ...execution.binding, runId: `${name}-first`, executionWorkspaceId: name },
@@ -12428,23 +12609,25 @@ describe("owned goal delivery admission", () => {
       await options.onSession?.(session);
       await options.beforeSessionGoalControl?.(control);
       throw new Error("claim boundary did not reject");
-    }).mockImplementationOnce(async options => {
-      expect(options.existingSession).toBe(session);
-      expect(dispatchLiveRunnerGoalControl(binding, control)).toBeNull();
-      return completed;
     });
     try {
       await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: name });
       runnerGoalControlBrokerInternals.resetForTests();
-      await expect(executePaperclipNativeSession({ db: leaseDb(second), execution: second,
+      await expect(executePaperclipNativeSession({ db: leaseDb(second, {}, {}, [], {}, "running", undefined,
+        committedOrdinarySource(first)), execution: second,
         runnerInstanceId: name, sessionGoalControl: control,
         inspectGoalDelivery: async () => ({ state: "ready", receiptRelation: "no_valid_receipt", claimOwnerRunId: null, claimId: null }),
         claimGoalDelivery: claim,
-      })).rejects.toBeInstanceOf(NativeGoalDeliveryHeldError);
+      })).rejects.toMatchObject({ settled: false });
       expect(claim).toHaveBeenCalledOnce();
       expect(dispatchLiveRunnerGoalControl(binding, control)).toBeNull();
-      await expect(executePaperclipNativeSession({ db: leaseDb(third), execution: third,
-        runnerInstanceId: name })).resolves.toMatchObject({ exitCode: 0 });
+      state.createBackend.mockClear();
+      await expect(executePaperclipNativeSession({ db: leaseDb(third, {}, {}, [], {}, "running", undefined,
+        uncommittedOrdinarySource(second, "running", "observed")), execution: third,
+        runnerInstanceId: name })).rejects.toThrow("native_ordinary_resume_source_uncommitted");
+      expect(state.createBackend).not.toHaveBeenCalled();
+      expect(state.execute).toHaveBeenCalledTimes(2);
+      expect(dispatchLiveRunnerGoalControl(binding, control)).toBeNull();
       expect(goal).not.toHaveBeenCalled();
       expect(session.close).not.toHaveBeenCalled();
     } finally {
@@ -13021,7 +13204,7 @@ describe("owned goal delivery admission", () => {
   });
 
   it.each(["claim", "consume"] as const)(
-    "releases a newly recovered warm entry after a %s HOLD so a later turn is not supervisor-busy",
+    "releases a newly recovered warm entry after a %s HOLD but fences same-session successors",
     async mode => {
       const actual = await vi.importActual<typeof import("../../vendor/paperclip-runner/index.js")>(
         "../../vendor/paperclip-runner/index.js",
@@ -13081,23 +13264,12 @@ describe("owned goal delivery admission", () => {
         async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; },
         async completeRun() {},
       };
-      const completed = { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" },
-        turnId: name, normalizedSessionId: name, providerSessionId: name,
-        driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1 };
       let oldOnSession: Parameters<typeof actual.executeNativeSession>[0]["onSession"];
-      const successorSession = { close: vi.fn(async () => undefined) };
       state.execute.mockReset().mockImplementationOnce(async options => {
         expect(options.existingSession).toBeUndefined();
         oldOnSession = options.onSession;
         return actual.executeNativeSession({ ...options, backend, controlPlane,
           persistedSession: snapshot });
-      }).mockImplementationOnce(async options => {
-        expect(options.existingSession).toBeUndefined();
-        await options.onSession?.(successorSession);
-        return completed;
-      }).mockImplementationOnce(async options => {
-        expect(options.existingSession).toBe(successorSession);
-        return completed;
       });
       const claim = vi.fn(async () => ({ state: "indeterminate" as const,
         receiptRelation: "no_valid_receipt" as const, claimOwnerRunId: null, claimId: null }));
@@ -13132,19 +13304,298 @@ describe("owned goal delivery admission", () => {
         expect(githubAccess.stop).toHaveBeenCalledTimes(mode === "claim" ? 1 : 0);
         expect(fixture.coordinator.phase).toBe("observed");
         expect(fixture.run.status).toBe("running");
-        const laterTurn = executePaperclipNativeSession({ db: leaseDb(next), execution: next,
+        state.createBackend.mockClear();
+        const prior = uncommittedOrdinarySource(first, "running", "observed");
+        const laterTurn = executePaperclipNativeSession({ db: leaseDb(next, {}, {}, [], {}, "running", undefined, prior), execution: next,
           runnerInstanceId: name });
-        await laterTurn.catch(() => undefined);
-        expect(state.execute).toHaveBeenCalledTimes(2);
-        await expect(laterTurn).resolves.toMatchObject({ exitCode: 0 });
+        await expect(laterTurn).rejects.toThrow("native_ordinary_resume_source_uncommitted");
+        expect(state.createBackend).not.toHaveBeenCalled();
+        expect(state.execute).toHaveBeenCalledOnce();
         await oldOnSession?.(null);
-        await expect(executePaperclipNativeSession({ db: leaseDb(successor), execution: successor,
-          runnerInstanceId: name })).resolves.toMatchObject({ exitCode: 0 });
-        expect(state.execute).toHaveBeenCalledTimes(3);
-        expect(successorSession.close).not.toHaveBeenCalled();
+        await expect(executePaperclipNativeSession({ db: leaseDb(successor, {}, {}, [], {}, "running", undefined, prior), execution: successor,
+          runnerInstanceId: name })).rejects.toThrow("native_ordinary_resume_source_uncommitted");
+        expect(state.execute).toHaveBeenCalledOnce();
+        expect(fixture.coordinator.leaseOwner).toBe(leaseOwner);
+        expect(close).not.toHaveBeenCalled();
+        expect(cancel).not.toHaveBeenCalled();
       } finally {
         await closeIdleWarmNativeSessionsForRestart();
       }
     },
   );
+});
+
+describe("ordinary native Run continuation admission", () => {
+  const sourceFixture = (name: string, phase: string | null, resultStatus = "accepted") => {
+    const sessionId = "be08021c-8221-4d6d-bff1-59dc94a47714";
+    const current = { ...execution,
+      binding: { ...execution.binding, runId: `${name}-current` },
+      session: { ...execution.session, normalizedSessionId: sessionId },
+    } as NativeExecutionInputV1;
+    const priorRunId = `${name}-prior`;
+    const resultId = `${name}-result`;
+    return { current, source: {
+      run: { id: priorRunId, companyId: current.binding.companyId,
+        agentId: current.binding.agentId, nativeIssueId: current.binding.issueId,
+        nativeSessionId: sessionId, runtimeMode: "native", status: "succeeded",
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        runnerProfileJson: { sessionCheckpoint: { identity: {
+          sessionId, runId: priorRunId, companyId: current.binding.companyId,
+          agentId: current.binding.agentId, issueId: current.binding.issueId,
+        } } },
+      },
+      finalization: phase === null ? null : { runId: priorRunId,
+        companyId: current.binding.companyId, issueId: current.binding.issueId,
+        phase, resultId: phase === "committed" ? resultId : null },
+      result: { id: resultId, runId: priorRunId, companyId: current.binding.companyId,
+        issueId: current.binding.issueId, schemaStatus: resultStatus },
+    } };
+  };
+
+  it.each(["committed", "observed", "missing", "rejected_result"])(
+    "admits only a committed accepted ordinary source (%s)", async kind => {
+      const { current, source } = sourceFixture(`ordinary-${kind}`,
+        kind === "missing" ? null : kind === "observed" ? "observed" : "committed",
+        kind === "rejected_result" ? "rejected" : "accepted");
+      state.createBackend.mockClear();
+      state.execute.mockReset().mockResolvedValue({
+        result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" },
+        turnId: "turn", normalizedSessionId: current.session.normalizedSessionId,
+        providerSessionId: null, driverKind: "test", driverVersion: "1",
+        nativeEventCount: 1, highestContiguousSourceSeq: 1,
+      });
+      const attempt = executePaperclipNativeSession({
+        db: leaseDb(current, {}, {}, [], {}, "running", undefined, source),
+        execution: current, runnerInstanceId: `runner-${kind}`,
+      });
+      if (kind === "committed") {
+        await expect(attempt).resolves.toBeDefined();
+        expect(state.createBackend).toHaveBeenCalledOnce();
+        expect(state.execute).toHaveBeenCalledOnce();
+      } else {
+        await expect(attempt).rejects.toThrow("native_ordinary_resume_source_uncommitted");
+        expect(state.createBackend).not.toHaveBeenCalled();
+        expect(state.execute).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("does not skip a newer unsafe source to reach an older committed result", async () => {
+    const { current, source } = sourceFixture("ordinary-newer", "committed");
+    const withNewer = { ...source, newerRun: { ...source.run, id: "ordinary-newer-unsafe",
+      status: "running", createdAt: new Date("2026-01-02T00:00:00.000Z") } };
+    state.createBackend.mockClear();
+    await expect(executePaperclipNativeSession({
+      db: leaseDb(current, {}, {}, [], {}, "running", undefined, withNewer),
+      execution: current, runnerInstanceId: "ordinary-newer-runner",
+    })).rejects.toThrow("native_ordinary_resume_source_uncommitted");
+    expect(state.createBackend).not.toHaveBeenCalled();
+  });
+
+  it("does not treat a rebound checkpoint with missing source history as fresh", async () => {
+    const { current } = sourceFixture("ordinary-missing-history", null);
+    const profile = { sessionCheckpoint: { identity: {
+      runId: current.binding.runId, companyId: current.binding.companyId,
+      agentId: current.binding.agentId, issueId: current.binding.issueId,
+      sessionId: current.session.normalizedSessionId,
+    } } };
+    state.createBackend.mockClear();
+    await expect(executePaperclipNativeSession({ db: leaseDb(current, {}, {}, [], profile),
+      execution: current, runnerInstanceId: "ordinary-missing-history-runner" }))
+      .rejects.toThrow("native_ordinary_resume_source_uncommitted");
+    expect(state.createBackend).not.toHaveBeenCalled();
+  });
+
+  it("advances a reused warm owner's Run identity across three committed Runs", async () => {
+    const sessionId = "be08021c-8221-4d6d-bff1-59dc94a47717";
+    const first = { ...execution,
+      binding: { ...execution.binding, runId: "ordinary-three-first" },
+      session: { ...execution.session, normalizedSessionId: sessionId,
+        lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    const second = { ...first, binding: { ...first.binding, runId: "ordinary-three-second" } };
+    const third = { ...first, binding: { ...first.binding, runId: "ordinary-three-third" } };
+    const session = { close: vi.fn(async () => undefined) };
+    state.execute.mockReset().mockImplementation(async options => {
+      await options.onSession?.(session);
+      return { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" },
+        turnId: "turn", normalizedSessionId: sessionId, providerSessionId: null,
+        driverKind: "test", driverVersion: "1", nativeEventCount: 1,
+        highestContiguousSourceSeq: 1 };
+    });
+    const source = (prior: NativeExecutionInputV1) => {
+      const resultId = `${prior.binding.runId}-result`;
+      return { run: { id: prior.binding.runId, companyId: prior.binding.companyId,
+        agentId: prior.binding.agentId, nativeIssueId: prior.binding.issueId,
+        nativeSessionId: sessionId, runtimeMode: "native", status: "succeeded",
+        runnerProfileJson: { sessionCheckpoint: { identity: {
+          runId: prior.binding.runId, companyId: prior.binding.companyId,
+          agentId: prior.binding.agentId, issueId: prior.binding.issueId, sessionId,
+        } } } },
+        finalization: { runId: prior.binding.runId, companyId: prior.binding.companyId,
+          issueId: prior.binding.issueId, phase: "committed", resultId },
+        result: { id: resultId, runId: prior.binding.runId, companyId: prior.binding.companyId,
+          issueId: prior.binding.issueId, schemaStatus: "accepted" } };
+    };
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: "three-first" });
+      await executePaperclipNativeSession({ db: leaseDb(second, {}, {}, [], {}, "running", undefined, source(first)),
+        execution: second, runnerInstanceId: "three-second" });
+      await executePaperclipNativeSession({ db: leaseDb(third, {}, {}, [], {}, "running", undefined, source(second)),
+        execution: third, runnerInstanceId: "three-third" });
+      expect(state.execute).toHaveBeenCalledTimes(3);
+    } finally {
+      await closeIdleWarmNativeSessionsForRestart();
+    }
+  });
+
+  it("rejects a foreign-Issue warm owner before touching the backend", async () => {
+    const sessionId = "be08021c-8221-4d6d-bff1-59dc94a47715";
+    const first = { ...execution,
+      binding: { ...execution.binding, runId: "ordinary-warm-first", issueId: "other-issue" },
+      session: { ...execution.session, normalizedSessionId: sessionId,
+        lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    const current = { ...first, binding: { ...first.binding,
+      runId: "ordinary-warm-current", issueId: execution.binding.issueId } };
+    const close = vi.fn(async () => undefined);
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onSession?.({ close });
+      return { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" },
+        turnId: "turn", normalizedSessionId: sessionId, providerSessionId: null,
+        driverKind: "test", driverVersion: "1", nativeEventCount: 1,
+        highestContiguousSourceSeq: 1 };
+    });
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(first), execution: first,
+        runnerInstanceId: "ordinary-warm-first-runner" });
+      state.createBackend.mockClear();
+      state.execute.mockClear();
+      await expect(executePaperclipNativeSession({ db: leaseDb(current), execution: current,
+        runnerInstanceId: "ordinary-warm-current-runner" }))
+        .rejects.toThrow("native_ordinary_resume_source_uncommitted");
+      expect(state.createBackend).not.toHaveBeenCalled();
+      expect(state.execute).not.toHaveBeenCalled();
+      expect(close).not.toHaveBeenCalled();
+    } finally {
+      await closeIdleWarmNativeSessionsForRestart();
+    }
+  });
+
+  it("rejects a foreign-Issue disk checkpoint before relabeling or backend creation", async () => {
+    const home = await mkdtemp(join(tmpdir(), "paperclip-ordinary-disk-"));
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const sessionId = "be08021c-8221-4d6d-bff1-59dc94a47716";
+    const current = { ...execution,
+      binding: { ...execution.binding, runId: "ordinary-disk-current" },
+      session: { ...execution.session, normalizedSessionId: sessionId },
+    } as NativeExecutionInputV1;
+    const directory = join(home, "instances", "default", "runtime", "paperclip-runner", "sessions");
+    process.env.PAPERCLIP_HOME = home;
+    try {
+      await mkdir(directory, { recursive: true });
+      await writeFile(join(directory, `${createHash("sha256").update(sessionId).digest("hex")}.json`),
+        JSON.stringify({ schema: "paperclip.native-session-supervisor.v1", snapshot: { identity: {
+          runId: "ordinary-disk-foreign", companyId: current.binding.companyId,
+          agentId: current.binding.agentId, issueId: "other-issue", sessionId,
+        } } }));
+      state.createBackend.mockClear();
+      await expect(executePaperclipNativeSession({ db: leaseDb(current), execution: current,
+        runnerInstanceId: "ordinary-disk-runner" }))
+        .rejects.toThrow("native_ordinary_resume_source_uncommitted");
+      expect(state.createBackend).not.toHaveBeenCalled();
+    } finally {
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousHome;
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["malformed", "oversized", "unreadable"])(
+    "holds an existing %s disk origin before backend creation without rewriting it", async kind => {
+      const home = await mkdtemp(join(tmpdir(), "paperclip-ordinary-disk-error-"));
+      const previousHome = process.env.PAPERCLIP_HOME;
+      const sessionId = "be08021c-8221-4d6d-bff1-59dc94a47718";
+      const current = { ...execution,
+        binding: { ...execution.binding, runId: `ordinary-disk-${kind}` },
+        session: { ...execution.session, normalizedSessionId: sessionId },
+      } as NativeExecutionInputV1;
+      const directory = join(home, "instances", "default", "runtime", "paperclip-runner", "sessions");
+      const path = join(directory, `${createHash("sha256").update(sessionId).digest("hex")}.json`);
+      process.env.PAPERCLIP_HOME = home;
+      try {
+        await mkdir(directory, { recursive: true });
+        if (kind === "malformed") await writeFile(path, "{");
+        if (kind === "oversized") {
+          await writeFile(path, "x");
+          await truncate(path, 8 * 1024 * 1024 + 1);
+        }
+        if (kind === "unreadable") {
+          const target = join(home, "existing-target");
+          await writeFile(target, "{}");
+          await symlink(target, path); // O_NOFOLLOW rejects the link.
+        }
+        const before = await lstat(path);
+        state.createBackend.mockClear();
+        let rejection: unknown;
+        try {
+          await executePaperclipNativeSession({ db: leaseDb(current), execution: current,
+            runnerInstanceId: `ordinary-disk-${kind}-runner` });
+        } catch (error) { rejection = error; }
+        expect(rejection).toBeInstanceOf(NativeSessionStartupBusyError);
+        expect((rejection as Error).message).toBe("native_ordinary_resume_source_uncommitted");
+        expect((rejection as Error & { cause?: unknown }).cause).toBeDefined();
+        expect(state.createBackend).not.toHaveBeenCalled();
+        const after = await lstat(path);
+        expect([after.dev, after.ino, after.size, after.mode]).toEqual(
+          [before.dev, before.ino, before.size, before.mode]);
+      } finally {
+        if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+        else process.env.PAPERCLIP_HOME = previousHome;
+        await rm(home, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("rejects an uncommitted previous Run before backend creation", async () => {
+    const sessionId = "be08021c-8221-4d6d-bff1-59dc94a47714";
+    const current = { ...execution,
+      binding: { ...execution.binding, runId: "ordinary-resume-current" },
+      session: { ...execution.session, normalizedSessionId: sessionId },
+    } as NativeExecutionInputV1;
+    const priorRunId = "ordinary-resume-prior";
+    const prior = {
+      id: priorRunId, companyId: current.binding.companyId,
+      agentId: current.binding.agentId, nativeIssueId: current.binding.issueId,
+      nativeSessionId: sessionId, runtimeMode: "native", status: "failed",
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      processPid: null, processGroupId: null, processStartedAt: null,
+      runnerProfileJson: { sessionCheckpoint: { identity: {
+        sessionId, runId: priorRunId, companyId: current.binding.companyId,
+        agentId: current.binding.agentId, issueId: current.binding.issueId,
+      } } },
+    };
+    state.createBackend.mockClear();
+    state.execute.mockReset().mockResolvedValue({
+      result: { summary: "unexpected provider admission" },
+      terminal: { runTerminalState: "succeeded" },
+      turnId: "turn", normalizedSessionId: sessionId, providerSessionId: null,
+      driverKind: "test", driverVersion: "1", nativeEventCount: 1,
+      highestContiguousSourceSeq: 1,
+    });
+    let rejected: unknown = null;
+    try { await executePaperclipNativeSession({
+      db: leaseDb(current, {}, {}, [], {}, "running", undefined, {
+        run: prior,
+        finalization: { runId: priorRunId, companyId: prior.companyId,
+          issueId: prior.nativeIssueId, phase: "terminal_failure", resultId: null },
+      }),
+      execution: current,
+      runnerInstanceId: "ordinary-resume-runner",
+    }); } catch (error) { rejected = error; }
+    expect(state.createBackend).not.toHaveBeenCalled();
+    expect(state.execute).not.toHaveBeenCalled();
+    expect(rejected).toBeInstanceOf(Error);
+    expect((rejected as Error).message).toBe("native_ordinary_resume_source_uncommitted");
+  });
 });
