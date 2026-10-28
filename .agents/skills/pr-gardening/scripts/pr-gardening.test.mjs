@@ -1091,27 +1091,27 @@ test("read corpus maps instruction and tool-config source paths to inert physica
    assert.deepEqual(new Set(corpus.manifest.files.map(row=>row.role)),new Set(["after","reverse","deps"]));
    assert.deepEqual(new Set(corpus.manifest.files.map(row=>row.sourcePath)),new Set(["AGENTS.md",".mcp.json"]));
    assert.ok(corpus.manifest.files.every(row=>/^assets\/[0-9a-f]{64}\.txt$/.test(row.path)));
-   const cwd=path.join(root,"corpus"),home=path.join(root,"home");mkdirSync(cwd);mkdirSync(home);
-   const settings=JSON.parse(readReviewSettings({cwd,home},corpus));
+   const settings=JSON.parse(readReviewSettings());
    assert.equal(settings.pluginConfigs["cc-plugin-agents-md@builtin"].options.instructionFiles,"managed-only");
    assert.equal(settings.autoMemoryEnabled,false);
-   assert.ok(settings.claudeMdExcludes.includes(path.join(root,"CLAUDE.md")));
-   assert.ok(settings.claudeMdExcludes.includes(path.join(cwd,"assets/.claude/rules/**")));
-   assert.ok(settings.claudeMdExcludes.includes(path.join(home,".claude/rules/**")));
-   assert.ok(settings.claudeMdExcludes.includes(path.join(home,".claude/CLAUDE.md")));
+   assert.equal(settings.disableAllHooks,true);
+   assert.deepEqual(settings.enabledPlugins,{});
+   assert.equal(Object.hasOwn(settings,"claudeMdExcludes"),false);
  }finally{f.close();rmSync(root,{recursive:true,force:true});}
 });
-test("Read settings reject aliased physical roots",()=>{
+test("Read settings are independent of home aliases and case spelling",()=>{
  const f=forkFixture(),root=realpathSync(mkdtempSync(path.join(os.tmpdir(),"read-settings-links-")));try{
    const corpus=readCorpusManifest(f.source),cwd=path.join(root,"corpus"),home=path.join(root,"home");
    mkdirSync(cwd);mkdirSync(home);
    const homeAlias=path.join(root,"home-alias"),cwdAlias=path.join(root,"corpus-alias");
    symlinkSync(home,homeAlias);symlinkSync(cwd,cwdAlias);
-   assert.throws(()=>readReviewSettings({cwd,home:homeAlias},corpus),/unsupported_launch_shape/);
-   assert.throws(()=>readReviewSettings({cwd:cwdAlias,home},corpus),/unsupported_launch_shape/);
+   const settings=readReviewSettings();
+   assert.equal(readReviewSettings({cwd,home:homeAlias},corpus),settings);
+   assert.equal(readReviewSettings({cwd:cwdAlias,home},corpus),settings);
+   assert.equal(readReviewSettings({cwd,home:home.toUpperCase()},corpus),settings);
  }finally{f.close();rmSync(root,{recursive:true,force:true});}
 });
-test("Read settings exclude regular instructions below nested symlinks",()=>{
+test("Read settings do not enumerate instructions below nested symlinks",()=>{
  const f=forkFixture(),root=realpathSync(mkdtempSync(path.join(os.tmpdir(),"read-settings-nested-")));try{
    const corpus=readCorpusManifest(f.source),cwd=path.join(root,"corpus"),home=path.join(root,"home");
    mkdirSync(cwd);mkdirSync(home);
@@ -1121,23 +1121,43 @@ test("Read settings exclude regular instructions below nested symlinks",()=>{
    writeFileSync(path.join(physicalClaude,"AGENTS.md"),"synthetic instruction\n");
    symlinkSync(physicalRules,path.join(physicalClaude,"rules"));
    symlinkSync(physicalClaude,path.join(home,".claude"));
-   const excludes=JSON.parse(readReviewSettings({cwd,home},corpus)).claudeMdExcludes;
-   assert.ok(excludes.includes(path.join(home,".claude/CLAUDE.md")));
-   assert.ok(excludes.includes(path.join(physicalClaude,"CLAUDE.md")));
-   assert.ok(excludes.includes(path.join(physicalClaude,"AGENTS.md")));
-   assert.ok(excludes.includes(path.join(physicalRules,"**")));
+   assert.equal(readReviewSettings({cwd,home},corpus),readReviewSettings());
+   assert.equal(Object.hasOwn(JSON.parse(readReviewSettings()),"claudeMdExcludes"),false);
  }finally{f.close();rmSync(root,{recursive:true,force:true});}
 });
-test("Read admission rejects a newly resolved instruction path absent from pinned argv",()=>{
+test("Read admission retains corpus authority when an instruction alias appears",()=>{
  const x=readJournalFixture(),{f}=x;try{
    assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
    const physicalClaude=path.join(realpathSync(f.directory),"physical-claude");
    mkdirSync(physicalClaude);writeFileSync(path.join(physicalClaude,"CLAUDE.md"),"synthetic instruction\n");
    symlinkSync(physicalClaude,path.join(f.data.start.home,".claude"));
-   x.refresh();
-   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
-     {status:"invalid",code:"independent_review_invalid",subcode:"unsupported_launch_shape"});
+   assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
  }finally{f.close();}
+});
+test("Read admission uses fixed safe-mode settings when instruction aliases change",()=>{
+ const x=readJournalFixture(),{f,corpus}=x;try{
+   const initial=readReviewSettings(f.data.start,corpus);
+   assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
+   const physicalClaude=path.join(realpathSync(f.directory),"physical-claude");
+   mkdirSync(physicalClaude);writeFileSync(path.join(physicalClaude,"CLAUDE.md"),"synthetic instruction\n");
+   const alias=path.join(f.data.start.home,".claude");symlinkSync(physicalClaude,alias);
+   assert.equal(readReviewSettings(f.data.start,corpus),initial);
+   assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
+   rmSync(alias);
+   assert.equal(readReviewSettings(f.data.start,corpus),initial);
+   assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
+ }finally{x.f.close();}
+});
+for (const [name,mutate] of [
+ ["missing safe mode",argv=>argv.splice(argv.indexOf("--safe-mode"),1)],
+ ["altered fixed settings",argv=>{argv[argv.indexOf("--settings")+1]=JSON.stringify({autoMemoryEnabled:true});}],
+ ["old lexical exclusion settings",argv=>{const index=argv.indexOf("--settings")+1;argv[index]=JSON.stringify({...JSON.parse(argv[index]),claudeMdExcludes:[]});}],
+]) test(`Read admission rejects ${name}`,()=>{
+ const x=readJournalFixture();try{
+   mutate(x.f.data.start.argv);x.refresh();
+   assert.deepEqual(admitTrustedJournal(x.f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"unsupported_launch_shape"});
+ }finally{x.f.close();}
 });
 test("read reverse asset is deterministic multiline text with complete before reconstruction",()=>{
  const before=`${"old long paragraph ".repeat(160)}\n`,after="new paragraph\n",source=sourceV2Fixture(before,after);

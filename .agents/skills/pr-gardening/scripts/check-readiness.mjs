@@ -444,46 +444,11 @@ function recommendedReadRanges(files) {
   });
 }
 
-export function readReviewSettings(start, corpus) {
-  ensure(typeof start.home === "string" && path.isAbsolute(start.home) && path.normalize(start.home) === start.home &&
-    typeof start.cwd === "string" && path.isAbsolute(start.cwd) && path.normalize(start.cwd) === start.cwd, "unsupported_launch_shape");
-  const physicalDirectory = (directory) => {
-    try { return fs.realpathSync(directory) === directory && fs.statSync(directory).isDirectory(); }
-    catch { return false; }
-  };
-  ensure(physicalDirectory(start.cwd) && physicalDirectory(start.home), "unsupported_launch_shape");
-  const bases = new Set();
-  const addAncestors = (leaf) => {
-    for (let directory = leaf;; directory = path.dirname(directory)) {
-      bases.add(directory);
-      if (directory === path.dirname(directory)) break;
-    }
-  };
-  addAncestors(start.cwd);
-  for (const file of corpus.files) addAncestors(path.dirname(path.join(start.cwd,file.path)));
-  bases.add(start.home);
-  const excludes = [];
-  const addPhysicalExclusion = (candidate,suffix="") => {
-    try { fs.lstatSync(candidate); }
-    catch (error) { ensure(error.code === "ENOENT", "unsupported_launch_shape"); return; }
-    let physical;
-    try { physical = fs.realpathSync(candidate); }
-    catch { throw new Error("unsupported_launch_shape"); }
-    if (physical !== candidate) excludes.push(suffix ? path.join(physical,suffix) : physical);
-  };
-  for (const directory of [...bases].sort()) {
-    for (const name of ["CLAUDE.md","CLAUDE.local.md",".claude/CLAUDE.md",".claude/CLAUDE.local.md","AGENTS.md",".claude/AGENTS.md"]) {
-      const candidate = path.join(directory,name);
-      excludes.push(candidate);
-      addPhysicalExclusion(candidate);
-    }
-    const rules = path.join(directory,".claude/rules");
-    excludes.push(path.join(rules,"**"));
-    addPhysicalExclusion(rules,"**");
-  }
-  return canonical({pluginConfigs:{"cc-plugin-agents-md@builtin":{options:{instructionFiles:"managed-only"}}},
-    autoMemoryEnabled:false,claudeMdExcludes:excludes,disableAllHooks:true,enabledPlugins:{}});
-}
+// Safe mode is an exact launch requirement. Instruction-path exclusions depend
+// on mutable filesystem state and must not be used as admission authority.
+const READ_REVIEW_SETTINGS = canonical({pluginConfigs:{"cc-plugin-agents-md@builtin":{options:{instructionFiles:"managed-only"}}},
+  autoMemoryEnabled:false,disableAllHooks:true,enabledPlugins:{}});
+export function readReviewSettings() { return READ_REVIEW_SETTINGS; }
 
 function readCorpusInventory(root, files) {
   const rootInfo = fs.lstatSync(root);
@@ -808,6 +773,8 @@ export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, p
     ensure(Buffer.from(materialText, "utf8").equals(material), "source_not_in_launch_input");
     let corpus, readEvidence;
     if (read) {
+      ensure(typeof start.home === "string" && path.isAbsolute(start.home) && path.normalize(start.home) === start.home,
+        "unsupported_launch_shape");
       corpus = readCorpusManifest(source);
       ensure(materialText.split(READ_SOURCE_BEGIN).length === 2 && materialText.split(READ_SOURCE_END).length === 2 &&
         !materialText.includes(SOURCE_BEGIN) && !materialText.includes(SOURCE_END), "source_not_in_launch_input");
@@ -840,7 +807,7 @@ export function admitTrustedJournal({ trustedRoot, registrySHA256, repository, p
     const expectedArgv = [entry.cliInvocationPath, "--print", "--session-id", start.sessionID,
       "--max-turns", read ? "64" : "1", "--model", "claude-opus-5-5", "--effort", "high", "--output-format", read ? "stream-json" : "json",
       "--safe-mode", "--restricted", "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-      "--setting-sources", "", "--settings", read ? readReviewSettings(start,corpus) : '{"disableAllHooks":true,"enabledPlugins":{}}',
+      "--setting-sources", "", "--settings", read ? readReviewSettings() : '{"disableAllHooks":true,"enabledPlugins":{}}',
       "--disable-slash-commands", "--no-chrome", "--permission-mode", "dontAsk", "--permission-prompts", "none",
       "--no-session-persistence", "--system-prompt", system.toString("utf8")];
     if (read) { expectedArgv[expectedArgv.indexOf("--tools")+1] = "Read,Glob,Grep"; expectedArgv.splice(expectedArgv.indexOf("--output-format")+2,0,"--verbose"); }
