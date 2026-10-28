@@ -1190,6 +1190,19 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
           .from(nativeRunResults)
           .where(eq(nativeRunResults.runId, runId));
         expect(accepted?.completionContractId).toBe(contractId);
+        const [settledOriginal] = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId));
+        expect(settledOriginal).toMatchObject({
+          status: "succeeded",
+          nativePhase: "committed",
+        });
+        // The new user wake was promoted while this Run still owned its
+        // in-process execution slot. Drive the same persisted queue once the
+        // original owner has fully exited, as the normal scheduler does.
+        await heartbeat.resumeQueuedRuns();
+        await drainHeartbeatRunsToQuiescence(db, heartbeat);
         const [receipt] = await db
           .select()
           .from(agentWakeupRequests)
@@ -1197,6 +1210,13 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
         expect(receipt.payload).toMatchObject({ commentId: newerCommentId });
         expect(receipt.status).toBe("completed");
         expect(receipt.runId).not.toBe(runId);
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))
+          .toEqual([expect.objectContaining({
+            status: "succeeded",
+            nativePhase: "committed",
+          })]);
+        expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, runId)))
+          .toEqual([expect.objectContaining({ id: accepted!.id, completionContractId: contractId })]);
         expect(freshStartTurn).toHaveBeenCalledOnce();
         const [freshRun] = await db
           .select()

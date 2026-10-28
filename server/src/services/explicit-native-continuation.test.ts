@@ -1517,6 +1517,7 @@ async function makeOwnedHomeTreeWritable(root: string, target = root): Promise<v
     });
     const backend: NativeSessionBackend = {
       async descriptor() { return { kind: "mock", name: "new-comment-test", version: "1",
+        runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" },
         capabilities: { resume: true, typedEvents: true, steering: false,
           interruption: true, structuredResult: true } }; },
       openSession,
@@ -1537,7 +1538,8 @@ async function makeOwnedHomeTreeWritable(root: string, target = root): Promise<v
       expect(wake).toMatchObject({ retryOfRunId: null,
         contextSnapshot: { forceFreshSession: true, previousRunId: f.sourceRunId,
           explicitUserContinuation: { commentId: f.commentId } } });
-      await heartbeat.resumeQueuedRuns();
+      // wakeup has registered this agent's execution before resolving. A global
+      // queue scan would also start the deliberately queued fixtures above.
       await heartbeat.drainActiveRunExecutions();
       expect(openSession).toHaveBeenCalledOnce();
       expect(openSession.mock.calls[0]![0].identity.sessionId).not.toBe(oldSessionId);
