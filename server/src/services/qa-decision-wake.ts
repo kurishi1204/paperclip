@@ -1,5 +1,6 @@
 import { and, eq, sql } from "drizzle-orm";
 import { agentWakeupRequests, issueExecutionDecisions, issues, type Db } from "@paperclipai/db";
+import type { IssueExecutionState } from "@paperclipai/shared";
 
 const QA_DECISION_WAKE_PREFIX = "qa-decision:";
 
@@ -11,6 +12,41 @@ export function qaDecisionIdFromWakeKey(key: string | null | undefined): string 
   if (!key?.startsWith(QA_DECISION_WAKE_PREFIX)) return null;
   const id = key.slice(QA_DECISION_WAKE_PREFIX.length);
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id) ? id : null;
+}
+
+/** Project the normal changes-requested route context after decision authorization.
+ * This does not authorize a wake. Admission must use the current locked issue
+ * state after isAuthorizedQaDecisionWake, never a caller's old wake snapshot.
+ */
+export function buildQaChangesRequestedWakeContext(input: {
+  issueId: string;
+  state: Pick<IssueExecutionState,
+    "currentStageId" | "currentStageType" | "currentParticipant" |
+    "returnAssignee" | "reviewRequest" | "lastDecisionOutcome">;
+  interruptedRunId?: string | null;
+}) {
+  const executionStage = {
+    wakeRole: "executor" as const,
+    stageId: input.state.currentStageId,
+    stageType: input.state.currentStageType,
+    currentParticipant: input.state.currentParticipant,
+    returnAssignee: input.state.returnAssignee,
+    reviewRequest: input.state.reviewRequest ?? null,
+    lastDecisionOutcome: input.state.lastDecisionOutcome,
+    allowedActions: ["address_changes", "resubmit"],
+  };
+  const interrupted = input.interruptedRunId ? { interruptedRunId: input.interruptedRunId } : {};
+  return {
+    payload: { issueId: input.issueId, mutation: "update" as const, executionStage, ...interrupted },
+    contextSnapshot: {
+      issueId: input.issueId,
+      taskId: input.issueId,
+      wakeReason: "execution_changes_requested" as const,
+      source: "issue.execution_stage" as const,
+      executionStage,
+      ...interrupted,
+    },
+  };
 }
 
 /** A terminal receipt is retryable only when its complete run linkage proves no claim or start.

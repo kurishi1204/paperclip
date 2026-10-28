@@ -6,7 +6,51 @@ import { agentWakeupRequests, chatConversations, chatEndpoints, heartbeatRuns, i
 import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
-import { EXECUTION_RECONCILIATION_CAUSES, type ExecutionBlocker } from "@paperclipai/shared";
+import { EXECUTION_RECONCILIATION_CAUSES, hasWorkspaceRestoreFailure, type ExecutionBlocker } from "@paperclipai/shared";
+import { hasSelfTaskDocumentReplayHold } from "./self-task-document-runtime.js";
+import { isAuthorizedQaDecisionWake, qaDecisionWakeKey } from "./qa-decision-wake.js";
+
+/** A new committed QA return can coexist with old document UNKNOWN receipts.
+ * Call under the issue lock, at both admission and final queued-run validation.
+ * This does not resolve a recovery action or authorize replay of the old run.
+ */
+export async function isIndependentQaDocumentEpisode(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; decisionId: string; runId?: string;
+}): Promise<boolean> {
+  if (!z.string().guid().safeParse(input.decisionId).success ||
+      !await isAuthorizedQaDecisionWake(db, input)) return false;
+  if (input.runId) {
+    const [run] = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.agentId, input.agentId),
+      sql`${heartbeatRuns.contextSnapshot}->>'qaDecisionId' = ${input.decisionId}`,
+    )).limit(1);
+    const [wake] = run?.wakeupRequestId ? await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, input.companyId),
+      eq(agentWakeupRequests.agentId, input.agentId), eq(agentWakeupRequests.runId, run.id),
+      eq(agentWakeupRequests.idempotencyKey, qaDecisionWakeKey(input.decisionId)),
+    )).limit(1) : [];
+    if (!wake) return false;
+  }
+  const actions = await db.select().from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.sourceIssueId, input.issueId),
+    executionBlockerPredicate(),
+  )).for("update");
+  if (!actions.length) return false;
+  for (const action of actions) {
+    const evidence = action.evidence;
+    const runId = z.string().guid().safeParse(evidence.runId ?? evidence.sourceRunId);
+    if (!runId.success || evidence.workspaceRestoreFailure === "restore_unsafe_archive") return false;
+    const [run] = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, runId.data), eq(heartbeatRuns.companyId, input.companyId),
+      sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId',
+        ${heartbeatRuns.contextSnapshot}->>'taskId') = ${input.issueId}`,
+    )).limit(1);
+    if (!run || !["succeeded", "interrupted", "failed", "cancelled", "timed_out"].includes(run.status) ||
+        !hasSelfTaskDocumentReplayHold(run) || hasWorkspaceRestoreFailure(run.resultJson)) return false;
+  }
+  return true;
+}
 
 /** Resolved recovery bookkeeping can still carry an effective no-replay hold. */
 export function executionBlockerPredicate() {

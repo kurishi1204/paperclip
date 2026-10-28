@@ -1,14 +1,16 @@
 import { randomUUID } from "node:crypto";
 import type { ServerAdapterModule } from "@paperclipai/adapter-utils";
-import { and, eq, sql } from "drizzle-orm";
-import { agentWakeupRequests, agents, budgetPolicies, costEvents, environmentLeases, heartbeatRuns, issueExecutionDecisions, issues } from "@paperclipai/db";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { agentWakeupRequests, agents, budgetPolicies, costEvents, environmentLeases, heartbeatRuns, issueExecutionDecisions, issueRecoveryActions, issues } from "@paperclipai/db";
 import { afterAll, afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
 import { createAdmissionTransactionScope, createWakeAdmissionReader } from "../modules/wake-queue/adapters/postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { isAuthorizedQaDecisionWake, qaDecisionWakeBlocksDelivery } from "../services/qa-decision-wake.js";
+import { SELF_TASK_DOCUMENT_CONTEXT_KEY } from "../services/self-task-document-runtime.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 import * as reviewProcesses from "@paperclipai/adapter-utils/server-utils";
@@ -365,7 +367,8 @@ describe("QA return fresh episode through real routes and PostgreSQL", () => {
     expect(execute).not.toHaveBeenCalled();
     const [heldReceipt] = await server.db.select().from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, deferred!.id));
-    expect(heldReceipt).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(heldReceipt).toMatchObject({ status: "deferred_issue_execution", runId: null,
+      payload: { executionWait: { reason: "qa_predecessor_ownership_active" } } });
     expect(await server.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
       .where(eq(heartbeatRuns.companyId, fixture.companyId))).toEqual([{ id: fixture.runId }]);
     // Only this disposable lease's synthetic completion changes. There is no
@@ -379,8 +382,9 @@ describe("QA return fresh episode through real routes and PostgreSQL", () => {
     await heartbeat.drainActiveRunExecutions();
     const [consumed] = await server.db.select().from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, deferred!.id));
-    expect(consumed).toMatchObject({ status: "completed", payload: deferred!.payload,
-      idempotencyKey: deferred!.idempotencyKey, coalescedCount: 0 });
+    expect(consumed).toMatchObject({ status: "completed", payload: {
+      ...deferred!.payload, executionWait: { reason: "qa_predecessor_ownership_active" },
+    }, idempotencyKey: deferred!.idempotencyKey, coalescedCount: 0 });
     expect(consumed!.runId).toBeTruthy();
     expect(consumed!.runId).not.toBe(fixture.runId);
     const [newRun] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, consumed!.runId!));
@@ -411,9 +415,153 @@ describe("QA return fresh episode through real routes and PostgreSQL", () => {
       .toEqual([{ id: deferred!.id }]);
   });
 
-  it.each(["decision", "stage", "assignee"] as const)(
+  it.each([false, true])("admits a new QA document episode only when every recovery action is document-held (mixed: %s)", async mixed => {
+    const { fixture, stageId, tool } = await reviewFixture();
+    await server.db.update(issues).set({ status: "done" }).where(eq(issues.id, fixture.blockerId));
+    await server.db.update(agents).set({ runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } } })
+      .where(eq(agents.id, fixture.agentId));
+    const adapterType = `qa_document_blocker_stub_${randomUUID().replaceAll("-", "")}`;
+    let implementerId: string | null = null;
+    const execute = vi.fn<ServerAdapterModule["execute"]>(async ctx => {
+      if (ctx.agent.id !== implementerId || ctx.context.issueId !== fixture.issueId) {
+        throw new Error("Unexpected provider dispatch in document blocker fixture");
+      }
+      const [current] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
+      const policy = normalizeIssueExecutionPolicy(current?.executionPolicy);
+      if (!current || !policy) throw new Error("Document blocker fixture lost its execution policy");
+      const transition = applyIssueExecutionPolicyTransition({
+        issue: current, policy, previousPolicy: policy,
+        requestedStatus: "in_review", requestedAssigneePatch: {},
+        actor: { agentId: implementerId, userId: null },
+        commentBody: "Synthetic document revision is ready for review.",
+      });
+      await server.db.update(issues).set({ ...transition.patch,
+        revision: current.revision + 1, statusVersion: current.statusVersion + 1,
+      }).where(eq(issues.id, fixture.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, summary: "Synthetic document revision resubmitted" };
+    });
+    registerServerAdapter({ type: adapterType, execute,
+      testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }) });
+    onTestFinished(async () => {
+      await heartbeatService(server.db).drainActiveRunExecutions();
+      unregisterServerAdapter(adapterType);
+    });
+    const [implementer] = await server.db.insert(agents).values({ companyId: fixture.companyId,
+      name: "Document return assignee", adapterType, status: "active",
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
+    }).returning();
+    implementerId = implementer!.id;
+    const [before] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    await server.db.update(issues).set({ executionState: {
+      ...(before!.executionState as Record<string, unknown>),
+      returnAssignee: { type: "agent", agentId: implementerId },
+    } }).where(eq(issues.id, fixture.issueId));
+    const assigned = (await tool("read_assigned_issue")).body.result.structuredContent;
+    const verdict = await tool("submit_review_decision", {
+      decision: "request_changes", summary: "Please revise the document evidence.",
+      expectedStageId: stageId, expectedStatusVersion: assigned.statusVersion,
+      expectedRevision: assigned.revision, expectedLastDecisionId: assigned.reviewStage.lastDecisionId,
+    });
+    expect(verdict.body.result.isError).not.toBe(true);
+    const decisionId = verdict.body.result.structuredContent.decisionId as string;
+    await expect.poll(() => server.db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, fixture.companyId),
+      eq(agentWakeupRequests.idempotencyKey, `qa-decision:${decisionId}`),
+    )), { timeout: 10_000 }).toEqual([expect.objectContaining({ status: "deferred_issue_execution", runId: null })]);
+    const [deferred] = await server.db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, fixture.companyId),
+      eq(agentWakeupRequests.idempotencyKey, `qa-decision:${decisionId}`),
+    ));
+    const finishedAt = new Date();
+    await server.db.update(heartbeatRuns).set({ status: "succeeded", finishedAt })
+      .where(eq(heartbeatRuns.id, fixture.runId));
+    settleSyntheticReviewProcess(fixture.runId);
+
+    // Both old runs have terminal receipts and no process, lease or finalization
+    // ownership. Only the newer source has the server document stamp.
+    const [oldOtherRun, oldDocumentRun] = await server.db.insert(heartbeatRuns).values([
+      { companyId: fixture.companyId, agentId: implementerId, status: "failed",
+        invocationSource: "assignment", triggerDetail: "system", nativeIssueId: fixture.issueId,
+        contextSnapshot: { issueId: fixture.issueId }, startedAt: new Date(finishedAt.getTime() - 180_000),
+        finishedAt: new Date(finishedAt.getTime() - 120_000) },
+      { companyId: fixture.companyId, agentId: implementerId, status: "failed",
+        invocationSource: "assignment", triggerDetail: "system", nativeIssueId: fixture.issueId,
+        contextSnapshot: { issueId: fixture.issueId, [SELF_TASK_DOCUMENT_CONTEXT_KEY]: true },
+        startedAt: new Date(finishedAt.getTime() - 120_000),
+        finishedAt: new Date(finishedAt.getTime() - 60_000) },
+    ]).returning();
+    const olderAt = new Date(finishedAt.getTime() - 120_000);
+    const newerAt = new Date(finishedAt.getTime() - 60_000);
+    if (mixed) await server.db.insert(issueRecoveryActions).values({
+      companyId: fixture.companyId, sourceIssueId: fixture.issueId,
+      kind: "active_run_watchdog", status: "active", ownerType: "board",
+      cause: "uncertain_external_action", fingerprint: `non-document:${oldOtherRun!.id}`,
+      evidence: { runId: oldOtherRun!.id, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+      nextAction: "Reconcile the earlier external effect before execution.", updatedAt: olderAt,
+    });
+    const [documentAction] = await server.db.insert(issueRecoveryActions).values({
+      companyId: fixture.companyId, sourceIssueId: fixture.issueId,
+      kind: "active_run_watchdog", status: "resolved", ownerType: "board",
+      cause: "uncertain_external_action", fingerprint: `document:${oldDocumentRun!.id}`,
+      evidence: { runId: oldDocumentRun!.id, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+      nextAction: "Preserve the old document effect without replay.", updatedAt: newerAt, resolvedAt: newerAt,
+    }).returning();
+    const actions = () => server.db.select().from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, fixture.companyId),
+        eq(issueRecoveryActions.sourceIssueId, fixture.issueId)));
+    const oldRuns = () => server.db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.id,
+      [oldOtherRun!.id, oldDocumentRun!.id]));
+    const byId = <T extends { id: string }>(rows: T[]) => rows.sort((a, b) => a.id.localeCompare(b.id));
+    const actionsBefore = byId(await actions());
+    const oldRunsBefore = byId(await oldRuns());
+    expect(actionsBefore).toHaveLength(mixed ? 2 : 1);
+    expect(oldRunsBefore).toHaveLength(2);
+    expect(await getExecutionBlocker(server.db, fixture.companyId, fixture.issueId))
+      .toMatchObject({ recoveryActionId: documentAction!.id, runId: oldDocumentRun!.id });
+
+    await server.db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 31_000) })
+      .where(eq(agentWakeupRequests.id, deferred!.id));
+    const heartbeat = heartbeatService(server.db);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    const [wakeAfter] = await server.db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferred!.id));
+    const newQaRuns = await server.db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, fixture.companyId),
+      sql`${heartbeatRuns.contextSnapshot}->>'qaDecisionId' = ${decisionId}`,
+    ));
+    if (mixed) {
+      expect(wakeAfter).toMatchObject({ status: "deferred_issue_execution", runId: null,
+        idempotencyKey: `qa-decision:${decisionId}` });
+      expect(newQaRuns).toEqual([]);
+      expect(execute).not.toHaveBeenCalled();
+    } else {
+      const admissionReadback = JSON.stringify({
+        wake: { status: wakeAfter?.status, reason: wakeAfter?.reason, error: wakeAfter?.error,
+          payload: wakeAfter?.payload, runId: wakeAfter?.runId },
+        newQaRuns: newQaRuns.map(run => ({ id: run.id, status: run.status,
+          errorCode: run.errorCode, startedAt: run.startedAt, wakeupRequestId: run.wakeupRequestId })),
+      });
+      expect(wakeAfter?.status, admissionReadback).toBe("completed");
+      expect(wakeAfter).toMatchObject({ status: "completed", idempotencyKey: `qa-decision:${decisionId}` });
+      expect(newQaRuns).toHaveLength(1);
+      expect(newQaRuns[0]).toMatchObject({ id: wakeAfter!.runId, agentId: implementerId,
+        status: "succeeded", sessionIdBefore: null,
+        contextSnapshot: { qaDecisionId: decisionId, forceFreshSession: true } });
+      expect(newQaRuns[0]!.startedAt).not.toBeNull();
+      expect(execute.mock.calls.map(([ctx]) => ctx.runId)).toEqual([newQaRuns[0]!.id]);
+    }
+    expect(byId(await actions())).toEqual(actionsBefore);
+    expect(byId(await oldRuns())).toEqual(oldRunsBefore);
+  });
+
+  it.each(["decision", "stage", "assignee", "budget"] as const)(
     "settles a queued QA return when its %s authority is superseded",
     async (invalidated) => {
+      const budgetCheckpoint = (stage: string) => {
+        if (invalidated === "budget") console.info(`qa-stale-budget checkpoint: ${stage}`);
+      };
+      budgetCheckpoint("fixture-start");
       const { fixture, stageId, tool } = await reviewFixture();
       const [implementer] = await server.db.insert(agents).values({
         companyId: fixture.companyId, name: "Return assignee", adapterType: "paperclip_runner", status: "active",
@@ -448,28 +596,52 @@ describe("QA return fresh episode through real routes and PostgreSQL", () => {
       expect(release.outcome.kind).toBe("promoted");
       const [wake] = await server.db.select().from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.agentId, implementer!.id));
+      budgetCheckpoint("route-decision-and-wake-committed");
       const [current] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
       const state = current!.executionState as Record<string, unknown>;
-      await server.db.update(issues).set(invalidated === "assignee"
+      if (invalidated === "budget") {
+        await server.db.insert(budgetPolicies).values({ companyId: fixture.companyId,
+          scopeType: "agent", scopeId: implementer!.id, metric: "billed_cents",
+          windowKind: "calendar_month_utc", amount: 1, hardStopEnabled: true, isActive: true });
+        await server.db.insert(costEvents).values({ companyId: fixture.companyId,
+          agentId: implementer!.id, provider: "test", biller: "test", billingType: "tokens",
+          model: "test-model", costCents: 1, occurredAt: new Date() });
+        budgetCheckpoint("budget-db-seed-committed");
+      } else await server.db.update(issues).set(invalidated === "assignee"
         ? { assigneeAgentId: fixture.agentId }
         : { executionState: { ...state,
           [invalidated === "decision" ? "lastDecisionId" : "currentStageId"]: randomUUID(),
         } }).where(eq(issues.id, fixture.issueId));
       const heartbeat = heartbeatService(server.db);
+      budgetCheckpoint("first-resume-start");
       await heartbeat.resumeQueuedRuns();
+      budgetCheckpoint("first-resume-finished");
       const [stale] = await server.db.select().from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, wake!.runId!));
+      budgetCheckpoint("first-resume-db-read-finished");
       expect(stale).toMatchObject({ status: "cancelled", errorCode:
+        invalidated === "budget" ? "cancelled" :
         invalidated === "assignee" ? "issue_assignee_changed" : "queued_run_claim_rejected" });
       expect(stale!.startedAt).toBeNull();
       // A new service instance models startup recovery against the persisted
       // row; a stale authority must not stay queued for every later scan.
+      budgetCheckpoint("second-resume-start");
       await heartbeatService(server.db).resumeQueuedRuns();
+      budgetCheckpoint("second-resume-finished");
       const [stillStale] = await server.db.select().from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, wake!.runId!));
+      budgetCheckpoint("second-resume-db-read-finished");
       expect(stillStale!.status).toBe("cancelled");
       expect(await server.db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.idempotencyKey, wake!.idempotencyKey!))).toHaveLength(1);
+      if (invalidated === "budget") {
+        const [held] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
+        expect(held).toMatchObject({ status: "in_progress", assigneeAgentId: implementer!.id,
+          executionState: { status: "changes_requested" } });
+        expect(await server.db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+          .where(and(eq(agentWakeupRequests.companyId, fixture.companyId),
+            eq(agentWakeupRequests.reason, "issue_continuation_needed")))).toEqual([]);
+      }
     },
   );
 
@@ -684,6 +856,63 @@ describe("QA return fresh episode through real routes and PostgreSQL", () => {
       .where(and(eq(agentWakeupRequests.companyId, fixture.companyId),
         sql`${agentWakeupRequests.payload}->'executionWait'->>'requestedIdempotencyKey' = ${`qa-decision:${seeds[1]!.decisionId}`}`)))
       .toEqual([{ id: laterSkip!.id }]);
+  });
+
+  it("does not let superseded QA authorities occupy the recovery page", async () => {
+    const fixture = await server.fixture({ connectionScenario: "fresh", reset: true });
+    await server.db.update(issues).set({ status: "done" }).where(eq(issues.id, fixture.blockerId));
+    const [agent] = await server.db.insert(agents).values({ companyId: fixture.companyId,
+      name: "Recovery page assignee", adapterType: "paperclip_runner", status: "active",
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } } }).returning();
+    const seeds = Array.from({ length: 102 }, (_, i) => ({ issueId: randomUUID(), stageId: randomUUID(),
+      decisionId: randomUUID(), valid: i === 101, updatedAt: new Date(Date.now() - (200 - i) * 1000) }));
+    await server.db.insert(issues).values(seeds.map(seed => ({ id: seed.issueId,
+      companyId: fixture.companyId, projectId: fixture.projectId, title: "Synthetic recovery page",
+      status: "in_progress", assigneeAgentId: agent!.id, responsibleUserId: fixture.responsibleUserId,
+      updatedAt: seed.updatedAt, executionState: { status: "changes_requested",
+        currentStageId: seed.stageId, lastDecisionId: seed.decisionId,
+        returnAssignee: { type: "agent", agentId: seed.valid ? agent!.id : fixture.agentId } } })));
+    await server.db.insert(issueExecutionDecisions).values(seeds.map(seed => ({ id: seed.decisionId,
+      companyId: fixture.companyId, issueId: seed.issueId, stageId: seed.stageId, stageType: "review",
+      outcome: "changes_requested", freshEpisodeWakeRequested: true, body: "Synthetic page authority" })));
+    await server.db.insert(heartbeatRuns).values(seeds.map(seed => ({ companyId: fixture.companyId,
+      agentId: agent!.id, status: "running", invocationSource: "assignment", triggerDetail: "system",
+      contextSnapshot: { issueId: seed.issueId } })));
+    await heartbeatService(server.db).reconcileStrandedAssignedIssues();
+    const receipts = await server.db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agent!.id));
+    expect(receipts).toEqual([expect.objectContaining({ status: "skipped", payload: expect.objectContaining({
+      issueId: seeds[101]!.issueId, executionWait: expect.objectContaining({
+        requestedIdempotencyKey: `qa-decision:${seeds[101]!.decisionId}` }) }) })]);
+  });
+
+  it("keeps a daily-capped deferred QA receipt without accumulating skipped aliases", async () => {
+    const fixture = await server.fixture({ connectionScenario: "fresh", reset: true });
+    const [agent] = await server.db.insert(agents).values({ companyId: fixture.companyId,
+      name: "Capped deferred assignee", adapterType: "paperclip_runner", status: "active",
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true, maxDailyRuns: 0 } } }).returning();
+    const issueId = randomUUID(), stageId = randomUUID(), decisionId = randomUUID();
+    await server.db.insert(issues).values({ id: issueId, companyId: fixture.companyId,
+      projectId: fixture.projectId, title: "Synthetic deferred cap", status: "in_progress",
+      assigneeAgentId: agent!.id, responsibleUserId: fixture.responsibleUserId,
+      executionState: { status: "changes_requested", currentStageId: stageId, lastDecisionId: decisionId,
+        currentStageIndex: 0, currentStageType: "review", currentParticipant: { type: "agent", agentId: fixture.agentId },
+        lastDecisionOutcome: "changes_requested", returnAssignee: { type: "agent", agentId: agent!.id } } });
+    await server.db.insert(issueExecutionDecisions).values({ id: decisionId, companyId: fixture.companyId,
+      issueId, stageId, stageType: "review", outcome: "changes_requested",
+      freshEpisodeWakeRequested: true, body: "Synthetic deferred cap" });
+    const [wake] = await server.db.insert(agentWakeupRequests).values({ companyId: fixture.companyId,
+      agentId: agent!.id, source: "assignment", triggerDetail: "system", reason: "execution_changes_requested",
+      payload: { issueId }, status: "deferred_issue_execution", idempotencyKey: `qa-decision:${decisionId}`,
+      updatedAt: new Date(Date.now() - 31_000) }).returning();
+    for (let i = 0; i < 2; i++) {
+      await server.db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 31_000) })
+        .where(eq(agentWakeupRequests.id, wake!.id));
+      await heartbeatService(server.db).resumeQueuedRuns();
+      expect(await server.db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agent!.id)))
+        .toEqual([expect.objectContaining({ id: wake!.id, status: "deferred_issue_execution", runId: null,
+          payload: { issueId, executionWait: expect.objectContaining({ reason: "heartbeat.daily_run_limit" }) } })]);
+    }
   });
 
 });

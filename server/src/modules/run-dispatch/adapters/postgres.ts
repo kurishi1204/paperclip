@@ -1,5 +1,5 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
-import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { getExecutionBlocker, isIndependentQaDocumentEpisode } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -952,7 +952,12 @@ export function createPostgresRunDispatchAdapter(
     const issueId = readNonEmptyString(contextSnapshot.issueId);
     if (!issueId) return { issueId: null, facts: null, decision: { stale: false as const } };
     const recovery = await getExecutionBlocker(tx, run.companyId, issueId, { conversationResetCommentId: deriveCommentId(contextSnapshot) });
-    if (recovery) return { issueId, facts: null, decision: { stale: true as const,
+    const independentQa = recovery?.recoveryActionId && recovery.runId &&
+      typeof contextSnapshot.qaDecisionId === "string" && await isIndependentQaDocumentEpisode(tx, {
+        companyId: run.companyId, issueId, agentId: run.agentId,
+        decisionId: contextSnapshot.qaDecisionId, runId: run.id,
+      });
+    if (recovery && !independentQa) return { issueId, facts: null, decision: { stale: true as const,
       errorCode: "execution_reconciliation_required" as const, reason: recovery.nextAction,
       details: { issueId, recoveryActionId: recovery.recoveryActionId },
     } };
