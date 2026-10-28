@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { documentService } from "../services/documents.js";
 import { callProjectTool } from "../services/project-tools.js";
+import { SELF_TASK_DOCUMENT_CONTEXT_KEY } from "../services/self-task-document-runtime.js";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
@@ -739,6 +740,10 @@ describe("run-bound QA review MCP", () => {
 
   it("reads the bounded writer's exact saved document revision before one QA decision", async () => {
     const fixture = await server.fixture({ disableWakeOnDemand: true });
+    const [writerRun] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+    await server.db.update(heartbeatRuns).set({ contextSnapshot: {
+      ...writerRun!.contextSnapshot, [SELF_TASK_DOCUMENT_CONTEXT_KEY]: true,
+    } }).where(eq(heartbeatRuns.id, fixture.runId));
     await server.db.update(issues).set({ checkoutRunId: fixture.runId }).where(eq(issues.id, fixture.issueId));
     // The seed input is older than this run's one permitted deliverable write.
     await server.db.update(documentRevisions).set({ createdByRunId: null })
