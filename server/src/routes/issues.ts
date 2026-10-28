@@ -230,7 +230,7 @@ import type {
 } from "../services/task-watchdogs.js";
 import { logger } from "../middleware/logger.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
-import { selfTaskDocumentModeAllowed } from "../services/project-tools.js";
+import { SELF_TASK_DOCUMENT_CONTEXT_KEY, selfTaskDocumentModeAllowed } from "../services/project-tools.js";
 import {
   badRequest,
   conflict,
@@ -9887,6 +9887,8 @@ export function issueRoutes(
           eq(heartbeatRuns.agentId, binding.agentId),
         )).for("no key update");
         if (!issue || !run || run.status !== "running") throw forbidden("Self-task run is unavailable");
+        if (run.contextSnapshot?.[SELF_TASK_DOCUMENT_CONTEXT_KEY] !== true)
+          throw forbidden("Task document tools require explicit run opt-in");
         const aliases = [run.nativeIssueId, run.contextSnapshot?.issueId, run.contextSnapshot?.taskId]
           .filter(value => value !== null && value !== undefined);
         if (aliases.length === 0 || aliases.some(value => value !== issue.id))

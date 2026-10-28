@@ -15,19 +15,22 @@ export function projectToolRoutes(db: Db) {
     const send = (result: unknown) => res.json({ jsonrpc: "2.0", id, result });
     if (method === "initialize") return send({ protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "paperclip-project-tools", version: "1" } });
     if (method === "notifications/initialized") return res.status(202).end();
-    const definitions = projectToolDefinitions(
-      context.issue.workMode, true, context.run.contextSnapshot?.[SELF_TASK_DOCUMENT_CONTEXT_KEY] === true,
-    );
+    const documentMode = context.run.contextSnapshot?.[SELF_TASK_DOCUMENT_CONTEXT_KEY] === true;
+    const definitions = projectToolDefinitions(context.issue.workMode, true, documentMode);
     if (method === "tools/list") return send({ tools: definitions });
     if (method !== "tools/call") return res.json({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
     try {
       if (!definitions.some(tool => tool.name === params?.name)) throw forbidden("Tool is unavailable in this mode");
-      // Keep this run credential on the listener that accepted the MCP request.
-      // PAPERCLIP_API_URL may identify a public tunnel.
-      const address = req.socket.localAddress;
-      const port = req.socket.localPort;
-      if (!address || !port) throw new Error("Paperclip local API listener is unavailable");
-      const apiUrl = `http://${address.includes(":") ? `[${address}]` : address}:${port}`;
+      let apiUrl = process.env.PAPERCLIP_API_URL;
+      if (documentMode) {
+        // Bound document credentials stay on the accepting listener. Ordinary
+        // project tools keep the configured origin they used before this mode.
+        const address = req.socket.localAddress;
+        const port = req.socket.localPort;
+        if (!address || !port) throw new Error("Paperclip local API listener is unavailable");
+        apiUrl = `http://${address.includes(":") ? `[${address}]` : address}:${port}`;
+      }
+      if (!apiUrl) throw new Error("Paperclip API origin is unavailable");
       const result = await callProjectTool({
         name: params.name, arguments: params.arguments ?? {}, apiUrl,
         token: req.header("authorization")!.replace(/^Bearer\s+/i, ""),

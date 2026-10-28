@@ -23,9 +23,17 @@ if (process.env.PAPERCLIP_REQUIRE_EMBEDDED_PG === "1" && !support.supported) {
   beforeAll(async () => { process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID(); server = await startRunnerApiTestServer(); }, 60_000);
   afterAll(async () => { await server?.close(); if (originalSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET; else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalSecret; });
   const call = (fixture: Awaited<ReturnType<typeof server.fixture>>, tool: string, args: Record<string, unknown>) => fixture.authority.execute({ tool, arguments: args, callId: randomUUID() });
+  const documentFixture = async () => {
+    const f = await server.fixture({ disableWakeOnDemand: true });
+    const [run] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await server.db.update(heartbeatRuns).set({ contextSnapshot: {
+      ...run!.contextSnapshot, [SELF_TASK_DOCUMENT_CONTEXT_KEY]: true,
+    } }).where(eq(heartbeatRuns.id, f.runId));
+    return f;
+  };
 
   it("uses the persisted opt-in flag for both document tool discovery and calls", async () => {
-    const f = await server.fixture({ disableWakeOnDemand: true });
+    const f = await documentFixture();
     await server.db.update(issues).set({ checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
     await server.db.update(documentRevisions).set({ createdByRunId: null })
       .where(eq(documentRevisions.createdByRunId, f.runId));
@@ -62,6 +70,17 @@ if (process.env.PAPERCLIP_REQUIRE_EMBEDDED_PG === "1" && !support.supported) {
       const refused = await rpc("tools/call", { name: "write_self_task_document", arguments: args });
       expect(refused.result).toMatchObject({ isError: true,
         content: [{ type: "text", text: "Tool is unavailable in this mode" }] });
+      // The same capability boundary must hold when a caller avoids MCP.
+      const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json",
+        "X-Paperclip-Document-Mode": "self-task", "X-Paperclip-Expected-Document-Id": "new" };
+      const directRead = await fetch(`${server.apiUrl}/api/issues/${f.issueId}/documents/notes`, { headers });
+      expect(directRead.status).toBe(403);
+      const directWrite = await fetch(`${server.apiUrl}/api/issues/${f.issueId}/documents/result`, {
+        method: "PUT", headers, body: JSON.stringify({ title: args.title, format: args.format,
+          body: args.body, baseRevisionId: null }),
+      });
+      expect(directWrite.status).toBe(403);
+      expect(directWrite.headers.get("X-Paperclip-Document-Outcome")).toBe("rejected");
       expect(await documentService(server.db).getIssueDocumentByKey(f.issueId, "result")).toBeNull();
     }
     await server.db.update(heartbeatRuns).set({ contextSnapshot: {
@@ -85,7 +104,7 @@ if (process.env.PAPERCLIP_REQUIRE_EMBEDDED_PG === "1" && !support.supported) {
   });
 
   it("binds a single document write to the active task, then exposes its fixed revision", async () => {
-    const f = await server.fixture({ disableWakeOnDemand: true });
+    const f = await documentFixture();
     await server.db.update(issues).set({ checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
     // The fixture input predates this bounded facade; the test run has made no write yet.
     await server.db.update(documentRevisions).set({ createdByRunId: null }).where(eq(documentRevisions.createdByRunId, f.runId));
@@ -109,7 +128,7 @@ if (process.env.PAPERCLIP_REQUIRE_EMBEDDED_PG === "1" && !support.supported) {
   });
 
   it("does not replay a committed document PUT after its response is lost", async () => {
-    const f = await server.fixture({ disableWakeOnDemand: true });
+    const f = await documentFixture();
     await server.db.update(issues).set({ checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
     await server.db.update(documentRevisions).set({ createdByRunId: null })
       .where(eq(documentRevisions.createdByRunId, f.runId));
@@ -157,7 +176,7 @@ if (process.env.PAPERCLIP_REQUIRE_EMBEDDED_PG === "1" && !support.supported) {
   });
 
   it("rejects a different task and refuses a locked document without creating another key", async () => {
-    const f = await server.fixture({ disableWakeOnDemand: true });
+    const f = await documentFixture();
     await server.db.update(issues).set({ checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
     await server.db.update(documentRevisions).set({ createdByRunId: null })
       .where(eq(documentRevisions.createdByRunId, f.runId));
