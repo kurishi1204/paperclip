@@ -9964,7 +9964,7 @@ export function heartbeatService(
             // must not retain a terminal claim. Do not request another retry.
             const settled = await wakeQueue.releaseIssueExecution({ companyId: source.companyId,
               runId: source.id, now: new Date(), suppressImmediateRecovery: true });
-            await applyWakeQueuePostCommitEffects(settled.postCommitEffects);
+            await applyWakeQueuePostCommitEffects(settled.postCommitEffects, options);
           }
         }
       } else if (effect.kind === "run_queued") {

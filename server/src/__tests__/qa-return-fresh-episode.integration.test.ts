@@ -54,7 +54,7 @@ describe("QA return fresh episode through real routes and PostgreSQL", () => {
     });
     await server.db.update(issues).set({
       status: "in_review",
-      executionPolicy: policy,
+      executionPolicy: policy ? { ...policy } : null,
       executionState: {
         status: "pending", currentStageId: stageId, currentStageIndex: 0,
         currentStageType: "review", currentParticipant: { type: "agent", agentId: fixture.agentId },
@@ -98,7 +98,7 @@ describe("QA return fresh episode through real routes and PostgreSQL", () => {
       stages: [{ id: stageId, type: "review", participants: [{ type: "agent", agentId: fixture.agentId }] }],
     });
     const [before] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
-    await server.db.update(issues).set({ executionPolicy: policy, responsibleUserId: fixture.responsibleUserId,
+    await server.db.update(issues).set({ executionPolicy: policy ? { ...policy } : null, responsibleUserId: fixture.responsibleUserId,
       executionState: { ...(before!.executionState as Record<string, unknown>),
         returnAssignee: { type: "agent", agentId: implementer!.id },
       },
@@ -158,9 +158,10 @@ describe("QA return fresh episode through real routes and PostgreSQL", () => {
         throw new Error("Unexpected provider dispatch in QA return fixture");
       }
       const [current] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
-      if (!current?.executionPolicy) throw new Error("QA return fixture lost its execution policy");
+      const policy = normalizeIssueExecutionPolicy(current?.executionPolicy);
+      if (!current || !policy) throw new Error("QA return fixture lost its execution policy");
       const transition = applyIssueExecutionPolicyTransition({
-        issue: current, policy: current.executionPolicy, previousPolicy: current.executionPolicy,
+        issue: current, policy, previousPolicy: policy,
         requestedStatus: "in_review", requestedAssigneePatch: {},
         actor: { agentId: implementerId, userId: null },
         commentBody: "Synthetic source evidence is ready for QA review.",
@@ -295,9 +296,10 @@ describe("QA return fresh episode through real routes and PostgreSQL", () => {
         throw new Error("Unexpected provider dispatch in stopped QA return fixture");
       }
       const [current] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
-      if (!current?.executionPolicy) throw new Error("Stopped QA return fixture lost its execution policy");
+      const policy = normalizeIssueExecutionPolicy(current?.executionPolicy);
+      if (!current || !policy) throw new Error("Stopped QA return fixture lost its execution policy");
       const transition = applyIssueExecutionPolicyTransition({
-        issue: current, policy: current.executionPolicy, previousPolicy: current.executionPolicy,
+        issue: current, policy, previousPolicy: policy,
         requestedStatus: "in_review", requestedAssigneePatch: {},
         actor: { agentId: implementerId, userId: null },
         commentBody: "Synthetic revision after the review stop is ready for QA.",
