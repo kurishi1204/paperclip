@@ -7,9 +7,9 @@ import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { recordNativeLocalProcessStop, hasNativeLocalProcessStop, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { and, eq, sql } from "drizzle-orm";
 import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
 import {
@@ -29,6 +29,21 @@ import type { NativeSession, NativeSessionBackend, PrpEvent } from "../vendor/pa
 import { createDurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { recordNativeFinalizationFailure } from "./native-runtime/native-run-finalizer.js";
 const support = await getEmbeddedPostgresTestSupport();
+// Only this test's mkdtemp HOME may be made removable. lstat prevents
+// following links out of it; protected production assets are never touched.
+async function makeOwnedHomeTreeWritable(root: string, target = root): Promise<void> {
+  const pathWithinRoot = relative(root, target);
+  if (pathWithinRoot === ".." || pathWithinRoot.startsWith(`..${sep}`) || isAbsolute(pathWithinRoot)) {
+    throw new Error("test_home_cleanup_outside_owned_root");
+  }
+  const entry = await lstat(target);
+  if (entry.isSymbolicLink()) return;
+  if (!entry.isDirectory()) return;
+  await chmod(target, 0o700);
+  for (const child of await readdir(target)) {
+    await makeOwnedHomeTreeWritable(root, join(target, child));
+  }
+}
 (support.supported ? describe : describe.skip)("explicit native conversation continuation", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
@@ -1545,6 +1560,7 @@ const support = await getEmbeddedPostgresTestSupport();
       finally {
         if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
         else process.env.PAPERCLIP_HOME = previousHome;
+        await makeOwnedHomeTreeWritable(home);
         await rm(home, { recursive: true, force: true });
       }
     }

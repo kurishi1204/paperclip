@@ -110,9 +110,14 @@ describeEmbeddedPostgres("runner goal service", () => {
     expect((await claimRunnerGoalActionDelivery(db, { ...claimBinding, sessionId: randomUUID() }, request, owner)).state).toBe("indeterminate");
     expect((await claimRunnerGoalActionDelivery(db, claimBinding, { ...request, objective: "Changed payload" }, owner)).state).toBe("indeterminate");
     expect((await db.select().from(agentSessionGoalActions))[0]?.status).toBe("ready");
+    // Restoring only the status cannot erase the first delivery receipt.
+    expect((await claimRunnerGoalActionDelivery(db, claimBinding, request, owner)).state).toBe("indeterminate");
+    const newRequest = { ...request, requestId: randomUUID(), expectedRevision: 1,
+      objective: "Deliver a separate new action" };
+    await service.act(binding.companyId, binding.issueId, newRequest);
     const concurrent = await Promise.all([
-      claimRunnerGoalActionDelivery(db, claimBinding, request, owner),
-      claimRunnerGoalActionDelivery(db, claimBinding, request, owner),
+      claimRunnerGoalActionDelivery(db, claimBinding, newRequest, owner),
+      claimRunnerGoalActionDelivery(db, claimBinding, newRequest, owner),
     ]);
     expect(concurrent.map((result) => result.state).sort()).toEqual(["claimed", "indeterminate"]);
   });

@@ -97,8 +97,23 @@ for (const action of ["task_retry", "thread_retry", "inbox_retry", "message", "q
         await page.getByRole("textbox", { name: "editable markdown" }).fill("Please continue the pending follow-up.");
         await page.getByRole("button", { name: "Send", exact: true }).click();
       } else {
+        const retryResponse = action === "inbox_retry"
+          ? page.waitForResponse(response => {
+              const call = response.request();
+              return call.method() === "POST" &&
+                new URL(response.url()).pathname === `/api/agents/${agent.id}/wakeup` &&
+                call.postDataJSON()?.failedRunId === sourceRunId;
+            })
+          : null;
         await page.getByRole("button", { name: action === "thread_retry" ? "Try again" : "Retry", exact: true }).click();
-        if (action === "inbox_retry") await page.goto(taskUrl);
+        if (retryResponse) {
+          const response = await retryResponse;
+          expect(response.ok(), `Retry returned HTTP ${response.status()}`).toBe(true);
+          const result = await response.json();
+          expect(result).toMatchObject({ id: expect.any(String), agentId: agent.id, companyId: company.id });
+          await page.waitForURL(url => url.pathname.endsWith(`/agents/${agent.id}/runs/${result.id}`));
+          await page.goto(taskUrl);
+        }
       }
       await expect(page.getByText("Answered the pending follow-up once.", { exact: false })).toBeVisible({ timeout: 45_000 });
       await expect(page.getByRole("status", { name: "Task recovery" })).toHaveCount(0);

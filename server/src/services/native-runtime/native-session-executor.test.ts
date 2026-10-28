@@ -66,6 +66,7 @@ import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { NativeGoalDeliveryHeldError, NativeSessionLeaseNotOwnedError, NativeSessionStartupBusyError, NativeWarmSessionRetirementPendingError } from "./native-goal-delivery-hold.js";
 import { dispatchLiveRunnerGoalControl, registerLiveRunnerGoalController, runnerGoalControlBrokerInternals } from "../runner-goal-control-broker.js";
 import { settleNativeSessionStartupBusy } from "../heartbeat-run-execution.js";
+import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -4867,6 +4868,7 @@ function leaseDb(
     finalization: Record<string, unknown> | null;
     result?: Record<string, unknown> | null;
   },
+  currentRunOverrides: Record<string, unknown> = {},
 ): Db {
   const coordinator: LeaseCoordinator = {
     runId: boundExecution.binding.runId,
@@ -4925,10 +4927,17 @@ function leaseDb(
                   agentId: boundExecution.binding.agentId,
                   companyId: boundExecution.binding.companyId,
                   nativeIssueId: boundExecution.binding.issueId,
+                  nativeSessionId: boundExecution.session.normalizedSessionId,
                   resultJson: runResultJson,
                   runnerProfileJson,
                   runtimeMode: "native",
                   status: runStatus,
+                  finishedAt: null,
+                  processPid: null,
+                  processGroupId: null,
+                  errorCode: null,
+                  nativePhase: null,
+                  ...currentRunOverrides,
                 },
               ]
             : table === issues
@@ -13326,6 +13335,58 @@ describe("owned goal delivery admission", () => {
 });
 
 describe("ordinary native Run continuation admission", () => {
+  it("admits a claimed same-Run retryable recovery before backend creation", async () => {
+    const current = { ...execution,
+      binding: { ...execution.binding, runId: "same-run-claimed-recovery" },
+      session: { ...execution.session, normalizedSessionId: "be08021c-8221-4d6d-bff1-59dc94a47714" },
+    } as NativeExecutionInputV1;
+    const { runId, companyId, agentId, issueId } = current.binding;
+    const leaseOwner = "same-run-recovery-owner";
+    const profile = { nativeExecutionInput: current, sessionCheckpoint: { identity: {
+      runId, companyId, agentId, issueId, sessionId: current.session.normalizedSessionId,
+    }, providerSessionId: "persisted-provider" } };
+    state.createBackend.mockClear();
+    state.execute.mockReset().mockResolvedValue({
+      result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" },
+      turnId: "turn", normalizedSessionId: current.session.normalizedSessionId,
+      providerSessionId: "persisted-provider", driverKind: "test", driverVersion: "1",
+      nativeEventCount: 1, highestContiguousSourceSeq: 1,
+    });
+    const attempt = executePaperclipNativeSession({
+      db: leaseDb(current, { phase: "observed", leaseOwner,
+        leaseExpiresAt: new Date(Date.now() + 60_000), resultId: null },
+        {}, [], profile),
+      execution: current, runnerInstanceId: "same-run-claimed-recovery-runner", leaseOwner,
+    });
+    await expect(attempt).resolves.toBeDefined();
+    expect(state.createBackend).toHaveBeenCalledOnce();
+    expect(state.execute).toHaveBeenCalledOnce();
+  });
+  it.each(["wrong_owner", "expired", "wrong_identity", "no_owner"])(
+    "holds a same-Run checkpoint without an exact live claim (%s)", async kind => {
+      const current = { ...execution,
+        binding: { ...execution.binding, runId: `same-run-unclaimed-${kind}` },
+        session: { ...execution.session, normalizedSessionId: "b74f812c-c813-4f2e-9f65-5dbfb45a4e0b" },
+      } as NativeExecutionInputV1;
+      const { runId, companyId, agentId, issueId } = current.binding;
+      const owner = `owner-${kind}`;
+      const profile = { nativeExecutionInput: current, sessionCheckpoint: { identity: {
+        runId: kind === "wrong_identity" ? "foreign-run" : runId,
+        companyId, agentId, issueId, sessionId: current.session.normalizedSessionId,
+      }, providerSessionId: "persisted-provider" } };
+      state.createBackend.mockClear();
+      await expect(executePaperclipNativeSession({
+        db: leaseDb(current, { phase: "observed",
+          leaseOwner: kind === "wrong_owner" ? "another-owner" : owner,
+          leaseExpiresAt: new Date(Date.now() + (kind === "expired" ? -60_000 : 60_000)),
+          resultId: null }, {}, [], profile),
+        execution: current, runnerInstanceId: `runner-${kind}`,
+        leaseOwner: kind === "no_owner" ? undefined : owner,
+      })).rejects.toThrow("native_ordinary_resume_source_uncommitted");
+      expect(state.createBackend).not.toHaveBeenCalled();
+      expect(state.execute).not.toHaveBeenCalled();
+    },
+  );
   const sourceFixture = (name: string, phase: string | null, resultStatus = "accepted") => {
     const sessionId = "be08021c-8221-4d6d-bff1-59dc94a47714";
     const current = { ...execution,
@@ -13351,6 +13412,64 @@ describe("ordinary native Run continuation admission", () => {
         issueId: current.binding.issueId, schemaStatus: resultStatus },
     } };
   };
+
+  it.each(["committed_claim", "committed_wrong_owner", "uncommitted_claim"])(
+    "checks a same-Run claim and older source independently (%s)", async kind => {
+      const { current, source } = sourceFixture(`same-run-history-${kind}`,
+        kind === "uncommitted_claim" ? "observed" : "committed");
+      const { runId, companyId, agentId, issueId } = current.binding;
+      const leaseOwner = `claimed-${kind}`;
+      const profile = { nativeExecutionInput: current, sessionCheckpoint: { identity: {
+        runId, companyId, agentId, issueId,
+        sessionId: current.session.normalizedSessionId,
+      }, providerSessionId: "persisted-provider" } };
+      state.createBackend.mockClear();
+      state.execute.mockReset().mockResolvedValue({
+        result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" },
+        turnId: "turn", normalizedSessionId: current.session.normalizedSessionId,
+        providerSessionId: "persisted-provider", driverKind: "test", driverVersion: "1",
+        nativeEventCount: 1, highestContiguousSourceSeq: 1,
+      });
+      const attempt = executePaperclipNativeSession({
+        db: leaseDb(current, { phase: "observed",
+          leaseOwner: kind === "committed_wrong_owner" ? "foreign-owner" : leaseOwner,
+          leaseExpiresAt: new Date(Date.now() + 60_000), resultId: null },
+          {}, [], profile, "running", undefined, source),
+        execution: current, runnerInstanceId: `runner-${kind}`, leaseOwner,
+      });
+      if (kind === "committed_claim") {
+        await expect(attempt).resolves.toBeDefined();
+        expect(state.createBackend).toHaveBeenCalledOnce();
+      } else {
+        await expect(attempt).rejects.toThrow("native_ordinary_resume_source_uncommitted");
+        expect(state.createBackend).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it.each([
+    { name: "live process", row: { processPid: 42 } },
+    { name: "live process group", row: { processGroupId: 42 } },
+    { name: "unverified native owner", row: {
+      errorCode: "native_execution_ownership_unverified", nativePhase: "terminal_failure",
+    } },
+  ])("holds a claimed same-Run checkpoint with $name before warm retirement", async ({ name, row }) => {
+    const { current, source } = sourceFixture(`same-run-owner-${name}`, "committed");
+    const { runId, companyId, agentId, issueId } = current.binding;
+    const leaseOwner = "exact-owner";
+    const profile = { nativeExecutionInput: current, sessionCheckpoint: { identity: {
+      runId, companyId, agentId, issueId,
+      sessionId: current.session.normalizedSessionId,
+    } } };
+    state.createBackend.mockClear();
+    await expect(executePaperclipNativeSession({
+      db: leaseDb(current, { phase: "observed", leaseOwner,
+        leaseExpiresAt: new Date(Date.now() + 60_000), resultId: null },
+        {}, [], profile, "running", undefined, source, row),
+      execution: current, runnerInstanceId: "same-run-owned", leaseOwner,
+    })).rejects.toThrow("native_ordinary_resume_source_uncommitted");
+    expect(state.createBackend).not.toHaveBeenCalled();
+  });
 
   it.each(["committed", "observed", "missing", "rejected_result"])(
     "admits only a committed accepted ordinary source (%s)", async kind => {
@@ -13490,8 +13609,8 @@ describe("ordinary native Run continuation admission", () => {
       binding: { ...execution.binding, runId: "ordinary-disk-current" },
       session: { ...execution.session, normalizedSessionId: sessionId },
     } as NativeExecutionInputV1;
-    const directory = join(home, "instances", "default", "runtime", "paperclip-runner", "sessions");
     process.env.PAPERCLIP_HOME = home;
+    const directory = join(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "sessions");
     try {
       await mkdir(directory, { recursive: true });
       await writeFile(join(directory, `${createHash("sha256").update(sessionId).digest("hex")}.json`),
@@ -13520,9 +13639,9 @@ describe("ordinary native Run continuation admission", () => {
         binding: { ...execution.binding, runId: `ordinary-disk-${kind}` },
         session: { ...execution.session, normalizedSessionId: sessionId },
       } as NativeExecutionInputV1;
-      const directory = join(home, "instances", "default", "runtime", "paperclip-runner", "sessions");
-      const path = join(directory, `${createHash("sha256").update(sessionId).digest("hex")}.json`);
       process.env.PAPERCLIP_HOME = home;
+      const directory = join(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "sessions");
+      const path = join(directory, `${createHash("sha256").update(sessionId).digest("hex")}.json`);
       try {
         await mkdir(directory, { recursive: true });
         if (kind === "malformed") await writeFile(path, "{");

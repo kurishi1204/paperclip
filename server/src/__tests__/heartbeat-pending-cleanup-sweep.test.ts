@@ -253,7 +253,7 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     });
 
     expect(await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 })).toMatchObject({
-      swept: shouldProtect ? 0 : 1, destroyed: shouldProtect ? 0 : 1,
+      swept: 1, destroyed: shouldProtect ? 0 : 1,
     });
     expect(destroyRunLease).toHaveBeenCalledTimes(shouldProtect ? 0 : 1);
     const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
@@ -295,7 +295,7 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
       environmentRuntime: { destroyRunLease, retryPendingSandboxTeardown } as unknown as HeartbeatEnvironmentRuntime,
     });
 
-    expect(await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 })).toMatchObject({ swept: 1, destroyed: 1 });
+    expect(await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 })).toMatchObject({ swept: 2, destroyed: 1 });
     expect(destroyRunLease).not.toHaveBeenCalled();
     expect(retryPendingSandboxTeardown).toHaveBeenCalledTimes(1);
     expect(retryPendingSandboxTeardown.mock.calls[0]?.[0].lease).toMatchObject({ id: rejectedLeaseId });

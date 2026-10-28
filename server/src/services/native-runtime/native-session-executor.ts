@@ -7391,6 +7391,7 @@ function ordinaryResumeDiskOrigin(execution: NativeExecutionInput): Record<strin
 async function assertOrdinaryNativeResumeSourceCommitted(input: {
   db: Db;
   execution: NativeExecutionInput;
+  leaseOwner?: string;
   restartRecovery?: NativeRestartRecoveryClaim;
 }): Promise<void> {
   if (input.restartRecovery) return; // This is the existing same-Run restart protocol.
@@ -7419,7 +7420,15 @@ async function assertOrdinaryNativeResumeSourceCommitted(input: {
     // silently bypass source admission. A text comparison remains read-only.
     sql`${heartbeatRuns.nativeSessionId}::text = ${sessionId}`,
   )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
-  const [current] = await input.db.select({ runnerProfileJson: heartbeatRuns.runnerProfileJson })
+  const [current] = await input.db.select({
+    id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
+    agentId: heartbeatRuns.agentId, nativeIssueId: heartbeatRuns.nativeIssueId,
+    nativeSessionId: heartbeatRuns.nativeSessionId, runtimeMode: heartbeatRuns.runtimeMode,
+    status: heartbeatRuns.status, finishedAt: heartbeatRuns.finishedAt,
+    processPid: heartbeatRuns.processPid, processGroupId: heartbeatRuns.processGroupId,
+    errorCode: heartbeatRuns.errorCode, nativePhase: heartbeatRuns.nativePhase,
+    runnerProfileJson: heartbeatRuns.runnerProfileJson,
+  })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId),
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
       eq(heartbeatRuns.nativeIssueId, issueId))).limit(1);
@@ -7431,8 +7440,55 @@ async function assertOrdinaryNativeResumeSourceCommitted(input: {
       checkpointIdentity.issueId !== issueId || checkpointIdentity.sessionId !== sessionId)) {
     throw new NativeOrdinaryResumeSourceUncommittedError();
   }
+  if (checkpoint != null && checkpointIdentity.runId === runId) {
+      // A same-Run retryable recovery is claimed by the reconciler, not by a
+      // caller's boolean. Re-read its durable owner and binding before any
+      // warm retirement or provider construction. The later execution claim
+      // remains the final write-side fence against a concurrent lease change.
+      const owner = input.leaseOwner;
+      if (!owner || current.id !== runId || current.companyId !== companyId ||
+          current.agentId !== agentId || current.nativeIssueId !== issueId ||
+          current.nativeSessionId !== sessionId || current.runtimeMode !== "native" ||
+          current.status !== "running" || current.finishedAt != null ||
+          current.processPid != null || current.processGroupId != null ||
+          isNativeRunnerOwnershipHeld(current) ||
+          checkpointIdentity.runId !== runId) {
+        throw new NativeOrdinaryResumeSourceUncommittedError();
+      }
+      let persisted: NativeExecutionInput;
+      try {
+        persisted = parseNativeExecutionInput(record(current.runnerProfileJson).nativeExecutionInput);
+      } catch (cause) {
+        throw new NativeOrdinaryResumeSourceUncommittedError(cause);
+      }
+      if (persisted.binding.runId !== runId || persisted.binding.companyId !== companyId ||
+          persisted.binding.agentId !== agentId || persisted.binding.issueId !== issueId ||
+          nativeSessionKey(persisted) !== sessionId) {
+        throw new NativeOrdinaryResumeSourceUncommittedError();
+      }
+      const [claim] = await input.db.select({
+        runId: nativeRunFinalizations.runId, companyId: nativeRunFinalizations.companyId,
+        issueId: nativeRunFinalizations.issueId, phase: nativeRunFinalizations.phase,
+        resultId: nativeRunFinalizations.resultId,
+        leaseOwner: nativeRunFinalizations.leaseOwner,
+        leaseExpiresAt: nativeRunFinalizations.leaseExpiresAt,
+      }).from(nativeRunFinalizations).where(and(
+        eq(nativeRunFinalizations.runId, runId),
+        eq(nativeRunFinalizations.companyId, companyId),
+        eq(nativeRunFinalizations.issueId, issueId),
+        eq(nativeRunFinalizations.leaseOwner, owner),
+        gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`),
+      )).limit(1);
+      if (!claim || claim.runId !== runId || claim.companyId !== companyId ||
+          claim.issueId !== issueId || claim.phase !== "observed" ||
+          claim.resultId != null || claim.leaseOwner !== owner ||
+          !claim.leaseExpiresAt || claim.leaseExpiresAt <= new Date()) {
+        throw new NativeOrdinaryResumeSourceUncommittedError();
+      }
+  }
   if (previous.length === 0) {
-    if (checkpoint != null || origins.some(origin => origin.runId !== runId)) {
+    if ((checkpoint != null && checkpointIdentity.runId !== runId) ||
+        origins.some(origin => origin.runId !== runId)) {
       throw new NativeOrdinaryResumeSourceUncommittedError();
     }
     return;
