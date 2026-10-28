@@ -1,10 +1,11 @@
 import { projectService } from "../services/projects.js";
 import { callProjectTool } from "../services/project-tools.js";
+import { SELF_TASK_DOCUMENT_CONTEXT_KEY } from "../services/self-task-document-runtime.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, issues, heartbeatRuns, projects, companyMemberships, executionWorkspaces } from "@paperclipai/db";
+import { agents, issues, heartbeatRuns, projects, companyMemberships, executionWorkspaces, documentRevisions } from "@paperclipai/db";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 import { issueService } from "../services/issues.js";
 import { documentService } from "../services/documents.js";
@@ -13,12 +14,180 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { getEmbeddedPostgresTestSupport } from "./helpers/embedded-postgres.js";
 
 const support = await getEmbeddedPostgresTestSupport();
+if (process.env.PAPERCLIP_REQUIRE_EMBEDDED_PG === "1" && !support.supported) {
+  throw new Error(`Embedded PostgreSQL is required for chat project tools: ${support.reason}`);
+}
 (support.supported ? describe : describe.skip)("chat project tool handoff", () => {
   let server: Awaited<ReturnType<typeof startRunnerApiTestServer>>;
   const originalSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
   beforeAll(async () => { process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID(); server = await startRunnerApiTestServer(); }, 60_000);
   afterAll(async () => { await server?.close(); if (originalSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET; else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalSecret; });
   const call = (fixture: Awaited<ReturnType<typeof server.fixture>>, tool: string, args: Record<string, unknown>) => fixture.authority.execute({ tool, arguments: args, callId: randomUUID() });
+
+  it("uses the persisted opt-in flag for both document tool discovery and calls", async () => {
+    const f = await server.fixture({ disableWakeOnDemand: true });
+    await server.db.update(issues).set({ checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
+    await server.db.update(documentRevisions).set({ createdByRunId: null })
+      .where(eq(documentRevisions.createdByRunId, f.runId));
+    const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.responsibleUserId)!;
+    const [run] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const snapshot = { ...run!.contextSnapshot };
+    delete snapshot[SELF_TASK_DOCUMENT_CONTEXT_KEY];
+    const input = await callProjectTool({ name: "read_self_task_document", arguments: { key: "notes" },
+      apiUrl: server.apiUrl, token, companyId: f.companyId, issueId: f.issueId,
+      agentId: f.agentId, conversation: false });
+    if (input.outcome !== "verified" || typeof input.documentId !== "string" ||
+        typeof input.revisionId !== "string" || typeof input.bodySha256 !== "string") {
+      throw new Error("Fixed synthetic input receipt missing");
+    }
+    const args = { key: "result", title: "Synthetic route result", format: "markdown", body: "One route-bound result",
+      documentId: null, baseRevisionId: null, input: { key: "notes", documentId: input.documentId,
+        revisionId: input.revisionId, bodySha256: input.bodySha256 } };
+    const rpc = async (method: string, params?: Record<string, unknown>) => {
+      const response = await fetch(`${server.apiUrl}/api/mcp/project-tools`, {
+        method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: "synthetic-opt-in", method, params }),
+      });
+      expect(response.status).toBe(200);
+      return response.json();
+    };
+    for (const flag of [undefined, false, "true"]) {
+      await server.db.update(heartbeatRuns).set({ contextSnapshot: {
+        ...snapshot, ...(flag === undefined ? {} : { [SELF_TASK_DOCUMENT_CONTEXT_KEY]: flag }),
+      } }).where(eq(heartbeatRuns.id, f.runId));
+      const listed = await rpc("tools/list");
+      expect(listed.result.tools.map((tool: { name: string }) => tool.name).sort()).toEqual([
+        "create_project", "create_task", "list_project_repositories", "list_projects", "set_task_title",
+      ]);
+      const refused = await rpc("tools/call", { name: "write_self_task_document", arguments: args });
+      expect(refused.result).toMatchObject({ isError: true,
+        content: [{ type: "text", text: "Tool is unavailable in this mode" }] });
+      expect(await documentService(server.db).getIssueDocumentByKey(f.issueId, "result")).toBeNull();
+    }
+    await server.db.update(heartbeatRuns).set({ contextSnapshot: {
+      ...snapshot, [SELF_TASK_DOCUMENT_CONTEXT_KEY]: true,
+    } }).where(eq(heartbeatRuns.id, f.runId));
+    const listed = await rpc("tools/list");
+    expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
+      "read_self_task_document", "write_self_task_document",
+    ]);
+    const refusedProject = await rpc("tools/call", { name: "list_projects", arguments: {} });
+    expect(refusedProject.result).toMatchObject({ isError: true,
+      content: [{ type: "text", text: "Tool is unavailable in this mode" }] });
+    const saved = await rpc("tools/call", { name: "write_self_task_document", arguments: args });
+    expect(saved.result).toMatchObject({ structuredContent: { outcome: "verified", body: args.body,
+      requests: { reads: 1, puts: 1, readbacks: 1 } } });
+    const stored = await documentService(server.db).getIssueDocumentByKey(f.issueId, "result");
+    expect(stored?.latestRevisionId).toBe(saved.result.structuredContent.revisionId);
+    const revisions = await server.db.select().from(documentRevisions)
+      .where(eq(documentRevisions.documentId, stored!.id));
+    expect(revisions).toHaveLength(1);
+  });
+
+  it("binds a single document write to the active task, then exposes its fixed revision", async () => {
+    const f = await server.fixture({ disableWakeOnDemand: true });
+    await server.db.update(issues).set({ checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
+    // The fixture input predates this bounded facade; the test run has made no write yet.
+    await server.db.update(documentRevisions).set({ createdByRunId: null }).where(eq(documentRevisions.createdByRunId, f.runId));
+    const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.responsibleUserId)!;
+    const base = { apiUrl: server.apiUrl, token, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, conversation: false };
+    const read = await callProjectTool({ ...base, name: "read_self_task_document", arguments: { key: "notes" } });
+    expect(read).toMatchObject({ outcome: "verified", taskId: f.issueId, key: "notes" });
+    if (read.outcome !== "verified" || typeof read.documentId !== "string" || typeof read.revisionId !== "string" || typeof read.bodySha256 !== "string") throw new Error("Fixed input missing");
+    const body = "# Verified result\n\nA single synthetic deliverable.";
+    const args = { key: "result", title: "Result", format: "markdown", body,
+      documentId: null, baseRevisionId: null,
+      input: { key: "notes", documentId: read.documentId, revisionId: read.revisionId, bodySha256: read.bodySha256 } };
+    const saved = await callProjectTool({ ...base, name: "write_self_task_document", arguments: args });
+    expect(saved).toMatchObject({ outcome: "verified", taskId: f.issueId, key: "result", bodySha256: createHash("sha256").update(body).digest("hex"), requests: { puts: 1, readbacks: 1 } });
+    if (saved.outcome !== "verified" || typeof saved.revisionId !== "string") throw new Error("Write receipt missing");
+    const fixed = await callProjectTool({ ...base, name: "read_self_task_document", arguments: { key: "result", revisionId: saved.revisionId } });
+    expect(fixed).toMatchObject({ outcome: "verified", revisionId: saved.revisionId, body });
+    const second = await callProjectTool({ ...base, name: "write_self_task_document", arguments: { ...args, key: "another" } });
+    expect(second).toMatchObject({ outcome: "rejected", status: 409, requests: { puts: 1, readbacks: 0 } });
+    expect(await documentService(server.db).getIssueDocumentByKey(f.issueId, "another")).toBeNull();
+  });
+
+  it("does not replay a committed document PUT after its response is lost", async () => {
+    const f = await server.fixture({ disableWakeOnDemand: true });
+    await server.db.update(issues).set({ checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
+    await server.db.update(documentRevisions).set({ createdByRunId: null })
+      .where(eq(documentRevisions.createdByRunId, f.runId));
+    const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.responsibleUserId)!;
+    const base = { apiUrl: server.apiUrl, token, companyId: f.companyId, issueId: f.issueId,
+      agentId: f.agentId, conversation: false };
+    const fixed = await callProjectTool({ ...base, name: "read_self_task_document", arguments: { key: "notes" } });
+    expect(fixed).toMatchObject({ outcome: "verified" });
+    if (fixed.outcome !== "verified" || typeof fixed.documentId !== "string" ||
+        typeof fixed.revisionId !== "string" || typeof fixed.bodySha256 !== "string")
+      throw new Error("Fixed input missing");
+    const originalFetch = globalThis.fetch;
+    let puts = 0, committedResponses = 0;
+    globalThis.fetch = async (resource, init) => {
+      const response = await originalFetch(resource, init);
+      if (init?.method === "PUT" && String(resource).endsWith(`/api/issues/${f.issueId}/documents/result`)) {
+        puts++;
+        if (response.ok) {
+          committedResponses++;
+          throw new TypeError("synthetic response lost after commit");
+        }
+      }
+      return response;
+    };
+    let result: Awaited<ReturnType<typeof callProjectTool>>;
+    try {
+      result = await callProjectTool({ ...base, name: "write_self_task_document", arguments: {
+        key: "result", title: "Result", format: "markdown", body: "One committed synthetic result",
+        documentId: null, baseRevisionId: null,
+        input: { key: "notes", documentId: fixed.documentId, revisionId: fixed.revisionId,
+          bodySha256: fixed.bodySha256 },
+      } });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    expect(result).toMatchObject({ outcome: "unknown", stage: "put",
+      requests: { reads: 1, puts: 1, readbacks: 0 } });
+    expect([puts, committedResponses]).toEqual([1, 1]);
+    const stored = await documentService(server.db).getIssueDocumentByKey(f.issueId, "result");
+    expect(stored).not.toBeNull();
+    expect(stored?.body).toBe("One committed synthetic result");
+    const revisions = await server.db.select().from(documentRevisions)
+      .where(eq(documentRevisions.documentId, stored!.id));
+    expect(revisions).toHaveLength(1);
+  });
+
+  it("rejects a different task and refuses a locked document without creating another key", async () => {
+    const f = await server.fixture({ disableWakeOnDemand: true });
+    await server.db.update(issues).set({ checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
+    await server.db.update(documentRevisions).set({ createdByRunId: null })
+      .where(eq(documentRevisions.createdByRunId, f.runId));
+    const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.responsibleUserId)!;
+    const base = { apiUrl: server.apiUrl, token, companyId: f.companyId,
+      issueId: f.issueId, agentId: f.agentId, conversation: false };
+    expect(await callProjectTool({ ...base, issueId: f.blockerId,
+      name: "read_self_task_document", arguments: { key: "notes" } }))
+      .toMatchObject({ outcome: "rejected", status: 403 });
+    const input = await callProjectTool({ ...base,
+      name: "read_self_task_document", arguments: { key: "notes" } });
+    expect(input.outcome).toBe("verified");
+    if (input.outcome !== "verified" || typeof input.documentId !== "string" ||
+        typeof input.revisionId !== "string" || typeof input.bodySha256 !== "string")
+      throw new Error("Locked-document input receipt missing");
+    const before = await documentService(server.db).listIssueDocuments(f.issueId);
+    await documentService(server.db).lockIssueDocument({ issueId: f.issueId, key: "notes",
+      lockedByAgentId: f.agentId });
+    const denied = await callProjectTool({ ...base, name: "write_self_task_document", arguments: {
+      key: "notes", documentId: input.documentId, baseRevisionId: input.revisionId,
+      title: "Locked replacement", format: "markdown", body: "This must not be saved.",
+      input: { key: "notes", documentId: input.documentId,
+        revisionId: input.revisionId, bodySha256: input.bodySha256 },
+    } });
+    expect(denied).toMatchObject({ outcome: "rejected", status: 409, requests: { puts: 1, readbacks: 0 } });
+    const after = await documentService(server.db).listIssueDocuments(f.issueId);
+    expect(after.map(doc => [doc.key, doc.id])).toEqual(before.map(doc => [doc.key, doc.id]));
+    expect((await documentService(server.db).getIssueDocumentByKey(f.issueId, "notes"))?.latestRevisionId)
+      .toBe(input.revisionId);
+  });
 
   it("pages only visible projects and prefilters low-trust agent and run scopes", async () => {
     const f = await server.fixture({ disableWakeOnDemand: true });

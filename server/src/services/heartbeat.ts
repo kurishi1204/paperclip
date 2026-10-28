@@ -315,6 +315,7 @@ import type {
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { createRuntimeToolsToken } from "../runtime-tools-token.js";
 import { QA_REVIEW_MCP_CONNECTION_ID, QA_REVIEW_MCP_NAME, qaReviewLocalApiUrl } from "./qa-review-tools.js";
+import { SELF_TASK_DOCUMENT_CONTEXT_KEY, hasSelfTaskDocumentReplayHold, isSelfTaskDocumentRuntime, selfTaskDocumentMcpServers } from "./self-task-document-runtime.js";
 import {
   parseObject,
   asBoolean,
@@ -14273,6 +14274,14 @@ export function heartbeatService(
     agent: typeof agents.$inferSelect,
     issueId: string,
   ) {
+    if (hasSelfTaskDocumentReplayHold(run)) {
+      await appendRunEvent(run, {
+        eventType: "lifecycle", stream: "system", level: "warn",
+        message: "Task document work requires receipt reconciliation before an explicit new episode.",
+        payload: { reason: "self_task_document_replay_hold", issueId, retrySuppressed: true },
+      });
+      return null;
+    }
     const invokability = await getAgentInvokability(agent);
     if (!invokability.invokable) {
       await appendRunEvent(run, {
@@ -15521,6 +15530,12 @@ export function heartbeatService(
       delayMs?: number;
     },
   ) {
+    if (hasSelfTaskDocumentReplayHold(run)) {
+      return { outcome: "not_scheduled" as const,
+        reason: "Reconcile task document receipts before an explicit new episode; automatic replay is disabled.",
+        errorCode: "self_task_document_replay_hold" as const,
+        issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
+    }
     if (readQaPagingHold(run)) {
       return { outcome: "not_scheduled" as const, reason: "Repair QA paging before explicit resumption.",
         issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
@@ -21977,6 +21992,19 @@ export function heartbeatService(
         resolve: () => resolveAssignedConnectionInstructionsForRun(db, { companyId: agent.companyId, agentId: agent.id, runId: run.id }),
         context, config: connectorDelivery.config, native: agent.adapterType === "paperclip_runner",
       });
+      const selfTaskDocumentMode = isSelfTaskDocumentRuntime(agent.adapterType, runtimeConfig);
+      // Replace caller wake data even when disabled. Both the HTTP tool endpoint
+      // and recovery observe the same server-owned mode before provider work.
+      context[SELF_TASK_DOCUMENT_CONTEXT_KEY] = selfTaskDocumentMode;
+      run = { ...run, contextSnapshot: { ...parseObject(run.contextSnapshot), [SELF_TASK_DOCUMENT_CONTEXT_KEY]: selfTaskDocumentMode } };
+      await db.transaction(async tx => {
+        // Share I -> Run ordering with wake admission, so a source cannot gain
+        // document capability between its replay check and successor creation.
+        if (issueId) await tx.execute(sql`select id from issues where id::text = ${issueId} and company_id = ${agent.companyId} for update`);
+        await tx.update(heartbeatRuns).set({
+          contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ [SELF_TASK_DOCUMENT_CONTEXT_KEY]: selfTaskDocumentMode })}::jsonb`,
+        }).where(eq(heartbeatRuns.id, run.id));
+      });
       const agentIdentity = supportsManagedAgentIdentity(agent.adapterType, agent.adapterConfig, run.runtimeMode === "native" ? run.driverKind : undefined)
         ? await agentIdentityService(db).ensureAgentIdentity(agent.companyId, agent.id)
         : undefined;
@@ -25196,13 +25224,18 @@ export function heartbeatService(
             };
             const qaReviewMode = ["claude_local", "codex_local"].includes(agent.adapterType) && runtimeConfig.qaReviewToolsOnly === true;
             const cycleMode = runtimeConfig.commanderCycleToolsOnly === true;
-            const runtimeTools = qaReviewMode || cycleMode ? undefined : createAdapterRuntimeToolAccess({
+            const isolatedTaskTools = qaReviewMode || cycleMode || selfTaskDocumentMode;
+            if (selfTaskDocumentMode) {
+              delete adapterContext.paperclipRuntimeTools;
+              delete adapterContext.paperclipManagedMcp;
+            }
+            const runtimeTools = isolatedTaskTools ? undefined : createAdapterRuntimeToolAccess({
               agentId: agent.id,
               companyId: agent.companyId,
               runId: run.id,
               responsibleUserId: run.responsibleUserId,
             });
-            if (!runtimeTools && !qaReviewMode && !cycleMode) {
+            if (!runtimeTools && !isolatedTaskTools) {
               logger.warn(
                 {
                   companyId: agent.companyId,
@@ -25212,7 +25245,7 @@ export function heartbeatService(
                 "runtime connection tools could not be delivered",
               );
             }
-            const runtimeMcpServers = qaReviewMode || cycleMode ? [] : await buildPaperclipRuntimeMcpServers({
+            const runtimeMcpServers = isolatedTaskTools ? [] : await buildPaperclipRuntimeMcpServers({
               db,
               agent,
               runId: run.id,
@@ -25227,8 +25260,10 @@ export function heartbeatService(
                 connectionId: "paperclip-runtime-tools",
               });
             }
-            const qaLocalApiUrl = qaReviewMode ? qaReviewLocalApiUrl() : null;
-            if (!cycleMode && authToken && issueRef && (qaReviewMode ? qaLocalApiUrl : configuredPaperclipApiBaseUrl())) {
+            const qaLocalApiUrl = qaReviewMode || selfTaskDocumentMode ? qaReviewLocalApiUrl() : null;
+            if (selfTaskDocumentMode) {
+              runtimeMcpServers.push(...selfTaskDocumentMcpServers({ localApiUrl: qaLocalApiUrl, authToken, hasIssue: !!issueRef }));
+            } else if (!cycleMode && authToken && issueRef && (qaReviewMode ? qaLocalApiUrl : configuredPaperclipApiBaseUrl())) {
               if (qaReviewMode) {
                 runtimeMcpServers.unshift({
                   name: QA_REVIEW_MCP_NAME,
@@ -25245,7 +25280,7 @@ export function heartbeatService(
             if (runtimeTools && runtimeToolDelivery === "invocation_context") {
               adapterContext.paperclipRuntimeTools = runtimeTools;
             }
-            const managedMcpConfig = qaReviewMode || cycleMode ? null : await createManagedMcpRunConfig({
+            const managedMcpConfig = isolatedTaskTools ? null : await createManagedMcpRunConfig({
               db,
               agent,
               runId: run.id,
@@ -27542,6 +27577,33 @@ export function heartbeatService(
       });
     };
 
+    // Called under the issue lock. Payload prose and old answers are not new
+    // execution authority: saved user input must re-enter through the existing
+    // authenticated user/durable-request/operator-action admission paths.
+    const documentReplayHold = async (queryDb: Db) => {
+      if (!issueId || opts.requestedByActorType === "user" || durableRequest || executionReconciliationWake) return null;
+      const [latest] = await queryDb.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agentId),
+        sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issueId}`,
+      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+      const rawSourceIds = [...new Set([enrichedContextSnapshot.retryOfRunId,
+        enrichedContextSnapshot.previousRunId, enrichedContextSnapshot.sourceRunId]
+        .filter((id): id is string => typeof id === "string" && id.length > 0))];
+      const sourceIds = rawSourceIds.filter(isUuidLike);
+      const namedSources = sourceIds.length ? await queryDb.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, agent.companyId), inArray(heartbeatRuns.id, sourceIds),
+      )) : [];
+      // Known sources in another task/worker belong to independent handoffs.
+      const applicable = namedSources.filter(run => run.agentId === agentId &&
+        (run.nativeIssueId ?? readNonEmptyString(run.contextSnapshot?.issueId) ?? readNonEmptyString(run.contextSnapshot?.taskId)) === issueId);
+      const heldSource = [latest, ...applicable].find(hasSelfTaskDocumentReplayHold);
+      const missingSource = rawSourceIds.find(id => !namedSources.some(run => run.id === id));
+      if (missingSource) return {
+        sourceRunId: missingSource, reason: "source_run_unavailable",
+      };
+      return heldSource ? { sourceRunId: heldSource.id, reason: "self_task_document_replay_hold" } : null;
+    };
+
     const schedulingSuppression = await getSchedulingSuppression();
     // A task drain holds ADMISSION, not the request. The drain is a
     // process-local pre-restart hold, so a wake that arrives while it is
@@ -28129,6 +28191,21 @@ export function heartbeatService(
               requestedByActorId: opts.requestedByActorId ?? null,
               idempotencyKey: opts.idempotencyKey ?? null,
               finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
+
+          const replayHold = await documentReplayHold(tx as unknown as Db);
+          if (replayHold) {
+            await tx.insert(agentWakeupRequests).values({
+              ...durableReceiptFields, companyId: agent.companyId, agentId, source, triggerDetail,
+              reason: "self_task_document_replay_hold", status: "skipped",
+              payload: { ...(payload ?? {}), heartbeatSkip: { ...replayHold,
+                automaticRetryAllowed: false, retryBudgetSpent: false,
+                nextAction: "Reconcile the source document receipt, then explicitly choose a new episode.",
+              } }, requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null, finishedAt: new Date(),
             });
             return { kind: "skipped" as const };
           }

@@ -331,9 +331,15 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     for (const key of ["PATH", "TMPDIR", "LANG", "LC_ALL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR"] as const) {
       if (typeof process.env[key] === "string") env[key] = process.env[key]!;
     }
-    // The QA MCP uses a loopback URL with a run-bound bearer token. Keep that
-    // request off an operator proxy even when the provider uses the proxy.
-    const noProxy = [process.env.NO_PROXY, process.env.no_proxy, "127.0.0.1", "localhost", "::1", "[::1]"]
+  }
+  if (qaReviewToolsOnly || config.selfTaskDocumentToolsOnly === true) {
+    // Keep run-bound tool requests on loopback even when the provider uses a
+    // proxy. Preserve QA's host-only proxy policy and normal task env overrides.
+    const noProxy = [
+      qaReviewToolsOnly ? process.env.NO_PROXY : env.NO_PROXY ?? process.env.NO_PROXY,
+      qaReviewToolsOnly ? process.env.no_proxy : env.no_proxy ?? process.env.no_proxy,
+      "127.0.0.1", "localhost", "::1", "[::1]",
+    ]
       .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
       .join(",");
     env.NO_PROXY = noProxy;
@@ -451,6 +457,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const commanderCycleToolsOnly = asBoolean(ctx.config.commanderCycleToolsOnly, false);
   const qaReviewToolsOnly = asBoolean(ctx.config.qaReviewToolsOnly, false);
   const isolatedToolsOnly = qaReviewToolsOnly || commanderCycleToolsOnly;
+  const selfTaskDocumentToolsOnly = ctx.config.selfTaskDocumentToolsOnly === true;
+  const invalidSelfTaskProjection = (message: string): AdapterExecutionResult => ({
+    exitCode: 1, signal: null, timedOut: false,
+    errorCode: "self_task_document_tools_configuration_invalid",
+    errorMessage: message,
+    resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+  });
+  if (ctx.config.selfTaskDocumentToolsOnly != null && typeof ctx.config.selfTaskDocumentToolsOnly !== "boolean") {
+    return invalidSelfTaskProjection("Task document tool mode must be an explicit boolean.");
+  }
+  if (selfTaskDocumentToolsOnly && (engineSelection.engine !== "cli" || isolatedToolsOnly)) {
+    return invalidSelfTaskProjection("Task document tools require the Claude CLI engine without another tool-only mode.");
+  }
   if (isolatedToolsOnly && engineSelection.engine !== "cli") {
     return { exitCode: 1, signal: null, timedOut: false, errorCode: "qa_review_configuration_invalid",
       errorMessage: "QA review tools require the Claude CLI engine.",
@@ -467,6 +486,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
   const executionTargetIsSandbox = executionTarget?.kind === "remote" && executionTarget.transport === "sandbox";
+  if (selfTaskDocumentToolsOnly && executionTargetIsRemote) {
+    return invalidSelfTaskProjection("Task document tools require a local Claude CLI target.");
+  }
 
   const promptTemplate = asString(
     config.promptTemplate,
@@ -478,6 +500,37 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const chrome = asBoolean(config.chrome, false);
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
   const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
+  if (selfTaskDocumentToolsOnly && dangerouslySkipPermissions) {
+    return invalidSelfTaskProjection("Task document tools require Claude permissions without bypass.");
+  }
+  if (selfTaskDocumentToolsOnly &&
+      ([config.extraArgs, config.args].some((value) => value !== undefined && (!Array.isArray(value) || value.length !== 0)))) {
+    return invalidSelfTaskProjection("Task document tools do not accept additional Claude CLI arguments.");
+  }
+  if (selfTaskDocumentToolsOnly &&
+      (typeof context.issueId !== "string" || context.issueId.trim().length === 0)) {
+    return invalidSelfTaskProjection("Task document tools require a run-bound issue.");
+  }
+  const selfTaskMcpServers = selfTaskDocumentToolsOnly ? (ctx.runtimeMcp?.getServers() ?? []) : null;
+  if (selfTaskMcpServers) {
+    const server = selfTaskMcpServers[0];
+    let validEndpoint = false;
+    try {
+      if (typeof server?.url === "string") {
+        const url = new URL(server.url);
+        validEndpoint = (url.protocol === "http:" || url.protocol === "https:") &&
+          url.pathname === "/api/mcp/project-tools" && !url.username && !url.password &&
+          !url.search && !url.hash;
+      }
+    } catch {
+      // Invalid MCP URLs cannot be projected into a privileged CLI run.
+    }
+    if (selfTaskMcpServers.length !== 1 || server?.name !== "Paperclip projects" ||
+        server.connectionId !== "paperclip-project-tools" ||
+        typeof server.token !== "string" || server.token.length === 0 || !validEndpoint) {
+      return invalidSelfTaskProjection("Task document tools require the sole run-bound Paperclip project MCP connection.");
+    }
+  }
   const configEnv = parseObject(config.env);
   const managedConnection = parseObject(config.managedAiConnection);
   if (isolatedToolsOnly) {
@@ -621,10 +674,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     instructionsContents: combinedInstructionsContents,
     onLog,
   });
-  const runtimeMcpServers = commanderCycleToolsOnly ? [] : qaReviewToolsOnly
+  const runtimeMcpServers = selfTaskMcpServers ?? (commanderCycleToolsOnly ? [] : qaReviewToolsOnly
     ? (ctx.runtimeMcp?.getServers() ?? []).filter((server) =>
         server.name === "paperclip_qa" && server.connectionId === "paperclip-qa-review")
-    : ctx.runtimeMcp?.getServers() ?? [];
+    : ctx.runtimeMcp?.getServers() ?? []);
   if (qaReviewToolsOnly && runtimeMcpServers.length !== 1) {
     return { exitCode: 1, signal: null, timedOut: false, errorCode: "qa_review_tools_unavailable",
       errorMessage: "The run-bound Paperclip QA MCP server is unavailable.",
@@ -730,7 +783,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
   if (!isolatedToolsOnly) refreshPaperclipWorkspaceEnvForExecution({
     env,
-    envConfig: configEnv,
+    // This refresh reapplies config.env; retain the task MCP loopback bypass
+    // computed above instead of restoring a narrower configured NO_PROXY.
+    envConfig: selfTaskDocumentToolsOnly
+      ? { ...configEnv, NO_PROXY: env.NO_PROXY, no_proxy: env.no_proxy }
+      : configEnv,
     workspaceCwd: effectiveWorkspaceCwd,
     workspaceSource,
     workspaceStrategy,
@@ -930,11 +987,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     attemptInstructionsFilePath: string | undefined,
   ) => {
     const args = ["--print", "--output-format", "stream-json", "--verbose"];
-    if (config.managedAiConnection && !isolatedToolsOnly) args.push("--setting-sources", "user");
+    if (config.managedAiConnection && !isolatedToolsOnly && !selfTaskDocumentToolsOnly) args.push("--setting-sources", "user");
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     if (isolatedToolsOnly) {
       args.push("--restricted", "--setting-sources", "", "--tools", "", "--permission-mode", "dontAsk", "--permission-prompts", "none");
       if (qaReviewToolsOnly) args.push("--allowedTools", "mcp__paperclip_qa__read_assigned_issue,mcp__paperclip_qa__list_assigned_issue_comments,mcp__paperclip_qa__read_assigned_issue_document,mcp__paperclip_qa__list_assigned_issue_attachments,mcp__paperclip_qa__read_assigned_issue_attachment_text,mcp__paperclip_qa__submit_review_decision,mcp__paperclip_qa__read_assigned_issue_description,mcp__paperclip_qa__list_assigned_issue_annotations,mcp__paperclip_qa__read_assigned_review_receipt,mcp__paperclip_qa__read_assigned_issue_comment,mcp__paperclip_qa__read_assigned_issue_annotation_text");
+    }
+    if (selfTaskDocumentToolsOnly) {
+      // The CLI experiment established this exact MCP name projection. Exclude
+      // user/project/local permission settings as well as built-in tools; the
+      // managed policy still applies. Reject extraArgs before this argv.
+      args.push("--restricted", "--setting-sources", "", "--tools", "",
+        "--permission-mode", "dontAsk", "--permission-prompts", "none",
+        "--allowedTools", "mcp__Paperclip_projects__read_self_task_document,mcp__Paperclip_projects__write_self_task_document");
     }
     args.push(...buildClaudeExecutionPermissionArgs({
       dangerouslySkipPermissions,
@@ -1437,6 +1502,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : null;
 
     if (sessionErrorKind !== null) {
+      if (selfTaskDocumentToolsOnly) {
+        // A write may have committed before the CLI stream was lost. Never
+        // start a new session automatically for this opt-in mode.
+        await onLog("stderr", "[paperclip] Task document tool session failed; no fresh-session retry was attempted.\n");
+        return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+      }
       const reason =
         sessionErrorKind === "poisoned"
           ? "returned a poisoned message-id"

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -251,4 +251,44 @@ describe("legacy continuation persisted authority", () => {
     const repair = (await f.runs()).find(r => r.id !== f.runId)!;
     expect(repair.contextSnapshot).toMatchObject({ legacyDispositionEpisode: { id: f.runId, attempt: 1 } });
   });
+  it("holds a completed document-capable episode before creating a continuation or repair action", async () => {
+    const f = await fixture({ paperclipSelfTaskDocumentToolsOnly: true });
+    const before = (await f.runs())[0];
+    expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("skipped");
+    expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("skipped");
+    expect(await f.runs()).toEqual([before]);
+    expect(await f.actions()).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+    const audit = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+    expect(audit.filter(row => row.action === "issue.automatic_replay_held")).toHaveLength(1);
+    expect(audit).toEqual(expect.arrayContaining([expect.objectContaining({
+      action: "issue.automatic_replay_held", runId: f.runId, details: expect.objectContaining({
+        reason: "self_task_document_no_automatic_replay", retryBudgetSpent: false, automaticRetryAllowed: false,
+      }),
+    })]));
+  });
+
+  it("holds a delayed second reservation without consuming the existing action attempt", async () => {
+    const f = await fixture();
+    await f.createRecovery().reconcileLegacyContinuation(f.runId);
+    const first = (await f.runs()).find(run => run.id !== f.runId)!;
+    await f.finish(first);
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...first.contextSnapshot, paperclipSelfTaskDocumentToolsOnly: true } })
+      .where(eq(heartbeatRuns.id, first.id));
+    const beforeRuns = await f.runs(), beforeActions = await f.actions();
+    expect(await f.createRecovery().reconcileLegacyContinuation(first.id)).toBe("skipped");
+    expect(await f.runs()).toEqual(beforeRuns);
+    expect(await f.actions()).toEqual(beforeActions);
+    expect((await f.actions())[0].attemptCount).toBe(1);
+  });
+
+  it("keeps the ordinary persisted false episode eligible instead of treating a mode preference as authority", async () => {
+    const f = await fixture({ paperclipSelfTaskDocumentToolsOnly: false });
+    // The live preference is deliberately different; the source episode is the contract.
+    await db.update(agents).set({ adapterConfig: { selfTaskDocumentToolsOnly: true } }).where(eq(agents.id, f.agentId));
+    expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("queued");
+    expect(await f.runs()).toHaveLength(2);
+    expect((await f.actions())[0].attemptCount).toBe(1);
+  });
+
 });
