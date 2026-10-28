@@ -75,6 +75,8 @@ For every candidate, the script re-fetches the current head SHA and records:
 
 Verdicts are `ready`, `needs_gardening`, or `report_only` for drafts. Always rerun this stage after any wake or claim that a PR was fixed. Never trust issue comments as proof of readiness.
 
+This fork derives complete source changes from hash-verified pinned Git trees and accounts for every received PR-file row in the private `sourceRelation` report, including already-adopted identical leaves. A capped compare-file list, unexplained row, unlisted change, unsupported mode/type, incomplete tree or changing final source snapshot cannot establish readiness; keep the existing journal, CI, findings and protection gates.
+
 ## Follow-up Create-PR Task Deduplication
 
 If gardening decides a branch needs a follow-up task to create a single pull request, deduplicate before creating anything.

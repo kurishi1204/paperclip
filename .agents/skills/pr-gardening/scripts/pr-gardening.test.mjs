@@ -326,8 +326,38 @@ import { createHash } from "node:crypto";
 import { admitTrustedJournal, assessForkChecks, assessDispositions, buildReviewSource, canonical, digest, checkReadiness, GREPTILE_APP, readCorpusManifest, readCorpusManifestBlock, readReviewSettings } from "./check-readiness.mjs";
 
 const FORK = "kurishi1204/paperclip";
-const HEAD = "1".repeat(40), BASE = "2".repeat(40), TREE = "3".repeat(40), BASE_TREE = "4".repeat(40);
 const hashBlob = (s) => createHash("sha1").update(`blob ${Buffer.byteLength(s)}\0${s}`).digest("hex");
+// Real Git tree objects, including directory entries, keep fixture migration
+// neutral on the adopted reader before tree-integrity assertions are added.
+function fixtureTree(leaves) {
+  const rows = leaves.map(row => ({ ...row }));
+  const directories = new Set([""]);
+  for (const row of rows) {
+    const parts = row.path.split("/");
+    for (let i = 1; i < parts.length; i += 1) directories.add(parts.slice(0, i).join("/"));
+  }
+  let root;
+  for (const directory of [...directories].sort((a,b) => b.split("/").length-a.split("/").length || b.length-a.length)) {
+    const children = rows.filter(row => path.posix.dirname(row.path) === (directory || "."));
+    children.sort((a,b) => Buffer.compare(Buffer.from(path.posix.basename(a.path)+(a.type==="tree"?"/":"")),Buffer.from(path.posix.basename(b.path)+(b.type==="tree"?"/":""))));
+    const body = Buffer.concat(children.flatMap(row => [Buffer.from(`${row.mode==="040000"?"40000":row.mode} ${path.posix.basename(row.path)}\0`),Buffer.from(row.sha,"hex")]));
+    const sha = createHash("sha1").update(Buffer.concat([Buffer.from(`tree ${body.length}\0`),body])).digest("hex");
+    if (directory) rows.push({path:directory,type:"tree",mode:"040000",sha}); else root=sha;
+  }
+  return { sha:root,truncated:false,tree:rows };
+}
+const HEAD = "1".repeat(40), BASE = "2".repeat(40);
+const TREE = fixtureTree([{path:"sample.mjs",type:"blob",mode:"100644",sha:hashBlob("new source\n")}]).sha;
+const BASE_TREE = fixtureTree([{path:"sample.mjs",type:"blob",mode:"100644",sha:hashBlob("old source\n")}]).sha;
+function reindexFixtureTrees(f, headRows, baseRows) {
+  const prefix=`repos/${FORK}`, head=fixtureTree(headRows), base=fixtureTree(baseRows);
+  f.routes[`${prefix}/git/trees/${head.sha}?recursive=1`]=head;
+  f.routes[`${prefix}/git/trees/${base.sha}?recursive=1`]=base;
+  f.routes[`${prefix}/git/commits/${HEAD}`]={sha:HEAD,tree:{sha:head.sha}};
+  f.routes[`${prefix}/git/commits/${BASE}`]={sha:BASE,tree:{sha:base.sha}};
+  f.source.treeSha=head.sha;
+  return {head,base};
+}
 function forkFixture({tempRoot=os.tmpdir()}={}) {
   const directory = mkdtempSync(path.join(tempRoot,"fork-quality-test-"));
   const root = path.join(directory,"operator"); mkdirSync(root,{mode:0o700});
@@ -369,13 +399,14 @@ function forkFixture({tempRoot=os.tmpdir()}={}) {
   routes[`${prefix}/rules/branches/master?per_page=100&page=1`]=[];
   routes[`${prefix}/branches/master`]={protected:false,commit:{sha:BASE}};
   routes[`${prefix}/pulls/1/files?per_page=100&page=1`]=[{filename:"sample.mjs",status:"modified",sha:newBlob}];
-  routes[`${prefix}/git/commits/${HEAD}`]={tree:{sha:TREE}};
-  routes[`${prefix}/git/commits/${BASE}`]={tree:{sha:BASE_TREE}};
+  routes[`${prefix}/git/commits/${HEAD}`]={sha:HEAD,tree:{sha:TREE}};
+  routes[`${prefix}/git/commits/${BASE}`]={sha:BASE,tree:{sha:BASE_TREE}};
   routes[`${prefix}/git/trees/${TREE}?recursive=1`]={sha:TREE,truncated:false,tree:[{path:"sample.mjs",type:"blob",mode:"100644",sha:newBlob}]};
   routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`]={sha:BASE_TREE,truncated:false,tree:[{path:"sample.mjs",type:"blob",mode:"100644",sha:oldBlob}]};
   for(const [b,text] of [[oldBlob,old],[newBlob,current]])routes[`${prefix}/git/blobs/${b}`]={sha:b,encoding:"base64",size:Buffer.byteLength(text),content:Buffer.from(text).toString("base64")};
   for(const route of [`issues/1/comments`,`pulls/1/comments`,`pulls/1/reviews`])routes[`${prefix}/${route}?per_page=100&page=1`]=[];
   routes[`${prefix}/compare/master...${HEAD}`]={behind_by:0,merge_base_commit:{sha:BASE}};
+  routes[`${prefix}/compare/${BASE}...${HEAD}`]=routes[`${prefix}/compare/master...${HEAD}`];
   const view={headRefOid:HEAD,reviewDecision:"",statusCheckRollup:[{__typename:"CheckRun",name:"ci",status:"COMPLETED",conclusion:"SUCCESS"}]};
   const reads=[];
   return {directory,root,data,admission,extraEntries,artifactPaths,source,pointer,seal,pr,ci,routes,view,reads,evidence,
@@ -508,7 +539,7 @@ test("first PR GET failure stays visible as unknown instead of disappearing from
 });
 
 test("review source paths use deterministic code-unit ordering",()=>{
- const f=forkFixture();try{const prefix=`repos/${FORK}`;const after=f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree[0],before=f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree[0];for(const [tree,row]of [[TREE,after],[BASE_TREE,before]])f.routes[`${prefix}/git/trees/${tree}?recursive=1`].tree=['a.mjs','Z.mjs'].map(p=>({...row,path:p}));const files=['a.mjs','Z.mjs'].map(filename=>({filename,status:'modified',sha:after.sha}));const result=buildReviewSource(f.deps.getJson,FORK,f.pr,files,TREE,BASE,BASE,[]);assert.deepEqual(result.changedFiles.map(x=>x.path),['Z.mjs','a.mjs']);}finally{f.close();}
+ const f=forkFixture();try{const prefix=`repos/${FORK}`;const after=f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree[0],before=f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree[0];const trees=reindexFixtureTrees(f,['a.mjs','Z.mjs'].map(p=>({...after,path:p})),['a.mjs','Z.mjs'].map(p=>({...before,path:p})));const files=['a.mjs','Z.mjs'].map(filename=>({filename,status:'modified',sha:after.sha}));const result=buildReviewSource(f.deps.getJson,FORK,f.pr,files,trees.head.sha,BASE,BASE,[]);assert.deepEqual(result.changedFiles.map(x=>x.path),['Z.mjs','a.mjs']);}finally{f.close();}
 });
 
 test("a new review or changed check inventory during final reads blocks the snapshot",async()=>{
@@ -744,12 +775,18 @@ function v2JournalFixture() {
  return f;
 }
 
-function readJournalFixture({tempRoot=os.tmpdir(),dependencyContent="export const dependency = 1;\n"}={}) {
+function readJournalFixture({tempRoot=os.tmpdir(),dependencyContent="export const dependency = 1;\n",alreadyAdoptedRow=false}={}) {
  const f=forkFixture({tempRoot}), dependency=dependencyContent, depBlob=hashBlob(dependency), prefix=`repos/${FORK}`;
  f.source.dependencyFiles.push({path:"dependency.mjs",blobSha:depBlob,content:dependency});
  f.pointer.dependencies=["dependency.mjs"];
  writeFileSync(f.evidence,JSON.stringify({schema:"paperclip.review-pointer/v1",repository:FORK,entries:[f.pointer]}));
- f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree.push({path:"dependency.mjs",type:"blob",mode:"100644",sha:depBlob});
+ const dependencyRow={path:"dependency.mjs",type:"blob",mode:"100644",sha:depBlob};
+ const adoptedRow={path:"already.mjs",type:"blob",mode:"100644",sha:hashBlob("same\n")};
+ const adopted=alreadyAdoptedRow?[adoptedRow]:[];
+ reindexFixtureTrees(f,
+   [...f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree,dependencyRow,...adopted],
+   [...f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree,dependencyRow,...adopted]);
+ if(alreadyAdoptedRow){f.routes[`${prefix}/pulls/1/files?per_page=100&page=1`].push({filename:adoptedRow.path,status:"added",sha:adoptedRow.sha});f.pr.changed_files=2;}
  f.routes[`${prefix}/git/blobs/${depBlob}`]={sha:depBlob,encoding:"base64",size:Buffer.byteLength(dependency),content:Buffer.from(dependency).toString("base64")};
  f.admission.kind="trusted-cli-read-journal/v1";f.admission.sourceSchema="paperclip.fork-review-read-corpus/v1";
  f.admission.sourceInputSHA256=digest(canonical(f.source));
@@ -783,8 +820,8 @@ function readJournalFixture({tempRoot=os.tmpdir(),dependencyContent="export cons
 }
 // Use the public writer's files and pre-inventory as the actual admission
 // inputs. The receiver computes its own current inventory from the filesystem.
-function emittedReadJournalFixture({tempRoot=os.tmpdir(),emitPacket=null,dependencyContent}={}) {
- const x=readJournalFixture({tempRoot,dependencyContent}),{f,events,corpus}=x,oldCwd=x.cwd;
+function emittedReadJournalFixture({tempRoot=os.tmpdir(),emitPacket=null,dependencyContent,alreadyAdoptedRow=false}={}) {
+ const x=readJournalFixture({tempRoot,dependencyContent,alreadyAdoptedRow}),{f,events,corpus}=x,oldCwd=x.cwd;
  rmSync(path.join(f.root,"corpus"),{recursive:true});
  const output=path.join(f.root,"packet-one");
  const profile=emitPacket ? emitPacket(f,output) : sourceCodec.emitReadCorpus(f.source,output,{checkoutRoot:process.cwd()});
@@ -939,6 +976,27 @@ test("read journal old kind fails and new pinned kind reaches real readiness wit
    assert.equal(accepted.pullRequests[0].source.changedFiles[0].before.content,"old source\n");
    assert.equal(accepted.pullRequests[0].source.dependencyFiles[0].content,"export const dependency = 1;\n");
  }finally{f.close();}
+});
+test("main-relative producer excludes an adopted row before Read corpus delivery and admission",async()=>{
+ const x=emittedReadJournalFixture({alreadyAdoptedRow:true}),{f,corpus}=x;
+ try {
+   const accepted=await checkReadiness(document,f.options(),f.deps);
+   const row=accepted.pullRequests[0];
+   assert.equal(row.verdict,"ready",JSON.stringify(row));
+   assert.equal(row.sourceRelation.totalRows,2);
+   assert.equal(row.sourceRelation.realRows,1);
+   assert.equal(row.sourceRelation.alreadyAdoptedRows,1);
+   assert.deepEqual(row.source.changedFiles.map(file=>file.path),["sample.mjs"]);
+   assert.deepEqual(row.source,f.source);
+   assert.equal(row.independentReview.status,"valid");
+   assert.equal(row.independentReview.evidenceKind,"read-journal-delivered-source");
+   assert.equal(row.independentReview.deliveredFiles,corpus.files.length);
+   const route=`repos/${FORK}/pulls/1/files?per_page=100&page=1`;
+   f.routes[route].splice(0,1);f.pr.changed_files=1;
+   const missing=await checkReadiness(document,f.options(),f.deps);
+   assert.equal(missing.pullRequests[0].verdict,"needs_gardening");
+   assert.equal(missing.pullRequests[0].reasons[0].subcode,"source_tree_change_unlisted");
+ } finally {f.close();}
 });
 test("read journal combines exact Read ranges before accepting a full source file",async()=>{
  const x=readJournalFixture(),{f,events}=x;try{
@@ -1296,7 +1354,7 @@ test("source v2 emitter preserves UTF8 BOM while default v1 behavior stays uncha
  const f=outputFixture();try{
  const source=sourceV2Fixture("\ufeffold\r\n","\ufeffnew\r\n");source.dependencyFiles=[];const file=source.changedFiles[0],prefix=`repos/${FORK}`;
  f.routes[`${prefix}/pulls/1/files?per_page=100&page=1`][0].sha=file.after.blobSha;
- f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree[0].sha=file.after.blobSha;f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree[0].sha=file.before.blobSha;
+ const trees=reindexFixtureTrees(f,[{path:file.after.path,type:'blob',mode:'100644',sha:file.after.blobSha}],[{path:file.before.path,type:'blob',mode:'100644',sha:file.before.blobSha}]);source.treeSha=trees.head.sha;
  for(const blob of [file.before,file.after])f.routes[`${prefix}/git/blobs/${blob.blobSha}`]={sha:blob.blobSha,encoding:"base64",size:Buffer.byteLength(blob.content),content:Buffer.from(blob.content).toString("base64")};writeFileSync(path.join(f.directory,"routes.json"),JSON.stringify(f.routes));
  const run=invokeSourceSchema(f,"v2");assert.equal(run.status,0,run.stderr);assert.deepEqual(sourceCodec.parseReviewSourceV2Block(run.stdout,source),source);
  const old=invokeSourceSchema(f,"v1");assert.equal(old.status,0,old.stderr);const body=JSON.parse(old.stdout.trimEnd().split("\n")[1]);assert.equal(body.changedFiles[0].after.content,"new\r\n");
@@ -1336,8 +1394,7 @@ function bomReadinessFixture(location) {
  if(location==="dependency")f.source.dependencyFiles=[{path:"dependency.mjs",content:"\ufeffdependency\r\n",blobSha:hashBlob("\ufeffdependency\r\n")}];
  const file=f.source.changedFiles[0];
  f.routes[`${prefix}/pulls/1/files?per_page=100&page=1`][0].sha=file.after.blobSha;
- f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree=[file.after,...f.source.dependencyFiles].map(b=>({path:b.path,type:"blob",mode:"100644",sha:b.blobSha}));
- f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree=[{path:file.before.path,type:"blob",mode:"100644",sha:file.before.blobSha}];
+ reindexFixtureTrees(f,[file.after,...f.source.dependencyFiles].map(b=>({path:b.path,type:'blob',mode:'100644',sha:b.blobSha})),[file.before,...f.source.dependencyFiles].map(b=>({path:b.path,type:'blob',mode:'100644',sha:b.blobSha})));
  for(const b of [file.before,file.after,...f.source.dependencyFiles])f.routes[`${prefix}/git/blobs/${b.blobSha}`]={sha:b.blobSha,encoding:"base64",size:Buffer.byteLength(b.content),content:Buffer.from(b.content).toString("base64")};
  f.pointer.dependencies=f.source.dependencyFiles.map(b=>b.path);
  f.pointer.sourceSchema="paperclip.fork-review-source/v1"; // untrusted hint must not override registry v2
@@ -1373,4 +1430,106 @@ test("untrusted pointer and unsupported registry cannot invoke a source factory"
 });
 test("admission rejects ambiguous direct source plus factory without invoking it",()=>{
  const f=v2JournalFixture();try{let calls=0;const r=admitTrustedJournal({...f.admissionArgs(),sourceFactory:()=>{calls++;return f.source;}});assert.equal(r.subcode,"review_source_factory");assert.equal(calls,0);}finally{f.close();}
+});
+
+// Main-relative repair RED population. These tests exercise the shared public
+// factory/entry points; they do not substitute a candidate readiness result for
+// an operator's adoption decision.
+function relationFixture(before, after, files) {
+ const blobs=new Map();
+ const leaves=values=>values.map(value=>{const content=value.content??value.path,sha=value.sha??hashBlob(content);blobs.set(sha,content);return{path:value.path,type:value.type??'blob',mode:value.mode??'100644',sha};});
+ const base=fixtureTree(leaves(before)),head=fixtureTree(leaves(after));
+ const get=route=>{
+  if(route.endsWith(`/git/commits/${BASE}`))return{sha:BASE,tree:{sha:base.sha}};
+  if(route.endsWith(`/git/trees/${base.sha}?recursive=1`))return structuredClone(base);
+  if(route.endsWith(`/git/trees/${head.sha}?recursive=1`))return structuredClone(head);
+  const sha=route.split('/').at(-1),content=blobs.get(sha);assert.notEqual(content,undefined,route);
+  return{sha,size:Buffer.byteLength(content),encoding:'base64',content:Buffer.from(content).toString('base64')};
+ };
+ const rows=files??after.map(x=>({filename:x.path,status:before.some(b=>b.path===x.path)?'modified':'added',sha:head.tree.find(r=>r.path===x.path).sha}));
+ const relation={};return{base,head,rows,relation,get,build:()=>buildReviewSource(get,FORK,{head:{sha:HEAD}},rows,head.sha,BASE,BASE,[],'paperclip.fork-review-source/v1',relation)};
+}
+function minimalRelationFixture(status='added') {
+ const f=relationFixture([{path:'X.txt',content:'same\n'},{path:'Y.txt',content:'before\n'}],[{path:'X.txt',content:'same\n'},{path:'Y.txt',content:'after\n'}]);f.rows[0].status=status;return f;
+}
+function refreshJournalSource(f) {
+ f.admission.sourceInputSHA256=digest(canonical(f.source));
+ f.data.material='Full reviewed source:\n'+(f.admission.kind==='trusted-cli-journal/v2'?sourceCodec.reviewSourceV2Block(f.source):`=== BEGIN PAPERCLIP REVIEW SOURCE ===\n${canonical(f.source)}\n=== END PAPERCLIP REVIEW SOURCE ===`);
+ const bytes=Buffer.concat([Buffer.from(f.data.system),Buffer.from([0]),Buffer.from(f.data.material)]);
+ f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(bytes);f.data.start.combinedBytes=bytes.length;f.seal();
+}
+function addAlreadyAdoptedRow(f) {
+ const prefix=`repos/${FORK}`,row={path:'already.mjs',type:'blob',mode:'100644',sha:hashBlob('same\n')};
+ const head=f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree,base=f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree;
+ reindexFixtureTrees(f,[...head,row],[...base,row]);
+ f.routes[`${prefix}/git/blobs/${row.sha}`]={sha:row.sha,encoding:'base64',size:5,content:Buffer.from('same\n').toString('base64')};
+ f.routes[`${prefix}/pulls/1/files?per_page=100&page=1`].push({filename:row.path,status:'added',sha:row.sha});f.pr.changed_files=2;refreshJournalSource(f);
+}
+
+test('main-relative RED minimal stale added row excludes X and preserves complete Y',()=>{
+ const f=minimalRelationFixture();const source=f.build();assert.deepEqual(source.changedFiles.map(x=>x.path),['Y.txt']);assert.equal(source.changedFiles[0].before.content,'before\n');assert.equal(source.changedFiles[0].after.content,'after\n');assert.equal(f.relation.totalRows,2);assert.equal(f.relation.alreadyAdoptedRows,1);assert.equal(f.relation.unexplainedRows,0);
+});
+test('main-relative RED phantom modified is classified rather than serialized',()=>{const f=minimalRelationFixture('modified');assert.equal(f.build().changedFiles.length,1);assert.equal(f.relation.rows.filter(x=>x.classification==='already-adopted').length,1);});
+test('main-relative RED full thirteen rows partition into seven changes and six equal leaves',()=>{
+ const before=[],after=[];for(let i=0;i<13;i++){before.push({path:`dir/file-${i}.mjs`,content:`old ${i}\n`});after.push({path:`dir/file-${i}.mjs`,content:i<7?`new ${i}\n`:`old ${i}\n`});}
+ const f=relationFixture(before,after);f.rows[12].status='added';assert.equal(f.build().changedFiles.length,7);assert.equal(f.relation.totalRows,13);assert.equal(f.relation.alreadyAdoptedRows,6);assert.equal(f.relation.differentLeaves,7);assert.equal(f.relation.uncoveredLeaves,0);
+});
+test('main-relative RED unlisted tree changes cannot be omitted by a short file list',()=>{const f=minimalRelationFixture('modified');f.rows.splice(1);assert.throws(()=>f.build(),/source_tree_change_unlisted/);});
+test('main-relative RED a capped3000-row list cannot hide3500 changed leaves',()=>{
+ const before=[],after=[];for(let i=0;i<3500;i++){before.push({path:`f-${i}`,content:'before'});after.push({path:`f-${i}`,content:'after'});}const f=relationFixture(before,after);f.rows.length=3000;assert.throws(()=>f.build(),/source_tree_change_unlisted/);
+});
+test('main-relative RED duplicate tree paths fail before Map can overwrite them',()=>{const f=minimalRelationFixture('modified');f.head.tree.push({...f.head.tree[0]});assert.throws(()=>f.build(),/source_tree_duplicate_path/);});
+test('main-relative RED tree body must reconstruct its pinned Git object',()=>{const f=minimalRelationFixture('modified');f.head.tree[0].sha=hashBlob('corrupt');assert.throws(()=>f.build(),/source_tree_hash_mismatch/);});
+test('main-relative RED mode-only changes are explicitly unrepresented',()=>{const f=relationFixture([{path:'run',content:'same',mode:'100644'}],[{path:'run',content:'same',mode:'100755'}]);assert.throws(()=>f.build(),/source_mode_unrepresented/);});
+test('main-relative RED non-rename previous_filename cannot alter the before source',()=>{const f=minimalRelationFixture('modified');f.rows[1].previous_filename='X.txt';assert.throws(()=>f.build(),/source_pr_row_unexplained/);});
+for(const version of ['v1','v2'])test(`main-relative RED ${version} readiness binds seven-relative source and retains complete received rows`,async()=>{
+ const f=version==='v2'?v2JournalFixture():forkFixture();try{addAlreadyAdoptedRow(f);const r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,'ready',JSON.stringify(r));assert.equal(r.pullRequests[0].source.changedFiles.length,1);assert.equal(r.pullRequests[0].sourceRelation.totalRows,2);assert.equal(r.pullRequests[0].sourceRelation.alreadyAdoptedRows,1);}finally{f.close();}
+});
+test('main-relative RED compare uses fixed current-main OID rather than a moving branch',async()=>{const f=forkFixture();try{delete f.routes[`repos/${FORK}/compare/master...${HEAD}`];const r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,'ready',JSON.stringify(r));assert.ok(f.reads.includes(`repos/${FORK}/compare/${BASE}...${HEAD}`));}finally{f.close();}});
+test('main-relative RED final PR row relation race blocks readiness',async()=>{const f=forkFixture();try{const get=f.deps.getJson;let count=0;f.deps.getJson=route=>{const v=get(route);if(route.includes('/pulls/1/files?')&&++count===2)v[0].status='added';return v;};const r=await checkReadiness(document,f.options(),f.deps);assert.ok(r.pullRequests[0].reasons.some(x=>x.code==='head_changed'),JSON.stringify(r));}finally{f.close();}});
+for(const schema of ['v1','v2'])test(`main-relative RED ${schema} emitter shares the accounted source`,()=>{
+ const f=outputFixture();try{addAlreadyAdoptedRow(f);writeFileSync(path.join(f.directory,'routes.json'),JSON.stringify(f.routes));const run=invokeSourceSchema(f,schema);assert.equal(run.status,0,run.stderr);if(schema==='v2')assert.deepEqual(sourceCodec.parseReviewSourceV2Block(run.stdout,f.source),f.source);else assert.equal(run.stdout,`=== BEGIN PAPERCLIP REVIEW SOURCE ===\n${canonical(f.source)}\n=== END PAPERCLIP REVIEW SOURCE ===\n`);}finally{f.close();}
+});
+
+test('main-relative control whole350-file delta is not limited to compare first300',()=>{const before=[],after=[];for(let i=0;i<350;i++){before.push({path:`f/${i}`,content:'old'});after.push({path:`f/${i}`,content:'new'});}const f=relationFixture(before,after);const s=f.build();assert.equal(s.changedFiles.length,350);assert.equal(new Set(s.changedFiles.map(x=>x.path)).size,350);});
+for(const status of ['added','modified','removed','renamed','copied'])test(`main-relative control canonical ${status} remains byte identical`,()=>{
+ const before=status==='added'?[]:[{path:status==='renamed'||status==='copied'?'old.mjs':'file.mjs',content:'old\n'}];const after=status==='removed'?[]:[...(status==='copied'?before:[]),{path:'file.mjs',content:'new\n'}];const filename='file.mjs',previous_filename=['renamed','copied'].includes(status)?'old.mjs':undefined;const sha=hashBlob(status==='removed'?'old\n':'new\n');
+ const f=relationFixture(before,after,[{filename,status,sha,...(previous_filename?{previous_filename}:{})}]);const s=f.build();const b=before[0],a=after.find(x=>x.path===filename);assert.equal(canonical(s),canonical({schema:'paperclip.fork-review-source/v1',repository:FORK,headSha:HEAD,treeSha:f.head.sha,baseSha:BASE,mergeBaseSha:BASE,changedFiles:[{path:filename,status,before:b?{path:b.path,blobSha:hashBlob(b.content),content:b.content}:null,after:a?{path:a.path,blobSha:hashBlob(a.content),content:a.content}:null}],dependencyFiles:[]}));
+});
+for(const fault of ['truncated','wrong root','blob content','duplicate PR row','unsupported symlink'])test(`main-relative control rejects ${fault}`,()=>{
+ const f=relationFixture([{path:'file',content:'old'}],[{path:'file',content:'new'}]);let code;
+ if(fault==='truncated'){f.head.truncated=true;code='source_tree_incomplete';}
+ if(fault==='wrong root')code='source_tree_incomplete';
+ if(fault==='duplicate PR row'){f.rows.push({...f.rows[0]});code='source_files_duplicate';}
+ if(fault==='unsupported symlink'){f.head.tree[0].mode='120000';const rebuilt=fixtureTree(f.head.tree);Object.assign(f.head,rebuilt);code='source_file_unsupported';}
+ const get=['blob content','wrong root'].includes(fault)?route=>{const v=f.get(route);if(fault==='blob content'&&route.includes('/git/blobs/'))v.content=Buffer.from('tampered').toString('base64');if(fault==='wrong root'&&route.includes('/git/trees/'))v.sha=BASE;return v;}:f.get;if(fault==='blob content')code='source_blob_mismatch';
+ assert.throws(()=>buildReviewSource(get,FORK,{head:{sha:HEAD}},f.rows,f.head.sha,BASE,BASE,[]),e=>e.message===code);
+});
+test('main-relative control absent deletion has no equal-leaf proof and stays HOLD',()=>{const f=relationFixture([],[],[{filename:'gone',status:'removed',sha:hashBlob('gone')}]);assert.throws(()=>f.build(),/source_pr_row_unexplained|source_files_mismatch/);});
+test('main-relative RED stale rename has explicit equal destination and absent origin proof',()=>{
+ const f=relationFixture([{path:'new',content:'same'},{path:'edit',content:'old'}],[{path:'new',content:'same'},{path:'edit',content:'new'}]);f.rows[0].status='renamed';f.rows[0].previous_filename='old';assert.deepEqual(f.build().changedFiles.map(x=>x.path),['edit']);assert.equal(f.relation.alreadyAdoptedRows,1);
+});
+test('main-relative RED two rows cannot both cover the old half of a rename',()=>{
+ const f=relationFixture([{path:'old',content:'old'}],[{path:'new',content:'new'}],[{filename:'new',previous_filename:'old',status:'renamed',sha:hashBlob('new')},{filename:'old',status:'removed',sha:hashBlob('old')}]);assert.throws(()=>f.build(),/source_tree_change_coverage/);
+});
+test('main-relative RED unknown tree shapes are explicit HOLD',()=>{const f=minimalRelationFixture('modified');f.head.tree[0].type='future';assert.throws(()=>f.build(),/source_tree_shape/);});
+test('main-relative RED final valid merge-base relation change blocks readiness',async()=>{
+ const f=forkFixture();try{const get=f.deps.getJson;let count=0;f.deps.getJson=route=>{const v=get(route);if(route===`repos/${FORK}/compare/${BASE}...${HEAD}`&&++count===2){v.behind_by=1;v.merge_base_commit.sha=HEAD;}return v;};const r=await checkReadiness(document,f.options(),f.deps);assert.ok(r.pullRequests[0].reasons.some(x=>x.code==='head_changed'),JSON.stringify(r));}finally{f.close();}
+});
+test('main-relative RED final emitter row race writes no output',()=>{
+ const f=outputFixture();try{
+ const counter=path.join(f.directory,'source-read-count');const stub=path.join(f.directory,'bin','gh');writeFileSync(stub,`#!${process.execPath}\nconst fs=require('fs'),a=process.argv.slice(2),routes=JSON.parse(fs.readFileSync(${JSON.stringify(path.join(f.directory,'routes.json'))},'utf8'));let v=routes[a[3]];if(a[3]?.includes('/pulls/1/files?')){let n=fs.existsSync(${JSON.stringify(counter)})?Number(fs.readFileSync(${JSON.stringify(counter)},'utf8')):0;fs.writeFileSync(${JSON.stringify(counter)},String(++n));if(n===2)v[0].status='added';}if(v)process.stdout.write(JSON.stringify(v));else process.exit(8);\n`);chmodSync(stub,0o700);
+ const target=path.join(f.directory,'must-not-exist.txt'),run=invokeSourceSchema(f,'v1',target);assert.equal(run.status,1);assert.match(run.stderr,/head_changed/);assert.equal(existsSync(target),false);
+ }finally{f.close();}
+});
+test('main-relative RED350 rows use all four pages at both snapshot boundaries',async()=>{
+ const f=forkFixture();try{
+ const before=[],after=[],files=[],pairs=[];const prefix=`repos/${FORK}`;
+ for(let i=0;i<350;i++){const p=`src/f-${i}.mjs`;before.push({path:p,type:'blob',mode:'100644',sha:hashBlob('old')});after.push({path:p,type:'blob',mode:'100644',sha:hashBlob('new')});files.push({filename:p,status:'modified',sha:hashBlob('new')});pairs.push({path:p,status:'modified',before:{path:p,blobSha:hashBlob('old'),content:'old'},after:{path:p,blobSha:hashBlob('new'),content:'new'}});}
+ reindexFixtureTrees(f,after,before);f.source.changedFiles=pairs.sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0);f.pr.changed_files=350;
+ for(let page=1;page<=4;page++)f.routes[`${prefix}/pulls/1/files?per_page=100&page=${page}`]=files.slice((page-1)*100,page*100);
+ for(const text of ['old','new'])f.routes[`${prefix}/git/blobs/${hashBlob(text)}`]={sha:hashBlob(text),encoding:'base64',size:text.length,content:Buffer.from(text).toString('base64')};refreshJournalSource(f);
+ const r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,'ready',JSON.stringify(r.pullRequests[0].reasons));assert.equal(r.pullRequests[0].source.changedFiles.length,350);assert.equal(f.reads.filter(x=>x.includes('/pulls/1/files?')).length,8);
+ delete f.routes[`${prefix}/pulls/1/files?per_page=100&page=3`];const failed=await checkReadiness(document,f.options(),f.deps);assert.equal(failed.pullRequests[0].verdict,'needs_gardening');assert.equal(failed.pullRequests[0].reasons[0].code,'readiness_unknown');
+ }finally{f.close();}
 });
