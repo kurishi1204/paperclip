@@ -875,7 +875,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
             // counter), or re-scopes.
             buildPendingStagePatch({
               patch,
-              previous: existingState,
+              previous: { ...existingState, lastDecisionOutcome: decision.outcome },
               policy: input.policy,
               stage: activeStage,
               participant: { type: "user", agentId: null, userId: escalationUserId },

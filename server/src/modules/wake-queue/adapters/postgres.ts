@@ -878,6 +878,11 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             eq(agentWakeupRequests.agentId, agentId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            // Exclude dedicated QA receipts before LIMIT so an older QA row
+            // cannot hide an ordinary deferred merge target behind it.
+            sql`btrim(coalesce(${agentWakeupRequests.payload} ->> 'qaDecisionId', '')) = ''`,
+            sql`btrim(coalesce(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'qaDecisionId', '')) = ''`,
+            sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'qa-decision:%'`,
             ...(durableActor
               ? [
                   durableActor.type === null
@@ -904,6 +909,7 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
       return {
         id: row.id,
         runId: row.runId,
+        idempotencyKey: row.idempotencyKey,
         payload,
         deferredContext: parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]),
         coalescedCount: row.coalescedCount,

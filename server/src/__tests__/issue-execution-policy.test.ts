@@ -1895,6 +1895,7 @@ describe("review round circuit breaker", () => {
       status: "pending",
       currentStageId: reviewStageId,
       currentParticipant: { type: "user", userId: boardUserId },
+      lastDecisionOutcome: "changes_requested",
       changesRequestedCount: 3,
     });
   });
@@ -2081,6 +2082,7 @@ describe("review round circuit breaker", () => {
     expect(result.patch.executionState).toMatchObject({
       status: "pending",
       currentParticipant: { type: "user", userId: boardUserId },
+      lastDecisionOutcome: "changes_requested",
       changesRequestedCount: 1,
     });
   });

@@ -14179,7 +14179,8 @@ export function issueRoutes(
                 actorAgentId: actor.agentId ?? null,
                 actorUserId: actor.actorType === "user" ? actor.actorId : null,
                 outcome: decision.outcome,
-                freshEpisodeWakeRequested: decision.stageType === "review" && decision.outcome === "changes_requested",
+                freshEpisodeWakeRequested: decision.stageType === "review" && decision.outcome === "changes_requested" &&
+                  updated.status === "in_progress",
                 body: decision.body,
                 createdByRunId: actor.runId ?? null,
               });

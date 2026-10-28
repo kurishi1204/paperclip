@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { issueExecutionDecisions, issues, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, issueExecutionDecisions, issues, type Db } from "@paperclipai/db";
+import { PgDialect } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import {
   isAuthorizedQaDecisionWake,
   isCurrentQaChangesRequestedDecision,
+  qaDecisionWakeBlocksDelivery,
   qaDecisionIdFromWakeKey,
   qaDecisionWakeKey,
 } from "./qa-decision-wake.js";
@@ -25,6 +28,18 @@ const current = {
 } as const;
 
 describe("QA decision wake authority", () => {
+  it("holds unknown or started receipts while admitting only settled prestart terminals", () => {
+    const rendered = new PgDialect().sqlToQuery(sql`select 1 from ${agentWakeupRequests} where ${qaDecisionWakeBlocksDelivery()}`);
+    expect(rendered.sql).toContain("status\" in ('failed','cancelled')");
+    expect(rendered.sql).toContain("claimed_at\" is null");
+    expect(rendered.sql).toContain("finished_at\" is not null");
+    expect(rendered.sql).toContain("qa_prior_run.started_at is null");
+    expect(rendered.sql).toContain("qa_prior_run.wakeup_request_id =");
+    expect(rendered.sql).toContain("qa_prior_run.status in ('failed','cancelled')");
+    expect(rendered.sql).toContain("qa_other_run.wakeup_request_id =");
+    expect(rendered.sql).toContain("process_started_at is null");
+  });
+
   it("accepts only the committed current decision for the return assignee", () => {
     expect(isCurrentQaChangesRequestedDecision(current)).toBe(true);
     expect(isCurrentQaChangesRequestedDecision({ ...current, agentId: "other" })).toBe(false);

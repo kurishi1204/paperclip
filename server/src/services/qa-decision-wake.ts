@@ -1,5 +1,5 @@
-import { and, eq } from "drizzle-orm";
-import { issueExecutionDecisions, issues, type Db } from "@paperclipai/db";
+import { and, eq, sql } from "drizzle-orm";
+import { agentWakeupRequests, issueExecutionDecisions, issues, type Db } from "@paperclipai/db";
 
 const QA_DECISION_WAKE_PREFIX = "qa-decision:";
 
@@ -11,6 +11,45 @@ export function qaDecisionIdFromWakeKey(key: string | null | undefined): string 
   if (!key?.startsWith(QA_DECISION_WAKE_PREFIX)) return null;
   const id = key.slice(QA_DECISION_WAKE_PREFIX.length);
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id) ? id : null;
+}
+
+/** A terminal receipt is retryable only when its complete run linkage proves no claim or start.
+ * Keep this predicate shared by recovery selection and admission under the issue lock.
+ * Missing, mismatched, active, or started run evidence remains a delivery fence.
+ */
+export function qaDecisionWakeBlocksDelivery() {
+  const wake = agentWakeupRequests;
+  return sql`not (
+    ${wake.status} in ('failed','cancelled')
+    and ${wake.claimedAt} is null
+    and ${wake.finishedAt} is not null
+    and (
+      (${wake.runId} is null and not exists (
+        select 1 from heartbeat_runs qa_other_run
+        where qa_other_run.wakeup_request_id = ${wake.id}
+      ))
+      or (${wake.runId} is not null and exists (
+        select 1 from heartbeat_runs qa_prior_run
+        where qa_prior_run.id = ${wake.runId}
+          and qa_prior_run.company_id = ${wake.companyId}
+          and qa_prior_run.wakeup_request_id = ${wake.id}
+          and qa_prior_run.status in ('failed','cancelled')
+          and qa_prior_run.started_at is null
+          and qa_prior_run.finished_at is not null
+          and qa_prior_run.process_started_at is null
+          and qa_prior_run.process_pid is null
+          and qa_prior_run.process_group_id is null
+          and qa_prior_run.external_run_id is null
+          and qa_prior_run.native_session_id is null
+          and qa_prior_run.execution_status_delivery_id is null
+          and qa_prior_run.controller_boot_id is null
+      ) and not exists (
+        select 1 from heartbeat_runs qa_other_run
+        where qa_other_run.wakeup_request_id = ${wake.id}
+          and qa_other_run.id <> ${wake.runId}
+      ))
+    )
+  )`;
 }
 
 /** A committed review decision is the authority; wake prose and actor labels are not. */
