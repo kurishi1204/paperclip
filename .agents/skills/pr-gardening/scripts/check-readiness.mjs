@@ -909,6 +909,13 @@ function relateReviewRows(files, base, head) {
     }
     for (const e of [before, after].filter(Boolean)) ensure(e.type === "blob" && ["100644", "100755"].includes(e.mode), "source_file_unsupported");
     ensure(!before || !after || before.mode === after.mode, "source_mode_unrepresented");
+    // The logical source carries file contents, not modes. A path entering or
+    // leaving the tree cannot express a non-regular mode even when both sides
+    // of a rename/copy happen to have the same mode. An unchanged same-path
+    // executable mode does not add an unrepresented mode change.
+    if (!before || !after || oldPath !== f.filename) {
+      ensure([before, after].filter(Boolean).every(e => e.mode === "100644"), "source_mode_unrepresented");
+    }
     const paths = f.status === "renamed" ? [oldPath, f.filename] : [f.filename];
     for (const p of paths) {
       ensure(delta.has(p), "source_pr_row_unexplained");
@@ -1124,6 +1131,7 @@ async function checkForkReadiness(document, options, dependencies) {
       ensure(pointers.length <= 1, "duplicate_review_pointer");
       const pointer = pointers[0];
       let source;
+      let sourceFailure = null;
       const sourceRelation = {};
       const sourceFactory = (schema) => {
         source = buildReviewSource(get, repository, pr, files, commit.tree.sha, branch.commit.sha, comparison.merge_base_commit.sha, pointer?.dependencies ?? [], schema, sourceRelation);
@@ -1132,7 +1140,10 @@ async function checkForkReadiness(document, options, dependencies) {
       const review = admitTrustedJournal({ trustedRoot: options.trusted_review_root, registrySHA256: options.trusted_review_registry_sha256, repository, pullRequest: candidate.number, headSha: head, sourceFactory, pointer, checkoutRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..") });
       // Without an admitted schema, retain the legacy v1 source in the report.
       // This never retries admission or changes an invalid/unreceived result.
-      if (source === undefined) sourceFactory(SOURCE_SCHEMA);
+      if (source === undefined) {
+        try { sourceFactory(SOURCE_SCHEMA); }
+        catch (error) { sourceFailure = error; }
+      }
       const comments = getPages(get, `repos/${repository}/issues/${candidate.number}/comments`);
       const inline = getPages(get, `repos/${repository}/pulls/${candidate.number}/comments`);
       const reviews = getPages(get, `repos/${repository}/pulls/${candidate.number}/reviews`);
@@ -1163,7 +1174,12 @@ async function checkForkReadiness(document, options, dependencies) {
       const changedHead = sourceIdentityChanged || final.comments!==pr.comments || final.review_comments!==pr.review_comments || final.state!==pr.state || final.draft!==pr.draft || finalMetadata.headRefOid!==head || finalMetadata.reviewDecision!==metadata.reviewDecision || reviewRowsSnapshot(finalFiles)!==reviewRowsSnapshot(files) || finalComparison.merge_base_commit.sha!==comparison.merge_base_commit.sha || finalComparison.behind_by!==comparison.behind_by;
       const reviewPolicies = [protection?.required_pull_request_reviews, ...rules.filter(r=>r.type==="pull_request").map(r=>r.parameters)].filter(Boolean);
       const requiredReview = reviewPolicies.some(p=>p.required_approving_review_count>0 || p.require_code_owner_reviews===true || p.require_code_owner_review===true || p.require_last_push_approval===true);
-      entry = { number: candidate.number, url: pr.html_url, title: pr.title, author: pr.user?.login, purpose: summarizePullRequestBody(pr.body), state: pr.state, isDraft: pr.draft, headSha: head, baseRefName: pr.base.ref, behindBy: comparison.behind_by, originatingIssue: candidate.originatingIssue, policy: "fork-v1", checks, normalCI:{runID:normalRun.id,jobs:jobs.length,conclusion:normalRun.conclusion}, independentReview: { ...review, report: undefined }, findings, greptile: { state: checks.advisory.length ? checks.advisory.map(r=>`${r.status}:${r.conclusion??"unreceived"}`).join(", ") : "unavailable/unreceived", score: null }, source, sourceRelation, ...readinessVerdict({policy:"fork-v1",pullRequest:{...pr,reviewDecision:metadata.reviewDecision},checks,review,findings,behindBy:comparison.behind_by,changedHead,changedEvidence,requiredReview}) };
+      const readiness = readinessVerdict({policy:"fork-v1",pullRequest:{...pr,reviewDecision:metadata.reviewDecision},checks,review,findings,behindBy:comparison.behind_by,changedHead,changedEvidence,requiredReview});
+      if (sourceFailure) {
+        readiness.reasons.push({ ...reason("readiness_unknown", "The complete review source could not be verified"), subcode:/^[a-z][a-z0-9_]+$/.test(sourceFailure.message) ? sourceFailure.message : "source_unavailable", operatorAction:true });
+        readiness.verdict = pr.draft ? "report_only" : "needs_gardening";
+      }
+      entry = { number: candidate.number, url: pr.html_url, title: pr.title, author: pr.user?.login, purpose: summarizePullRequestBody(pr.body), state: pr.state, isDraft: pr.draft, headSha: head, baseRefName: pr.base.ref, behindBy: comparison.behind_by, originatingIssue: candidate.originatingIssue, policy: "fork-v1", checks, normalCI:{runID:normalRun.id,jobs:jobs.length,conclusion:normalRun.conclusion}, independentReview: { ...review, report: undefined }, findings, greptile: { state: checks.advisory.length ? checks.advisory.map(r=>`${r.status}:${r.conclusion??"unreceived"}`).join(", ") : "unavailable/unreceived", score: null }, source, sourceRelation: sourceFailure ? null : sourceRelation, ...readiness };
     } catch (error) {
       entry = { number: candidate.number, url: pr?.html_url, title: pr?.title ?? candidate.title ?? "Unreceived", state: pr?.state ?? "unknown", isDraft: pr?.draft ?? false, policy: "fork-v1", headSha: pr?.head?.sha ?? null, verdict: pr?.draft ? "report_only" : "needs_gardening", reasons:[{...reason("readiness_unknown", "Required GitHub or trusted-review evidence could not be verified"),subcode:/^[a-z][a-z0-9_]+$/.test(error.message)?error.message:"read_dependency_unavailable",operatorAction:true}] };
     }

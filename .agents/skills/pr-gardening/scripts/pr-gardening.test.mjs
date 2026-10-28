@@ -995,8 +995,27 @@ test("main-relative producer excludes an adopted row before Read corpus delivery
    f.routes[route].splice(0,1);f.pr.changed_files=1;
    const missing=await checkReadiness(document,f.options(),f.deps);
    assert.equal(missing.pullRequests[0].verdict,"needs_gardening");
-   assert.equal(missing.pullRequests[0].reasons[0].subcode,"source_tree_change_unlisted");
+   assert.ok(missing.pullRequests[0].reasons.some(reason=>reason.code==="readiness_unknown"&&reason.subcode==="source_tree_change_unlisted"));
  } finally {f.close();}
+});
+test("main-relative public read CLI accounts for an adopted row before journal admission",async()=>{
+ const documentPath=fileURLToPath(new URL('../SKILL.md',import.meta.url));
+ const x=emittedReadJournalFixture({alreadyAdoptedRow:true,emitPacket:(f,output)=>emitDocumentedReadCommand(f,output,documentPath)}),{f,corpus}=x;
+ try {
+   const calls=readFileSync(path.join(f.directory,'documented-gh-calls.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+   assert.ok(calls.length>0);
+   assert.ok(calls.every(args=>args[0]==='api'&&args[1]==='--method'&&args[2]==='GET'));
+   const row=(await checkReadiness(document,f.options(),f.deps)).pullRequests[0];
+   assert.equal(row.verdict,'ready',JSON.stringify(row));
+   assert.deepEqual(row.source.changedFiles.map(file=>file.path),['sample.mjs']);
+   assert.equal(row.sourceRelation.totalRows,2);
+   assert.equal(row.sourceRelation.realRows,1);
+   assert.equal(row.sourceRelation.alreadyAdoptedRows,1);
+   assert.equal(row.independentReview.status,'valid');
+   assert.equal(row.independentReview.evidenceKind,'read-journal-delivered-source');
+   assert.equal(row.independentReview.deliveredFiles,corpus.files.length);
+   assert.deepEqual(JSON.parse(f.data.manifest).files.map(file=>file.path),corpus.files.map(file=>file.path));
+ }finally{f.close();}
 });
 test("read journal combines exact Read ranges before accepting a full source file",async()=>{
  const x=readJournalFixture(),{f,events}=x;try{
@@ -1481,6 +1500,42 @@ test('main-relative RED a capped3000-row list cannot hide3500 changed leaves',()
 test('main-relative RED duplicate tree paths fail before Map can overwrite them',()=>{const f=minimalRelationFixture('modified');f.head.tree.push({...f.head.tree[0]});assert.throws(()=>f.build(),/source_tree_duplicate_path/);});
 test('main-relative RED tree body must reconstruct its pinned Git object',()=>{const f=minimalRelationFixture('modified');f.head.tree[0].sha=hashBlob('corrupt');assert.throws(()=>f.build(),/source_tree_hash_mismatch/);});
 test('main-relative RED mode-only changes are explicitly unrepresented',()=>{const f=relationFixture([{path:'run',content:'same',mode:'100644'}],[{path:'run',content:'same',mode:'100755'}]);assert.throws(()=>f.build(),/source_mode_unrepresented/);});
+for(const [status,before,after,row] of [
+ ['added',[],[{path:'new',content:'new',mode:'100755'}],{filename:'new',status:'added',sha:hashBlob('new')}],
+ ['removed',[{path:'old',content:'old',mode:'100755'}],[],{filename:'old',status:'removed',sha:hashBlob('old')}],
+ ['renamed',[{path:'old',content:'old',mode:'100755'}],[{path:'new',content:'old',mode:'100755'}],{filename:'new',previous_filename:'old',status:'renamed',sha:hashBlob('old')}],
+ ['copied',[{path:'old',content:'old',mode:'100755'}],[{path:'old',content:'old',mode:'100755'},{path:'new',content:'old',mode:'100755'}],{filename:'new',previous_filename:'old',status:'copied',sha:hashBlob('old')}],
+])test(`main-relative unrepresented executable ${status} remains HOLD`,()=>{
+ const f=relationFixture(before,after,[row]);assert.throws(()=>f.build(),/source_mode_unrepresented/);
+});
+test('main-relative unchanged executable mode and new regular file remain representable',()=>{
+ const modified=relationFixture([{path:'run',content:'old',mode:'100755'}],[{path:'run',content:'new',mode:'100755'}]);
+ assert.equal(modified.build().changedFiles.length,1);
+ const added=relationFixture([],[{path:'new',content:'new',mode:'100644'}]);
+ assert.equal(added.build().changedFiles.length,1);
+ const removed=relationFixture([{path:'old',content:'old',mode:'100644'}],[],[{filename:'old',status:'removed',sha:hashBlob('old')}]);
+ assert.equal(removed.build().changedFiles.length,1);
+});
+test('main-relative identical adopted executable row adds no source change',()=>{
+ const f=relationFixture([{path:'same',content:'same',mode:'100755'},{path:'edit',content:'old'}],[{path:'same',content:'same',mode:'100755'},{path:'edit',content:'new'}]);
+ assert.deepEqual(f.build().changedFiles.map(file=>file.path),['edit']);
+ assert.equal(f.relation.alreadyAdoptedRows,1);
+});
+test('main-relative source failure retains received CI and findings without a ready verdict',async()=>{
+ const f=forkFixture();try{
+   const prefix=`repos/${FORK}`,old=hashBlob('old source\n'),current=hashBlob('new source\n');
+   reindexFixtureTrees(f,[{path:'sample.mjs',type:'blob',mode:'100755',sha:current}],[{path:'sample.mjs',type:'blob',mode:'100644',sha:old}]);
+   f.pr.comments=1;f.routes[`${prefix}/issues/1/comments?per_page=100&page=1`]=[{id:23,body:'Synthetic finding',created_at:'2026-01-01T00:00:00Z'}];
+   const result=await checkReadiness(document,f.options(),f.deps),row=result.pullRequests[0];
+   assert.equal(row.verdict,'needs_gardening');
+   assert.equal(row.checks.checks.length,1);
+   assert.equal(row.normalCI.conclusion,'success');
+   assert.equal(row.independentReview.status,'invalid');
+   assert.deepEqual(row.findings.sources.map(source=>source.id),['issue_comment:23']);
+   assert.ok(row.reasons.some(reason=>reason.code==='readiness_unknown'&&reason.subcode==='source_mode_unrepresented'));
+   assert.match(renderReport(result),/Synthetic finding|Findings: incomplete/);
+ }finally{f.close();}
+});
 test('main-relative RED non-rename previous_filename cannot alter the before source',()=>{const f=minimalRelationFixture('modified');f.rows[1].previous_filename='X.txt';assert.throws(()=>f.build(),/source_pr_row_unexplained/);});
 for(const version of ['v1','v2'])test(`main-relative RED ${version} readiness binds seven-relative source and retains complete received rows`,async()=>{
  const f=version==='v2'?v2JournalFixture():forkFixture();try{addAlreadyAdoptedRow(f);const r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,'ready',JSON.stringify(r));assert.equal(r.pullRequests[0].source.changedFiles.length,1);assert.equal(r.pullRequests[0].sourceRelation.totalRows,2);assert.equal(r.pullRequests[0].sourceRelation.alreadyAdoptedRows,1);}finally{f.close();}
