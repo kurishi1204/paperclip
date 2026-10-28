@@ -17698,7 +17698,10 @@ export function heartbeatService(
             !await isAuthorizedQaDecisionWake(tx, {
               companyId: run.companyId, issueId, agentId: run.agentId, decisionId,
             })) {
-          return { ownsIssue: false, blocked: true };
+          // A QA return is bound to one committed decision and assignee. Once
+          // that authority changes, the queued run can never become valid on a
+          // later scan or restart; settle it through permanent claim rejection.
+          throw new HttpError(403, "QA decision wake is no longer current");
         }
       }
       const ownsIssue = owner?.assigneeAgentId === run.agentId &&
