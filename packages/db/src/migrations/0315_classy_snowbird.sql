@@ -1,0 +1,1 @@
+ALTER TABLE "issue_execution_decisions" ADD COLUMN "fresh_episode_wake_requested" boolean DEFAULT false NOT NULL;

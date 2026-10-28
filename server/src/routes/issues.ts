@@ -14179,6 +14179,7 @@ export function issueRoutes(
                 actorAgentId: actor.agentId ?? null,
                 actorUserId: actor.actorType === "user" ? actor.actorId : null,
                 outcome: decision.outcome,
+                freshEpisodeWakeRequested: decision.stageType === "review" && decision.outcome === "changes_requested",
                 body: decision.body,
                 createdByRunId: actor.runId ?? null,
               });
@@ -14959,6 +14960,13 @@ export function issueRoutes(
         requestedByActorType: actor.actorType,
         requestedByActorId: actor.actorId,
       });
+      if (executionStageWakeup?.wakeup.reason === "execution_changes_requested" &&
+          decision?.stageType === "review" && decision.outcome === "changes_requested" && decisionId) {
+        Object.assign(executionStageWakeup.wakeup, {
+          qaDecisionId: decisionId,
+          allowRunCoalescing: false,
+        });
+      }
 
       // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
       void (async () => {

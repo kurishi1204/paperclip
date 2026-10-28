@@ -808,6 +808,53 @@ function createFakeAdmissionHelpers(
 }
 
 describe("admitWakeBehindIssueExecution", () => {
+  it("keeps a QA return wake separate while an older document receipt is deferred", async () => {
+    const oldMixed = {
+      id: "old-document-deferred", payload: { issueId: "issue-1", savedText: "old mixed" },
+      deferredContext: { paperclipSelfTaskDocumentToolsOnly: true }, coalescedCount: 0,
+    };
+    const oldSnapshot = structuredClone(oldMixed);
+    const reader = createFakeAdmissionReader({
+      findExistingDeferredWake: vi.fn(async () => oldMixed),
+    });
+    const writer = createFakeAdmissionWriter();
+    const admit = createAdmitWakeBehindIssueExecution({
+      reader, writer, helpers: createFakeAdmissionHelpers(),
+    });
+    const input = admissionInput({
+      activeExecutionRun: { ...ACTIVE_EXECUTION_RUN, status: "running" },
+      reason: "execution_changes_requested",
+      source: "assignment",
+      requestedByActorType: "agent",
+      requestedByActorId: "qa-reviewer",
+      idempotencyKey: "qa-decision:11111111-1111-4111-8111-111111111111",
+      allowRunCoalescing: false,
+      forceFreshSession: true,
+      contextSnapshot: {
+        issueId: "issue-1", wakeReason: "execution_changes_requested",
+        qaDecisionId: "11111111-1111-4111-8111-111111111111",
+        forceFreshSession: true,
+      },
+    });
+
+    expect(await admit(SCOPE, input)).toEqual({ kind: "deferred" });
+    expect(writer.insertNewDeferredWake).toHaveBeenCalledExactlyOnceWith(
+      SCOPE, expect.objectContaining({
+        idempotencyKey: input.idempotencyKey,
+        payload: expect.objectContaining({
+          _paperclipWakeContext: expect.objectContaining({
+            qaDecisionId: "11111111-1111-4111-8111-111111111111",
+            forceFreshSession: true,
+          }),
+        }),
+      }),
+    );
+    expect(writer.coalesceIntoActiveExecutionRun).not.toHaveBeenCalled();
+    expect(writer.mergeIntoExistingDeferredWake).not.toHaveBeenCalled();
+    expect(reader.findExistingDeferredWake).not.toHaveBeenCalled();
+    expect(oldMixed).toEqual(oldSnapshot);
+  });
+
   it.each(["running", "queued"])(
     "keeps a dedicated durable continuation separate from a %s execution and an existing deferred wake",
     async (status) => {

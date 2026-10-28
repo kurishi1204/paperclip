@@ -43,6 +43,7 @@ import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/papercli
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "./connector-runtime.js";
 import { admitExplicitNativeContinuation, admitExplicitContinuationRetry, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
+import { isAuthorizedQaDecisionWake, qaDecisionIdFromWakeKey, qaDecisionWakeKey } from "./qa-decision-wake.js";
 import { canRetryStoppedRun, isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
@@ -114,6 +115,7 @@ import {
   lt,
   lte,
   ne,
+  notExists,
   notInArray,
   or,
   sql,
@@ -178,6 +180,7 @@ import {
   issueApprovals,
   issueAttachments,
   issueComments,
+  issueExecutionDecisions,
   issuePlanDecompositions,
   issueRecoveryActions,
   issueRelations,
@@ -3819,6 +3822,8 @@ function normalizeMaxConcurrentRuns(value: unknown) {
 }
 
 interface WakeupOptions {
+  /** Committed review decision whose return-assignee work this wake carries. */
+  qaDecisionId?: string;
   commanderGuard?: { parentRunId: string; commanderAgentId: string; policy: CommanderPolicy; admission: CommanderAdmission };
   /** Set only by authenticated board wake routes; never copied from caller payloads. */
   manualUserWake?: boolean;
@@ -17678,6 +17683,24 @@ export function heartbeatService(
       }).from(issues).where(and(
         eq(issues.id, issueId), eq(issues.companyId, run.companyId),
       )).for("update") : [];
+      if (context.qaDecisionId !== undefined) {
+        const decisionId = typeof context.qaDecisionId === "string" ? context.qaDecisionId : "";
+        const [receipt] = run.wakeupRequestId ? await tx.select({
+          idempotencyKey: agentWakeupRequests.idempotencyKey,
+          agentId: agentWakeupRequests.agentId,
+        }).from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.id, run.wakeupRequestId),
+          eq(agentWakeupRequests.companyId, run.companyId),
+        )).limit(1) : [];
+        if (!issueId || !owner || !receipt || receipt.agentId !== run.agentId ||
+            receipt.idempotencyKey !== qaDecisionWakeKey(decisionId) ||
+            qaDecisionIdFromWakeKey(receipt.idempotencyKey) !== decisionId ||
+            !await isAuthorizedQaDecisionWake(tx, {
+              companyId: run.companyId, issueId, agentId: run.agentId, decisionId,
+            })) {
+          return { ownsIssue: false, blocked: true };
+        }
+      }
       const ownsIssue = owner?.assigneeAgentId === run.agentId &&
         context.wakeReason !== "source_scoped_recovery_action";
       if (ownsIssue && ["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? "") &&
@@ -20031,8 +20054,59 @@ export function heartbeatService(
 
   async function reconcileStrandedAssignedIssues() {
     await reconcileCommanderResultHandoffs();
+    // PATCH commits the review decision before its fire-and-forget wake.
+    // Recover that gap from the committed decision itself on startup/periodic reconciliation.
+    const cutoff = await getWorktreeExecutionCutoff();
+    const pendingQa = await db.select({
+      id: issues.id,
+      companyId: issues.companyId,
+      agentId: issues.assigneeAgentId,
+      executionState: issues.executionState,
+    }).from(issues).where(and(
+      eq(issues.status, "in_progress"),
+      sql`${issues.executionState}->>'status' = 'changes_requested'`,
+      cutoff ? gte(issues.createdAt, cutoff) : undefined,
+      exists(db.select({ id: issueExecutionDecisions.id }).from(issueExecutionDecisions).where(and(
+        eq(issueExecutionDecisions.companyId, issues.companyId),
+        eq(issueExecutionDecisions.issueId, issues.id),
+        sql`${issueExecutionDecisions.id}::text = ${issues.executionState}->>'lastDecisionId'`,
+        eq(issueExecutionDecisions.stageType, "review"),
+        eq(issueExecutionDecisions.outcome, "changes_requested"),
+        eq(issueExecutionDecisions.freshEpisodeWakeRequested, true),
+      ))),
+      notExists(db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issues.companyId),
+        sql`${agentWakeupRequests.idempotencyKey} = 'qa-decision:' || (${issues.executionState}->>'lastDecisionId')`,
+        sql`${agentWakeupRequests.status} <> 'skipped'`,
+      ))),
+    )).orderBy(asc(issues.updatedAt)).limit(100);
+    for (const candidate of pendingQa) {
+      const state = parseObject(candidate.executionState);
+      const decisionId = readNonEmptyString(state.lastDecisionId);
+      if (!decisionId || !candidate.agentId || !isUuidLike(decisionId)) continue;
+      const [decision] = await db.select({ id: issueExecutionDecisions.id })
+        .from(issueExecutionDecisions).where(and(
+          eq(issueExecutionDecisions.id, decisionId),
+          eq(issueExecutionDecisions.companyId, candidate.companyId),
+          eq(issueExecutionDecisions.issueId, candidate.id),
+          eq(issueExecutionDecisions.stageType, "review"),
+          eq(issueExecutionDecisions.outcome, "changes_requested"),
+          eq(issueExecutionDecisions.freshEpisodeWakeRequested, true),
+        )).limit(1);
+      if (!decision) continue;
+      await enqueueWakeup(candidate.agentId, {
+        source: "assignment", triggerDetail: "system", reason: "execution_changes_requested",
+        qaDecisionId: decisionId, allowRunCoalescing: false,
+        payload: { issueId: candidate.id },
+        requestedByActorType: "system", requestedByActorId: "qa-decision-recovery",
+        contextSnapshot: {
+          issueId: candidate.id, taskId: candidate.id,
+          wakeReason: "execution_changes_requested", source: "issue.execution_stage",
+        },
+      });
+    }
     return recovery.reconcileStrandedAssignedIssues({
-      issueCreatedAtGte: await getWorktreeExecutionCutoff(),
+      issueCreatedAtGte: cutoff,
     });
   }
 
@@ -27342,6 +27416,17 @@ export function heartbeatService(
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
+    if (!opts.qaDecisionId && opts.idempotencyKey?.startsWith("qa-decision:")) {
+      throw new HttpError(403, "QA decision wake requires its committed source");
+    }
+    if (opts.qaDecisionId) {
+      if (opts.reason !== "execution_changes_requested" || opts.source !== "assignment" ||
+          opts.triggerDetail !== "system" || !qaDecisionIdFromWakeKey(qaDecisionWakeKey(opts.qaDecisionId))) {
+        throw new HttpError(403, "Invalid QA decision wake");
+      }
+      opts = { ...opts, idempotencyKey: qaDecisionWakeKey(opts.qaDecisionId), allowRunCoalescing: false };
+    }
+    let authorizedQaDecisionWake = false;
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = {
@@ -27581,7 +27666,7 @@ export function heartbeatService(
     // execution authority: saved user input must re-enter through the existing
     // authenticated user/durable-request/operator-action admission paths.
     const documentReplayHold = async (queryDb: Db) => {
-      if (!issueId || opts.requestedByActorType === "user" || durableRequest || executionReconciliationWake) return null;
+      if (!issueId || opts.requestedByActorType === "user" || durableRequest || executionReconciliationWake || authorizedQaDecisionWake) return null;
       const [latest] = await queryDb.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agentId),
         sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issueId}`,
@@ -28195,6 +28280,30 @@ export function heartbeatService(
             return { kind: "skipped" as const };
           }
 
+          if (opts.qaDecisionId) {
+            if (issue.id !== issueId || !await isAuthorizedQaDecisionWake(tx as unknown as Db, {
+              companyId: agent.companyId, issueId: issue.id, agentId, decisionId: opts.qaDecisionId,
+            })) {
+              return { kind: "skipped" as const };
+            }
+            authorizedQaDecisionWake = true;
+            enrichedContextSnapshot.forceFreshSession = true;
+            enrichedContextSnapshot.qaDecisionId = opts.qaDecisionId;
+            const [priorWake] = await tx.select().from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.idempotencyKey, qaDecisionWakeKey(opts.qaDecisionId)),
+              sql`${agentWakeupRequests.status} <> 'skipped'`,
+            )).limit(1);
+            if (priorWake) {
+              const [priorRun] = priorWake.runId
+                ? await tx.select().from(heartbeatRuns).where(and(
+                    eq(heartbeatRuns.id, priorWake.runId), eq(heartbeatRuns.companyId, agent.companyId),
+                  )).limit(1)
+                : [];
+              return priorRun ? { kind: "replayed" as const, run: priorRun } : { kind: "skipped" as const };
+            }
+          }
+
           const replayHold = await documentReplayHold(tx as unknown as Db);
           if (replayHold) {
             await tx.insert(agentWakeupRequests).values({
@@ -28417,12 +28526,32 @@ export function heartbeatService(
             tx as unknown as Db, issue.companyId, issue.id,
             { conversationResetCommentId: opts.requestedByActorType === "user" ? wakeCommentId : null },
           );
+          // A committed QA return is new work. It may pass an unresolved,
+          // terminal document episode without settling or replaying that episode.
+          // Unsafe workspace restoration and live predecessor work remain holds.
+          const independentQaDocumentEpisode = authorizedQaDecisionWake &&
+            Boolean(executionBlocker?.runId && executionBlocker.recoveryActionId &&
+              isHeartbeatRunTerminalStatus(executionBlocker.runStatus)) &&
+            await (async () => {
+              const [sourceRun] = await tx.select().from(heartbeatRuns).where(and(
+                eq(heartbeatRuns.id, executionBlocker!.runId!),
+                eq(heartbeatRuns.companyId, issue.companyId),
+              )).limit(1);
+              const [action] = await tx.select({ evidence: issueRecoveryActions.evidence })
+                .from(issueRecoveryActions).where(and(
+                  eq(issueRecoveryActions.id, executionBlocker!.recoveryActionId!),
+                  eq(issueRecoveryActions.companyId, issue.companyId),
+                )).limit(1);
+              return Boolean(sourceRun && action && hasSelfTaskDocumentReplayHold(sourceRun) &&
+                !hasWorkspaceRestoreFailure(sourceRun.resultJson) &&
+                parseObject(action.evidence).workspaceRestoreFailure !== "restore_unsafe_archive");
+            })();
           // Prove eligibility without retiring the hold. Later gates can still
           // decline this wake; hold retirement and successor creation stay atomic.
           // A bound chat request has already rechecked its current principal
           // above. Treat its new user message like a board comment, but keep
           // failed-run retry actions on their separate exact-request path.
-          if (executionBlocker && !(await admitExplicitNativeContinuation({
+          if (executionBlocker && !independentQaDocumentEpisode && !(await admitExplicitNativeContinuation({
             db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
             agentId, actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
             reason: durableRequest && !failedChatRetry ? "issue_commented" : reason,
@@ -29189,7 +29318,7 @@ export function heartbeatService(
             return { kind: "skipped" as const };
           }
 
-          const explicitContinuation = await admitExplicitNativeContinuation({
+          const explicitContinuation = independentQaDocumentEpisode ? null : await admitExplicitNativeContinuation({
             db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
             agentId, actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
             reason: durableRequest && !failedChatRetry ? "issue_commented" : reason,
@@ -29197,7 +29326,8 @@ export function heartbeatService(
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
           });
-          if (!explicitContinuation && executionBlocker) return deferBlockedExecution(executionBlocker);
+          if (!explicitContinuation && executionBlocker && !independentQaDocumentEpisode)
+            return deferBlockedExecution(executionBlocker);
           if (explicitContinuation) {
             enrichedContextSnapshot.forceFreshSession = true;
             enrichedContextSnapshot.previousRunId = explicitContinuation.previousRunId;
@@ -29308,7 +29438,7 @@ export function heartbeatService(
                     adoptedCommentIds,
                   )
                 : enrichedContextSnapshot,
-              sessionIdBefore: explicitContinuation ? null : sessionBefore,
+              sessionIdBefore: explicitContinuation || authorizedQaDecisionWake ? null : sessionBefore,
               continuationAttempt,
               ...(reconciledSourceRunId
                 ? { retryOfRunId: reconciledSourceRunId }
@@ -29572,7 +29702,7 @@ export function heartbeatService(
           responsibleUserId: await resolveQueuedResponsibleUserId(),
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: enrichedContextSnapshot,
-          sessionIdBefore: sessionBefore,
+          sessionIdBefore: authorizedQaDecisionWake ? null : sessionBefore,
           continuationAttempt,
         })
         .returning()
