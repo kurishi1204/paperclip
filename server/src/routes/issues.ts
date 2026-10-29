@@ -316,6 +316,7 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
+  resolveIssueResumeStatus,
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
@@ -13574,7 +13575,7 @@ export function issueRoutes(
           shouldResumeInProgressScheduledRetry) &&
         updateFields.status === undefined
       ) {
-        updateFields.status = "todo";
+        updateFields.status = resolveIssueResumeStatus(existing);
       }
       let cancelledScheduledRetryRunId: string | null = null;
       if (
@@ -18091,6 +18092,7 @@ export function issueRoutes(
           (isBlocked && !hasUnresolvedFirstClassBlockers) ||
           shouldResumeInProgressScheduledRetry)
       ) {
+        const resumedStatus = resolveIssueResumeStatus(issue);
         scheduledRetrySupersededByComment =
           shouldResumeInProgressScheduledRetry &&
           issue.status === "in_progress";
@@ -18101,7 +18103,7 @@ export function issueRoutes(
               actor,
             })
           : null;
-        const reopenedIssue = await svc.update(id, { status: "todo" });
+        const reopenedIssue = await svc.update(id, { status: resumedStatus });
         if (!reopenedIssue) {
           res.status(404).json({ error: "Issue not found" });
           return;
@@ -18121,7 +18123,7 @@ export function issueRoutes(
           entityType: "issue",
           entityId: currentIssue.id,
           details: {
-            status: "todo",
+            status: resumedStatus,
             ...(reopened
               ? { reopened: true, reopenedFrom: reopenFromStatus }
               : {}),

@@ -9,6 +9,29 @@ function request(kinds = ["allow_once", "allow_always", "reject_once"]): AcpPerm
   } } as AcpPermissionRequest;
 }
 describe("ACP permission normalization", () => {
+  it("shows operation arguments before a permission decision without exposing credentials", () => {
+    const value = request();
+    Object.assign(value.raw.toolCall, { title: "mcp__paperclip__call_api", rawInput: {
+      operationId: "GET /api/issues/{id}/documents/{key}",
+      pathParams: { id: "parent-task", key: "knowledge-verification-readiness" },
+      query: { token: "fixture-secret-value" }, responseText: { limitBytes: 24576 },
+    } });
+    const result = normalizeAcpxPermission(value);
+    expect(result.title).toContain("GET /api/issues/{id}/documents/{key}");
+    expect(result.title).toContain("knowledge-verification-readiness");
+    expect(result.title).toContain("24576");
+    expect(result.title).toContain("[REDACTED]");
+    expect(result.title).not.toContain("fixture-secret-value");
+    expect(result.resolve({ action: "accept" })).toEqual({ outcome: "allow_once" });
+  });
+
+  it("makes omitted oversized permission arguments visible instead of silently dropping them", () => {
+    const value = request(); Object.assign(value.raw.toolCall, { rawInput: { body: "x".repeat(10000) } });
+    const result = normalizeAcpxPermission(value);
+    expect(result.title).toContain("Arguments omitted");
+    expect(result.title.length).toBeLessThanOrEqual(4000);
+    expect(result.choices.map(x => x.key)).toEqual(["accept", "decline", "cancel"]);
+  });
   it("keeps requests answerable when a provider omits its operation title", () => {
     for (const title of [undefined, "", "   "]) {
       const value = request();

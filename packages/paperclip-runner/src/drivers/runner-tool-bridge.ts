@@ -32,6 +32,8 @@ export interface RunnerToolCall {
 
 export interface RunnerToolBridgeOptions {
   tools?: readonly Readonly<Record<string, unknown>>[];
+  /** A derived GET-only view of an already assigned call_api. No new authority. */
+  paperclipApiReadView?: boolean;
   /** Runner-owned operations that are callable but never model-visible. */
   privateTools?: readonly Readonly<Record<string, unknown>>[];
   handler(call: RunnerToolCall): Promise<unknown>;
@@ -69,6 +71,7 @@ const DEFAULT_MAX_BODY_BYTES = 1_048_576;
 const DEFAULT_REQUEST_BODY_TIMEOUT_MS = 30_000;
 const MAX_CALLS = 2_048;
 const MAX_RESULT_CHUNK_BYTES = 64 * 1024;
+export const PAPERCLIP_API_READ_VIEW_TOOL = "call_api_read";
 const RESERVED_TOOLS: readonly RunnerToolDefinition[] = [
   {
     name: PRP_COMPLETION_TOOL_NAME,
@@ -110,7 +113,23 @@ export async function startRunnerToolBridge(
       );
     }
   }
-  const visibleTools = [...tools, ...structuredClone(RESERVED_TOOLS)];
+  const apiTool = options.paperclipApiReadView === true
+    ? tools.find((tool) => tool.name === "call_api") : undefined;
+  const apiReadView: RunnerToolDefinition[] = apiTool ? [{
+    name: PAPERCLIP_API_READ_VIEW_TOOL,
+    description: "Read a discovered Paperclip GET API operation using your existing server permissions. Use this view instead of call_api for GET, including parent-task documents. It cannot send a body, files or contentType. Mutations still use call_api and its normal permission flow.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...(isRecord(apiTool.inputSchema.properties) ? structuredClone(apiTool.inputSchema.properties) : {}),
+        operationId: { type: "string", pattern: "^GET /api/[^\\s?#\\\\]+$" },
+      },
+      required: ["operationId"],
+      allOf: [structuredClone(apiTool.inputSchema)],
+      not: { anyOf: ["body", "files", "contentType"].map((key) => ({ required: [key] })) },
+    },
+  }] : [];
+  const visibleTools = [...tools, ...apiReadView, ...structuredClone(RESERVED_TOOLS)];
   const admittedTools = [...visibleTools, ...privateTools];
   const validators = compileValidators(admittedTools);
   const calls = new Map<string, AdmittedCall>();
@@ -287,6 +306,14 @@ async function handleRequest(
   const callId = String(id);
   const callKey = rpcIdKey(id);
   const args = params.arguments ?? {};
+  // Enforce the view at the actual runner-owned invocation boundary, never
+  // from an ACP permission request's claimed name, effect or rawInput.
+  if (tool === PAPERCLIP_API_READ_VIEW_TOOL && (!isRecord(args)
+    || typeof args.operationId !== "string"
+    || args.operationId !== args.operationId.trim())) {
+    writeToolError(response, id, "Invalid GET-only API view input.");
+    return;
+  }
   const validator = context.validators.get(tool);
   if (validator === undefined || !validator(args)) {
     const detail = validator?.errors
@@ -327,7 +354,7 @@ async function handleRequest(
       Promise.resolve()
         .then(() =>
           context.handler({
-            tool,
+            tool: tool === PAPERCLIP_API_READ_VIEW_TOOL ? "call_api" : tool,
             callId,
             arguments: structuredClone(args),
             signal: controller!.signal,
@@ -360,7 +387,7 @@ function normalizeTools(
 ): RunnerToolDefinition[] {
   const tools: RunnerToolDefinition[] = [];
   const seen = new Set<string>();
-  const reservedNames = new Set(RESERVED_TOOLS.map((tool) => tool.name));
+  const reservedNames = new Set([...RESERVED_TOOLS.map((tool) => tool.name), PAPERCLIP_API_READ_VIEW_TOOL]);
   for (const raw of input) {
     const name =
       typeof raw.name === "string" ? canonicalRunnerToolName(raw.name) : "";

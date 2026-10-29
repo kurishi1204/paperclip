@@ -17289,6 +17289,53 @@ export function heartbeatService(
     return Boolean(row);
   }
 
+  async function findNativeTimerIssue(agent: typeof agents.$inferSelect, cutoff: Date | null) {
+    // A timer is not a retry, review decision, or task assignment. Inspect the
+    // complete unfinished assignment set, then use the same ownership and
+    // dependency readers as ordinary admission; never choose an arbitrary row.
+    const candidates = await db.select().from(issues).where(and(
+      eq(issues.companyId, agent.companyId), eq(issues.assigneeAgentId, agent.id),
+      isNull(issues.assigneeUserId), isNull(issues.hiddenAt), isNull(issues.conversationAgentId),
+      notInArray(issues.status, ["done", "cancelled"]), nonIdleSlackIssueCondition(),
+      cutoff ? gte(issues.createdAt, cutoff) : undefined,
+    ));
+    if (!candidates.length) return null;
+    const readiness = await issuesSvc.listDependencyReadiness(agent.companyId, candidates.map(issue => issue.id));
+    const activeRuns = await db.select({ issueId: sql<string>`coalesce(${heartbeatRuns.nativeIssueId}::text,
+      ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId')` })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, agent.companyId),
+        inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES])));
+    const activeIssueIds = new Set(activeRuns.map(run => run.issueId));
+    const commanders = await db.select({ adapterConfig: agents.adapterConfig }).from(agents)
+      .where(eq(agents.companyId, agent.companyId));
+    const ordered = candidates.sort((left, right) =>
+      Number(right.status === "in_progress") - Number(left.status === "in_progress")
+      || issueRunPriorityRank(left.priority) - issueRunPriorityRank(right.priority)
+      || left.createdAt.getTime() - right.createdAt.getTime() || left.id.localeCompare(right.id));
+    for (const issue of ordered) {
+      if (!TIMER_ACTIONABLE_ISSUE_STATUSES.includes(issue.status as (typeof TIMER_ACTIONABLE_ISSUE_STATUSES)[number])
+        || !["standard", "planning", "ask"].includes(issue.workMode)
+        || issue.executionRunId || issue.checkoutRunId || activeIssueIds.has(issue.id)) continue;
+      const state = parseIssueExecutionState(issue.executionState);
+      // Review/approval and a committed QA return already own exact wake
+      // receipts. A timer cannot manufacture a replacement for those intents.
+      if (issue.executionState != null && (!state || state.status === "pending" || state.status === "changes_requested")) continue;
+      if (readiness.get(issue.id)?.isDependencyReady !== true) continue;
+      if (issue.status === "todo" && commanders.some(commander => commanderReservesTodo(parseObject(commander.adapterConfig), issue, agent.id))) continue;
+      if (await treeControlSvc.getActivePauseHoldGate(agent.companyId, issue.id)) continue;
+      if (await getExecutionBlocker(db, agent.companyId, issue.id)) continue;
+      if (await hasQaPredecessorOwnershipHold(db, agent.companyId, issue.id)) continue;
+      const [latest] = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agent.id),
+          sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issue.id}`))
+        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+      if (hasSelfTaskDocumentReplayHold(latest)) continue;
+      if (await budgets.getInvocationBlock(agent.companyId, agent.id, { issueId: issue.id, projectId: issue.projectId })) continue;
+      return issue;
+    }
+    return null;
+  }
+
   async function markTimerHeartbeatChecked(
     agentId: string,
     source: WakeupOptions["source"],
@@ -20088,13 +20135,14 @@ export function heartbeatService(
   // Terminal status records the result, not release of the physical executor.
   // A new QA episode may leave the old UNKNOWN untouched only after ownership
   // has ended. Check all predecessors, not just the latest recovery action.
-  async function readQaPredecessorOwnershipHold(queryDb: Db, companyId: string, issueId: string, exceptRunId?: string) {
+  async function readQaPredecessorOwnershipHold(queryDb: Db, companyId: string, issueId: string, exceptRunId?: string, onlyRunId?: string) {
     const predecessors = await queryDb.select({ id: heartbeatRuns.id, processPid: heartbeatRuns.processPid,
       processGroupId: heartbeatRuns.processGroupId, processStartedAt: heartbeatRuns.processStartedAt,
       finishedAt: heartbeatRuns.finishedAt })
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
         sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issueId}`,
         inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+        onlyRunId ? eq(heartbeatRuns.id, onlyRunId) : undefined,
         exceptRunId ? ne(heartbeatRuns.id, exceptRunId) : undefined));
     if (!predecessors.length) return null;
     const ids = predecessors.map(run => run.id);
@@ -20181,9 +20229,47 @@ export function heartbeatService(
     }
   }
 
+  async function resumeCommittedNativeApprovalHandoffs() {
+    const cutoff = await getWorktreeExecutionCutoff();
+    const pending = await db.select({ wake: agentWakeupRequests, sourceRun: heartbeatRuns,
+      decisionId: issueExecutionDecisions.id }).from(agentWakeupRequests)
+      .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        eq(issues.assigneeAgentId, agentWakeupRequests.agentId)))
+      .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
+      .innerJoin(issueExecutionDecisions, and(eq(issueExecutionDecisions.companyId, issues.companyId),
+        eq(issueExecutionDecisions.issueId, issues.id),
+        sql`${issueExecutionDecisions.id}::text = ${issues.executionState}->>'lastDecisionId'`,
+        eq(issueExecutionDecisions.stageType, "approval"), eq(issueExecutionDecisions.outcome, "changes_requested")))
+      .innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, issueExecutionDecisions.createdByRunId),
+        eq(heartbeatRuns.companyId, issues.companyId), eq(heartbeatRuns.runtimeMode, "native"),
+        eq(heartbeatRuns.status, "succeeded")))
+      .innerJoin(nativeRunFinalizations, and(eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId),
+        eq(nativeRunFinalizations.runId, heartbeatRuns.id), eq(nativeRunFinalizations.phase, "committed"),
+        isNull(nativeRunFinalizations.leaseOwner)))
+      .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+        isNull(issues.executionRunId), isNull(issues.checkoutRunId), isNull(issues.assigneeUserId),
+        eq(issues.status, "in_progress"),
+        sql`${issues.executionState}->>'status' = 'changes_requested'`,
+        sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,source}' = 'issue.execution_stage'`,
+        sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'execution_changes_requested'`,
+        cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
+      .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).limit(50);
+    for (const { wake, sourceRun, decisionId } of pending) {
+      if (liveRunExecutions.has(sourceRun.id) || activeRunExecutions.has(sourceRun.id) ||
+          adapterExecutionControls.has(sourceRun.id) ||
+          await readQaPredecessorOwnershipHold(db, wake.companyId, String(wake.payload?.issueId), undefined, sourceRun.id)) continue;
+      await releaseIssueExecutionAndPromote(sourceRun, { suppressImmediateRecovery: true,
+        nativeStageHandoff: { wakeId: wake.id, decisionId } }).catch(err => {
+        logger.warn({ err, queueId: wake.id }, "failed to promote committed native approval handoff");
+      });
+    }
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeDeferredQaDecisionWakes();
+    await resumeCommittedNativeApprovalHandoffs();
     await resumeExecutionWaitComments();
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
@@ -28066,7 +28152,8 @@ export function heartbeatService(
 
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
-    options: { suppressImmediateRecovery?: boolean; suppressQueueAdvance?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; suppressQueueAdvance?: boolean;
+      nativeStageHandoff?: { wakeId: string; decisionId: string } } = {},
   ) {
     try {
       const source = await getRun(run.id, { unsafeFullResultJson: true });
@@ -28075,6 +28162,7 @@ export function heartbeatService(
         companyId: run.companyId,
         runId: run.id,
         now: new Date(),
+        ...(options.nativeStageHandoff ? { nativeStageHandoff: options.nativeStageHandoff } : {}),
         // A durable authentication card owns recovery. This covers the review path,
         // while continuation classification blocks periodic generic retries.
         // Every terminal QA path shares this boundary, including setup/pool
@@ -28637,13 +28725,14 @@ export function heartbeatService(
       !readNonEmptyString(enrichedContextSnapshot.taskId) &&
       !readNonEmptyString(enrichedContextSnapshot.taskKey);
     if (
-      policy.skipTimerWhenNoActionableWork &&
       genericTimerWake &&
-      !(await hasActionableTimerWork(agent))
+      (agent.adapterType === "paperclip_runner" ||
+        policy.skipTimerWhenNoActionableWork && !(await hasActionableTimerWork(agent)))
     ) {
       await writeSkippedHeartbeatRequest("heartbeat.timer.no_actionable_work", {
-        reason:
-          "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
+        reason: agent.adapterType === "paperclip_runner"
+          ? "No executable assigned task is bound to this timer wake; no provider invocation was started."
+          : "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
       });
       await markTimerHeartbeatChecked(agentId, source);
       return null;
@@ -31857,6 +31946,8 @@ export function heartbeatService(
         );
         if (!timerClaim) continue;
 
+        const timerIssue = agent.adapterType === "paperclip_runner"
+          ? await findNativeTimerIssue(agent, cutoff) : null;
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
           triggerDetail: "system",
@@ -31868,7 +31959,13 @@ export function heartbeatService(
             reason: "interval_elapsed",
             now: now.toISOString(),
             timerClaimWasFirstHeartbeat: timerClaim.wasFirstHeartbeat,
+            ...(timerIssue ? { issueId: timerIssue.id, taskId: timerIssue.id } : {}),
           },
+          ...(timerIssue ? {
+            payload: { issueId: timerIssue.id },
+            issueStateGuard: { statuses: [timerIssue.status], assigneeAgentId: agent.id,
+              revision: timerIssue.revision, statusVersion: timerIssue.statusVersion },
+          } : {}),
         });
         if (run) enqueued += 1;
         else skipped += 1;

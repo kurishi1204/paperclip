@@ -132,6 +132,7 @@ export type ReleaseIssueExecutionInput = {
   runId: string;
   now: Date;
   suppressImmediateRecovery?: boolean;
+  nativeStageHandoff?: { wakeId: string; decisionId: string };
 };
 
 type PauseHoldFacts = Awaited<ReturnType<WakeQueueTransaction["getPauseHoldFacts"]>>;
@@ -168,6 +169,7 @@ async function runReleaseDrain(
   while (true) {
     const candidate = await ports.transaction.findNextDeferredWake({
       companyId: run.companyId, issueId: issue.id,
+      ...(input.nativeStageHandoff ? { wakeId: input.nativeStageHandoff.wakeId } : {}),
       ...(handoffWakeIds.length ? { excludedWakeIds: handoffWakeIds } : {}),
     });
     if (!candidate) break;
@@ -336,6 +338,7 @@ async function runReleaseDrain(
     return promoted;
   }
 
+  if (input.nativeStageHandoff) return { outcome: { kind: "released" }, postCommitEffects };
   return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
 }
 
@@ -1005,7 +1008,8 @@ export function createReleaseIssueExecution(deps: {
     input: ReleaseIssueExecutionInput,
   ): Promise<{ outcome: ReleaseOutcome; postCommitEffects: PostCommitEffect[] }> {
     const result = await deps.issueLock.withIssueExecutionLock(
-      { companyId: input.companyId, runId: input.runId, now: input.now },
+      { companyId: input.companyId, runId: input.runId, now: input.now,
+        ...(input.nativeStageHandoff ? { nativeStageHandoff: input.nativeStageHandoff } : {}) },
       (locked, ports) => runReleaseDrain(locked, ports, input),
     );
 

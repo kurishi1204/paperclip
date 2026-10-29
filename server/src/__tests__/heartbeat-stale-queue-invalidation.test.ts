@@ -15,6 +15,8 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueExecutionDecisions,
+  issueRelations,
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
@@ -975,6 +977,158 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
 
     expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
+
+  it("promotes only the saved native approval return after finalization and executor cleanup settle", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ heartbeatConfig: { enabled: false } });
+    const approver = randomUUID(), sourceRun = randomUUID(), issueId = randomUUID();
+    const stageId = randomUUID(), decisionId = randomUUID(), wakeId = randomUUID(), unrelatedWake = randomUUID();
+    const leaseId = randomUUID(), now = new Date();
+    const state = { status: "changes_requested", currentStageId: stageId, currentStageIndex: 0,
+      currentStageType: "approval", currentParticipant: { type: "agent", agentId: approver },
+      returnAssignee: { type: "agent", agentId }, reviewRequest: null, completedStageIds: [],
+      lastDecisionId: decisionId, lastDecisionOutcome: "changes_requested" };
+    await db.insert(agents).values({ id: approver, companyId, name: "Native approver", role: "manager",
+      status: "idle", adapterType: "paperclip_runner", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Formal approval return",
+      status: "in_progress", assigneeAgentId: agentId, executionState: state });
+    await db.insert(heartbeatRuns).values({ id: sourceRun, companyId, agentId: approver, status: "succeeded",
+      runtimeMode: "native", nativeIssueId: issueId, invocationSource: "assignment",
+      contextSnapshot: { issueId }, startedAt: now, finishedAt: now });
+    await db.insert(issueExecutionDecisions).values({ id: decisionId, companyId, issueId, stageId,
+      stageType: "approval", outcome: "changes_requested", actorAgentId: approver,
+      createdByRunId: sourceRun, body: "Synthetic formal decision" });
+    await db.insert(nativeRunFinalizations).values({ runId: sourceRun, companyId, issueId,
+      phase: "observed", leaseOwner: null });
+    await db.insert(environmentLeases).values({ id: leaseId, companyId, issueId, heartbeatRunId: sourceRun,
+      provider: "local", status: "active", leasePolicy: "ephemeral" });
+    const context = { issueId, taskId: issueId, source: "issue.execution_stage", wakeReason: "execution_changes_requested",
+      executionStage: { stageId, stageType: "approval", wakeRole: "executor", returnAssignee: state.returnAssignee } };
+    const oldPayload = { issueId, mutation: "update", _paperclipWakeContext: { issueId, source: "old-unresolved-intent" } };
+    await db.insert(agentWakeupRequests).values([
+      { id: unrelatedWake, companyId, agentId, source: "assignment", reason: "issue_execution_deferred",
+        status: "deferred_issue_execution", payload: oldPayload, requestedAt: new Date(now.getTime() - 60_000) },
+      { id: wakeId, companyId, agentId, source: "assignment", triggerDetail: "system", reason: "issue_execution_deferred",
+        status: "deferred_issue_execution", requestedByActorType: "agent", requestedByActorId: approver,
+        payload: { issueId, mutation: "update", executionStage: context.executionStage, _paperclipWakeContext: context } },
+    ]);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    mockAdapterExecute.mockImplementation(async () => {
+      await gate;
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Returned work saved", provider: "test", model: "test-model" };
+    });
+    try {
+      await heartbeat.resumeQueuedRuns();
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+      await db.update(nativeRunFinalizations).set({ phase: "committed", leaseOwner: "still-finalizing" })
+        .where(eq(nativeRunFinalizations.runId, sourceRun));
+      await heartbeat.resumeQueuedRuns();
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+      await db.update(nativeRunFinalizations).set({ leaseOwner: null }).where(eq(nativeRunFinalizations.runId, sourceRun));
+      await heartbeat.resumeQueuedRuns();
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(0);
+      await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
+        .where(eq(environmentLeases.id, leaseId));
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
+      const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(next?.wakeupRequestId).toBe(wakeId);
+      expect(next?.contextSnapshot).toMatchObject({ issueId, wakeReason: "execution_changes_requested" });
+      const receipts = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      expect(receipts).toHaveLength(2);
+      expect(receipts.find(wake => wake.id === unrelatedWake)).toMatchObject({ status: "deferred_issue_execution", runId: null, payload: oldPayload });
+      await heartbeat.resumeQueuedRuns();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(1);
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    } finally {
+      // The unrelated old receipt is fixture-only. Do not let ordinary worker
+      // completion dispatch it while this test is tearing down its own DB.
+      await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(eq(agentWakeupRequests.id, unrelatedWake));
+      release();
+      await heartbeat.drainActiveRunExecutions();
+    }
+  });
+
+  it("binds a native scheduled timer to ready priority work while preserving old holds and the concurrent run", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ heartbeatConfig: {
+      enabled: true, intervalSec: 60, skipTimerWhenNoActionableWork: false,
+    } });
+    const now = new Date();
+    await db.update(agents).set({ adapterType: "paperclip_runner",
+      lastHeartbeatAt: new Date(now.getTime() - 120_000) }).where(eq(agents.id, agentId));
+    const activeIssue = randomUUID(), heldIssue = randomUUID(), blockedIssue = randomUUID();
+    const reviewIssue = randomUUID(), qaIssue = randomUUID(), blocker = randomUUID();
+    const selected = randomUUID(), lowerPriority = randomUUID();
+    const priorRun = randomUUID(), activeRun = randomUUID();
+    const pendingState = { status: "pending", currentStageId: randomUUID(), currentStageIndex: 0,
+      currentStageType: "review", currentParticipant: { type: "agent", agentId },
+      returnAssignee: { type: "agent", agentId }, reviewRequest: null, completedStageIds: [],
+      lastDecisionId: null, lastDecisionOutcome: null };
+    await db.insert(issues).values([
+      { id: activeIssue, companyId, title: "Already running", status: "in_progress", priority: "critical", assigneeAgentId: agentId },
+      { id: heldIssue, companyId, title: "Old native ownership", status: "in_progress", priority: "critical", assigneeAgentId: agentId },
+      { id: blockedIssue, companyId, title: "Dependency waiting", status: "todo", priority: "critical", assigneeAgentId: agentId },
+      { id: reviewIssue, companyId, title: "Review owns the next turn", status: "todo", priority: "critical", assigneeAgentId: agentId, executionState: pendingState },
+      { id: qaIssue, companyId, title: "QA return owns its exact wake", status: "in_progress", priority: "critical", assigneeAgentId: agentId,
+        executionState: { ...pendingState, status: "changes_requested", lastDecisionId: randomUUID(), lastDecisionOutcome: "changes_requested" } },
+      { id: blocker, companyId, title: "Unfinished dependency", status: "backlog" },
+      { id: lowerPriority, companyId, title: "Older lower priority", status: "todo", priority: "low", assigneeAgentId: agentId, createdAt: new Date(now.getTime() - 60_000) },
+      { id: selected, companyId, title: "Ready high priority", status: "todo", priority: "high", assigneeAgentId: agentId },
+    ]);
+    await db.insert(issueRelations).values({ companyId, issueId: blocker, relatedIssueId: blockedIssue, type: "blocks" });
+    await db.insert(heartbeatRuns).values([
+      { id: activeRun, companyId, agentId, status: "running", invocationSource: "assignment", contextSnapshot: { issueId: activeIssue }, startedAt: now },
+      { id: priorRun, companyId, agentId, status: "failed", runtimeMode: "native", nativeIssueId: heldIssue,
+        invocationSource: "assignment", contextSnapshot: { issueId: heldIssue }, finishedAt: now },
+    ]);
+    await db.insert(nativeRunFinalizations).values({ runId: priorRun, companyId, issueId: heldIssue,
+      phase: "observed", leaseOwner: "old-unknown-owner" });
+    const old = (await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, priorRun)))[0];
+    try {
+      const tick = await heartbeat.tickTimers(now);
+      expect(tick.enqueued).toBe(1);
+      const timers = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.invocationSource, "timer"));
+      expect(timers).toHaveLength(1);
+      expect(timers[0]?.contextSnapshot).toMatchObject({ issueId: selected, taskId: selected, wakeReason: "heartbeat_timer" });
+      expect(timers[0]?.status).toBe("queued");
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+      expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, priorRun)))[0]).toEqual(old);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, activeRun)))[0]?.status).toBe("running");
+    } finally {
+      // Teardown must also run against the broken baseline. Direct fixture
+      // cancellation never promotes the queued native run into a real provider.
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.invocationSource, "timer"));
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, activeRun));
+    }
+  });
+
+  it("skips a native scheduled timer with no task even when proactive timers are enabled", async () => {
+    const { agentId } = await seedCompanyAndAgent({ heartbeatConfig: {
+      enabled: true, intervalSec: 60, skipTimerWhenNoActionableWork: false,
+    } });
+    const now = new Date();
+    await db.update(agents).set({ adapterType: "paperclip_runner",
+      lastHeartbeatAt: new Date(now.getTime() - 120_000) }).where(eq(agents.id, agentId));
+    expect(await heartbeat.tickTimers(now)).toMatchObject({ checked: 1, enqueued: 0, skipped: 1 });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(0);
+    const wake = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wake).toHaveLength(1);
+    expect(wake[0]?.reason).toBe("heartbeat.timer.no_actionable_work");
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it("never invokes a native provider for an unbound direct timer wake", async () => {
+    const { agentId } = await seedCompanyAndAgent({ heartbeatConfig: { enabled: true,
+      skipTimerWhenNoActionableWork: false } });
+    await db.update(agents).set({ adapterType: "paperclip_runner" }).where(eq(agents.id, agentId));
+    expect(await heartbeat.wakeup(agentId, { source: "timer", triggerDetail: "system" })).toBeNull();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(0);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
 
   it("allows legacy generic timer wakes by default when no skip policy is set", async () => {

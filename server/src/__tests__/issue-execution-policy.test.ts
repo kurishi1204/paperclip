@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, resolveIssueResumeStatus } from "../services/issue-execution-policy.ts";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
 const coderAgentId = "11111111-1111-4111-8111-111111111111";
@@ -7,6 +7,57 @@ const qaAgentId = "22222222-2222-4222-8222-222222222222";
 const ctoAgentId = "33333333-3333-4333-8333-333333333333";
 const ctoUserId = "cto-user";
 const boardUserId = "board-user";
+
+describe("resolveIssueResumeStatus", () => {
+  function pendingIssue(type: "review" | "approval" = "approval") {
+    const policy = makePolicy([{ type, participants: [{ type: "agent", agentId: qaAgentId }] }]);
+    const state: IssueExecutionState = {
+      status: "pending", currentStageId: policy.stages[0].id, currentStageIndex: 0,
+      currentStageType: type, currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId }, completedStageIds: [],
+      lastDecisionId: null, lastDecisionOutcome: null, monitor: null, reviewRequest: null,
+    };
+    return { status: "blocked", assigneeAgentId: qaAgentId, assigneeUserId: null,
+      executionPolicy: policy, executionState: state };
+  }
+
+  it.each(["review", "approval"] as const)("resumes valid pending %s without changing its stage or participant", type => {
+    const issue = pendingIssue(type), original = structuredClone(issue);
+    expect(resolveIssueResumeStatus(issue)).toBe("in_review");
+    expect(issue).toEqual(original);
+  });
+
+  it.each(["policy", "stage", "stage_type", "assignee"])("rejects a pending %s mismatch without guessing a new stage", mismatch => {
+    const issue = pendingIssue();
+    if (mismatch === "policy") issue.executionPolicy = { ...issue.executionPolicy, stages: [] };
+    if (mismatch === "stage") issue.executionState.currentStageId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    if (mismatch === "stage_type") issue.executionState.currentStageType = "review";
+    if (mismatch === "assignee") issue.assigneeAgentId = coderAgentId;
+    const original = structuredClone(issue);
+    expect(() => resolveIssueResumeStatus(issue)).toThrow("Pending execution stage or participant changed");
+    expect(issue).toEqual(original);
+  });
+
+  it("preserves the existing escalated-human review hold", () => {
+    const issue = pendingIssue("review");
+    expect(resolveIssueResumeStatus({ ...issue, assigneeAgentId: null, assigneeUserId: boardUserId,
+      executionState: { ...issue.executionState, currentParticipant: { type: "user", userId: boardUserId },
+        changesRequestedCount: 3 } })).toBe("in_review");
+  });
+
+  it("does not treat an unreadable execution state as ordinary work", () => {
+    expect(() => resolveIssueResumeStatus({ ...pendingIssue(), executionState: { status: "pending" } }))
+      .toThrow("Execution state is invalid");
+  });
+
+  it.each(["done", "cancelled"])("retains ordinary explicit reopening for %s", status => {
+    expect(resolveIssueResumeStatus({ ...pendingIssue(), status })).toBe("todo");
+  });
+
+  it("retains ordinary resume without a pending execution stage", () => {
+    expect(resolveIssueResumeStatus({ status: "blocked", assigneeAgentId: coderAgentId })).toBe("todo");
+  });
+});
 
 function makePolicy(
   stages: Array<{ type: "review" | "approval"; participants: Array<{ type: "agent" | "user"; agentId?: string; userId?: string }> }>,

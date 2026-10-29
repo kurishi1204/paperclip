@@ -13,6 +13,7 @@ import {
   startRunnerToolBridge,
   type RunnerToolBridge,
 } from "./runner-tool-bridge.js";
+import { callApiAction } from "../protocol-actions/call-api.js";
 
 const bridges: RunnerToolBridge[] = [];
 
@@ -36,6 +37,68 @@ async function rpc(
 }
 
 describe("runner semantic MCP bridge", () => {
+  it("offers an assigned GET-only API view without changing the original authority or input", async () => {
+    const handler = vi.fn(async () => ({ ok: false, error: "existing_role_denied" }));
+    const bridge = await startRunnerToolBridge({
+      paperclipApiReadView: true,
+      tools: [{ name: "call_api", inputSchema: callApiAction.live.descriptor.inputSchema }],
+      handler,
+    });
+    bridges.push(bridge);
+    const listed = await (await rpc(bridge, { id: "list", method: "tools/list" })).json() as { result: { tools: Array<{ name: string }> } };
+    expect(listed.result.tools.map((x: { name: string }) => x.name)).toContain("call_api_read");
+    expect(listed.result.tools.find(x => x.name === "call_api_read")).toMatchObject({
+      inputSchema: { type: "object", properties: { operationId: { type: "string" }, pathParams: { type: "object" } } },
+    });
+    const input = {
+      operationId: "GET /api/issues/{id}/documents/{key}",
+      pathParams: { id: "parent-task", key: "knowledge-verification-readiness" },
+      responseText: { limitBytes: 24576 },
+    };
+    const result = await (await rpc(bridge, {
+      id: "read-parent", method: "tools/call", params: { name: "call_api_read", arguments: input },
+    })).json() as { result: { content: Array<{ text: string }> } };
+    expect(handler).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ tool: "call_api", arguments: input }));
+    // A provider allowance cannot change the authenticated server's result.
+    expect(result.result.content[0].text).toContain("existing_role_denied");
+  });
+
+  it("rejects mutation, file and malformed inputs at the read view before dispatch", async () => {
+    const handler = vi.fn(async () => ({ ok: true }));
+    const bridge = await startRunnerToolBridge({
+      paperclipApiReadView: true,
+      tools: [{ name: "call_api", inputSchema: callApiAction.live.descriptor.inputSchema }], handler,
+    });
+    bridges.push(bridge);
+    for (const [index, input] of [
+      { operationId: "POST /api/issues/{id}/comments", body: { body: "write" } },
+      { operationId: "GET /api/issues/{id}", body: {} },
+      { operationId: "GET /api/issues/{id}", files: [{ field: "upload", path: "private.txt" }] },
+      { operationId: "GET /api/issues/{id}", contentType: "text/plain" },
+      { operationId: "GET /api/issues/{id}\n" },
+      { operationId: "GET https://other.example/api/issues" },
+    ].entries()) {
+      expect(await (await rpc(bridge, { id: `denied-${index}`, method: "tools/call", params: { name: "call_api_read", arguments: input } })).json())
+        .toMatchObject({ result: { isError: true } });
+    }
+    expect(handler).not.toHaveBeenCalled();
+    await rpc(bridge, { id: "ordinary-write", method: "tools/call", params: { name: "call_api", arguments: { operationId: "POST /api/issues/{id}/comments", body: { body: "write" } } } });
+    expect(handler).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ tool: "call_api" }));
+  });
+
+  it("does not expose the API read view without both host enablement and an assigned call_api", async () => {
+    for (const options of [
+      { tools: [{ name: "call_api", inputSchema: callApiAction.live.descriptor.inputSchema }] },
+      { paperclipApiReadView: true, tools: [tool("read_document")] },
+    ]) {
+      const handler = vi.fn(async () => ({}));
+      const bridge = await startRunnerToolBridge({ ...options, handler }); bridges.push(bridge);
+      const listed = await (await rpc(bridge, { id: "list", method: "tools/list" })).json() as { result: { tools: Array<{ name: string }> } };
+      expect(listed.result.tools.map((x: { name: string }) => x.name)).not.toContain("call_api_read");
+      expect(await (await rpc(bridge, { id: "forged", method: "tools/call", params: { name: "call_api_read", arguments: { operationId: "GET /api/issues/{id}" } } })).json()).toMatchObject({ result: { isError: true } });
+      expect(handler).not.toHaveBeenCalled();
+    }
+  });
   it("binds to loopback, requires authentication, and exposes a closed catalog", async () => {
     const bridge = await startRunnerToolBridge({
       secret: "session-secret",

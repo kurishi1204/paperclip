@@ -255,8 +255,8 @@ describe("ACPX runtime host", () => {
   });
 
   it.each([
-    ["approve-reads", ["mcp__paperclip__get_task_context"]],
-    ["approve-paperclip", ["mcp__paperclip__create_task", "mcp__paperclip__get_task_context", "mcp__paperclip__reassign_task", "mcp__paperclip__write_document"]],
+    ["approve-reads", ["mcp__paperclip__call_api_read", "mcp__paperclip__get_task_context"]],
+    ["approve-paperclip", ["mcp__paperclip__call_api_read", "mcp__paperclip__create_task", "mcp__paperclip__get_task_context", "mcp__paperclip__reassign_task", "mcp__paperclip__write_document"]],
     ["deny-all", undefined],
   ] as const)("binds exact assigned Claude tools to %s before provider launch", async (permissionMode, allow) => {
     const fixture = await hostFixture();
@@ -270,6 +270,12 @@ describe("ACPX runtime host", () => {
         expect(options.mcpServers).toMatchObject([
           { name: "paperclip", runnerOwned: true },
         ]);
+        const response = await fetch(options.mcpServers[0]!.url, {
+          method: "POST", headers: { Authorization: `Bearer ${options.mcpServers[0]!.bearerToken}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+        });
+        const listed = await response.json() as { result: { tools: Array<{ name: string }> } };
+        expect(listed.result.tools.some(x => x.name === "call_api_read")).toBe(permissionMode !== "deny-all");
         return runtimePort({
           getStatus: async () => ({ models: { currentModelId: "claude-sonnet-5" } }),
         });
@@ -281,7 +287,7 @@ describe("ACPX runtime host", () => {
       model: "claude-sonnet-5",
       permissionMode,
       semanticTools: {
-        tools: ["get_task_context", "write_document", "create_task", "reassign_task", "unknown_read"].map((name) => ({
+        tools: ["get_task_context", "write_document", "create_task", "reassign_task", "unknown_read", "call_api"].map((name) => ({
           name,
           inputSchema: { type: "object" },
           // Supplied hints cannot grant write or unknown operations read access.

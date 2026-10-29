@@ -13,6 +13,7 @@ import {
   chatActions,
   heartbeatRuns,
   issueComments,
+  issueExecutionDecisions,
   issueRecoveryActions,
   issueRelations,
   issues,
@@ -201,7 +202,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       return { id: agent.id, companyId: agent.companyId, name: agent.name, invokable: invokability.invokable };
     },
 
-    async findNextDeferredWake({ companyId, issueId, excludedWakeIds }) {
+    async findNextDeferredWake({ companyId, issueId, excludedWakeIds, wakeId }) {
       while (true) {
         const row = await tx
           .select()
@@ -210,6 +211,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             and(
               eq(agentWakeupRequests.companyId, companyId),
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+              wakeId ? eq(agentWakeupRequests.id, wakeId) : undefined,
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
               interruptQueueId ? eq(agentWakeupRequests.id, interruptQueueId) : undefined,
@@ -1073,6 +1075,44 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
             ),
           )
           .orderBy(asc(issues.id));
+
+        if (input.nativeStageHandoff) {
+          // Recheck the saved handoff under the same issue lock as promotion.
+          // A later decision, new owner, or claimed executor cannot reuse it.
+          const issue = candidateIssues.find(candidate => candidate.id === contextIssueId);
+          const state = parseIssueExecutionState(issue?.executionState);
+          const [wake] = await tx.select().from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.id, input.nativeStageHandoff.wakeId),
+            eq(agentWakeupRequests.companyId, input.companyId),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS), isNull(agentWakeupRequests.runId),
+          )).for("update");
+          const context = parseObject(wake?.payload?._paperclipWakeContext);
+          const stage = parseObject(context.executionStage);
+          const [decision] = await tx.select({ id: issueExecutionDecisions.id })
+            .from(issueExecutionDecisions).innerJoin(nativeRunFinalizations, and(
+              eq(nativeRunFinalizations.runId, issueExecutionDecisions.createdByRunId),
+              eq(nativeRunFinalizations.companyId, issueExecutionDecisions.companyId),
+              eq(nativeRunFinalizations.phase, "committed"), isNull(nativeRunFinalizations.leaseOwner),
+            )).where(and(eq(issueExecutionDecisions.id, input.nativeStageHandoff.decisionId),
+              eq(issueExecutionDecisions.companyId, input.companyId),
+              eq(issueExecutionDecisions.createdByRunId, run.id),
+              eq(issueExecutionDecisions.issueId, issue?.id ?? run.id),
+              eq(issueExecutionDecisions.stageType, "approval"), eq(issueExecutionDecisions.outcome, "changes_requested"),
+              eq(issueExecutionDecisions.actorAgentId, run.agentId),
+              sql`${issueExecutionDecisions.stageId}::text = ${stage.stageId ?? null}`,
+            ));
+          if (!issue || issue.executionRunId || issue.checkoutRunId || issue.assigneeUserId ||
+              run.runtimeMode !== "native" || run.status !== "succeeded" || !decision || !wake ||
+              state?.status !== "changes_requested" || state.currentStageType !== "approval" ||
+              state.lastDecisionId !== decision.id || state.returnAssignee?.type !== "agent" ||
+              state.returnAssignee.agentId !== wake.agentId || issue.assigneeAgentId !== wake.agentId ||
+              context.source !== "issue.execution_stage" || context.wakeReason !== "execution_changes_requested" ||
+              context.issueId !== issue.id || wake.payload?.issueId !== issue.id || stage.wakeRole !== "executor" ||
+              stage.stageId !== state.currentStageId || wake.requestedByActorType !== "agent" ||
+              wake.requestedByActorId !== run.agentId) {
+            return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          }
+        }
 
         // Two separate updates: a retry can move `executionRunId` to a new run
         // while `checkoutRunId` still points at this one finishing.

@@ -8,6 +8,13 @@ import {
 } from "./permission-policy.js";
 
 describe("ACPX permission policy", () => {
+  it("allows the assigned task approval-stage tool only in approve-paperclip, keeping general approvals closed", () => {
+    const tools = ["decide_issue_approval_stage", "decide_approval", "mcp__other__decide_issue_approval_stage"].map(name => ({ name }));
+    expect(claudePaperclipPermissionRules(tools, "approve-paperclip")).toEqual(["mcp__paperclip__decide_issue_approval_stage"]);
+    expect(claudePaperclipPermissionRules(tools, "approve-reads")).toEqual([]);
+    expect(claudePaperclipPermissionRules(tools, "deny-all")).toEqual([]);
+    expect(claudePaperclipPermissionRules([], "approve-paperclip")).toEqual([]);
+  });
   it.each(["approve-reads", "approve-paperclip"] as const)("allows assigned canonical live reads, including approval lookup, in %s", mode => {
     const reads = capabilityCanonicalOperationsForSurface("live").filter(action => action.sideEffectClass === "read");
     expect(reads.some(action => action.operationId === "get_approval")).toBe(true);
@@ -22,7 +29,7 @@ describe("ACPX permission policy", () => {
       "call_api", "request_approval", "unknown_read", "mcp__other__get_task_context",
     ].map((name) => ({ name, annotations: { readOnlyHint: true, effect: "read" } }));
     expect(claudePaperclipPermissionRules(tools, "approve-reads")).toEqual([
-      "mcp__paperclip__get_task_context", "mcp__paperclip__read_document",
+      "mcp__paperclip__call_api_read", "mcp__paperclip__get_task_context", "mcp__paperclip__read_document",
     ]);
     expect(claudePaperclipPermissionRules([], "approve-reads")).toEqual([]);
   });
@@ -33,7 +40,7 @@ describe("ACPX permission policy", () => {
       "decide_approval", "control_workspace_service", "call_api", "create_skill", "schedule_wake"]
       .map(name => ({ name, annotations: { readOnlyHint: true } }));
     expect(claudePaperclipPermissionRules(tools, "approve-paperclip")).toEqual([
-      "mcp__paperclip__create_task", "mcp__paperclip__reassign_task",
+      "mcp__paperclip__call_api_read", "mcp__paperclip__create_task", "mcp__paperclip__reassign_task",
       "mcp__paperclip__request_approval", "mcp__paperclip__write_document",
     ]);
     expect(claudePaperclipPermissionRules([], "approve-paperclip")).toEqual([]);

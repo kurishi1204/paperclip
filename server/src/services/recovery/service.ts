@@ -3628,6 +3628,8 @@ export function recoveryService(
       legacyEpisode: input.legacyEpisode,
     });
     const now = new Date();
+    const ownerCannotRecordDisposition =
+      input.terminalReason === "owner_disposition_capability_unavailable";
     await db
       .update(issueRecoveryActions)
       .set({
@@ -3646,8 +3648,9 @@ export function recoveryService(
           sourceMaxAttempts: input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS,
           routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
         },
-        nextAction:
-          "Inspect the evidence and choose whether to repair, retry the original owner, explicitly reassign, or resolve the source issue.",
+        nextAction: ownerCannotRecordDisposition
+          ? "The existing coordinator or board must record the source disposition or explicitly assign a capable owner; do not send company-state repair to the web-only worker."
+          : "Inspect the evidence and choose whether to repair, retry the original owner, explicitly reassign, or resolve the source issue.",
         wakePolicy: {
           type: "board_escalation",
           reason: input.terminalReason,
@@ -3675,14 +3678,18 @@ export function recoveryService(
     await issuesSvc.addComment(
       input.issue.id,
       [
-        "Paperclip exhausted the bounded original-owner disposition repair without a durable source-state change.",
+        ownerCannotRecordDisposition
+          ? "Paperclip left disposition repair with the board because the original owner is a web-only research worker without company-state tools; no repair wake was dispatched."
+          : "Paperclip exhausted the bounded original-owner disposition repair without a durable source-state change.",
         "",
         `- Attempts: ${input.attemptCount}/${input.legacyEpisode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS}`,
         `- Terminal reason: \`${input.terminalReason}\``,
         "- Recovery owner: board",
         "- Source ownership: unchanged; reassignment requires an explicit decision or a policy-defined serious failure.",
         "",
-        "Next action: repair the liveness disposition or request an explicit source-owner decision.",
+        ownerCannotRecordDisposition
+          ? "Next action: the existing coordinator or board records the disposition or explicitly assigns a capable owner, while preserving the research result and source ownership."
+          : "Next action: repair the liveness disposition or request an explicit source-owner decision.",
       ].join("\n"),
       {},
       {
@@ -3936,6 +3943,23 @@ export function recoveryService(
         terminalReason: !ownerInvokable
           ? "owner_not_invokable"
           : "owner_budget_blocked",
+      });
+      return escalated ? "escalated" : "skipped";
+    }
+
+    // Bounded Hermes can verify public web evidence, but cannot mutate company
+    // state. Leave the missing disposition visible instead of scheduling a
+    // repair that its sealed tool surface cannot perform.
+    if (ownerAgent?.adapterType === "hermes_local" &&
+      (parseObject(ownerAgent.adapterConfig).boundedExecution === true ||
+        process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID === ownerAgent.id)) {
+      const escalated = await escalateDispositionRepair({
+        issue: current,
+        latestRun,
+        fingerprint: state.fingerprint,
+        attemptCount: sameFingerprintAttempt,
+        terminalReason: "owner_disposition_capability_unavailable",
+        legacyEpisode: episode,
       });
       return escalated ? "escalated" : "skipped";
     }
