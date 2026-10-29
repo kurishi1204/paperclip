@@ -10,6 +10,7 @@ const writeSelfTaskSchema = upsertIssueDocumentSchema.extend({
   key: issueDocumentKeySchema,
   documentId: z.string().uuid().nullable(),
   baseRevisionId: z.string().uuid().nullable(),
+  submitForReview: z.boolean().optional(),
   input: z.object({ key: issueDocumentKeySchema, documentId: z.string().uuid(), revisionId: z.string().uuid(),
     bodySha256: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
 }).strict();
@@ -34,7 +35,7 @@ export function projectToolDefinitions(workMode: string, includeTask = false, se
     inputSchema: z.toJSONSchema(readSelfTaskSchema, { io: "input" }),
   });
   if (selfTaskOnly && selfTaskDocumentModeAllowed(workMode, true)) definitions.push({
-    name: "write_self_task_document", description: "Save one fixed-input revision to this run's task; never replay an unknown write.",
+    name: "write_self_task_document", description: "Save one fixed-input revision to this run's task. Set submitForReview=true when the saved result is ready for the task's configured review; never replay an unknown write or submission.",
     inputSchema: z.toJSONSchema(writeSelfTaskSchema, { io: "input" }),
   });
   return definitions;
@@ -184,11 +185,54 @@ async function callSelfTaskDocumentTool(input: DocumentToolInput) {
     if (observed.data.id !== doc.id || observed.data.latestRevisionId !== doc.latestRevisionId ||
         observed.data.latestRevisionNumber !== doc.latestRevisionNumber || observed.data.body !== doc.body)
       return result("mismatch", { reason: "Readback differs from PUT receipt" });
+    if (args.submitForReview) {
+      // Save and submission are separate effects. An unacknowledged submission
+      // must never cause the already verified document write to be repeated.
+      stage = "review";
+      const review = await submitSavedDocumentForReview(input, doc);
+      return result("verified", { key: doc.key, documentId: doc.id, revisionId: doc.latestRevisionId,
+        revisionNumber: doc.latestRevisionNumber, body: doc.body, bodySha256: digest(doc.body), review });
+    }
     stage = "complete";
     return result("verified", { key: doc.key, documentId: doc.id, revisionId: doc.latestRevisionId,
       revisionNumber: doc.latestRevisionNumber, body: doc.body, bodySha256: digest(doc.body) });
   } catch (error) {
     return result(putAttempted ? "unknown" : error instanceof z.ZodError ? "rejected" : "unknown",
       { reason: error instanceof Error ? error.message : "Document tool failed" });
+  }
+}
+
+/** Only the existing review policy may choose the next assignee/stage. */
+async function submitSavedDocumentForReview(input: DocumentToolInput, doc: z.infer<typeof currentDocumentSchema>) {
+  const url = `${input.apiUrl.replace(/\/+$/, "").replace(/\/api$/, "")}/api/issues/${input.issueId}`;
+  const headers = { Authorization: `Bearer ${input.token}`, "Content-Type": "application/json",
+    "X-Paperclip-Document-Mode": "self-task", "X-Paperclip-Expected-Document-Id": doc.id };
+  let attempted = false;
+  try {
+    const before = await fetch(url, { headers, redirect: "manual", signal: AbortSignal.timeout(60_000) });
+    if (before.status !== 200) return { outcome: "rejected", reason: "Saved document retained; task could not be read for review" };
+    const task = z.object({ id: z.string(), companyId: z.string(), revision: z.number().int(),
+      statusVersion: z.number().int(), status: z.string(), assigneeAgentId: z.string().nullable(),
+      executionState: z.object({ lastDecisionId: z.string().uuid().nullable().optional() }).passthrough().nullable(),
+    }).parse(await before.json());
+    if (task.id !== input.issueId || task.companyId !== input.companyId || task.status !== "in_progress" ||
+        task.assigneeAgentId !== input.agentId) return { outcome: "rejected", reason: "Saved document retained; task ownership changed" };
+    attempted = true;
+    const submitted = await fetch(url, { method: "PATCH", headers, redirect: "manual", signal: AbortSignal.timeout(60_000),
+      body: JSON.stringify({ status: "in_review", selfTaskReviewExpected: {
+        key: doc.key, documentId: doc.id, revisionId: doc.latestRevisionId, bodySha256: digest(doc.body),
+        revision: task.revision, statusVersion: task.statusVersion, lastDecisionId: task.executionState?.lastDecisionId ?? null,
+      } }),
+    });
+    if (submitted.status !== 200) return { outcome: submitted.status >= 500 || [408, 429].includes(submitted.status) ? "unknown" : "rejected",
+      status: submitted.status, reason: "Saved document retained; review submission was not acknowledged. Do not repeat the write." };
+    const next = await submitted.json();
+    if (next.id !== task.id || next.companyId !== task.companyId || next.status !== "in_review")
+      return { outcome: "unknown", reason: "Saved document retained; unexpected review receipt. Reconcile without repeating the write." };
+    return { outcome: "verified", status: "in_review", revision: next.revision,
+      submittedDocumentId: doc.id, submittedRevisionId: doc.latestRevisionId };
+  } catch {
+    return { outcome: attempted ? "unknown" : "rejected",
+      reason: "Saved document retained; review transport could not be confirmed. Reconcile without repeating the write." };
   }
 }

@@ -83,6 +83,26 @@ pnpm dev:stop --data-dir ./tmp/paperclip-dev
 
 Issue execution may also use project execution workspace policies and workspace runtime services for per-project worktrees, preview servers, and managed dev commands. Configure those through the project workspace/runtime surfaces rather than starting long-running unmanaged processes when a task needs a reusable service.
 
+### Document-only task delivery
+
+`claude_local` agents explicitly configured with `selfTaskDocumentToolsOnly: true`
+receive only the task-bound read and write document tools. A newly assigned task
+without `initialPlan` preserves its original title/description as the `plan`
+document labelled **Task request**. An explicit initial plan remains unchanged.
+
+When the result is ready, pass `submitForReview: true` to
+`write_self_task_document`. After saving and reading back that revision, the tool
+submits it to the task's existing review policy. The server rechecks the task,
+run, document revision and author under locks; the tool cannot choose a reviewer
+or approve its own result. QA-requested changes use a new run and revision, then
+the same submission path. A submission conflict or lost acknowledgement leaves
+the saved revision intact: inspect `review.outcome` and reconcile before acting;
+do not repeat the document write. Omitting the option still only saves.
+
+A temporary workspace scan failure before provider entry may use the existing
+bounded retry only after its owning executor settles cleanup and records exact
+non-entry evidence. Unknown or entered episodes retain their replay hold.
+
 ### Mobile-friendly preview (`pnpm dev:mobile`)
 
 The vite dev server serves an unbundled module graph. This is fast to reload on a local machine but too heavy for phones and tablets on slow links (airplane wifi, mobile data, distant tailnet peers). `pnpm dev:mobile` builds the UI once and serves the small production bundle on port `3101` via `vite preview`, proxying `/api` requests to the dev API on `3100`.

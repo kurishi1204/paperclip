@@ -3,9 +3,11 @@ import { callProjectTool } from "../services/project-tools.js";
 import { SELF_TASK_DOCUMENT_CONTEXT_KEY } from "../services/self-task-document-runtime.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { createHash, randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
+import * as reviewProcesses from "@paperclipai/adapter-utils/server-utils";
 import { eq } from "drizzle-orm";
-import { agents, issues, heartbeatRuns, projects, companyMemberships, executionWorkspaces, documentRevisions } from "@paperclipai/db";
+import { agents, issues, heartbeatRuns, projects, companyMemberships, executionWorkspaces, documentRevisions, agentTaskSessions, agentSessionGoalActions } from "@paperclipai/db";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 import { issueService } from "../services/issues.js";
 import { documentService } from "../services/documents.js";
@@ -31,6 +33,136 @@ if (process.env.PAPERCLIP_REQUIRE_EMBEDDED_PG === "1" && !support.supported) {
     } }).where(eq(heartbeatRuns.id, f.runId));
     return f;
   };
+
+  it("saves, enters configured QA, receives changes and resubmits the exact revised document through HTTP", async () => {
+    const f = await documentFixture();
+    await server.db.update(documentRevisions).set({ createdByRunId: null })
+      .where(eq(documentRevisions.createdByRunId, f.runId));
+    const [reviewer] = await server.db.insert(agents).values({
+      companyId: f.companyId, name: "Document QA", adapterType: "paperclip_runner", status: "active",
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
+    }).returning();
+    const stageId = randomUUID();
+    await server.db.update(issues).set({ checkoutRunId: f.runId, executionPolicy: { ...normalizeIssueExecutionPolicy({
+      stages: [{ id: stageId, type: "review", participants: [{ type: "agent", agentId: reviewer!.id }] }],
+    })! } }).where(eq(issues.id, f.issueId));
+    const save = async (runId: string, key: string, inputKey: string, body: string, documentId: string | null, baseRevisionId: string | null) => {
+      const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", runId)!;
+      const access = { apiUrl: server.apiUrl, token, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, conversation: false };
+      const input = await callProjectTool({ ...access, name: "read_self_task_document", arguments: { key: inputKey } });
+      expect(input.outcome).toBe("verified");
+      return callProjectTool({ ...access, name: "write_self_task_document", arguments: {
+        key, title: "Document result", format: "markdown", body, documentId, baseRevisionId, submitForReview: true,
+        input: { key: inputKey, documentId: input.documentId, revisionId: input.revisionId, bodySha256: input.bodySha256 },
+      } });
+    };
+    const qa = async (decision: "approve" | "request_changes") => {
+      const runId = randomUUID();
+      await server.db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: reviewer!.id,
+        status: "running", runtimeMode: "native", nativeIssueId: f.issueId, invocationSource: "assignment",
+        contextSnapshot: { issueId: f.issueId }, runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } } });
+      await server.db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, f.issueId));
+      const token = createLocalAgentJwt(reviewer!.id, f.companyId, "paperclip_runner", runId)!;
+      reviewProcesses.runningProcesses.set(runId, {
+        child: { pid: 12345678, exitCode: null, signalCode: null, kill: vi.fn() } as never,
+        graceSec: 10, processGroupId: null,
+      });
+      reviewProcesses.bindQaReviewProcess(runId, 12345678);
+      const call = async (name: string, args: object) => {
+        const response = await fetch(`${server.apiUrl}/api/mcp/qa-review`, { method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: randomUUID(), method: "tools/call", params: { name, arguments: args } }) });
+        expect(response.status).toBe(200);
+        const wire = await response.json();
+        expect(wire.result.isError, JSON.stringify(wire)).not.toBe(true);
+        return wire.result.structuredContent;
+      };
+      try {
+        const task = await call("read_assigned_issue", {});
+        await call("submit_review_decision", { decision, summary: decision === "approve" ? "Corrected result verified." : "Add the missing source.",
+          expectedStageId: stageId, expectedStatusVersion: task.statusVersion, expectedRevision: task.revision,
+          expectedLastDecisionId: task.reviewStage.lastDecisionId });
+      } finally {
+        const active = reviewProcesses.runningProcesses.get(runId);
+        if (active) { active.closed = true; for (const cleanup of active.closeCleanups ?? []) cleanup(); }
+        reviewProcesses.runningProcesses.delete(runId);
+        await server.db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+      }
+    };
+    const first = await save(f.runId, "result", "notes", "First draft", null, null);
+    expect(first).toMatchObject({ outcome: "verified", review: { outcome: "verified", status: "in_review", submittedRevisionId: first.revisionId } });
+    await server.db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    await qa("request_changes");
+    expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
+      .toMatchObject({ status: "in_progress", assigneeAgentId: f.agentId });
+    const revisionRunId = randomUUID();
+    await server.db.insert(heartbeatRuns).values({ id: revisionRunId, companyId: f.companyId, agentId: f.agentId,
+      status: "running", runtimeMode: "native", nativeIssueId: f.issueId, invocationSource: "assignment",
+      contextSnapshot: { issueId: f.issueId, [SELF_TASK_DOCUMENT_CONTEXT_KEY]: true } });
+    await server.db.update(issues).set({ executionRunId: revisionRunId, checkoutRunId: revisionRunId }).where(eq(issues.id, f.issueId));
+    const revised = await save(revisionRunId, "result", "result", "Corrected result with source", first.documentId as string, first.revisionId as string);
+    expect(revised).toMatchObject({ outcome: "verified", revisionNumber: 2,
+      review: { outcome: "verified", status: "in_review", submittedRevisionId: revised.revisionId } });
+    expect(revised.revisionId).not.toBe(first.revisionId);
+    await server.db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, revisionRunId));
+    await qa("approve");
+    expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0]?.status).toBe("done");
+    expect((await documentService(server.db).getIssueDocumentByKey(f.issueId, "result"))?.latestRevisionId).toBe(revised.revisionId);
+  }, 45_000);
+
+  it.each(["task changes", "active goal", "submission response is lost"])("retains the saved revision when %s before review acknowledgement", async scenario => {
+    const f = await documentFixture();
+    await server.db.update(documentRevisions).set({ createdByRunId: null })
+      .where(eq(documentRevisions.createdByRunId, f.runId));
+    const [reviewer] = await server.db.insert(agents).values({ companyId: f.companyId, name: "QA",
+      adapterType: "paperclip_runner", status: "active", runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } } }).returning();
+    await server.db.update(issues).set({ checkoutRunId: f.runId, executionPolicy: { ...normalizeIssueExecutionPolicy({
+      stages: [{ id: randomUUID(), type: "review", participants: [{ type: "agent", agentId: reviewer!.id }] }],
+    })! } }).where(eq(issues.id, f.issueId));
+    const goal = { objective: "Complete the existing goal", status: "active" };
+    const [goalSession] = scenario === "active goal" ? await server.db.insert(agentTaskSessions).values({
+      companyId: f.companyId, agentId: f.agentId, taskKey: f.issueId, adapterType: "paperclip_runner",
+      goalJson: goal, goalStatus: "active", goalDesiredState: "active", goalRevision: 7,
+      goalCapabilityJson: { availability: "available", actions: ["pause", "clear"] },
+    }).returning() : [];
+    const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId)!;
+    const access = { apiUrl: server.apiUrl, token, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, conversation: false };
+    const input = await callProjectTool({ ...access, name: "read_self_task_document", arguments: { key: "notes" } });
+    const originalFetch = globalThis.fetch;
+    let submissions = 0, writes = 0;
+    const intercepted = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      if (init?.method === "PUT") writes++;
+      if (init?.method === "PATCH" && String(url) === `${server.apiUrl}/api/issues/${f.issueId}`) {
+        submissions++;
+        if (scenario === "task changes") {
+          const [current] = await server.db.select().from(issues).where(eq(issues.id, f.issueId));
+          await server.db.update(issues).set({ title: "Updated request", revision: current!.revision + 1 })
+            .where(eq(issues.id, f.issueId));
+        }
+        const response = await originalFetch(url, init);
+        if (scenario === "submission response is lost") throw new Error("Synthetic lost submission acknowledgement");
+        return response;
+      }
+      return originalFetch(url, init);
+    });
+    try {
+      const saved = await callProjectTool({ ...access, name: "write_self_task_document", arguments: {
+        key: "result", title: "Retained result", format: "markdown", body: "Verified draft", documentId: null, baseRevisionId: null,
+        submitForReview: true, input: { key: "notes", documentId: input.documentId, revisionId: input.revisionId, bodySha256: input.bodySha256 },
+      } });
+      expect(saved).toMatchObject({ outcome: "verified", review: { outcome: scenario === "submission response is lost" ? "unknown" : "rejected" } });
+      expect(writes).toBe(1); expect(submissions).toBe(1);
+      const stored = await documentService(server.db).getIssueDocumentByKey(f.issueId, "result");
+      expect(stored).toMatchObject({ body: "Verified draft", latestRevisionId: saved.revisionId, latestRevisionNumber: 1 });
+      expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0]?.status)
+        .toBe(scenario === "submission response is lost" ? "in_review" : "in_progress");
+      if (goalSession) {
+        expect((await server.db.select().from(agentTaskSessions).where(eq(agentTaskSessions.id, goalSession.id)))[0])
+          .toMatchObject({ goalJson: goal, goalRevision: 7, goalDesiredState: "active" });
+        expect(await server.db.select().from(agentSessionGoalActions).where(eq(agentSessionGoalActions.sessionId, goalSession.id))).toEqual([]);
+      }
+    } finally { intercepted.mockRestore(); }
+  });
 
   it("uses the persisted opt-in flag for both document tool discovery and calls", async () => {
     const f = await documentFixture();
@@ -446,7 +578,7 @@ if (process.env.PAPERCLIP_REQUIRE_EMBEDDED_PG === "1" && !support.supported) {
       const paths = [`/api/companies/${f.companyId}/issues`, `/api/issues/${f.issueId}/children`];
       const selections = [{ projectWorkspaceId: f.projectWorkspaceId }, { executionWorkspaceId: executionWorkspace.id },
         { inheritExecutionWorkspaceFromIssueId: f.blockerId }];
-      const create = async (path: string, selection: Record<string, string>) => {
+      const create = async (path: string, selection: Record<string, string | undefined>) => {
         const response = await fetch(`${server.apiUrl}${path}`, {
           method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
           body: JSON.stringify({ title: `Workspace scope ${randomUUID()}`, parentId: f.issueId,

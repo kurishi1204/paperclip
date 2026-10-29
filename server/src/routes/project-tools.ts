@@ -37,7 +37,9 @@ export function projectToolRoutes(db: Db) {
         companyId: context.run.companyId, issueId: context.issue.id, agentId: context.run.agentId,
         conversation: Boolean(context.issue.conversationAgentId),
       });
-      const failed = result && typeof result === "object" && "outcome" in result && result.outcome !== "verified";
+      const review = result && typeof result === "object" && "review" in result ? result.review : null;
+      const failed = result && typeof result === "object" && "outcome" in result && result.outcome !== "verified" ||
+        review && typeof review === "object" && "outcome" in review && review.outcome !== "verified";
       return send({ ...(failed ? { isError: true } : {}), content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result });
     } catch (error) {
       return send({ isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : "Project tool failed" }] });

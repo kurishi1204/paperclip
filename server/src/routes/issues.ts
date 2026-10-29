@@ -387,6 +387,15 @@ const updateIssueRouteSchema = updateIssueSchema.extend({
     revision: z.number().int().nonnegative(),
     lastDecisionId: z.string().uuid().nullable(),
   }).strict().optional(),
+  selfTaskReviewExpected: z.object({
+    key: issueDocumentKeySchema,
+    documentId: z.string().uuid(),
+    revisionId: z.string().uuid(),
+    bodySha256: z.string().regex(/^[0-9a-f]{64}$/),
+    revision: z.number().int().nonnegative(),
+    statusVersion: z.number().int().nonnegative(),
+    lastDecisionId: z.string().uuid().nullable(),
+  }).strict().optional(),
 });
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
@@ -9873,6 +9882,7 @@ export function issueRoutes(
   async function withSelfTaskDocument<T>(
     req: Request, res: Response, write: boolean,
     action: (issue: typeof issueRows.$inferSelect, executor: Db) => Promise<T>,
+    options?: { operation: "submit"; key: string; query: Db },
   ): Promise<T> {
     const actor = req.actor;
     if (actor.type !== "agent" || actor.source !== "agent_jwt" || !actor.companyId || !actor.agentId || !actor.runId)
@@ -9880,7 +9890,7 @@ export function issueRoutes(
     const issueId = req.params.id as string;
     const binding = { companyId: actor.companyId, agentId: actor.agentId, runId: actor.runId };
     try {
-      return await db.transaction(async tx => {
+      return await (options?.query ?? db).transaction(async tx => {
         const executor = tx as unknown as Db;
         const [issue] = await tx.select().from(issueRows).where(and(
           eq(issueRows.id, issueId), eq(issueRows.companyId, binding.companyId),
@@ -9924,7 +9934,7 @@ export function issueRoutes(
         });
         if (!decision.allowed) throw forbidden("Task document is outside this actor's authorization boundary");
         if (write) {
-          const key = issueDocumentKeySchema.parse(String(req.params.key ?? "").trim().toLowerCase());
+          const key = issueDocumentKeySchema.parse(String(options?.key ?? req.params.key ?? "").trim().toLowerCase());
           const [target] = await tx.select({ id: documents.id }).from(documents)
             .innerJoin(issueDocuments, eq(issueDocuments.documentId, documents.id))
             .where(and(eq(issueDocuments.issueId, issue.id), eq(issueDocuments.key, key)))
@@ -9934,9 +9944,11 @@ export function issueRoutes(
             throw conflict("Document identity changed before the bounded write");
           // The run lock serializes concurrent writes by this same run. No
           // second document revision may be created under one run authority.
-          const [prior] = await tx.select({ id: documentRevisions.id }).from(documentRevisions)
-            .where(and(eq(documentRevisions.companyId, issue.companyId), eq(documentRevisions.createdByRunId, run.id))).limit(1);
-          if (prior) throw conflict("This run already saved a document revision");
+          if (options?.operation !== "submit") {
+            const [prior] = await tx.select({ id: documentRevisions.id }).from(documentRevisions)
+              .where(and(eq(documentRevisions.companyId, issue.companyId), eq(documentRevisions.createdByRunId, run.id))).limit(1);
+            if (prior) throw conflict("This run already saved a document revision");
+          }
         }
         return action(issue, executor);
       });
@@ -13072,6 +13084,12 @@ export function issueRoutes(
 
   const handleIssuePatch = async (req: Request, res: Response, formalApprovalExpected?: NativeApprovalStageDecision) => {
       const id = req.params.id as string;
+      const selfTaskReviewExpected = req.body.selfTaskReviewExpected as z.infer<typeof updateIssueRouteSchema>["selfTaskReviewExpected"];
+      if (selfTaskReviewExpected && (req.body.status !== "in_review" ||
+          Object.keys(req.body).some(key => !["status", "selfTaskReviewExpected"].includes(key)) ||
+          !isSelfTaskDocumentRequest(req))) {
+        throw forbidden("Task document submission can only enter the configured review");
+      }
       // Conditional edits must fail before run cancellation, wake, or workspace work.
       const expectedRevision = req.body.expectedRevision as number | undefined;
       if (
@@ -13237,6 +13255,7 @@ export function issueRoutes(
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         expectedRevision: _expectedRevision,
         qaReviewExpected: _qaReviewExpected,
+        selfTaskReviewExpected: _selfTaskReviewExpected,
         boardReviewExpected: _boardReviewExpected,
         ...updateFields
       } = req.body;
@@ -13841,20 +13860,28 @@ export function issueRoutes(
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
       if (!boardReviewExpected && !formalApprovalExpected && req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
-        await stopRunnerGoalForOwnershipChange({
+        const ownershipChange = {
           companyId: existing.companyId,
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
-        });
+        };
+        if (selfTaskReviewExpected) {
+          // A document submission is not permission to pause/clear a goal.
+          // Reject it without sending a control action, including before CAS.
+          const goal = await runnerGoals.projection(ownershipChange.companyId, ownershipChange.issueId, ownershipChange.agentId);
+          if (goal?.pendingAction || goal?.goal && goal.goal.status !== "complete")
+            throw conflict("Finish the active goal before submitting the saved document for review");
+        } else await stopRunnerGoalForOwnershipChange(ownershipChange);
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
-        // A formal QA request_changes is submitted by the run being reassigned.
+        // A formal QA request_changes or exact self-document submission comes
+        // from the run being reassigned.
         // Cancelling that run before the locked verdict write can kill the
         // response and make its run-bound receipt unreachable. After the
         // transition, QA tools expose only this run's receipt; let the CLI
         // receive it and finish normally while assignment dispatch proceeds.
-        const qaVerdictFromActiveRun = Boolean(qaReviewExpected && actor.runId &&
+        const responseFromActiveRun = Boolean((qaReviewExpected || selfTaskReviewExpected) && actor.runId &&
           runToStopForReassignment?.id === actor.runId);
-        if (runToStopForReassignment && !qaVerdictFromActiveRun) {
+        if (runToStopForReassignment && !responseFromActiveRun) {
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
             "Cancelled before issue reassignment",
@@ -14129,10 +14156,28 @@ export function issueRoutes(
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
         reviewPolicySensitiveMutationRequested ||
-        Boolean(qaReviewExpected) || Boolean(boardReviewExpected) || Boolean(formalApprovalExpected);
+        Boolean(qaReviewExpected) || Boolean(boardReviewExpected) || Boolean(formalApprovalExpected) || Boolean(selfTaskReviewExpected);
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
+            if (selfTaskReviewExpected) await withSelfTaskDocument(req, res, true, async (locked, executor) => {
+              const expected = selfTaskReviewExpected;
+              if (locked.revision !== expected.revision || locked.statusVersion !== expected.statusVersion ||
+                  (parseIssueExecutionState(locked.executionState)?.lastDecisionId ?? null) !== expected.lastDecisionId ||
+                  locked.revision !== existing.revision || locked.statusVersion !== existing.statusVersion)
+                throw conflict("Task changed after the saved document was read; reconcile before review submission");
+              const policy = normalizeIssueExecutionPolicy(locked.executionPolicy);
+              if (!policy?.stages.length || !policy.stages.some(stage => stage.type === "review"))
+                throw conflict("Configure a review stage before submitting this task document");
+              const document = await documentService(executor).getIssueDocumentByKey(locked.id, expected.key);
+              const [saved] = await executor.select().from(documentRevisions)
+                .where(and(eq(documentRevisions.id, expected.revisionId), eq(documentRevisions.companyId, locked.companyId)));
+              if (!document || document.id !== expected.documentId || document.latestRevisionId !== expected.revisionId ||
+                  !saved || saved.documentId !== document.id || saved.createdByRunId !== req.actor.runId ||
+                  typeof document.body !== "string" ||
+                  createHash("sha256").update(Buffer.from(document.body, "utf8")).digest("hex") !== expected.bodySha256)
+                throw conflict("Only the current revision saved by this run can enter review");
+            }, { operation: "submit", key: selfTaskReviewExpected.key, query: tx as unknown as Db });
             if (boardReviewExpected) await assertBoardReviewStart(tx, await svc.getByIdForUpdate(id, tx));
             if (formalApprovalExpected) {
               const locked = await svc.getByIdForUpdate(id, tx);

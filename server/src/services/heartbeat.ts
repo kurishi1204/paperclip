@@ -320,7 +320,7 @@ import type {
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { createRuntimeToolsToken } from "../runtime-tools-token.js";
 import { QA_REVIEW_MCP_CONNECTION_ID, QA_REVIEW_MCP_NAME, qaReviewLocalApiUrl } from "./qa-review-tools.js";
-import { SELF_TASK_DOCUMENT_CONTEXT_KEY, hasSelfTaskDocumentReplayHold, isSelfTaskDocumentRuntime, selfTaskDocumentMcpServers } from "./self-task-document-runtime.js";
+import { SELF_TASK_DOCUMENT_CONTEXT_KEY, hasSelfTaskDocumentReplayHold, hasSelfTaskDocumentSetupRetryHold, isSelfTaskDocumentRuntime, selfTaskDocumentMcpServers } from "./self-task-document-runtime.js";
 import {
   parseObject,
   asBoolean,
@@ -13035,6 +13035,13 @@ export function heartbeatService(
     patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
     status: string,
   ) {
+    if (previous && parseObject(previous.contextSnapshot)[SELF_TASK_DOCUMENT_CONTEXT_KEY] === true && patch?.resultJson) {
+      // Adapter output is data, never a post-cleanup non-entry attestation.
+      // Only executeRun's settled CAS below may mint this receipt.
+      const recovery = { ...parseObject(patch.resultJson.executionRecovery) };
+      delete recovery.selfTaskDocumentPreProvider;
+      patch = { ...patch, resultJson: { ...patch.resultJson, executionRecovery: recovery } };
+    }
     if (!previous || !readNonEmptyString(parseObject(previous.contextSnapshot).qaDecisionId)) return patch;
     const prior = parseObject(parseObject(previous.resultJson).executionRecovery);
     const requested = parseObject(parseObject(patch?.resultJson).executionRecovery);
@@ -15689,7 +15696,7 @@ export function heartbeatService(
       delayMs?: number;
     },
   ) {
-    if (hasSelfTaskDocumentReplayHold(run)) {
+    if (hasSelfTaskDocumentSetupRetryHold(run)) {
       return { outcome: "not_scheduled" as const,
         reason: "Reconcile task document receipts before an explicit new episode; automatic replay is disabled.",
         errorCode: "self_task_document_replay_hold" as const,
@@ -21262,6 +21269,10 @@ export function heartbeatService(
     > | null = null;
     let providerTraceFinalized = false;
     let readFailureReportSecrets: () => string[] = () => [];
+    // Only this live executor can attest a new ordinary document setup failure.
+    // Never reconstruct non-entry from a historical providerWorkStarted:false.
+    let selfTaskSetupFailure: typeof heartbeatRuns.$inferSelect | null = null;
+    let selfTaskSetupCleanupComplete = true;
     let identityRedactor = createAgentIdentityRedactor();
     if (qaObservation) {
       qaObservation.preparationStarted = true;
@@ -26024,6 +26035,14 @@ export function heartbeatService(
               dispatchRunId:dispatch?.id ?? null, outcome:admitted ? dispatch ? "dispatched" : "held" : "idle"}};
           }
           adapterResult = identityRedactor.redact(adapterResult);
+          if (selfTaskDocumentMode) {
+            // Liveness and presentation reuse this source result after the
+            // status write; strip executor-only authority before every reader.
+            delete parseObject(adapterResult.resultJson?.executionRecovery).selfTaskDocumentPreProvider;
+            if (adapterResult.executionRecovery) {
+              delete (adapterResult.executionRecovery as unknown as Record<string, unknown>).selfTaskDocumentPreProvider;
+            }
+          }
           if(commanderResultClaim && adapterResult.exitCode===0 && !adapterResult.timedOut) {
             const handoff=await completeCommanderHermesResult(db,run.id,commanderResultClaim,adapterResult.resultJson ?? {}).catch(error=>{throw new ConfigurationIncompleteFailure(error instanceof Error?error.message:"Commander result handoff changed",{...adapterResult.resultJson,configurationIncomplete:{reason:"commander_handoff_changed",companyId:run.companyId,agentId:run.agentId,responsibleUserId:commanderResultClaim.admission.resultHandoff!.ownerUserId,actionUrl:`/issues/${issueId}`},commanderHandoffHold:{phase:"after_provider_before_handoff",runId:run.id,issueId},executionRecovery:{providerWorkStarted:true}});});
             adapterResult.resultJson={...adapterResult.resultJson,commanderHandoff:handoff.receipt};
@@ -27533,6 +27552,13 @@ export function heartbeatService(
           const failedAgent =
             setupFailureAgent ??
             (await getAgent(run.agentId).catch(() => null));
+          if (run.runtimeMode === "legacy" && run.controllerBootId === legacyControllerBootId &&
+              parseObject(run.contextSnapshot)[SELF_TASK_DOCUMENT_CONTEXT_KEY] === true &&
+              !readNonEmptyString(parseObject(run.contextSnapshot).qaDecisionId) &&
+              !legacyAdapterEntered && !nativeDispatchStarted && !nativeOwnershipHeld &&
+              isTransientWorkspaceGitScanCode(livenessRun.errorCode)) {
+            selfTaskSetupFailure = livenessRun;
+          }
           if (failedAgent) {
             await refreshContinuationSummaryForRun(
               livenessRun,
@@ -27549,7 +27575,7 @@ export function heartbeatService(
             // No provider work began. Retry temporary host scan failures with
             // the existing durable failure budget, before releasing execution.
             // Generic recovery must not grant a second budget on exhaustion.
-            await (isTransientWorkspaceGitScanCode(livenessRun.errorCode)
+            if (!selfTaskSetupFailure) await (isTransientWorkspaceGitScanCode(livenessRun.errorCode)
               ? scheduleBoundedRetryForRun(livenessRun, failedAgent)
               : scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, failedAgent)
             ).catch((retryError) => {
@@ -27559,7 +27585,7 @@ export function heartbeatService(
               );
             });
           }
-          await releaseIssueExecutionAndPromote(livenessRun, {
+          if (!selfTaskSetupFailure) await releaseIssueExecutionAndPromote(livenessRun, {
             suppressImmediateRecovery:
               readNonEmptyString(
                 parseObject(livenessRun.contextSnapshot).goalControlRequestId,
@@ -27572,7 +27598,7 @@ export function heartbeatService(
               "failed to release issue execution after heartbeat setup failure",
             );
           });
-          await handleIssueReviewPathDisposition(livenessRun).catch(
+          if (!selfTaskSetupFailure) await handleIssueReviewPathDisposition(livenessRun).catch(
             (reviewPathError) => {
               logger.error(
                 { err: reviewPathError, runId },
@@ -27597,8 +27623,14 @@ export function heartbeatService(
         }
       }
     } finally {
-      await nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
-      if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
+      await nativeInstructionReservation?.release().catch(error => {
+        selfTaskSetupCleanupComplete = false;
+        logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed");
+      });
+      if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => {
+        selfTaskSetupCleanupComplete = false;
+        logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed");
+      });
       let latestRun = await getRun(run.id).catch(() => null);
       try {
         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
@@ -27676,6 +27708,7 @@ export function heartbeatService(
           ) {
             await cleanupGitHubOperationLaunchers(githubLauncherLocation).catch(
               (err) => {
+                selfTaskSetupCleanupComplete = false;
                 logger.warn(
                   { err, runId: run.id },
                   "failed to clean managed GitHub launchers",
@@ -27701,7 +27734,7 @@ export function heartbeatService(
             providerResourceDisposition: providerResourceDispositionForRun,
             nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
           }));
-          await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          await releaseRuntimeServicesForRun(run.id).catch(() => { selfTaskSetupCleanupComplete = false; });
         }
         if (
           runScratch &&
@@ -27719,6 +27752,7 @@ export function heartbeatService(
               isProcessGroupAlive,
             });
           } catch (scratchCleanupError) {
+            selfTaskSetupCleanupComplete = false;
             logger.warn(
               {
                 err: scratchCleanupError,
@@ -27742,6 +27776,7 @@ export function heartbeatService(
             }).catch(() => undefined);
           }
           if (scratchCleanup) {
+            if (!scratchCleanup.removed) selfTaskSetupCleanupComplete = false;
             await appendRunEvent(latestRun, {
               eventType: "lifecycle",
               stream: "system",
@@ -27793,6 +27828,56 @@ export function heartbeatService(
         if (adapterExecutionControls.get(run.id) === executionControl) {
           adapterExecutionControls.delete(run.id);
         }
+      }
+      if (selfTaskSetupFailure) {
+        // The setup catch owned this failure, and its original execution has
+        // now left the provider/lease/controller boundary. Preserve uncertainty
+        // if cleanup failed, ownership changed, or any positive evidence exists.
+        if (selfTaskSetupCleanupComplete && !legacyAdapterEntered && !nativeDispatchStarted &&
+            !nativeOwnershipHeld && !nativeSessionResumeScheduled && !nativeWorkspaceFinalizeScheduled) {
+          const proof = { schema: "paperclip.self-task-document-pre-provider/v1",
+            companyId: run.companyId, agentId: run.agentId, runId: run.id,
+            wakeupRequestId: run.wakeupRequestId, controllerBootId: legacyControllerBootId,
+            issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
+            cleanupSettledAt: new Date().toISOString() };
+          latestRun = await db.transaction(async tx => {
+            const [pendingLease] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+              eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
+              or(and(isNull(environmentLeases.releasedAt),
+                sql`not coalesce(${environmentLeases.status} = 'retained' and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+                  and ${environmentLeases.cleanupStatus} = 'success', false)`),
+                eq(environmentLeases.status, "pending_cleanup"), eq(environmentLeases.cleanupStatus, "failed")),
+            )).limit(1);
+            if (pendingLease) return latestRun;
+            const [settled] = await tx.update(heartbeatRuns).set({
+              resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb),
+                '{executionRecovery,selfTaskDocumentPreProvider}', ${JSON.stringify(proof)}::jsonb)`,
+              updatedAt: new Date(),
+            }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+              eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.status, "failed"),
+              eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+              run.wakeupRequestId ? eq(heartbeatRuns.wakeupRequestId, run.wakeupRequestId) : sql`false`,
+              eq(heartbeatRuns.errorCode, selfTaskSetupFailure!.errorCode!),
+              sql`${heartbeatRuns.contextSnapshot}->'paperclipSelfTaskDocumentToolsOnly' = 'true'::jsonb`,
+              sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${proof.issueId}`,
+              sql`${heartbeatRuns.contextSnapshot}->>'qaDecisionId' is null`,
+              sql`${heartbeatRuns.resultJson} #>> '{executionRecovery,kind}' = 'bootstrap'`,
+              sql`${heartbeatRuns.resultJson} #> '{executionRecovery,providerWorkStarted}' = 'false'::jsonb`,
+              isNull(heartbeatRuns.processPid), isNull(heartbeatRuns.processGroupId), isNull(heartbeatRuns.processStartedAt),
+              isNull(heartbeatRuns.externalRunId), isNull(heartbeatRuns.nativeSessionId),
+            )).returning();
+            return settled ?? latestRun;
+          });
+        }
+        const settled = latestRun ?? selfTaskSetupFailure;
+        const failedAgent = await getAgent(run.agentId);
+        if (failedAgent) await scheduleBoundedRetryForRun(settled, failedAgent).catch(err => {
+          logger.warn({ err, runId: run.id }, "failed to schedule settled document setup retry");
+        });
+        await releaseIssueExecutionAndPromote(settled, { suppressImmediateRecovery:
+          readNonEmptyString(parseObject(settled.contextSnapshot).goalControlRequestId) !== null ||
+          parseObject(settled.contextSnapshot).resumeSessionGoalHeartbeat === true });
+        await handleIssueReviewPathDisposition(settled);
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
