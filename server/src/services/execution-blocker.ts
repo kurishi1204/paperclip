@@ -10,6 +10,33 @@ import { EXECUTION_RECONCILIATION_CAUSES, hasWorkspaceRestoreFailure, type Execu
 import { hasSelfTaskDocumentReplayHold } from "./self-task-document-runtime.js";
 import { isAuthorizedQaDecisionWake, qaDecisionWakeKey } from "./qa-decision-wake.js";
 
+/** Read projection only. This is not an execution-admission or retry authority.
+ * A QA wait need not contain a user comment; use the existing task notice rather
+ * than hiding it in the comment queue's non-empty-entry presentation contract.
+ */
+export async function getQaPredecessorWaitBlocker(db: Db, companyId: string, issueId: string): Promise<ExecutionBlocker | null> {
+  const [entry] = await db.select({
+    runId: heartbeatRuns.id, agentId: heartbeatRuns.agentId, payload: agentWakeupRequests.payload,
+  }).from(heartbeatRuns).innerJoin(issues, and(
+    eq(issues.companyId, heartbeatRuns.companyId), eq(issues.id, issueId),
+    eq(issues.executionRunId, heartbeatRuns.id),
+  )).innerJoin(agentWakeupRequests, and(
+    eq(agentWakeupRequests.id, heartbeatRuns.wakeupRequestId),
+    eq(agentWakeupRequests.runId, heartbeatRuns.id), eq(agentWakeupRequests.companyId, heartbeatRuns.companyId),
+    eq(agentWakeupRequests.agentId, heartbeatRuns.agentId),
+  )).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "queued"),
+    sql`${agentWakeupRequests.idempotencyKey} = 'qa-decision:' || (${heartbeatRuns.contextSnapshot}->>'qaDecisionId')`,
+    sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' = 'qa_predecessor_ownership_active'`,
+  )).limit(1);
+  const wait = entry?.payload?.executionWait as Record<string, unknown> | undefined;
+  if (!entry || typeof wait?.message !== "string") return null;
+  return { recoveryActionId: null, runId: entry.runId, agentId: entry.agentId,
+    cause: "qa_predecessor_ownership_active", runStatus: "queued", runError: wait.message,
+    nextAction: "前の実行の停止と後始末を確認してください。受領が確認できれば、同じ判断に基づく新しい作業を再開します。",
+    canContinue: false, canRetry: false,
+  };
+}
+
 /** A new committed QA return can coexist with old document UNKNOWN receipts.
  * Call under the issue lock, at both admission and final queued-run validation.
  * This does not resolve a recovery action or authorize replay of the old run.

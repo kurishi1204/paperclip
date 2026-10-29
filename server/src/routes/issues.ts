@@ -10,7 +10,7 @@ import { retryNativeWorkspaceExport } from "../services/native-runtime/native-wo
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
-import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { getExecutionBlocker, getQaPredecessorWaitBlocker } from "../services/execution-blocker.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -8959,7 +8959,9 @@ export function issueRoutes(
       relations, recoveryActionsByRelationIssue,
     );
     // Recovery revalidation may change the blocker; read it afterwards.
-    const executionBlocker = await timing.time("execution_blocker", () => getExecutionBlocker(db, issue.companyId, issue.id));
+    const executionBlocker = await timing.time("execution_blocker", async () =>
+      await getQaPredecessorWaitBlocker(db, issue.companyId, issue.id)
+        ?? getExecutionBlocker(db, issue.companyId, issue.id));
     res.setHeader("Server-Timing", timing.header());
     res.json({
       ...issue,

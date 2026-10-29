@@ -5,12 +5,89 @@ import { sql } from "drizzle-orm";
 import type { IssueExecutionState } from "@paperclipai/shared";
 import {
   buildQaChangesRequestedWakeContext,
+  buildQaPreProviderRecovery,
   isAuthorizedQaDecisionWake,
   isCurrentQaChangesRequestedDecision,
   qaDecisionWakeBlocksDelivery,
   qaDecisionIdFromWakeKey,
   qaDecisionWakeKey,
 } from "./qa-decision-wake.js";
+
+const preProviderRun = {
+  id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  runtimeMode: "legacy",
+  contextSnapshot: { qaDecisionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", forceFreshSession: true },
+};
+
+describe("QA pre-provider recovery evidence", () => {
+  it("binds a new host observation to this run and decision while preserving unrelated recovery fields", () => {
+    const existingRecovery = { kind: "old_kind", providerWorkStarted: false, attempt: 2,
+      detail: { retryAt: "synthetic-later" },
+      qaPreProvider: { schema: "paperclip.qa-pre-provider/v1", runId: "other-run", decisionId: "other-decision" } };
+    const before = structuredClone({ run: preProviderRun, existingRecovery });
+    expect(buildQaPreProviderRecovery({ run: preProviderRun, kind: "bootstrap",
+      providerMayHaveStarted: false, existingRecovery })).toEqual({
+      kind: "bootstrap", providerWorkStarted: false, attempt: 2, detail: { retryAt: "synthetic-later" },
+      qaPreProvider: { schema: "paperclip.qa-pre-provider/v1", runId: preProviderRun.id,
+        decisionId: preProviderRun.contextSnapshot.qaDecisionId },
+    });
+    expect({ run: preProviderRun, existingRecovery }).toEqual(before);
+  });
+
+  it("creates evidence without inheriting an old false stamp", () => {
+    expect(buildQaPreProviderRecovery({ run: preProviderRun, kind: "workspace_wait",
+      providerMayHaveStarted: false })).toEqual({
+      kind: "workspace_wait", providerWorkStarted: false,
+      qaPreProvider: { schema: "paperclip.qa-pre-provider/v1", runId: preProviderRun.id,
+        decisionId: preProviderRun.contextSnapshot.qaDecisionId },
+    });
+  });
+
+  it.each([
+    { providerMayHaveStarted: true, previous: false },
+    { providerMayHaveStarted: false, previous: true },
+    { providerMayHaveStarted: true, previous: true },
+  ])("preserves possible provider work and removes stale proof for $providerMayHaveStarted/$previous", ({ providerMayHaveStarted, previous }) => {
+    const projected = buildQaPreProviderRecovery({ run: preProviderRun, kind: "bootstrap",
+      providerMayHaveStarted, existingRecovery: { providerWorkStarted: previous, retryAt: "synthetic-later",
+        qaPreProvider: { schema: "paperclip.qa-pre-provider/v1", runId: preProviderRun.id,
+          decisionId: preProviderRun.contextSnapshot.qaDecisionId } } });
+    expect(projected).toEqual({ kind: "bootstrap", providerWorkStarted: true, retryAt: "synthetic-later" });
+    expect(projected).not.toHaveProperty("qaPreProvider");
+  });
+
+  it.each([
+    { label: "native", run: { ...preProviderRun, runtimeMode: "native" } },
+    { label: "non-QA", run: { ...preProviderRun, contextSnapshot: { forceFreshSession: true } } },
+    { label: "invalid decision", run: { ...preProviderRun, contextSnapshot: { qaDecisionId: "not-a-uuid", forceFreshSession: true } } },
+    { label: "not fresh", run: { ...preProviderRun, contextSnapshot: { ...preProviderRun.contextSnapshot, forceFreshSession: false } } },
+    { label: "string fresh", run: { ...preProviderRun, contextSnapshot: { ...preProviderRun.contextSnapshot, forceFreshSession: "true" } } },
+    { label: "null context", run: { ...preProviderRun, contextSnapshot: null } },
+    { label: "array context", run: { ...preProviderRun, contextSnapshot: [preProviderRun.contextSnapshot] } },
+  ])("does not mint or retain QA proof for $label", ({ run }) => {
+    expect(buildQaPreProviderRecovery({ run, kind: "bootstrap", providerMayHaveStarted: false,
+      existingRecovery: { providerWorkStarted: false, attempt: 1, qaPreProvider: { schema: "old" } } }))
+      .toEqual({ kind: "bootstrap", providerWorkStarted: false, attempt: 1 });
+  });
+
+  it("does not turn an omitted runtime observation into proof by inheriting false", () => {
+    const projected = buildQaPreProviderRecovery({ run: preProviderRun, kind: "bootstrap",
+      providerMayHaveStarted: undefined as unknown as boolean,
+      existingRecovery: { providerWorkStarted: false } });
+    expect(projected).toEqual({ kind: "bootstrap", providerWorkStarted: true });
+  });
+
+  it("binds each new observation to its current run and decision", () => {
+    const run = { ...preProviderRun, id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      contextSnapshot: { ...preProviderRun.contextSnapshot, qaDecisionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" } };
+    const prior = buildQaPreProviderRecovery({ run: preProviderRun, kind: "bootstrap", providerMayHaveStarted: false });
+    const projected = buildQaPreProviderRecovery({ run, kind: "bootstrap", providerMayHaveStarted: false,
+      existingRecovery: prior });
+    expect(projected.qaPreProvider).toEqual({ schema: "paperclip.qa-pre-provider/v1",
+      runId: run.id, decisionId: run.contextSnapshot.qaDecisionId });
+    expect(prior.qaPreProvider?.runId).toBe(preProviderRun.id);
+  });
+});
 
 const changesRequestedState: IssueExecutionState = {
   status: "changes_requested",
@@ -137,9 +214,9 @@ const current = {
 } as const;
 
 describe("QA decision wake authority", () => {
-  it("holds unknown or started receipts while admitting only settled prestart terminals", () => {
+  it("holds unknown or started receipts while admitting only settled pre-provider terminals", () => {
     const rendered = new PgDialect().sqlToQuery(sql`select 1 from ${agentWakeupRequests} where ${qaDecisionWakeBlocksDelivery()}`);
-    expect(rendered.sql).toContain("status\" in ('failed','cancelled')");
+    expect(rendered.sql).toContain("status\" in ('failed','cancelled','skipped')");
     expect(rendered.sql).toContain("claimed_at\" is null");
     expect(rendered.sql).toContain("finished_at\" is not null");
     expect(rendered.sql).toContain("qa_prior_run.started_at is null");

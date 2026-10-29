@@ -680,6 +680,25 @@ export function createPostgresRunDispatchAdapter(
         finishedAt: input.now,
         error: input.reason,
         errorCode: input.errorCode,
+        // A scheduled QA retry cancelled before promotion has never been
+        // claimed. Persist that positive fact so the shared delivery fence can
+        // recover the decision after the temporary gate is lifted. Never
+        // overwrite dispatch evidence or an UNKNOWN provider result.
+        resultJson: sql`case when
+          ${heartbeatRuns.contextSnapshot}->>'qaDecisionId' is not null
+          and ${heartbeatRuns.runtimeMode} = 'legacy'
+          and ${heartbeatRuns.contextSnapshot}->'forceFreshSession' = 'true'::jsonb
+          and ${heartbeatRuns.startedAt} is null
+          and ${heartbeatRuns.processStartedAt} is null and ${heartbeatRuns.processPid} is null
+          and ${heartbeatRuns.processGroupId} is null and ${heartbeatRuns.externalRunId} is null
+          and ${heartbeatRuns.nativeSessionId} is null and ${heartbeatRuns.executionStatusDeliveryId} is null
+          and ${heartbeatRuns.controllerBootId} is null
+          and (${heartbeatRuns.resultJson} #> '{executionRecovery,providerWorkStarted}') is distinct from 'true'::jsonb
+          then coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object('executionRecovery',
+            jsonb_build_object('kind', 'scheduled_retry_gate', 'providerWorkStarted', false,
+              'qaPreProvider', jsonb_build_object('schema', 'paperclip.qa-pre-provider/v1',
+                'runId', ${heartbeatRuns.id}::text, 'decisionId', ${heartbeatRuns.contextSnapshot}->>'qaDecisionId')))
+          else ${heartbeatRuns.resultJson} end`,
         updatedAt: input.now,
       })
       .where(
@@ -1057,6 +1076,19 @@ export function createPostgresRunDispatchAdapter(
           input.now,
         );
         return { dispatched: false as const, cancellation };
+      }
+
+      if (readNonEmptyString(parseObject(run.contextSnapshot).qaDecisionId)) {
+        // Claim/start metadata is not evidence of provider dispatch. Record the
+        // positive boundary only after all locked gates accept this exact run,
+        // then enter its adapter synchronously below. Later terminal writers
+        // must not turn this fact into a pre-provider retry proof.
+        await tx.update(heartbeatRuns).set({
+          resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb), '{executionRecovery}',
+            (coalesce(${heartbeatRuns.resultJson}->'executionRecovery', '{}'::jsonb) - 'qaPreProvider')
+              || '{"providerWorkStarted":true}'::jsonb)`,
+          updatedAt: input.now,
+        }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
       }
 
       // Hand off while ownership is still locked, but do not await the provider

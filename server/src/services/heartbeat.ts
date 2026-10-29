@@ -43,7 +43,7 @@ import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/papercli
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "./connector-runtime.js";
 import { admitExplicitNativeContinuation, admitExplicitContinuationRetry, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
-import { buildQaChangesRequestedWakeContext, isAuthorizedQaDecisionWake, qaDecisionIdFromWakeKey, qaDecisionWakeBlocksDelivery, qaDecisionWakeKey } from "./qa-decision-wake.js";
+import { buildQaChangesRequestedWakeContext, buildQaPreProviderRecovery, isAuthorizedQaDecisionWake, qaDecisionIdFromWakeKey, qaDecisionWakeBlocksDelivery, qaDecisionWakeKey } from "./qa-decision-wake.js";
 import { canRetryStoppedRun, isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
@@ -100,6 +100,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { isDeepStrictEqual, promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   and,
   asc,
@@ -1303,6 +1304,20 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+const queuedRunStartScope = new AsyncLocalStorage<Array<{ agentId: string; held: boolean }>>();
+
+// Queue effects can request another start while their caller still owns the
+// same lock. Defer only that recursive advance, not unrelated concurrent work.
+// Background executeRun promises inherit the context, so mark the token released
+// when the callback ends rather than leaving a permanently inherited lock flag.
+async function withQueuedRunStartScope<T>(agentId: string, callback: () => Promise<T>): Promise<T> {
+  const inherited = queuedRunStartScope.getStore() ?? [];
+  const token = { agentId, held: true };
+  return withAgentStartLock(agentId, () => queuedRunStartScope.run([...inherited, token], async () => {
+    try { return await callback(); }
+    finally { token.held = false; }
+  }));
+}
 // A legacy process adapter's signal exit can race the operator cancellation CAS while
 // its owned process group is still being joined. Keep that exit from becoming
 // a successful result (or a competing failure) before Stop settles. This is an
@@ -13000,6 +13015,42 @@ export function heartbeatService(
     void reportRunFailure(db, updated, failureReport);
   }
 
+  function reconcileQaProviderEvidence(
+    previous: typeof heartbeatRuns.$inferSelect | null,
+    patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
+    status: string,
+  ) {
+    if (!previous || !readNonEmptyString(parseObject(previous.contextSnapshot).qaDecisionId)) return patch;
+    const prior = parseObject(parseObject(previous.resultJson).executionRecovery);
+    const requested = parseObject(parseObject(patch?.resultJson).executionRecovery);
+    if (prior.providerWorkStarted !== true && !(requested.providerWorkStarted === false &&
+        ["queued", "running", "scheduled_retry"].includes(previous.status) &&
+        ["failed", "cancelled", "interrupted"].includes(status))) return patch;
+    const recovery = buildQaPreProviderRecovery({ run: previous,
+      kind: readNonEmptyString(requested.kind) ?? readNonEmptyString(prior.kind) ?? "preparation",
+      providerMayHaveStarted: prior.providerWorkStarted === true,
+      existingRecovery: { ...prior, ...requested },
+    });
+    return { ...patch, resultJson: { ...parseObject(previous?.resultJson),
+      ...parseObject(patch?.resultJson), executionRecovery: recovery } };
+  }
+
+  function preserveQaDispatchEvidenceAtWrite(
+    previous: typeof heartbeatRuns.$inferSelect | null,
+    patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
+  ) {
+    if (!previous || !readNonEmptyString(parseObject(previous.contextSnapshot).qaDecisionId)
+      || !patch?.resultJson) return {};
+    // Recheck at the actual UPDATE, not only the earlier SELECT. Another
+    // controller's positive dispatch must dominate a stale pre-provider patch.
+    return { resultJson: sql`case
+      when ${heartbeatRuns.resultJson} #> '{executionRecovery,providerWorkStarted}' = 'true'::jsonb
+      then ${JSON.stringify(patch.resultJson)}::jsonb || jsonb_build_object('executionRecovery',
+        (${JSON.stringify(parseObject(patch.resultJson.executionRecovery))}::jsonb - 'qaPreProvider')
+          || '{"providerWorkStarted":true}'::jsonb)
+      else ${JSON.stringify(patch.resultJson)}::jsonb end` };
+  }
+
   async function setRunStatus(
     runId: string,
     status: string,
@@ -13032,6 +13083,7 @@ export function heartbeatService(
         },
       };
     }
+    patch = reconcileQaProviderEvidence(previousStatus, patch, status);
     const updated =
       previousStatus &&
       await legacyExecutionNeedsReconciliationWithEvidence(db, {
@@ -13050,6 +13102,7 @@ export function heartbeatService(
             .set({
               status,
               ...patch,
+              ...preserveQaDispatchEvidenceAtWrite(previousStatus, patch),
               executionStatusDeliveryId: randomUUID(),
               updatedAt: new Date(),
             })
@@ -13123,6 +13176,7 @@ export function heartbeatService(
         },
       };
     }
+    patch = reconcileQaProviderEvidence(previousStatus, patch, status);
     const updated =
       previousStatus &&
       await legacyExecutionNeedsReconciliationWithEvidence(db, {
@@ -13142,6 +13196,7 @@ export function heartbeatService(
             .set({
               status,
               ...patch,
+              ...preserveQaDispatchEvidenceAtWrite(previousStatus, patch),
               executionStatusDeliveryId: randomUUID(),
               updatedAt: new Date(),
             })
@@ -17719,8 +17774,27 @@ export function heartbeatService(
           throw new HttpError(403, "QA decision wake is no longer current");
         }
         if (await hasQaPredecessorOwnershipHold(tx, run.companyId, issueId, run.id)) {
+          const message = "前のAIの停止・後始末が確認できるまで待機しています。実行履歴から停止の受領を確認してください。";
+          const [changed] = await tx.update(agentWakeupRequests).set({
+            payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
+              ${JSON.stringify({ reason: "qa_predecessor_ownership_active", message })}::jsonb)`,
+            updatedAt: new Date(),
+          }).where(and(eq(agentWakeupRequests.id, run.wakeupRequestId!),
+            eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.runId, run.id),
+            sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' is distinct from 'qa_predecessor_ownership_active'`,
+          )).returning({ id: agentWakeupRequests.id });
+          if (changed) await appendHeartbeatRunEvent(tx, {
+            companyId: run.companyId, runId: run.id, agentId: run.agentId,
+            eventType: "lifecycle", stream: "system", level: "warn", message,
+            payload: { reason: "qa_predecessor_ownership_active", providerWorkStarted: false },
+          });
           return { ownsIssue: owner.assigneeAgentId === run.agentId, blocked: true };
         }
+        await tx.update(agentWakeupRequests).set({
+          payload: sql`${agentWakeupRequests.payload} - 'executionWait'`, updatedAt: new Date(),
+        }).where(and(eq(agentWakeupRequests.id, run.wakeupRequestId!),
+          eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.runId, run.id),
+          sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' = 'qa_predecessor_ownership_active'`));
       }
       const ownsIssue = owner?.assigneeAgentId === run.agentId &&
         context.wakeReason !== "source_scoped_recovery_action";
@@ -20468,13 +20542,14 @@ export function heartbeatService(
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
+    if (queuedRunStartScope.getStore()?.some(lock => lock.agentId === agentId && lock.held)) return [];
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
     // Cancelled after the start lock is released: cancelRunInternal promotes the
     // agent's next queued run, which takes this same lock.
     const rejectedClaims: Array<{ run: typeof heartbeatRuns.$inferSelect; err: HttpError }> = [];
 
-    return withAgentStartLock(agentId, async () => {
+    return withQueuedRunStartScope(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
@@ -20725,6 +20800,29 @@ export function heartbeatService(
         activeWakeupPromises.delete(promise);
       });
     return promise;
+  }
+
+  function withQaProviderDispatchGate<T>(
+    run: typeof heartbeatRuns.$inferSelect,
+    dispatchGate: (gate: ReturnType<typeof createRunDispatch>) => Promise<T>,
+  ): Promise<T> {
+    const decisionId = readNonEmptyString(parseObject(run.contextSnapshot).qaDecisionId);
+    if (!decisionId) return dispatchGate(runDispatch);
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId)
+      ?? readNonEmptyString(parseObject(run.contextSnapshot).taskId) ?? run.nativeIssueId;
+    return db.transaction(async tx => {
+      if (!issueId) throw conflict("QA execution has no task");
+      await tx.execute(sql`select id from issues where id = ${issueId} and company_id = ${run.companyId} for update`);
+      if (!await isAuthorizedQaDecisionWake(tx as unknown as Db, {
+        companyId: run.companyId, issueId, agentId: run.agentId, decisionId,
+      }) || await hasQaPredecessorOwnershipHold(tx as unknown as Db, run.companyId, issueId, run.id)) {
+        throw conflict("QA execution is no longer ready for provider dispatch");
+      }
+      // The existing gate must share this transaction/connection. A separate
+      // transaction could outlive a failed outer gate and dispatch after rollback.
+      // Its result wraps the provider promise; neither transaction awaits work.
+      return dispatchGate(createRunDispatch(tx as unknown as Db));
+    });
   }
 
   async function executeRun(
@@ -23303,7 +23401,8 @@ export function heartbeatService(
         }
         if (
           !issueId ||
-          (!isResolvedInteractionContinuationWakeContext(context) &&
+          (!readNonEmptyString(context.qaDecisionId) &&
+            !isResolvedInteractionContinuationWakeContext(context) &&
             !["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? ""))
         ) {
           return { dispatched: true, resultPromise: dispatch(() => {}) };
@@ -23317,22 +23416,33 @@ export function heartbeatService(
           runId: run.id,
           issueId,
         });
-        const gate = await runDispatch.dispatchResolvedInteractionIfCurrent({
-          runId: run.id,
-          companyId: run.companyId,
-          expectedStatus: "running",
-          // Synchronous handoff under the ownership lock; the gate commits
-          // without awaiting the adapter's asynchronous bootstrap or finalizer.
-          dispatch,
-        });
+        const handedOff: { resultPromise?: Promise<T> } = {};
+        try {
+          const gate = await withQaProviderDispatchGate(run, currentDispatch => currentDispatch.dispatchResolvedInteractionIfCurrent({
+            runId: run.id,
+            companyId: run.companyId,
+            expectedStatus: "running",
+            // Synchronous handoff under the ownership lock. Retain ownership
+            // outside the transaction so a failed commit cannot orphan work.
+            dispatch: markDispatchStarted => {
+              const resultPromise = dispatch(markDispatchStarted);
+              handedOff.resultPromise = resultPromise;
+              return resultPromise;
+            },
+          }));
 
-        if (gate.dispatched) return gate;
-        if (gate.cancellation.outcome === "cancelled") {
-          applyRunDispatchPostCommitEffects(
-            gate.cancellation.postCommitEffects,
-          );
+          if (gate.dispatched) return gate;
+          if (gate.cancellation.outcome === "cancelled") {
+            applyRunDispatchPostCommitEffects(gate.cancellation.postCommitEffects);
+          }
+          return { dispatched: false };
+        } catch (error) {
+          // Locks have been released/rolled back. Keep the run, controller and
+          // environment owned until dispatched work settles or normal Stop
+          // joins it; finalization must not race an unobserved provider promise.
+          if (handedOff.resultPromise) await handedOff.resultPromise.catch(() => {});
+          throw error;
         }
-        return { dispatched: false };
       };
       if (!executionTarget || executionTarget.kind === "local") {
         try {
@@ -25306,8 +25416,9 @@ export function heartbeatService(
             );
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
-                (markDispatchStarted) =>
-                  executePaperclipNativeSession({
+                (markDispatchStarted) => {
+                  nativeDispatchStarted = true;
+                  return executePaperclipNativeSession({
                     db,
                     execution: nativeExecution,
                     getFreshSessionHandoff: getNativeFreshSessionHandoff,
@@ -25441,7 +25552,8 @@ export function heartbeatService(
                       markDispatchStarted();
                       await persistRunProcessMetadata(run.id, meta);
                     },
-                  }),
+                  });
+                },
               );
             if (!guardedDispatch.dispatched) return;
             nativeDispatchStarted = true;
@@ -26828,7 +26940,15 @@ export function heartbeatService(
               ...(workspaceValidationFailure?.resultJson ??
                 configurationIncompleteFailure?.resultJson ??
                 {}),
-              ...(!legacyAdapterEntered && run.runtimeMode !== "native"
+              ...(readNonEmptyString(context.qaDecisionId) &&
+                  (legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld)
+                ? {
+                    // The dispatch transaction may have rolled back after the
+                    // synchronous handoff. This executor still observed and
+                    // joined provider work, so preserve that positive fact.
+                    executionRecovery: { kind: "provider_failure", providerWorkStarted: true },
+                  }
+                : !legacyAdapterEntered && run.runtimeMode !== "native"
                 ? {
                     executionRecovery: {
                       kind: "bootstrap",
@@ -27076,7 +27196,8 @@ export function heartbeatService(
             : null);
         const setupFailureResultJson = {
           ...setupFailureDetails,
-          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+          executionRecovery: { kind: "bootstrap",
+            providerWorkStarted: legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld },
         };
         const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {
           error: message,
@@ -27573,7 +27694,11 @@ export function heartbeatService(
         now: new Date(),
         // A durable authentication card owns recovery. This covers the review path,
         // while continuation classification blocks periodic generic retries.
-        suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationBlocked(source),
+        // Every terminal QA path shares this boundary, including setup/pool
+        // failures and exhausted retries. Never turn the committed decision
+        // into a generic old-session continuation because a caller omitted an option.
+        suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationBlocked(source)
+          || Boolean(readNonEmptyString(parseObject(source?.contextSnapshot).qaDecisionId)),
       });
       await applyWakeQueuePostCommitEffects(postCommitEffects, {
         deferStartForAgentId: options.suppressQueueAdvance ? source?.agentId : undefined,
