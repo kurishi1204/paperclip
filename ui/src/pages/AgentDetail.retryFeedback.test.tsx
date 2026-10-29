@@ -2,7 +2,7 @@
 
 import { act, useSyncExternalStore } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { defaultScheduler, notifyManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryRouter, RouterProvider } from "react-router-dom";
 import type { AgentDetail as AgentRecord, HeartbeatRun } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -128,6 +128,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  notifyManager.setScheduler(defaultScheduler);
   await act(async () => { root.unmount(); });
   queryClient.clear();
   container.remove();
@@ -186,11 +187,19 @@ describe("AgentDetail retry feedback across canonical navigation", () => {
     agentsApiMock.retryFailedRun.mockReturnValue(retry.promise);
     const router = makeRouter();
     await renderRouter(router);
+    await flush();
+    const pendingNotification = deferred<void>();
+    // The API starts before TanStack's scheduled observer update reaches React.
+    notifyManager.setScheduler((callback) => { void pendingNotification.promise.then(callback); });
     await clickRetry();
     expect(agentsApiMock.retryFailedRun).toHaveBeenCalledTimes(1);
     expect(navigation.queued.length).toBeGreaterThan(0);
-    const pendingButton = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Retrying…");
-    expect(pendingButton?.disabled).toBe(true);
+    queueMicrotask(() => pendingNotification.resolve());
+    let pendingButton: HTMLButtonElement | undefined;
+    await waitFor(() => {
+      pendingButton = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Retrying…");
+      expect(pendingButton?.disabled).toBe(true);
+    });
     await act(async () => { pendingButton?.click(); });
     expect(agentsApiMock.retryFailedRun).toHaveBeenCalledTimes(1);
     await act(async () => { navigation.holdCanonical = false; navigation.queued.shift()?.(); });
