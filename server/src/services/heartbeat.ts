@@ -151,6 +151,7 @@ import {
 import {
   agents,
   agentConfigRevisions,
+  agentInstructionWorkingCopies,
   agentRuntimeState,
   agentSessionGoalActions,
   agentTaskSessions,
@@ -17954,6 +17955,22 @@ export function heartbeatService(
           inArray(agentWakeupRequests.status, ["queued", "claimed"]),
         )).returning({ id: agentWakeupRequests.id });
         if (!claimedWake) throw conflict("QA wake changed while claiming its execution");
+        if (claimedRun.runtimeMode === "legacy") {
+          // A new, server-bound claim has not entered preparation yet. Its
+          // first executor must consume this fence on the same run row before
+          // allocating resources; an expired, unconsumed claim is recoverable.
+          const [stamped] = await tx.update(heartbeatRuns).set({
+            runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) ||
+              ${JSON.stringify({ qaClaimPreparation: { schema: "paperclip.qa-claim-preparation/v1",
+                runId: claimedRun.id, decisionId: context.qaDecisionId,
+                controllerBootId: claimedRun.controllerBootId, state: "pending" } })}::jsonb`,
+          }).where(and(eq(heartbeatRuns.id, claimedRun.id), eq(heartbeatRuns.companyId, run.companyId)))
+            .returning({ runnerProfileJson: heartbeatRuns.runnerProfileJson });
+          if (!stamped) throw conflict("QA preparation claim changed while binding its execution");
+          // All claim branches return this row, including executeRun's direct
+          // queued-claim path. Never return the pre-stamp profile snapshot.
+          claimedRun.runnerProfileJson = stamped.runnerProfileJson;
+        }
       }
       if (!claimedRun || !issueId || !ownsIssue) return;
       await tx.update(issues).set({
@@ -19439,6 +19456,62 @@ export function heartbeatService(
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
   }
 
+  async function failExpiredQaClaimBeforePreparation(run: typeof heartbeatRuns.$inferSelect, now: Date) {
+    const fence = parseObject(parseObject(run.runnerProfileJson).qaClaimPreparation);
+    const decisionId = qaDecisionIdFromWakeKey(qaDecisionWakeKey(
+      readNonEmptyString(parseObject(run.contextSnapshot).qaDecisionId) ?? ""));
+    if (run.runtimeMode !== "legacy" || !run.controllerBootId || !run.wakeupRequestId || !decisionId ||
+        fence.schema !== "paperclip.qa-claim-preparation/v1" || fence.state !== "pending" ||
+        fence.runId !== run.id || fence.decisionId !== decisionId ||
+        fence.controllerBootId !== run.controllerBootId) return { applicable: false as const, run: null };
+    const recovery = { kind: "bootstrap", providerWorkStarted: false,
+      qaPreProvider: { schema: "paperclip.qa-pre-provider/v1", runId: run.id, decisionId },
+      orphanClaim: { schema: "paperclip.qa-orphan-claim/v1", controllerBootId: run.controllerBootId } };
+    // Terminalize and attest in one conditional write. Expiry alone is not
+    // no-provider evidence: only this new, unconsumed server claim qualifies.
+    // Old terminal UNKNOWNs and all entered/dispatching preparations stay held.
+    const [failed] = await db.update(heartbeatRuns).set({
+      status: "failed", error: buildProcessLossMessage(run), errorCode: "process_lost", finishedAt: now,
+      executionStatusDeliveryId: randomUUID(), updatedAt: now,
+      resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object(
+        'executionRecovery', coalesce(${heartbeatRuns.resultJson}->'executionRecovery', '{}'::jsonb)
+          || ${JSON.stringify(recovery)}::jsonb)`,
+    }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+      eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.runtimeMode, "legacy"),
+      eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.controllerBootId, run.controllerBootId),
+      lte(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`),
+      eq(heartbeatRuns.executionStage, "preparing"), isNull(heartbeatRuns.runtimeModeResolvedAt),
+      eq(heartbeatRuns.wakeupRequestId, run.wakeupRequestId),
+      sql`${heartbeatRuns.runnerProfileJson}->'qaClaimPreparation' = ${JSON.stringify(fence)}::jsonb`,
+      sql`${heartbeatRuns.contextSnapshot}->>'qaDecisionId' = ${decisionId}`,
+      sql`${heartbeatRuns.contextSnapshot}->'forceFreshSession' = 'true'::jsonb`,
+      isNull(heartbeatRuns.processPid), isNull(heartbeatRuns.processGroupId), isNull(heartbeatRuns.processStartedAt),
+      isNull(heartbeatRuns.externalRunId), isNull(heartbeatRuns.nativeSessionId), isNull(heartbeatRuns.sessionIdAfter),
+      sql`(${heartbeatRuns.resultJson} #> '{executionRecovery,providerWorkStarted}') is distinct from 'true'::jsonb`,
+      sql`coalesce(${heartbeatRuns.resultJson}->>'workspaceRestoreFailure', '') = ''`,
+      notExists(db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, run.companyId),
+        eq(issueRecoveryActions.fingerprint, `legacy-execution:${run.id}`)))),
+      exists(db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, run.companyId),
+        eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.runId, run.id),
+        eq(agentWakeupRequests.status, "claimed"), eq(agentWakeupRequests.idempotencyKey, qaDecisionWakeKey(decisionId))))),
+      notExists(db.select({ id: environmentLeases.id }).from(environmentLeases)
+        .where(eq(environmentLeases.heartbeatRunId, run.id))),
+      notExists(db.select({ id: agentInstructionWorkingCopies.runId }).from(agentInstructionWorkingCopies)
+        .where(eq(agentInstructionWorkingCopies.runId, run.id))),
+      notExists(db.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations)
+        .where(eq(nativeRunFinalizations.runId, run.id))),
+    )).returning();
+    if (failed) {
+      publishLiveEvent({ companyId: failed.companyId, type: "heartbeat.run.status",
+        payload: buildHeartbeatRunStatusLiveEventPayload(failed) });
+      publishRunLifecyclePluginEvent(failed);
+      emitTerminalAgentTaskRun(failed, "running");
+    }
+    return { applicable: true as const, run: failed ?? null };
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -19840,11 +19913,15 @@ export function heartbeatService(
         ((tracksLegacyLocalChild &&
           (!!run.processPid || !!run.processGroupId)) ||
           monitorDispatchLostWithoutFutureWake);
-      if (!(await revokeExpiredLegacyController(db, run))) continue;
+      const orphanQaClaim = await failExpiredQaClaimBeforePreparation(run, now);
+      if (orphanQaClaim.applicable && !orphanQaClaim.run) continue;
+      if (!orphanQaClaim.applicable && !(await revokeExpiredLegacyController(db, run))) continue;
       const baseMessage = buildProcessLossMessage(run);
       const conversationContinuationEligible = await runUsedConversationAdapter(db, run);
 
-      const failureWrite = await setRunStatusFromLive(
+      const failureWrite = orphanQaClaim.run
+        ? { run: orphanQaClaim.run, updated: true as const }
+        : await setRunStatusFromLive(
         run.id,
         "failed",
         ["running"],
@@ -21018,6 +21095,27 @@ export function heartbeatService(
       }
       run = claimed;
       markQaObservationClaimed(qaObservation, run);
+    }
+
+    const qaClaimPreparation = parseObject(parseObject(run.runnerProfileJson).qaClaimPreparation);
+    if (run.runtimeMode === "legacy" && qaClaimPreparation.schema === "paperclip.qa-claim-preparation/v1") {
+      // This UPDATE and orphan recovery serialize on the run row. No setup,
+      // file copy, environment lease or provider call may precede consumption.
+      if (qaClaimPreparation.runId !== run.id ||
+          qaClaimPreparation.decisionId !== parseObject(run.contextSnapshot).qaDecisionId ||
+          qaClaimPreparation.controllerBootId !== legacyControllerBootId ||
+          qaClaimPreparation.state !== "pending") return;
+      const [entered] = await db.update(heartbeatRuns).set({
+        runnerProfileJson: sql`jsonb_set(${heartbeatRuns.runnerProfileJson},
+          '{qaClaimPreparation,state}', '"entered"'::jsonb)`, updatedAt: new Date(),
+      }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+        eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.runtimeMode, "legacy"),
+        eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+        gt(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`),
+        sql`${heartbeatRuns.runnerProfileJson}->'qaClaimPreparation' = ${JSON.stringify(qaClaimPreparation)}::jsonb`,
+      )).returning();
+      if (!entered) return;
+      run = entered;
     }
 
     const instructionCleanupRun = run;
@@ -25228,6 +25326,9 @@ export function heartbeatService(
                 else '{}'::jsonb end)
               || (case when ${heartbeatRuns.runnerProfileJson} ? 'adapterDispatch'
                 then jsonb_build_object('adapterDispatch', ${heartbeatRuns.runnerProfileJson}->'adapterDispatch')
+                else '{}'::jsonb end)
+              || (case when ${heartbeatRuns.runnerProfileJson} ? 'qaClaimPreparation'
+                then jsonb_build_object('qaClaimPreparation', ${heartbeatRuns.runnerProfileJson}->'qaClaimPreparation')
                 else '{}'::jsonb end) || ${JSON.stringify(providerTraceRequested ? { providerTrace: { mode: "raw", traceId: providerTraceCapture?.metadata.id ?? null, maxBytes: PROVIDER_TRACE_MAX_BYTES } } : {})}::jsonb`,
               updatedAt: new Date(),
             })

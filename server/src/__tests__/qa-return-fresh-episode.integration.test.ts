@@ -905,6 +905,205 @@ describe("QA return fresh episode through real routes and PostgreSQL", () => {
     }, 30_000,
   );
 
+  it.each([false, true])("consumes the committed QA claim before provider dispatch (reaper wins: %s)", async reaperWins => {
+    const qa = await returnedQaFixture();
+    const source = await qa.promote();
+    const [decisionBefore] = await server.db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.id, qa.decisionId));
+    let observedClaim = 0;
+    let recoveredAtEntry = false;
+    let reapedSource: typeof heartbeatRuns.$inferSelect | undefined;
+    const entryBarrierDb = new Proxy(server.db, {
+      get(target, property) {
+        if (property === "transaction") return async (...args: Parameters<typeof server.db.transaction>) => {
+          const result = await target.transaction(...args);
+          const claimed = result as typeof heartbeatRuns.$inferSelect | null;
+          // Inspect the first actual claim COMMIT, not later preparation
+          // transactions that also return a running Run snapshot.
+          if (observedClaim === 0 && claimed?.id === source.id && claimed.status === "running") {
+            observedClaim += 1;
+            const [actual] = await target.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id));
+            expect(claimed.runnerProfileJson).toEqual(actual!.runnerProfileJson);
+            expect(claimed.runnerProfileJson).toMatchObject({ qaClaimPreparation: {
+              schema: "paperclip.qa-claim-preparation/v1", state: "pending", runId: source.id,
+              decisionId: qa.decisionId, controllerBootId: claimed.controllerBootId } });
+          }
+          return result;
+        };
+        if (property === "update") return ((table: unknown) => {
+          const update = target.update(table as typeof heartbeatRuns);
+          return new Proxy(update, { get(updateTarget, updateProperty) {
+            if (updateProperty !== "set") return Reflect.get(updateTarget, updateProperty, updateTarget);
+            return (values: Record<string, unknown>) => {
+              const setter = updateTarget.set(values);
+              if (table !== heartbeatRuns || !reaperWins || recoveredAtEntry || !values.runnerProfileJson ||
+                  !values.updatedAt || Object.keys(values).length !== 2) return setter;
+              return new Proxy(setter, { get(setTarget, setProperty) {
+                if (setProperty !== "where") return Reflect.get(setTarget, setProperty, setTarget);
+                return (...whereArgs: Parameters<typeof setter.where>) => {
+                  const query = setTarget.where(...whereArgs);
+                  return new Proxy(query, { get(queryTarget, queryProperty) {
+                    if (queryProperty !== "returning") return Reflect.get(queryTarget, queryProperty, queryTarget);
+                    return async () => {
+                      const [beforeEntry] = await target.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id));
+                      expect(beforeEntry!.runnerProfileJson).toMatchObject({ qaClaimPreparation: { state: "pending" } });
+                      recoveredAtEntry = true;
+                      await target.update(heartbeatRuns).set({
+                        controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'`,
+                      }).where(eq(heartbeatRuns.id, source.id));
+                      expect((await heartbeatService(target).reapOrphanedRuns()).runIds).toContain(source.id);
+                      [reapedSource] = await target.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id));
+                      return queryTarget.returning();
+                    };
+                  } });
+                };
+              } });
+            };
+          } });
+        }) as typeof target.update;
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const enteredAtDispatch: string[] = [];
+    const implementation = qa.execute.getMockImplementation()!;
+    qa.execute.mockImplementation(async ctx => {
+      const [actual] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, ctx.runId));
+      expect(actual!.runnerProfileJson).toMatchObject({ qaClaimPreparation: {
+        schema: "paperclip.qa-claim-preparation/v1", state: "entered", runId: ctx.runId,
+        decisionId: qa.decisionId, controllerBootId: actual!.controllerBootId } });
+      enteredAtDispatch.push(ctx.runId);
+      return implementation(ctx);
+    });
+    const heartbeat = heartbeatService(entryBarrierDb);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    expect(observedClaim).toBe(1);
+    if (reaperWins) {
+      expect(recoveredAtEntry).toBe(true);
+      expect(qa.execute).not.toHaveBeenCalled();
+      const restarted = heartbeatService(server.db);
+      await restarted.reconcileStrandedAssignedIssues();
+      await restarted.resumeQueuedRuns();
+      await restarted.drainActiveRunExecutions();
+      expect(enteredAtDispatch).toHaveLength(1);
+      expect(enteredAtDispatch[0]).not.toBe(source.id);
+      expect((await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id)))[0])
+        .toMatchObject({ status: reapedSource!.status, errorCode: reapedSource!.errorCode,
+          finishedAt: reapedSource!.finishedAt, resultJson: reapedSource!.resultJson });
+      await restarted.reconcileStrandedAssignedIssues();
+      await restarted.resumeQueuedRuns();
+      await restarted.drainActiveRunExecutions();
+    } else expect(enteredAtDispatch).toEqual([source.id]);
+    expect(qa.execute).toHaveBeenCalledTimes(1);
+    expect(await qa.genericWakes()).toEqual([]);
+    expect((await server.db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.id, qa.decisionId)))[0]).toEqual(decisionBefore);
+  }, 30_000);
+
+  it.each(["unconsumed", "entered", "old_unversioned", "provider_started"] as const)(
+    "handles an expired QA claim without replaying entered or unknown work: %s", async state => {
+    const qa = await returnedQaFixture();
+    const source = await qa.promote();
+    const [decisionBefore] = await server.db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.id, qa.decisionId));
+    let lostClaim = false;
+    const lostControllerDb = new Proxy(server.db, {
+      get(target, property) {
+        if (property === "transaction") return async (...args: Parameters<typeof server.db.transaction>) => {
+          const result = await target.transaction(...args);
+          const claimed = result as { id?: unknown; status?: unknown } | null;
+          if (!lostClaim && claimed?.id === source.id && claimed.status === "running") {
+            lostClaim = true;
+            // Lose the caller after the actual claim COMMIT, before executeRun
+            // receives it. This reproduces the persisted crash state, not an
+            // OS SIGKILL; it does not fabricate an old failure/no-provider row.
+            throw new Error("Synthetic controller loss after QA claim commit");
+          }
+          return result;
+        };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const lostController = heartbeatService(lostControllerDb);
+    await expect(lostController.resumeQueuedRuns()).rejects.toThrow("Synthetic controller loss after QA claim commit");
+    await lostController.drainActiveRunExecutions();
+    expect(lostClaim).toBe(true);
+    const [claimed] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id));
+    expect(claimed).toMatchObject({ status: "running", executionStage: "preparing" });
+    expect((await server.db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, qa.wake.id)))[0]).toMatchObject({ status: "claimed", runId: source.id });
+    expect((await qa.issueDetail(source.id)).executionRunId).toBe(source.id);
+    expect(qa.execute).not.toHaveBeenCalled();
+    expect(await server.db.select().from(environmentLeases)
+      .where(eq(environmentLeases.heartbeatRunId, source.id))).toEqual([]);
+    // Negative controls represent a preparation that entered, an older claim
+    // without this contract, and an explicitly dispatched provider. They must
+    // never acquire a no-provider proof from expiry alone.
+    if (state === "entered") await server.db.update(heartbeatRuns).set({
+      runnerProfileJson: sql`jsonb_set(${heartbeatRuns.runnerProfileJson}, '{qaClaimPreparation,state}', '"entered"'::jsonb)`,
+    }).where(eq(heartbeatRuns.id, source.id));
+    if (state === "old_unversioned") await server.db.update(heartbeatRuns).set({
+      runnerProfileJson: sql`${heartbeatRuns.runnerProfileJson} - 'qaClaimPreparation'`,
+    }).where(eq(heartbeatRuns.id, source.id));
+    if (state === "provider_started") await server.db.update(heartbeatRuns).set({
+      resultJson: { executionRecovery: { kind: "provider_failure", providerWorkStarted: true } },
+    }).where(eq(heartbeatRuns.id, source.id));
+    // Advance only the disposable controller lease clock. Preserve source
+    // context, claim/wake IDs, decision, outcome and all UNKNOWN history.
+    await server.db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'` })
+      .where(eq(heartbeatRuns.id, source.id));
+    const restarted = heartbeatService(server.db);
+    const reaped = await restarted.reapOrphanedRuns();
+    const [settled] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id));
+    if (state !== "unconsumed") {
+      expect((settled!.resultJson?.executionRecovery as Record<string, unknown> | undefined)?.qaPreProvider)
+        .toBeUndefined();
+      if (state === "provider_started") expect(settled!.resultJson!.executionRecovery)
+        .toMatchObject({ providerWorkStarted: true });
+      expect(await server.db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.id, qa.wake.id), qaDecisionWakeBlocksDelivery())))
+        .toEqual([{ id: qa.wake.id }]);
+      await restarted.reconcileStrandedAssignedIssues();
+      await restarted.resumeQueuedRuns();
+      await restarted.drainActiveRunExecutions();
+      expect(qa.execute).not.toHaveBeenCalled();
+      expect(await qa.genericWakes()).toEqual([]);
+      expect((await server.db.select().from(issueExecutionDecisions)
+        .where(eq(issueExecutionDecisions.id, qa.decisionId)))[0]).toEqual(decisionBefore);
+      return;
+    }
+    expect(reaped.runIds).toContain(source.id);
+    expect(settled).toMatchObject({ status: "failed", errorCode: "process_lost",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false,
+        qaPreProvider: { schema: "paperclip.qa-pre-provider/v1", runId: source.id, decisionId: qa.decisionId },
+        orphanClaim: { schema: "paperclip.qa-orphan-claim/v1", controllerBootId: claimed!.controllerBootId },
+      } } });
+    expect(await server.db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.id, qa.wake.id), qaDecisionWakeBlocksDelivery()))).toEqual([]);
+    expect(await server.db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, qa.fixture.companyId),
+      eq(issueRecoveryActions.fingerprint, `legacy-execution:${source.id}`)))).toEqual([]);
+    expect(await qa.genericWakes()).toEqual([]);
+    await restarted.reconcileStrandedAssignedIssues();
+    await restarted.resumeQueuedRuns();
+    await restarted.drainActiveRunExecutions();
+    expect(qa.execute).toHaveBeenCalledTimes(1);
+    expect(qa.execute.mock.calls[0]![0]).toMatchObject({
+      context: { qaDecisionId: qa.decisionId, forceFreshSession: true },
+    });
+    expect(qa.execute.mock.calls[0]![0].runId).not.toBe(source.id);
+    expect((await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id)))[0]).toEqual(settled);
+    expect((await server.db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.id, qa.decisionId)))[0]).toEqual(decisionBefore);
+    expect(await qa.genericWakes()).toEqual([]);
+    await restarted.reconcileStrandedAssignedIssues();
+    await restarted.resumeQueuedRuns();
+    await restarted.drainActiveRunExecutions();
+    expect(qa.execute).toHaveBeenCalledTimes(1);
+  }, 30_000);
+
   it("settles a QA cancellation after claim commit but before execute preparation begins", async () => {
     const qa = await returnedQaFixture();
     const source = await qa.promote();
