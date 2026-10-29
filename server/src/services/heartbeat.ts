@@ -17983,6 +17983,12 @@ export function heartbeatService(
       if (!claimedRun || !issueId || !ownsIssue) return;
       await tx.update(issues).set({
         executionRunId: claimedRun.id,
+        // A fresh legacy QA return has already passed current decision,
+        // assignee and predecessor-ownership checks under this Issue lock.
+        // Bind both owners in that same claim: document-only workers cannot
+        // call checkout, and execution_* wakes skip ordinary auto-checkout.
+        ...(context.qaDecisionId !== undefined && context.forceFreshSession === true &&
+          claimedRun.runtimeMode === "legacy" ? { checkoutRunId: claimedRun.id } : {}),
         executionAgentNameKey: normalizeAgentNameKey(agent.name),
         executionLockedAt: claimedAt,
         updatedAt: claimedAt,

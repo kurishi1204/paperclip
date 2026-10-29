@@ -1,9 +1,9 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ServerAdapterModule } from "@paperclipai/adapter-utils";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { agentWakeupRequests, agents, budgetPolicies, costEvents, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueExecutionDecisions, issueRecoveryActions, issues } from "@paperclipai/db";
+import { agentWakeupRequests, agents, budgetPolicies, companies, costEvents, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueExecutionDecisions, issueRecoveryActions, issues } from "@paperclipai/db";
 import { afterAll, afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
@@ -1646,6 +1646,118 @@ describe("QA return fresh episode through real routes and PostgreSQL", () => {
       .where(and(eq(agentWakeupRequests.companyId, fixture.companyId),
         eq(agentWakeupRequests.idempotencyKey, `qa-decision:${decisionId}`))))
       .toEqual([{ id: deferred!.id }]);
+  });
+
+  it("checks out a fresh QA return before its real document read, save and review submission", async () => {
+    const { fixture, stageId, tool } = await reviewFixture();
+    execFileSync("git", ["init", "--quiet", fixture.workspace]);
+    await server.db.update(issues).set({ status: "done" }).where(eq(issues.id, fixture.blockerId));
+    await server.db.update(companies).set({ defaultResponsibleUserId: fixture.responsibleUserId })
+      .where(eq(companies.id, fixture.companyId));
+    await server.db.update(agents).set({ runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } } })
+      .where(eq(agents.id, fixture.agentId));
+    vi.stubEnv("PAPERCLIP_LISTEN_HOST", "127.0.0.1");
+    vi.stubEnv("PAPERCLIP_LISTEN_PORT", new URL(server.apiUrl).port);
+    let implementerId = "";
+    const receipts: { name: string; status: number; result: any }[] = [];
+    const checkoutAtDispatch: (string | null)[] = [];
+    const body = "Corrected source verification from the fixed task input.";
+    const execute = vi.fn<ServerAdapterModule["execute"]>(async ctx => {
+      expect(ctx.agent.id).toBe(implementerId);
+      expect(ctx.context.issueId).toBe(fixture.issueId);
+      const [current] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
+      checkoutAtDispatch.push(current!.checkoutRunId);
+      // Use the credential and endpoint issued by the real heartbeat. Neither
+      // this adapter nor the fixture calls checkout or writes its ownership.
+      const endpoint = ctx.runtimeMcp?.getServers().find(item => item.connectionId === "paperclip-project-tools");
+      if (!endpoint?.url || !endpoint.token) throw new Error("Document MCP was not issued by heartbeat");
+      const call = async (name: string, args: object) => {
+        const response = await fetch(endpoint.url, { method: "POST",
+          headers: { Authorization: `Bearer ${endpoint.token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: randomUUID(), method: "tools/call",
+            params: { name, arguments: args } }),
+        });
+        const result = (await response.json()).result;
+        receipts.push({ name, status: response.status, result });
+        return result?.structuredContent;
+      };
+      const input = await call("read_self_task_document", { key: "notes" });
+      if (input?.outcome !== "verified") {
+        return { exitCode: 1, signal: null, timedOut: false, summary: "QA return document read was refused" };
+      }
+      await call("write_self_task_document", { key: "qa-corrected-result", documentId: null,
+        baseRevisionId: null, title: "Corrected verification", format: "markdown", body,
+        input: { key: input.key, documentId: input.documentId,
+          revisionId: input.revisionId, bodySha256: input.bodySha256 }, submitForReview: true,
+      });
+      return { exitCode: 0, signal: null, timedOut: false, summary: "Corrected task document submitted" };
+    });
+    registerServerAdapter({ type: "claude_local", supportsLocalAgentJwt: true, execute,
+      testEnvironment: async () => ({ adapterType: "claude_local", status: "pass", checks: [], testedAt: new Date().toISOString() }) });
+    onTestFinished(async () => {
+      await heartbeatService(server.db).drainActiveRunExecutions();
+      unregisterServerAdapter("claude_local");
+    });
+    const [implementer] = await server.db.insert(agents).values({ companyId: fixture.companyId,
+      name: "Document QA return worker", adapterType: "claude_local", status: "active",
+      adapterConfig: { engine: "cli", selfTaskDocumentToolsOnly: true, dangerouslySkipPermissions: false },
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
+    }).returning();
+    implementerId = implementer!.id;
+    const [before] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    await server.db.update(issues).set({ executionState: {
+      ...(before!.executionState as Record<string, unknown>),
+      returnAssignee: { type: "agent", agentId: implementerId },
+    } }).where(eq(issues.id, fixture.issueId));
+    const assigned = (await tool("read_assigned_issue")).body.result.structuredContent;
+    const verdict = await tool("submit_review_decision", { decision: "request_changes",
+      summary: "Correct the fixed task document evidence.", expectedStageId: stageId,
+      expectedStatusVersion: assigned.statusVersion, expectedRevision: assigned.revision,
+      expectedLastDecisionId: assigned.reviewStage.lastDecisionId,
+    });
+    expect(verdict.body.result.isError).not.toBe(true);
+    const decisionId = verdict.body.result.structuredContent.decisionId as string;
+    await expect.poll(() => server.db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, fixture.companyId),
+      eq(agentWakeupRequests.idempotencyKey, `qa-decision:${decisionId}`),
+    )), { timeout: 10_000 }).toEqual([expect.objectContaining({ status: "deferred_issue_execution", runId: null })]);
+    const [wake] = await server.db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, fixture.companyId),
+      eq(agentWakeupRequests.idempotencyKey, `qa-decision:${decisionId}`),
+    ));
+    const [oldDecision] = await server.db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.id, decisionId));
+    // End only the synthetic reviewer. Production admission must then acquire
+    // the implementer's checkout, rather than having the test install it.
+    await server.db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, fixture.runId));
+    settleSyntheticReviewProcess(fixture.runId);
+    await server.db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 31_000) })
+      .where(eq(agentWakeupRequests.id, wake!.id));
+    const heartbeat = heartbeatService(server.db);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    expect(receipts[0]).toMatchObject({ name: "read_self_task_document", status: 200,
+      result: { structuredContent: { outcome: "verified", body: "Document verification code: silver-wren." } } });
+    expect(receipts).toHaveLength(2);
+    expect(receipts[1]).toMatchObject({ name: "write_self_task_document", status: 200,
+      result: { structuredContent: { outcome: "verified", body,
+        review: { outcome: "verified", status: "in_review" } } } });
+    expect(execute).toHaveBeenCalledOnce();
+    const newRunId = execute.mock.calls[0]![0].runId;
+    expect(newRunId).not.toBe(fixture.runId);
+    expect(checkoutAtDispatch).toEqual([newRunId]);
+    const [returned] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    const saved = receipts[1]!.result.structuredContent;
+    expect(returned).toMatchObject({ status: "in_review", assigneeAgentId: fixture.agentId,
+      executionState: { status: "pending", submittedDocument: {
+        documentId: saved.documentId, key: "qa-corrected-result", revisionId: saved.revisionId,
+        bodySha256: createHash("sha256").update(body).digest("hex"), submittedByRunId: newRunId,
+      } } });
+    const [completed] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, newRunId));
+    expect(completed).toMatchObject({ status: "succeeded", contextSnapshot: { qaDecisionId: decisionId, forceFreshSession: true } });
+    expect(await server.db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.id, decisionId)))
+      .toEqual([oldDecision]);
   });
 
   it.each([false, true])("admits a new QA document episode only when every recovery action is document-held (mixed: %s)", async mixed => {
