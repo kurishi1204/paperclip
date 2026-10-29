@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { randomUUID } from "node:crypto";
 import type { ServerAdapterModule } from "@paperclipai/adapter-utils";
 import { and, eq, inArray, sql } from "drizzle-orm";
@@ -7,7 +9,7 @@ import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { createWakeQueue } from "../modules/wake-queue/index.js";
 import { createAdmissionTransactionScope, createWakeAdmissionReader } from "../modules/wake-queue/adapters/postgres.js";
-import { heartbeatService } from "../services/heartbeat.js";
+import { heartbeatService, persistHeartbeatRunProcessMetadata } from "../services/heartbeat.js";
 import { agentService } from "../services/agents.js";
 import { adapterExecutionControls } from "../services/adapter-execution-control.js";
 import { getExecutionBlocker, getQaPredecessorWaitBlocker } from "../services/execution-blocker.js";
@@ -175,6 +177,102 @@ describe("QA return fresh episode through real routes and PostgreSQL", () => {
     };
     return { fixture, implementerId, decisionId, wake: wake!, execute, heartbeat, promote, genericWakes, issueDetail };
   }
+
+  async function ownedLocalProcess(withChild = false) {
+    const program = withChild
+      ? `const {spawn}=require('node:child_process');
+         const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+         process.stdout.write(JSON.stringify({childPid:child.pid})+'\\n');setInterval(()=>{},1000);`
+      : `process.stdout.write('ready\\n');setInterval(()=>{},1000);`;
+    const child = spawn(process.execPath, ["-e", program], {
+      detached: true, stdio: ["ignore", "pipe", "pipe"],
+    });
+    const closed = once(child, "exit");
+    const [wire] = await once(child.stdout!, "data");
+    const childPid: number | null = withChild ? JSON.parse(String(wire)).childPid : null;
+    let stopped = false;
+    const stop = async () => {
+      if (stopped) return;
+      stopped = true;
+      if (childPid) {
+        try { process.kill(childPid, "SIGTERM"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+      }
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      await closed;
+      await expect.poll(() => {
+        try { process.kill(-child.pid!, 0); return false; }
+        catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+      }).toBe(true);
+    };
+    onTestFinished(stop);
+    return { child, childPid, closed, stop };
+  }
+
+  it.skipIf(process.platform !== "darwin")("delivers one QA episode past a real later local PID=PGID generation without stopping that new group", async () => {
+    const qa = await returnedQaFixture();
+    const current = await ownedLocalProcess(true);
+    const queued = await qa.promote();
+    const recorded = await persistHeartbeatRunProcessMetadata(server.db, qa.fixture.runId, {
+      pid: current.child.pid!, processGroupId: current.child.pid!, startedAt: new Date().toISOString(),
+    });
+    expect(recorded!.processPid).toBe(recorded!.processGroupId);
+    expect(recorded!.processStartedAt).toBeInstanceOf(Date);
+    // Real current child/group, synthetic historical ownership of the same
+    // numbers. We do not force OS PID recycling or rewrite any real old Run.
+    const now = Date.now();
+    await server.db.update(heartbeatRuns).set({
+      processStartedAt: new Date(now - 120_000), finishedAt: new Date(now - 60_000),
+    }).where(eq(heartbeatRuns.id, qa.fixture.runId));
+    const [source] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, qa.fixture.runId));
+    const [decision] = await server.db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.id, qa.decisionId));
+    await qa.heartbeat.resumeQueuedRuns();
+    await qa.heartbeat.drainActiveRunExecutions();
+    expect(qa.execute.mock.calls.map(([ctx]) => ctx.runId)).toEqual([queued.id]);
+    expect((await qa.issueDetail(queued.id)).executionBlocker?.cause).not.toBe("qa_predecessor_ownership_active");
+    expect(await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, qa.fixture.runId))).toEqual([source]);
+    expect(await server.db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.id, qa.decisionId))).toEqual([decision]);
+    expect(await qa.genericWakes()).toEqual([]);
+    expect(() => process.kill(current.child.pid!, 0)).not.toThrow();
+    expect(() => process.kill(current.childPid!, 0)).not.toThrow();
+    await qa.heartbeat.resumeQueuedRuns();
+    await qa.heartbeat.drainActiveRunExecutions();
+    expect(qa.execute).toHaveBeenCalledTimes(1);
+    await current.stop();
+  });
+
+  it.skipIf(process.platform !== "darwin")("holds a surviving real old group child even when the stored PID belongs to a later unrelated process", async () => {
+    const qa = await returnedQaFixture();
+    const old = await ownedLocalProcess(true);
+    const replacement = await ownedLocalProcess();
+    const queued = await qa.promote();
+    await persistHeartbeatRunProcessMetadata(server.db, qa.fixture.runId, {
+      pid: replacement.child.pid!, processGroupId: old.child.pid!, startedAt: new Date().toISOString(),
+    });
+    const now = Date.now();
+    await server.db.update(heartbeatRuns).set({
+      processStartedAt: new Date(now - 120_000), finishedAt: new Date(now - 60_000),
+    }).where(eq(heartbeatRuns.id, qa.fixture.runId));
+    // The old leader exits; its owned child keeps the old group alive. A
+    // replacement PID alone must never erase that remaining ownership.
+    old.child.kill("SIGTERM");
+    await old.closed;
+    expect(() => process.kill(old.childPid!, 0)).not.toThrow();
+    await qa.heartbeat.resumeQueuedRuns();
+    await qa.heartbeat.drainActiveRunExecutions();
+    expect(qa.execute).not.toHaveBeenCalled();
+    expect((await qa.issueDetail(queued.id)).executionBlocker).toMatchObject({
+      cause: "qa_predecessor_ownership_active", runId: qa.fixture.runId,
+    });
+    expect(await qa.genericWakes()).toEqual([]);
+    // End only this fixture's owned descendant, not the replacement process.
+    await old.stop();
+    await qa.heartbeat.resumeQueuedRuns();
+    await qa.heartbeat.drainActiveRunExecutions();
+    expect(qa.execute.mock.calls.map(([ctx]) => ctx.runId)).toEqual([queued.id]);
+    expect(() => process.kill(replacement.child.pid!, 0)).not.toThrow();
+    await replacement.stop();
+  });
 
   it("shows the ownership hold on a promoted QA receipt and delivers it once after exact fixture cleanup", async () => {
     const qa = await returnedQaFixture();

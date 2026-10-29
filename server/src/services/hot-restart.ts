@@ -156,7 +156,7 @@ function isProcessAlive(pid: number) {
   }
 }
 
-function runProcessCommand(command: string, args: string[]) {
+function runProcessCommand(command: string, args: string[], env?: NodeJS.ProcessEnv) {
   return new Promise<string>((resolve, reject) => {
     execFile(
       command,
@@ -165,6 +165,7 @@ function runProcessCommand(command: string, args: string[]) {
         encoding: "utf8",
         timeout: 1_500,
         windowsHide: true,
+        ...(env ? { env } : {}),
       },
       (error, stdout) => {
         if (error) reject(error);
@@ -231,6 +232,98 @@ export async function readProcessStartedAt(
   }
 
   return null;
+}
+
+type LocalProcessObservation = {
+  pid: number;
+  parentPid: number;
+  processGroupId: number;
+  startedAt: string | null;
+};
+
+async function readDarwinProcessSnapshot(): Promise<LocalProcessObservation[]> {
+  // Numeric identity and kernel start time only: never read command lines or
+  // environments. Darwin ps lstart uses p_starttime.tv_sec (one-second floor).
+  const stdout = await runProcessCommand("/bin/ps", ["-A", "-o", "pid=,ppid=,pgid=,lstart="],
+    { ...process.env, LC_ALL: "C", TZ: "UTC" });
+  return stdout.split("\n").filter(line => line.trim()).map(line => {
+    const fields = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
+    if (!fields) throw new Error("Incomplete local process identity observation");
+    const start = fields[4]!;
+    // C locale is fixed above; an unfamiliar or missing timestamp is unknown.
+    const startedAt = /^[A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(start)
+      ? asDateString(`${start} UTC`) : null;
+    return { pid: Number(fields[1]), parentPid: Number(fields[2]),
+      processGroupId: Number(fields[3]), startedAt };
+  });
+}
+
+export async function hasLocalPredecessorProcessOwnership(
+  prior: { processPid: number | null; processGroupId: number | null;
+    processStartedAt: Date | null; finishedAt: Date | null },
+  options: { platform?: NodeJS.Platform; signal?: (pid: number) => void;
+    readSnapshot?: () => Promise<LocalProcessObservation[]> } = {},
+): Promise<boolean> {
+  if ([prior.processPid, prior.processGroupId].some(pid =>
+    pid !== null && (!Number.isInteger(pid) || pid <= 0))) return true;
+  const signal = options.signal ?? (pid => process.kill(pid, 0));
+  const state = (pid: number | null): "alive" | "absent" | "unknown" => {
+    if (pid === null) return "absent";
+    if (!Number.isInteger(pid) || pid === 0) return "unknown";
+    try { signal(pid); return "alive"; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH" ? "absent" : "unknown"; }
+  };
+  const pidState = state(prior.processPid);
+  const groupState = state(prior.processGroupId === null ? null : -prior.processGroupId);
+  if (pidState === "absent" && groupState === "absent") return false;
+  if (pidState !== "alive" || groupState === "unknown" || !prior.processPid ||
+      (options.platform ?? process.platform) !== "darwin") return true;
+  const previousStart = prior.processStartedAt?.getTime();
+  const finished = prior.finishedAt?.getTime();
+  if (previousStart == null || finished == null || !Number.isFinite(previousStart) ||
+      !Number.isFinite(finished) || finished < previousStart) return true;
+  // The saved start may be a second floor or an onSpawn fallback. Only a
+  // strict later birth beyond both bounds qualifies; same-second is unknown.
+  const after = Math.max(previousStart + 1_000, finished);
+  const readSnapshot = options.readSnapshot ?? readDarwinProcessSnapshot;
+  const evaluate = (snapshot: LocalProcessObservation[]) => {
+    const byPid = new Map(snapshot.map(row => [row.pid, row]));
+    if (byPid.size !== snapshot.length) return null;
+    const leader = byPid.get(prior.processPid!);
+    const later = (row: LocalProcessObservation) => {
+      const start = row.startedAt === null ? NaN : Date.parse(row.startedAt);
+      return Number.isFinite(start) && start > after && start <= Date.now();
+    };
+    if (!leader || !later(leader)) return null;
+    if (groupState === "absent") return JSON.stringify([leader]);
+    // A recycled PID alone never settles a different surviving process group.
+    if (prior.processGroupId !== leader.pid || leader.processGroupId !== leader.pid) return null;
+    const members = snapshot.filter(row => row.processGroupId === leader.pid);
+    if (!members.length || members.some(row => !later(row))) return null;
+    const group = new Map(members.map(row => [row.pid, row]));
+    if (group.has(leader.parentPid)) return null;
+    for (const member of members) {
+      let current = member;
+      const seen = new Set<number>();
+      while (current.pid !== leader.pid) {
+        if (seen.has(current.pid)) return null;
+        seen.add(current.pid);
+        const parent = group.get(current.parentPid);
+        if (!parent) return null; // Orphan / external parent: old ownership is unknown.
+        current = parent;
+      }
+    }
+    // Darwin's PID allocator excludes extant PGIDs and session IDs (XNU
+    // kern_fork.c: pghash_exists_locked/session_find_locked). A later leader
+    // with the same PID=PGID cannot coexist with the old group. Also check
+    // every observed member's ancestry, rather than inferring from the leader.
+    return JSON.stringify(members.sort((a, b) => a.pid - b.pid));
+  };
+  try {
+    const first = evaluate(await readSnapshot());
+    if (!first) return true;
+    return evaluate(await readSnapshot()) !== first;
+  } catch { return true; } // Denied, truncated, unstable or unsupported means hold.
 }
 
 export function isObservedHotRestartTargetAlive(

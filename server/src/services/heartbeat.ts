@@ -644,6 +644,7 @@ import {
   findMissingHotRestartSnapshotRunIds,
   readHotRestartIntent,
   readProcessStartedAt,
+  hasLocalPredecessorProcessOwnership,
   removeHotRestartIntent,
   shouldHonorHotRestartIntentForProcess,
   writeHotRestartReport,
@@ -20076,7 +20077,8 @@ export function heartbeatService(
   // has ended. Check all predecessors, not just the latest recovery action.
   async function readQaPredecessorOwnershipHold(queryDb: Db, companyId: string, issueId: string, exceptRunId?: string) {
     const predecessors = await queryDb.select({ id: heartbeatRuns.id, processPid: heartbeatRuns.processPid,
-      processGroupId: heartbeatRuns.processGroupId })
+      processGroupId: heartbeatRuns.processGroupId, processStartedAt: heartbeatRuns.processStartedAt,
+      finishedAt: heartbeatRuns.finishedAt })
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
         sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issueId}`,
         inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
@@ -20107,11 +20109,6 @@ export function heartbeatService(
     )).limit(1);
     if (lease) return { sourceRunId: lease.runId!, message: "前のAIの実行環境の後始末が完了していません。停止と後始末の受領を確認してください。" };
     if (finalization) return { sourceRunId: finalization.id, message: "前のAIの成果保存と終了処理が完了していません。終了の受領を確認してください。" };
-    const possiblyAlive = (pid: number | null) => {
-      if (!pid) return false;
-      try { process.kill(pid, 0); return true; }
-      catch (err) { return (err as NodeJS.ErrnoException).code !== "ESRCH"; }
-    };
     for (const run of predecessors) {
       if (liveRunExecutions.has(run.id) || activeRunExecutions.has(run.id) || adapterExecutionControls.has(run.id)) {
         return { sourceRunId: run.id, message: "前のAIが終了処理中です。処理が完了すると、同じ判断に基づく作業を再開します。" };
@@ -20119,9 +20116,9 @@ export function heartbeatService(
       // Exact provider receipts settle remote process ownership; identically
       // numbered PIDs/PGIDs on this host do not belong to that remote run.
       if (stoppedRemoteRunIds.has(run.id)) continue;
-      // A different timestamp alone does not prove a live local PID stopped:
-      // the stored fallback and the OS probe can have different precision.
-      if (possiblyAlive(run.processPid) || possiblyAlive(run.processGroupId ? -run.processGroupId : null)) {
+      // Settle only an absent executor or a proven later local generation.
+      // A surviving/unknown old group remains a hold even if its PID changed.
+      if (await hasLocalPredecessorProcessOwnership(run)) {
         return { sourceRunId: run.id, message: "前のAIのプロセスが停止した証拠をまだ確認できません。実行履歴から停止の受領を確認してください。" };
       }
     }
