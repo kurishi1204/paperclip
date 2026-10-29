@@ -8960,9 +8960,9 @@ export function issueRoutes(
     );
     // Recovery revalidation may change the blocker; read it afterwards.
     const executionBlocker = await timing.time("execution_blocker", async () =>
-      await getQaPredecessorWaitBlocker(db, issue.companyId, issue.id,
-        () => heartbeat.readQaPredecessorOwnershipHold(issue.companyId, issue.id))
-        ?? getExecutionBlocker(db, issue.companyId, issue.id));
+      await getExecutionBlocker(db, issue.companyId, issue.id)
+        ?? getQaPredecessorWaitBlocker(db, issue.companyId, issue.id,
+          () => heartbeat.readQaPredecessorOwnershipHold(issue.companyId, issue.id)));
     res.setHeader("Server-Timing", timing.header());
     res.json({
       ...issue,

@@ -10,7 +10,8 @@ import { createAdmissionTransactionScope, createWakeAdmissionReader } from "../m
 import { heartbeatService } from "../services/heartbeat.js";
 import { agentService } from "../services/agents.js";
 import { adapterExecutionControls } from "../services/adapter-execution-control.js";
-import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { getExecutionBlocker, getQaPredecessorWaitBlocker } from "../services/execution-blocker.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { isAuthorizedQaDecisionWake, qaDecisionWakeBlocksDelivery } from "../services/qa-decision-wake.js";
 import { SELF_TASK_DOCUMENT_CONTEXT_KEY } from "../services/self-task-document-runtime.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
@@ -277,6 +278,129 @@ describe("QA return fresh episode through real routes and PostgreSQL", () => {
     expect((await readIssue()).executionBlocker?.cause).not.toBe("qa_predecessor_ownership_active");
     expect(qa.execute).not.toHaveBeenCalled();
     expect(await qa.genericWakes()).toEqual([]);
+  });
+
+  it("clears a suppressed QA controller claim before a queued cancellation and redelivers once", async () => {
+    const qa = await returnedQaFixture();
+    const source = await qa.promote();
+    const [decisionBefore] = await server.db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.id, qa.decisionId));
+    const runtimeEnv: Record<string, string | undefined> = { PAPERCLIP_RESTORE_IN_PROGRESS: "0" };
+    const heartbeat = heartbeatService(server.db, { runtimeEnv });
+    let claimed = 0;
+    const unsubscribe = subscribeCompanyLiveEvents(qa.fixture.companyId, event => {
+      const value = event.payload as { runId?: string; status?: string };
+      if (event.type === "heartbeat.run.status" && value.runId === source.id && value.status === "running") {
+        claimed += 1;
+        runtimeEnv.PAPERCLIP_RESTORE_IN_PROGRESS = "1";
+      }
+    });
+    try {
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+    } finally {
+      unsubscribe();
+    }
+    expect(claimed).toBe(1);
+    const [returned] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id));
+    expect(returned).toMatchObject({ status: "queued", startedAt: null, responsibleUserId: null,
+      controllerBootId: null, controllerLeaseExpiresAt: null, executionStage: null });
+    expect((await server.db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, qa.wake.id)))[0]).toMatchObject({ status: "queued", claimedAt: null });
+    expect(qa.execute).not.toHaveBeenCalled();
+
+    // Use the real claim gate for the next cancellation. Do not manually
+    // erase boot IDs or mint a no-provider proof in the fixture.
+    runtimeEnv.PAPERCLIP_RESTORE_IN_PROGRESS = "0";
+    await server.db.update(agents).set({ runtimeConfig: {
+      heartbeat: { enabled: false, wakeOnDemand: true, maxDailyRuns: 0 },
+    } }).where(eq(agents.id, qa.implementerId));
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    const [cancelled] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id));
+    expect(cancelled).toMatchObject({ status: "cancelled", startedAt: null,
+      controllerBootId: null, errorCode: "heartbeat.daily_run_limit" });
+    expect((cancelled!.resultJson?.executionRecovery as Record<string, unknown> | undefined)?.qaPreProvider)
+      .toBeUndefined();
+    expect(await server.db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.id, qa.wake.id), qaDecisionWakeBlocksDelivery()))).toEqual([]);
+    expect(qa.execute).not.toHaveBeenCalled();
+    await server.db.update(agents).set({ runtimeConfig: {
+      heartbeat: { enabled: false, wakeOnDemand: true },
+    } }).where(eq(agents.id, qa.implementerId));
+    // Advance only the disposable retry cursor past the existing five-minute
+    // skipped backoff. The run, decision, claim and proof fields stay intact.
+    await server.db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 6 * 60_000) })
+      .where(eq(agentWakeupRequests.id, qa.wake.id));
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    expect(qa.execute).toHaveBeenCalledTimes(1);
+    expect(qa.execute.mock.calls[0]![0]).toMatchObject({
+      context: { qaDecisionId: qa.decisionId, forceFreshSession: true },
+    });
+    expect((await server.db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.id, qa.decisionId)))[0]).toEqual(decisionBefore);
+    expect((await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id)))[0])
+      .toEqual(cancelled);
+    expect(await qa.genericWakes()).toEqual([]);
+  }, 30_000);
+
+  it.each(["running", "succeeded", "provider-failed"] as const)(
+    "does not project a predecessor wait after the current QA decision is %s", async deliveredState => {
+      const qa = await returnedQaFixture();
+      await server.db.insert(environmentLeases).values({ companyId: qa.fixture.companyId,
+        issueId: qa.fixture.issueId, heartbeatRunId: qa.fixture.runId,
+        status: "pending_cleanup", leasePolicy: "ephemeral", provider: "local", metadata: { driver: "local" } });
+      const source = await qa.promote();
+      const readWait = () => getQaPredecessorWaitBlocker(server.db, qa.fixture.companyId, qa.fixture.issueId,
+        () => qa.heartbeat.readQaPredecessorOwnershipHold(qa.fixture.companyId, qa.fixture.issueId));
+      expect(await readWait()).toMatchObject({ cause: "qa_predecessor_ownership_active", runId: qa.fixture.runId });
+      // Persisted delivery-state fixtures exercise the real DB reader. They
+      // are not claims that this synthetic provider actually ran or failed.
+      await server.db.update(heartbeatRuns).set({
+        status: deliveredState === "provider-failed" ? "failed" : deliveredState,
+        ...(deliveredState === "provider-failed" ? {
+          resultJson: { executionRecovery: { providerWorkStarted: true } },
+        } : {}),
+      }).where(eq(heartbeatRuns.id, source.id));
+      expect(await readWait()).toBeNull();
+      // A run for a different decision cannot hide the pending current one.
+      await server.db.update(heartbeatRuns).set({ contextSnapshot: {
+        ...source.contextSnapshot, qaDecisionId: randomUUID(),
+      } }).where(eq(heartbeatRuns.id, source.id));
+      expect(await readWait()).toMatchObject({ cause: "qa_predecessor_ownership_active" });
+      expect(qa.execute).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps an actionable recovery blocker ahead of an undelivered QA ownership notice", async () => {
+    const qa = await returnedQaFixture();
+    await server.db.insert(environmentLeases).values({ companyId: qa.fixture.companyId,
+      issueId: qa.fixture.issueId, heartbeatRunId: qa.fixture.runId,
+      status: "pending_cleanup", leasePolicy: "ephemeral", provider: "local", metadata: { driver: "local" } });
+    const queued = await qa.promote();
+    const [old] = await server.db.insert(heartbeatRuns).values({ companyId: qa.fixture.companyId,
+      agentId: qa.implementerId, invocationSource: "assignment", triggerDetail: "system", status: "failed",
+      contextSnapshot: { issueId: qa.fixture.issueId }, finishedAt: new Date(),
+    }).returning();
+    const [action] = await server.db.insert(issueRecoveryActions).values({
+      companyId: qa.fixture.companyId, sourceIssueId: qa.fixture.issueId, kind: "active_run_watchdog",
+      status: "resolved", ownerType: "board", cause: "uncertain_external_action",
+      fingerprint: `synthetic-priority:${old!.id}`, resolvedAt: new Date(),
+      evidence: { runId: old!.id, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+      nextAction: "Inspect the preserved synthetic failure.",
+    }).returning();
+    const original = await getExecutionBlocker(server.db, qa.fixture.companyId, qa.fixture.issueId);
+    expect(original).toMatchObject({ recoveryActionId: action!.id, runId: old!.id,
+      cause: "uncertain_external_action", canRetry: true });
+    expect(await getQaPredecessorWaitBlocker(server.db, qa.fixture.companyId, qa.fixture.issueId,
+      () => qa.heartbeat.readQaPredecessorOwnershipHold(qa.fixture.companyId, qa.fixture.issueId)))
+      .toMatchObject({ cause: "qa_predecessor_ownership_active" });
+    expect((await qa.issueDetail(queued.id)).executionBlocker).toEqual(original);
+    expect((await server.db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(action);
+    expect(qa.execute).not.toHaveBeenCalled();
   });
 
   it("cancels a daily-capped QA claim without reentering the same agent start lock", async () => {

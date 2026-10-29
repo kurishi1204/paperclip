@@ -18410,10 +18410,20 @@ export function heartbeatService(
           status: "queued",
           startedAt: null,
           responsibleUserId: null,
+          // Return the whole pre-provider claim to its unclaimed state. A
+          // later queued cancellation must not inherit an obsolete controller
+          // claim and become indistinguishable from possibly dispatched work.
+          controllerBootId: null,
+          controllerLeaseExpiresAt: null,
+          executionStage: null,
           updatedAt: now,
         })
         .where(
-          and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")),
+          and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running"),
+            isNull(heartbeatRuns.processPid), isNull(heartbeatRuns.processGroupId),
+            isNull(heartbeatRuns.processStartedAt), isNull(heartbeatRuns.externalRunId),
+            isNull(heartbeatRuns.nativeSessionId),
+            sql`(${heartbeatRuns.resultJson} #> '{executionRecovery,providerWorkStarted}') is distinct from 'true'::jsonb`),
         )
         .returning()
         .then((rows) => rows[0] ?? null);

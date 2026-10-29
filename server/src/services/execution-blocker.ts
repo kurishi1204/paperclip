@@ -34,6 +34,27 @@ export async function getQaPredecessorWaitBlocker(
     companyId, issueId, agentId: issue.assigneeAgentId, decisionId: decisionId.data,
   })) return null;
 
+  // A committed return is an intent, including before a runless receipt is
+  // promoted. Once its actual linked episode is running or delivered, old
+  // ownership must not mislabel that work as still waiting for delivery.
+  // Do not depend on the diagnostic/coalesced wake key: the server-bound run
+  // context and its bidirectional receipt linkage identify this decision.
+  const [delivered] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+    .innerJoin(agentWakeupRequests, and(
+      eq(agentWakeupRequests.id, heartbeatRuns.wakeupRequestId),
+      eq(agentWakeupRequests.runId, heartbeatRuns.id),
+      eq(agentWakeupRequests.companyId, heartbeatRuns.companyId),
+      eq(agentWakeupRequests.agentId, heartbeatRuns.agentId),
+    )).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, issue.assigneeAgentId),
+      sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId',
+        ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issueId}`,
+      sql`${heartbeatRuns.contextSnapshot}->>'qaDecisionId' = ${decisionId.data}`,
+      or(inArray(heartbeatRuns.status, ["running", "succeeded"]),
+        sql`${heartbeatRuns.resultJson} #> '{executionRecovery,providerWorkStarted}' = 'true'::jsonb`),
+    )).limit(1);
+  if (delivered) return null;
+
   const ownership = await readOwnership();
   if (!ownership) return null;
   // The held predecessor may belong to the QA agent, rather than the current
