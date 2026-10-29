@@ -11,28 +11,44 @@ import { hasSelfTaskDocumentReplayHold } from "./self-task-document-runtime.js";
 import { isAuthorizedQaDecisionWake, qaDecisionWakeKey } from "./qa-decision-wake.js";
 
 /** Read projection only. This is not an execution-admission or retry authority.
- * A QA wait need not contain a user comment; use the existing task notice rather
- * than hiding it in the comment queue's non-empty-entry presentation contract.
+ * Read current ownership after validating the current committed QA return;
+ * skipped/coalesced diagnostics and the existence of a queued run are not its
+ * source of truth. The same ownership reader serves actual admission.
  */
-export async function getQaPredecessorWaitBlocker(db: Db, companyId: string, issueId: string): Promise<ExecutionBlocker | null> {
-  const [entry] = await db.select({
-    runId: heartbeatRuns.id, agentId: heartbeatRuns.agentId, payload: agentWakeupRequests.payload,
-  }).from(heartbeatRuns).innerJoin(issues, and(
-    eq(issues.companyId, heartbeatRuns.companyId), eq(issues.id, issueId),
-    eq(issues.executionRunId, heartbeatRuns.id),
-  )).innerJoin(agentWakeupRequests, and(
-    eq(agentWakeupRequests.id, heartbeatRuns.wakeupRequestId),
-    eq(agentWakeupRequests.runId, heartbeatRuns.id), eq(agentWakeupRequests.companyId, heartbeatRuns.companyId),
-    eq(agentWakeupRequests.agentId, heartbeatRuns.agentId),
-  )).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "queued"),
-    sql`${agentWakeupRequests.idempotencyKey} = 'qa-decision:' || (${heartbeatRuns.contextSnapshot}->>'qaDecisionId')`,
-    sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' = 'qa_predecessor_ownership_active'`,
+export async function getQaPredecessorWaitBlocker(
+  db: Db,
+  companyId: string,
+  issueId: string,
+  readOwnership: () => Promise<{ sourceRunId: string; message: string } | null>,
+): Promise<ExecutionBlocker | null> {
+  const [issue] = await db.select({
+    status: issues.status,
+    assigneeAgentId: issues.assigneeAgentId,
+    executionState: issues.executionState,
+  }).from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).limit(1);
+  const state = issue?.executionState;
+  if (issue?.status !== "in_progress" || !issue.assigneeAgentId ||
+      !state || typeof state !== "object" || Array.isArray(state)) return null;
+  const decisionId = z.string().guid().safeParse((state as Record<string, unknown>).lastDecisionId);
+  if (!decisionId.success || !await isAuthorizedQaDecisionWake(db, {
+    companyId, issueId, agentId: issue.assigneeAgentId, decisionId: decisionId.data,
+  })) return null;
+
+  const ownership = await readOwnership();
+  if (!ownership) return null;
+  // The held predecessor may belong to the QA agent, rather than the current
+  // implementer. Inspect its actual run/agent, never a diagnostic or new run.
+  const [sourceRun] = await db.select({
+    id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status,
+  }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, ownership.sourceRunId),
+    sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId',
+      ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issueId}`,
   )).limit(1);
-  const wait = entry?.payload?.executionWait as Record<string, unknown> | undefined;
-  if (!entry || typeof wait?.message !== "string") return null;
-  return { recoveryActionId: null, runId: entry.runId, agentId: entry.agentId,
-    cause: "qa_predecessor_ownership_active", runStatus: "queued", runError: wait.message,
-    nextAction: "前の実行の停止と後始末を確認してください。受領が確認できれば、同じ判断に基づく新しい作業を再開します。",
+  if (!sourceRun) return null;
+  return { recoveryActionId: null, runId: sourceRun.id, agentId: sourceRun.agentId,
+    cause: "qa_predecessor_ownership_active", runStatus: sourceRun.status, runError: ownership.message,
+    nextAction: "前の実行の停止と後始末の記録を確認してください。確認が終わるまで、新しい差し戻し作業は待機します。",
     canContinue: false, canRetry: false,
   };
 }

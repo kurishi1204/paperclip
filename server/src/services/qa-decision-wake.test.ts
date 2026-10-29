@@ -221,7 +221,8 @@ describe("QA decision wake authority", () => {
     expect(rendered.sql).toContain("finished_at\" is not null");
     expect(rendered.sql).toContain("qa_prior_run.started_at is null");
     expect(rendered.sql).toContain("qa_prior_run.wakeup_request_id =");
-    expect(rendered.sql).toContain("qa_prior_run.status in ('failed','cancelled')");
+    expect(rendered.sql).toMatch(/qa_prior_run\.status in \(\$\d+, \$\d+, \$\d+, \$\d+\)/);
+    expect(rendered.params).toEqual(["failed", "cancelled", "interrupted", "timed_out"]);
     expect(rendered.sql).toContain("qa_other_run.wakeup_request_id =");
     expect(rendered.sql).toContain("process_started_at is null");
   });

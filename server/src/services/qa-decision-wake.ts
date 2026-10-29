@@ -4,6 +4,10 @@ import type { IssueExecutionState } from "@paperclipai/shared";
 
 const QA_DECISION_WAKE_PREFIX = "qa-decision:";
 
+// A terminal outcome alone never permits delivery; these statuses also require
+// exact, settled, no-provider evidence in qaDecisionWakeBlocksDelivery.
+export const QA_PRE_PROVIDER_TERMINAL_STATUSES = ["failed", "cancelled", "interrupted", "timed_out"] as const;
+
 export function qaDecisionWakeKey(decisionId: string): string {
   return `${QA_DECISION_WAKE_PREFIX}${decisionId}`;
 }
@@ -104,11 +108,11 @@ export function qaDecisionWakeBlocksDelivery() {
           and qa_prior_run.company_id = ${wake.companyId}
           and qa_prior_run.agent_id = ${wake.agentId}
           and qa_prior_run.wakeup_request_id = ${wake.id}
-          and qa_prior_run.status in ('failed','cancelled')
+          and qa_prior_run.status in (${sql.join(QA_PRE_PROVIDER_TERMINAL_STATUSES.map(status => sql`${status}`), sql`, `)})
           and (qa_prior_run.result_json #> '{executionRecovery,providerWorkStarted}') is distinct from 'true'::jsonb
           and (
             (${wake.claimedAt} is null and qa_prior_run.started_at is null
-              and qa_prior_run.execution_status_delivery_id is null and qa_prior_run.controller_boot_id is null)
+              and qa_prior_run.controller_boot_id is null)
             or (
               qa_prior_run.runtime_mode = 'legacy'
               and qa_prior_run.result_json #>> '{executionRecovery,qaPreProvider,schema}' = 'paperclip.qa-pre-provider/v1'

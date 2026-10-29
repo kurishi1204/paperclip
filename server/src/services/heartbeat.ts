@@ -43,7 +43,7 @@ import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/papercli
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "./connector-runtime.js";
 import { admitExplicitNativeContinuation, admitExplicitContinuationRetry, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
-import { buildQaChangesRequestedWakeContext, buildQaPreProviderRecovery, isAuthorizedQaDecisionWake, qaDecisionIdFromWakeKey, qaDecisionWakeBlocksDelivery, qaDecisionWakeKey } from "./qa-decision-wake.js";
+import { buildQaChangesRequestedWakeContext, buildQaPreProviderRecovery, QA_PRE_PROVIDER_TERMINAL_STATUSES, isAuthorizedQaDecisionWake, qaDecisionIdFromWakeKey, qaDecisionWakeBlocksDelivery, qaDecisionWakeKey } from "./qa-decision-wake.js";
 import { canRetryStoppedRun, isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
@@ -1304,6 +1304,19 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+type QaProviderObservation = {
+  companyId: string;
+  runId: string;
+  decisionId: string;
+  wakeupRequestId: string;
+  controllerBootId: string | null;
+  claimSucceeded: boolean;
+  preparationStarted: boolean;
+  providerMayHaveStarted: () => boolean;
+};
+// Separate service instances (pause route, shutdown and scheduler) can consult
+// this executing host's observation without inventing evidence from old JSON.
+const qaProviderObservations = new Map<string, QaProviderObservation>();
 const queuedRunStartScope = new AsyncLocalStorage<Array<{ agentId: string; held: boolean }>>();
 
 // Queue effects can request another start while their caller still owns the
@@ -13023,16 +13036,95 @@ export function heartbeatService(
     if (!previous || !readNonEmptyString(parseObject(previous.contextSnapshot).qaDecisionId)) return patch;
     const prior = parseObject(parseObject(previous.resultJson).executionRecovery);
     const requested = parseObject(parseObject(patch?.resultJson).executionRecovery);
-    if (prior.providerWorkStarted !== true && !(requested.providerWorkStarted === false &&
-        ["queued", "running", "scheduled_retry"].includes(previous.status) &&
-        ["failed", "cancelled", "interrupted"].includes(status))) return patch;
-    const recovery = buildQaPreProviderRecovery({ run: previous,
-      kind: readNonEmptyString(requested.kind) ?? readNonEmptyString(prior.kind) ?? "preparation",
-      providerMayHaveStarted: prior.providerWorkStarted === true,
-      existingRecovery: { ...prior, ...requested },
-    });
-    return { ...patch, resultJson: { ...parseObject(previous?.resultJson),
+    const observer = qaProviderObservations.get(previous.id);
+    const observedHere = previous.runtimeMode === "legacy" && observer?.companyId === previous.companyId
+      && observer.runId === previous.id && observer.wakeupRequestId === previous.wakeupRequestId
+      && observer.decisionId === parseObject(previous.contextSnapshot).qaDecisionId
+      && observer.controllerBootId === previous.controllerBootId;
+    const positive = prior.providerWorkStarted === true || requested.providerWorkStarted === true
+      || (observedHere && observer.providerMayHaveStarted());
+    const terminal = (QA_PRE_PROVIDER_TERMINAL_STATUSES as readonly string[]).includes(status);
+    if (!positive && !(observedHere && terminal)) return patch;
+    const recovery: Record<string, unknown> = {
+      ...prior, ...requested,
+      kind: readNonEmptyString(requested.kind) ?? readNonEmptyString(prior.kind) ?? "bootstrap",
+      providerWorkStarted: positive,
+    };
+    // While cleanup is pending this is only an observation. Only the owning
+    // executor's finally block can mint a settled pre-provider delivery proof.
+    delete recovery.qaPreProvider;
+    return { ...patch, resultJson: { ...parseObject(previous.resultJson),
       ...parseObject(patch?.resultJson), executionRecovery: recovery } };
+  }
+
+  function reserveQaProviderObservation(run: typeof heartbeatRuns.$inferSelect) {
+    const decisionId = qaDecisionIdFromWakeKey(qaDecisionWakeKey(
+      readNonEmptyString(parseObject(run.contextSnapshot).qaDecisionId) ?? "",
+    ));
+    if (!decisionId || !run.wakeupRequestId) return { observation: null };
+    if (qaProviderObservations.has(run.id)) return null;
+    const observation: QaProviderObservation = {
+      companyId: run.companyId, runId: run.id, decisionId,
+      wakeupRequestId: run.wakeupRequestId,
+      controllerBootId: run.runtimeMode === "legacy" ? legacyControllerBootId : run.controllerBootId,
+      claimSucceeded: false, preparationStarted: false,
+      providerMayHaveStarted: () => false,
+    };
+    // Reserve before the claim transaction can commit. A separate pause or
+    // shutdown service must observe this owner throughout claim-to-execute.
+    qaProviderObservations.set(run.id, observation);
+    return { observation };
+  }
+
+  function markQaObservationClaimed(observation: QaProviderObservation | null, run: typeof heartbeatRuns.$inferSelect) {
+    if (observation && qaProviderObservations.get(run.id) === observation &&
+        observation.companyId === run.companyId && observation.runId === run.id &&
+        observation.wakeupRequestId === run.wakeupRequestId &&
+        observation.decisionId === parseObject(run.contextSnapshot).qaDecisionId &&
+        observation.controllerBootId === run.controllerBootId) observation.claimSucceeded = true;
+  }
+
+  async function settleQaPreProviderObservation(observation: QaProviderObservation) {
+    if (qaProviderObservations.get(observation.runId) !== observation ||
+        !observation.claimSucceeded || observation.providerMayHaveStarted() ||
+        !observation.controllerBootId) return null;
+    const current = await getRun(observation.runId);
+    if (!current || current.companyId !== observation.companyId || current.runtimeMode !== "legacy" ||
+        current.wakeupRequestId !== observation.wakeupRequestId ||
+        current.controllerBootId !== observation.controllerBootId ||
+        parseObject(current.contextSnapshot).qaDecisionId !== observation.decisionId ||
+        !(QA_PRE_PROVIDER_TERMINAL_STATUSES as readonly string[]).includes(current.status)) return null;
+    const recovery = buildQaPreProviderRecovery({ run: current,
+      kind: readNonEmptyString(parseObject(current.resultJson?.executionRecovery).kind) ?? "bootstrap",
+      providerMayHaveStarted: false, existingRecovery: parseObject(current.resultJson?.executionRecovery) });
+    if (!recovery.qaPreProvider) return null;
+    return db.update(heartbeatRuns).set({
+      resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb), '{executionRecovery}',
+        coalesce(${heartbeatRuns.resultJson}->'executionRecovery', '{}'::jsonb) || ${JSON.stringify(recovery)}::jsonb)`,
+      updatedAt: new Date(),
+    }).where(and(eq(heartbeatRuns.id, observation.runId), eq(heartbeatRuns.companyId, observation.companyId),
+      eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.controllerBootId, observation.controllerBootId),
+      eq(heartbeatRuns.wakeupRequestId, observation.wakeupRequestId),
+      inArray(heartbeatRuns.status, [...QA_PRE_PROVIDER_TERMINAL_STATUSES]),
+      sql`${heartbeatRuns.contextSnapshot}->>'qaDecisionId' = ${observation.decisionId}`,
+      sql`${heartbeatRuns.contextSnapshot}->'forceFreshSession' = 'true'::jsonb`,
+      isNull(heartbeatRuns.processPid), isNull(heartbeatRuns.processGroupId), isNull(heartbeatRuns.processStartedAt),
+      isNull(heartbeatRuns.externalRunId), isNull(heartbeatRuns.nativeSessionId),
+      sql`(${heartbeatRuns.resultJson} #> '{executionRecovery,providerWorkStarted}') is distinct from 'true'::jsonb`,
+    )).returning().then(rows => rows[0] ?? null);
+  }
+
+  async function closeQaClaimObservation(observation: QaProviderObservation | null) {
+    if (!observation || qaProviderObservations.get(observation.runId) !== observation) return;
+    try {
+      // A successful claim has acquired no runtime resources. Once preparation
+      // starts, only executeRun's existing post-cleanup finally may settle it.
+      if (!observation.preparationStarted) await settleQaPreProviderObservation(observation);
+    } catch (err) {
+      logger.error({ err, runId: observation.runId }, "failed to persist settled QA claim evidence; delivery remains fenced");
+    } finally {
+      if (qaProviderObservations.get(observation.runId) === observation) qaProviderObservations.delete(observation.runId);
+    }
   }
 
   function preserveQaDispatchEvidenceAtWrite(
@@ -14710,6 +14802,9 @@ export function heartbeatService(
     // A second process-loss retry would compete for the same outbox input.
     if (run.contextSnapshot?.wakeReason === CHAT_COMPLETION_WAKE_REASON &&
         Array.isArray(run.contextSnapshot?.chatCompletionDeliveryIds)) return null;
+    // The committed QA decision owns its next episode. Shutdown must not also
+    // create a retry chain before the executing host has settled preparation.
+    if (readNonEmptyString(parseObject(run.contextSnapshot).qaDecisionId)) return null;
     // Native sessions have their own fenced same-run controller. Legacy
     // bootstrap recovery shares the durable delay and incident counter with
     // transient retries; process loss must not open a second retry budget.
@@ -17847,6 +17942,19 @@ export function heartbeatService(
       return { ownsIssue, blocked: false };
     }
     async function bindClaimedIssueExecution(tx: Db, ownsIssue: boolean, claimedRun: typeof heartbeatRuns.$inferSelect | null | undefined) {
+      if (claimedRun && context.qaDecisionId !== undefined && run.wakeupRequestId) {
+        const [claimedWake] = await tx.update(agentWakeupRequests).set({
+          status: "claimed", claimedAt, updatedAt: claimedAt,
+        }).where(and(
+          eq(agentWakeupRequests.id, run.wakeupRequestId),
+          eq(agentWakeupRequests.companyId, run.companyId),
+          eq(agentWakeupRequests.agentId, run.agentId),
+          eq(agentWakeupRequests.runId, run.id),
+          eq(agentWakeupRequests.idempotencyKey, qaDecisionWakeKey(String(context.qaDecisionId))),
+          inArray(agentWakeupRequests.status, ["queued", "claimed"]),
+        )).returning({ id: agentWakeupRequests.id });
+        if (!claimedWake) throw conflict("QA wake changed while claiming its execution");
+      }
       if (!claimedRun || !issueId || !ownsIssue) return;
       await tx.update(issues).set({
         executionRunId: claimedRun.id,
@@ -18229,7 +18337,7 @@ export function heartbeatService(
     });
     publishRunLifecyclePluginEvent(claimed);
 
-    if (!nativeReviewContext) {
+    if (!nativeReviewContext && context.qaDecisionId === undefined) {
       await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
     }
 
@@ -18239,7 +18347,7 @@ export function heartbeatService(
     const claimedIssueId = readNonEmptyString(claimedContext.issueId);
     const claimedWakeReason = readNonEmptyString(claimedContext.wakeReason);
     if (
-      !nativeReviewContext && claimedIssueId &&
+      !nativeReviewContext && context.qaDecisionId === undefined && claimedIssueId &&
       claimedWakeReason !== "source_scoped_recovery_action"
     ) {
       const claimedAgent = await getAgent(claimed.agentId);
@@ -19879,14 +19987,14 @@ export function heartbeatService(
   // Terminal status records the result, not release of the physical executor.
   // A new QA episode may leave the old UNKNOWN untouched only after ownership
   // has ended. Check all predecessors, not just the latest recovery action.
-  async function hasQaPredecessorOwnershipHold(queryDb: Db, companyId: string, issueId: string, exceptRunId?: string) {
+  async function readQaPredecessorOwnershipHold(queryDb: Db, companyId: string, issueId: string, exceptRunId?: string) {
     const predecessors = await queryDb.select({ id: heartbeatRuns.id, processPid: heartbeatRuns.processPid,
       processGroupId: heartbeatRuns.processGroupId })
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
         sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issueId}`,
         inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
         exceptRunId ? ne(heartbeatRuns.id, exceptRunId) : undefined));
-    if (!predecessors.length) return false;
+    if (!predecessors.length) return null;
     const ids = predecessors.map(run => run.id);
     // A released sandbox lease does not itself prove that its provider child
     // stopped. PIDs on this host cannot establish remote ownership release.
@@ -19894,9 +20002,11 @@ export function heartbeatService(
       eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, ids),
       isNotNull(environmentLeases.provider), ne(environmentLeases.provider, "local"),
     ));
-    if (remoteLeases.some(lease => !hasRemoteTerminationReceipt(lease))) return true;
+    const remoteHold = remoteLeases.find(lease => !hasRemoteTerminationReceipt(lease));
+    if (remoteHold) return { sourceRunId: remoteHold.heartbeatRunId!,
+      message: "前のAIの遠隔実行について、停止した証拠をまだ確認できません。環境の保持だけでは作業の停止を確認できません。" };
     const stoppedRemoteRunIds = new Set(remoteLeases.map(lease => lease.heartbeatRunId));
-    const [lease] = await queryDb.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+    const [lease] = await queryDb.select({ id: environmentLeases.id, runId: environmentLeases.heartbeatRunId }).from(environmentLeases).where(and(
       eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, ids),
       or(and(isNull(environmentLeases.releasedAt),
         sql`not coalesce(${environmentLeases.status} = 'retained' and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
@@ -19908,22 +20018,31 @@ export function heartbeatService(
       or(isNotNull(nativeRunFinalizations.leaseOwner),
         notInArray(nativeRunFinalizations.phase, ["committed", "applied", "terminal_failure"])),
     )).limit(1);
-    if (lease || finalization) return true;
+    if (lease) return { sourceRunId: lease.runId!, message: "前のAIの実行環境の後始末が完了していません。停止と後始末の受領を確認してください。" };
+    if (finalization) return { sourceRunId: finalization.id, message: "前のAIの成果保存と終了処理が完了していません。終了の受領を確認してください。" };
     const possiblyAlive = (pid: number | null) => {
       if (!pid) return false;
       try { process.kill(pid, 0); return true; }
       catch (err) { return (err as NodeJS.ErrnoException).code !== "ESRCH"; }
     };
     for (const run of predecessors) {
-      if (liveRunExecutions.has(run.id) || activeRunExecutions.has(run.id) || adapterExecutionControls.has(run.id)) return true;
+      if (liveRunExecutions.has(run.id) || activeRunExecutions.has(run.id) || adapterExecutionControls.has(run.id)) {
+        return { sourceRunId: run.id, message: "前のAIが終了処理中です。処理が完了すると、同じ判断に基づく作業を再開します。" };
+      }
       // Exact provider receipts settle remote process ownership; identically
       // numbered PIDs/PGIDs on this host do not belong to that remote run.
       if (stoppedRemoteRunIds.has(run.id)) continue;
       // A different timestamp alone does not prove a live local PID stopped:
       // the stored fallback and the OS probe can have different precision.
-      if (possiblyAlive(run.processPid) || possiblyAlive(run.processGroupId ? -run.processGroupId : null)) return true;
+      if (possiblyAlive(run.processPid) || possiblyAlive(run.processGroupId ? -run.processGroupId : null)) {
+        return { sourceRunId: run.id, message: "前のAIのプロセスが停止した証拠をまだ確認できません。実行履歴から停止の受領を確認してください。" };
+      }
     }
-    return false;
+    return null;
+  }
+
+  async function hasQaPredecessorOwnershipHold(queryDb: Db, companyId: string, issueId: string, exceptRunId?: string) {
+    return (await readQaPredecessorOwnershipHold(queryDb, companyId, issueId, exceptRunId)) !== null;
   }
 
   async function resumeDeferredQaDecisionWakes() {
@@ -20659,6 +20778,20 @@ export function heartbeatService(
       });
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      const pendingQaTransfers = new Map<string, {
+        run: typeof heartbeatRuns.$inferSelect; observation: QaProviderObservation;
+      }>();
+      const startClaimedExecution = (claimedRun: typeof heartbeatRuns.$inferSelect) => {
+        const pending = pendingQaTransfers.get(claimedRun.id);
+        pendingQaTransfers.delete(claimedRun.id);
+        const execution = executeRun(claimedRun.id, pending
+          ? { qaProviderObservation: pending.observation } : {}).catch((err) => {
+          logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
+        });
+        activeRunExecutionPromises.add(execution);
+        void execution.finally(() => activeRunExecutionPromises.delete(execution));
+      };
+      try {
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
         const queuedContext = parseObject(queuedRun.contextSnapshot);
@@ -20672,9 +20805,16 @@ export function heartbeatService(
           const current = await getRun(queuedRun.id);
           if (current?.status !== "queued") continue;
         }
+        const reservation = reserveQaProviderObservation(queuedRun);
+        if (!reservation) continue;
+        const observation = reservation.observation;
         let claimed: typeof heartbeatRuns.$inferSelect | null;
         try {
           claimed = await claimQueuedRun(queuedRun, companyAgents);
+          if (claimed && observation) {
+            markQaObservationClaimed(observation, claimed);
+            pendingQaTransfers.set(claimed.id, { run: claimed, observation });
+          }
         } catch (err) {
           if (isPermanentClaimRejection(err)) {
             rejectedClaims.push({ run: queuedRun, err });
@@ -20686,30 +20826,27 @@ export function heartbeatService(
             "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass",
           );
           continue;
+        } finally {
+          if (observation && !pendingQaTransfers.has(queuedRun.id)) await closeQaClaimObservation(observation);
         }
         if (claimed) claimedRuns.push(claimed);
       }
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
-        const execution = executeRun(claimedRun.id).catch((err) => {
-          logger.error(
-            { err, runId: claimedRun.id },
-            "queued heartbeat execution failed",
-          );
-        });
         // Register the in-flight execution so drainActiveRunExecutions() can await
         // it. executeRun resolves only after its finally block finishes flushing
         // run rows/events, so awaiting this promise guarantees the run's writes
         // have landed before a caller (e.g. a test's afterEach) mutates the DB.
-        activeRunExecutionPromises.add(execution);
-        void execution.finally(() => {
-          // drainActiveRunExecutions loops on activeRunExecutionPromises.size,
-          // so an entry that never clears here would hang it forever.
-          activeRunExecutionPromises.delete(execution);
-        });
+        startClaimedExecution(claimedRun);
       }
       return claimedRuns;
+      } finally {
+        // A later claim can throw after an earlier QA claim committed. Transfer
+        // every already-claimed scope to its normal executor even on that exit;
+        // executeRun rechecks cancellation/suppression before preparation.
+        for (const pending of [...pendingQaTransfers.values()]) startClaimedExecution(pending.run);
+      }
     }).finally(() => cancelRejectedQueuedRuns(rejectedClaims));
   }
 
@@ -20830,8 +20967,11 @@ export function heartbeatService(
     runOptions: {
       nativeLeaseOwner?: string;
       nativeRestartRecovery?: NativeRestartRecoveryClaim;
+      qaProviderObservation?: QaProviderObservation;
     } = {},
   ) {
+    let qaObservation = runOptions.qaProviderObservation ?? null;
+    try {
     const attemptStartedAtMs = Date.now();
     let attestedQuestionResponseAtMs: number | null = null;
     if ((await getSchedulingSuppression()).suppressed) {
@@ -20849,7 +20989,16 @@ export function heartbeatService(
     let legacyAdapterEntered = false;
     let run = await getRun(runId);
     if (!run) return;
+    if (qaObservation && (qaProviderObservations.get(runId) !== qaObservation ||
+        qaObservation.companyId !== run.companyId || qaObservation.runId !== run.id ||
+        qaObservation.wakeupRequestId !== run.wakeupRequestId ||
+        qaObservation.decisionId !== parseObject(run.contextSnapshot).qaDecisionId)) return;
     if (run.status !== "queued" && run.status !== "running") return;
+    if (!qaObservation) {
+      const reservation = reserveQaProviderObservation(run);
+      if (!reservation) return;
+      qaObservation = reservation.observation;
+    }
 
     if (run.status === "queued") {
       const claimed = await claimQueuedRun(run);
@@ -20858,6 +21007,7 @@ export function heartbeatService(
         return;
       }
       run = claimed;
+      markQaObservationClaimed(qaObservation, run);
     }
 
     const instructionCleanupRun = run;
@@ -20971,6 +21121,7 @@ export function heartbeatService(
 
     if (run.runtimeMode === "legacy" && run.controllerBootId &&
         run.controllerBootId !== legacyControllerBootId) return;
+    if (qaObservation && qaProviderObservations.get(run.id) !== qaObservation) return;
     activeRunExecutions.add(run.id);
     const executionControl = createAdapterExecutionControl();
     // This coarse scope also covers host finalization after the adapter returns.
@@ -21007,6 +21158,10 @@ export function heartbeatService(
     let providerTraceFinalized = false;
     let readFailureReportSecrets: () => string[] = () => [];
     let identityRedactor = createAgentIdentityRedactor();
+    if (qaObservation) {
+      qaObservation.preparationStarted = true;
+      qaObservation.providerMayHaveStarted = () => legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld;
+    }
 
     try {
       let agent = await getAgent(run.agentId);
@@ -27515,7 +27670,11 @@ export function heartbeatService(
               ${JSON.stringify({ startupPreparationSettledAt: new Date().toISOString() })}::jsonb`,
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled")));
         }
+        if (qaObservation) {
+          latestRun = await settleQaPreProviderObservation(qaObservation) ?? latestRun;
+        }
       } finally {
+        if (qaObservation && qaProviderObservations.get(run.id) === qaObservation) qaProviderObservations.delete(run.id);
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
         // A failed owned Stop remains visible until this exact executor settles,
@@ -27567,6 +27726,11 @@ export function heartbeatService(
         }
         await startNextQueuedRunForAgent(run.agentId);
       }
+    }
+    } finally {
+      // Includes suppression, claim rejection and terminal-before-execute exits.
+      // A prepared executor settles only inside its post-cleanup finally above.
+      await closeQaClaimObservation(qaObservation);
     }
   }
 
@@ -31371,6 +31535,8 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    readQaPredecessorOwnershipHold: (companyId: string, issueId: string) =>
+      readQaPredecessorOwnershipHold(db, companyId, issueId),
 
     scheduleBoundedRetry: async (
       runId: string,
