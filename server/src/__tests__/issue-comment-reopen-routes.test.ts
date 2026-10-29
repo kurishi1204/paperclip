@@ -4090,6 +4090,8 @@ describe("issue comment reopen routes", () => {
         "22222222-2222-4222-8222-222222222222",
         expect.objectContaining({
           reason: "execution_changes_requested",
+          qaDecisionId: expect.any(String),
+          allowRunCoalescing: false,
           payload: expect.objectContaining({
             issueId: "11111111-1111-4111-8111-111111111111",
             executionStage: expect.objectContaining({
@@ -4102,5 +4104,14 @@ describe("issue comment reopen routes", () => {
         }),
       ),
     );
+    const qaWake = mockHeartbeatService.wakeup.mock.calls.find(
+      (call) => call[1]?.reason === "execution_changes_requested",
+    )?.[1];
+    expect(mockTxInsertValues).toHaveBeenCalledWith(expect.objectContaining({
+      id: qaWake?.qaDecisionId,
+      stageType: "review",
+      outcome: "changes_requested",
+      freshEpisodeWakeRequested: true,
+    }));
   });
 });

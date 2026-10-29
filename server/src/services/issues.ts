@@ -4,6 +4,7 @@ import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackConversation } from "./slack-conversation-state.js";
 import { documentService } from "./documents.js";
+import { isSelfTaskDocumentRuntime } from "./self-task-document-runtime.js";
 import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
 import { createdFromIssueCondition } from "./issue-creation-origin.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
@@ -10273,9 +10274,30 @@ export function issueService(db: Db) {
             tx,
           );
         }
-        if (initialPlan?.trim()) {
+        let inputPlan = initialPlan?.trim() ? initialPlan : null;
+        let inputPlanTitle = "Plan";
+        if (!inputPlan && issue.assigneeAgentId) {
+          const [assignee] = await tx.select({
+            adapterType: agents.adapterType, adapterConfig: agents.adapterConfig,
+          }).from(agents).where(and(
+            eq(agents.id, issue.assigneeAgentId), eq(agents.companyId, companyId),
+          ));
+          const config = {
+            ...parseObject(assignee?.adapterConfig),
+            ...parseObject(parseObject(issue.assigneeAdapterOverrides).adapterConfig),
+          };
+          if (assignee && isSelfTaskDocumentRuntime(assignee.adapterType, config)) {
+            // Preserve the submitted request as fixed input, not a generated plan.
+            // A duplicate returns above and cannot append another document version.
+            inputPlan = [data.title, data.description]
+              .filter((part): part is string => typeof part === "string" && !!part.trim())
+              .join("\n\n");
+            inputPlanTitle = "Task request";
+          }
+        }
+        if (inputPlan) {
           await documentService(tx as unknown as Db).upsertIssueDocument({
-            issueId: issue.id, key: "plan", title: "Plan", format: "markdown", body: initialPlan,
+            issueId: issue.id, key: "plan", title: inputPlanTitle, format: "markdown", body: inputPlan,
             createdByAgentId: issueData.createdByAgentId, createdByUserId: issueData.createdByUserId,
             createdByRunId: actorRunId,
             sourceTrust: issue.sourceTrust,

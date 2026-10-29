@@ -337,6 +337,7 @@ export type CoalescedDeferredAdmissionReceipt = DurableWakeAdmissionReceipt & {
 export type ExistingDeferredWake = {
   id: string;
   runId?: string | null;
+  idempotencyKey?: string | null;
   payload: Record<string, unknown>;
   /** `payload._paperclipWakeContext`, already parsed to a plain object. */
   deferredContext: Record<string, unknown>;

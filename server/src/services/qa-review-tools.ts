@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { request as directHttpRequest } from "node:http";
 import { z } from "zod";
 import { and, eq } from "drizzle-orm";
@@ -81,6 +82,7 @@ export function qaReviewLocalApiUrl(env: NodeJS.ProcessEnv = process.env): strin
 const documentSummarySchema = z.object({
   id: z.string().uuid(), issueId: z.string().uuid(), key: z.string(),
   title: z.string().nullable(), format: z.string(),
+  latestRevisionId: z.string().uuid().nullable(),
   latestRevisionNumber: z.number().int().nonnegative(),
 });
 
@@ -105,6 +107,7 @@ const assignedIssueSourceSchema = z.object({
 const documentPageSchema = z.object({
   key: issueDocumentKeySchema,
   expectedRevision: z.number().int().nonnegative(),
+  expectedDocumentRevisionId: z.string().uuid().optional(),
   offset: z.number().int().nonnegative().max(10_000_000).default(0),
   limit: z.number().int().min(1).max(16_000).default(8_000),
 }).strict();
@@ -160,7 +163,7 @@ export const qaReviewToolDefinitions = [
   },
   {
     name: QA_REVIEW_TOOL_NAMES[2],
-    description: "Read a bounded page of one document attached to the assigned issue at the expected issue revision. Discover keys in read_assigned_issue.documentSummaries; continue with nextOffset until null.",
+    description: "Read a bounded page of one assigned-issue document. The submitted result must match the server-bound document ID, revision and full-body hash even when expectedDocumentRevisionId is omitted. For other documents, provide expectedDocumentRevisionId when verifying a writer receipt.",
     inputSchema: z.toJSONSchema(documentPageSchema, { io: "input" }),
   },
   {
@@ -446,11 +449,13 @@ function projectAssignedIssue(input: QaToolInput, raw: unknown, stage: ReturnTyp
     descriptionCharacters: Array.from(issue.description ?? "").length,
     status: issue.status, workMode: issue.workMode,
     statusVersion: issue.statusVersion, revision: issue.revision,
-    reviewStage: { stageId: stage.currentStageId, lastDecisionId: stage.lastDecisionId },
+    reviewStage: { stageId: stage.currentStageId, lastDecisionId: stage.lastDecisionId,
+      submittedDocument: stage.submittedDocument ?? null },
     planDocument: issue.planDocument ? {
       id: issue.planDocument.id, key: issue.planDocument.key,
       title: issue.planDocument.title, format: issue.planDocument.format,
       latestRevisionNumber: issue.planDocument.latestRevisionNumber,
+      latestRevisionId: issue.planDocument.latestRevisionId,
       bodyCharacters: Array.from(issue.planDocument.body).length,
     } : null,
     legacyPlanDocument: issue.legacyPlanDocument ? {
@@ -460,6 +465,7 @@ function projectAssignedIssue(input: QaToolInput, raw: unknown, stage: ReturnTyp
     documentSummaries: issue.documentSummaries.map((doc) => ({
       id: doc.id, key: doc.key, title: doc.title, format: doc.format,
       latestRevisionNumber: doc.latestRevisionNumber,
+      latestRevisionId: doc.latestRevisionId,
     })),
     workProducts: issue.workProducts.map((product) => ({
       id: product.id, type: product.type, provider: product.provider,
@@ -638,6 +644,16 @@ export async function callQaReviewTool(input: QaToolInput) {
     if (!doc || doc.issueId !== input.issue.id || doc.key !== args.key || typeof doc.body !== "string") {
       throw conflict("Assigned issue document could not be verified");
     }
+    if (typeof doc.latestRevisionId !== "string" ||
+        (args.expectedDocumentRevisionId && doc.latestRevisionId !== args.expectedDocumentRevisionId)) {
+      throw conflict("Document revision changed during QA evidence read; read the document again");
+    }
+    const submitted = stage.submittedDocument;
+    if (submitted && args.key === submitted.key &&
+        (doc.id !== submitted.documentId || doc.latestRevisionId !== submitted.revisionId ||
+          createHash("sha256").update(Buffer.from(doc.body, "utf8")).digest("hex") !== submitted.bodySha256)) {
+      throw conflict("Submitted document changed after review handoff; request changes instead of approving a replacement");
+    }
     const characters = Array.from(doc.body);
     if (args.offset > characters.length) throw conflict("Document offset is beyond the current body");
     const nextOffset = args.offset + args.limit < characters.length ? args.offset + args.limit : null;
@@ -647,6 +663,7 @@ export async function callQaReviewTool(input: QaToolInput) {
       body: characters.slice(args.offset, args.offset + args.limit).join(""),
       offset: args.offset, nextOffset, totalCharacters: characters.length,
       latestRevisionNumber: doc.latestRevisionNumber,
+      latestRevisionId: doc.latestRevisionId,
     };
   }
   if (input.name === QA_REVIEW_TOOL_NAMES[3]) {

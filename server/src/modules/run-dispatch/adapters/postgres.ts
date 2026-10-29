@@ -1,5 +1,5 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
-import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { getExecutionBlocker, isIndependentQaDocumentEpisode } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -680,6 +680,25 @@ export function createPostgresRunDispatchAdapter(
         finishedAt: input.now,
         error: input.reason,
         errorCode: input.errorCode,
+        // A scheduled QA retry cancelled before promotion has never been
+        // claimed. Persist that positive fact so the shared delivery fence can
+        // recover the decision after the temporary gate is lifted. Never
+        // overwrite dispatch evidence or an UNKNOWN provider result.
+        resultJson: sql`case when
+          ${heartbeatRuns.contextSnapshot}->>'qaDecisionId' is not null
+          and ${heartbeatRuns.runtimeMode} = 'legacy'
+          and ${heartbeatRuns.contextSnapshot}->'forceFreshSession' = 'true'::jsonb
+          and ${heartbeatRuns.startedAt} is null
+          and ${heartbeatRuns.processStartedAt} is null and ${heartbeatRuns.processPid} is null
+          and ${heartbeatRuns.processGroupId} is null and ${heartbeatRuns.externalRunId} is null
+          and ${heartbeatRuns.nativeSessionId} is null and ${heartbeatRuns.executionStatusDeliveryId} is null
+          and ${heartbeatRuns.controllerBootId} is null
+          and (${heartbeatRuns.resultJson} #> '{executionRecovery,providerWorkStarted}') is distinct from 'true'::jsonb
+          then coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object('executionRecovery',
+            jsonb_build_object('kind', 'scheduled_retry_gate', 'providerWorkStarted', false,
+              'qaPreProvider', jsonb_build_object('schema', 'paperclip.qa-pre-provider/v1',
+                'runId', ${heartbeatRuns.id}::text, 'decisionId', ${heartbeatRuns.contextSnapshot}->>'qaDecisionId')))
+          else ${heartbeatRuns.resultJson} end`,
         updatedAt: input.now,
       })
       .where(
@@ -952,7 +971,12 @@ export function createPostgresRunDispatchAdapter(
     const issueId = readNonEmptyString(contextSnapshot.issueId);
     if (!issueId) return { issueId: null, facts: null, decision: { stale: false as const } };
     const recovery = await getExecutionBlocker(tx, run.companyId, issueId, { conversationResetCommentId: deriveCommentId(contextSnapshot) });
-    if (recovery) return { issueId, facts: null, decision: { stale: true as const,
+    const independentQa = recovery?.recoveryActionId && recovery.runId &&
+      typeof contextSnapshot.qaDecisionId === "string" && await isIndependentQaDocumentEpisode(tx, {
+        companyId: run.companyId, issueId, agentId: run.agentId,
+        decisionId: contextSnapshot.qaDecisionId, runId: run.id,
+      });
+    if (recovery && !independentQa) return { issueId, facts: null, decision: { stale: true as const,
       errorCode: "execution_reconciliation_required" as const, reason: recovery.nextAction,
       details: { issueId, recoveryActionId: recovery.recoveryActionId },
     } };
@@ -1052,6 +1076,19 @@ export function createPostgresRunDispatchAdapter(
           input.now,
         );
         return { dispatched: false as const, cancellation };
+      }
+
+      if (readNonEmptyString(parseObject(run.contextSnapshot).qaDecisionId)) {
+        // Claim/start metadata is not evidence of provider dispatch. Record the
+        // positive boundary only after all locked gates accept this exact run,
+        // then enter its adapter synchronously below. Later terminal writers
+        // must not turn this fact into a pre-provider retry proof.
+        await tx.update(heartbeatRuns).set({
+          resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb), '{executionRecovery}',
+            (coalesce(${heartbeatRuns.resultJson}->'executionRecovery', '{}'::jsonb) - 'qaPreProvider')
+              || '{"providerWorkStarted":true}'::jsonb)`,
+          updatedAt: input.now,
+        }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
       }
 
       // Hand off while ownership is still locked, but do not await the provider

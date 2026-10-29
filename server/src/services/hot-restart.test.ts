@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   findMissingHotRestartSnapshotRunIds,
+  hasLocalPredecessorProcessOwnership,
   isObservedHotRestartTargetAlive,
   parseHotRestartIntent,
   readHotRestartIntent,
@@ -531,5 +532,57 @@ describe("hot-restart path compatibility", () => {
         }],
       },
     })).toEqual(["missing-run"]);
+  });
+});
+
+
+describe("local predecessor process generation", () => {
+  const prior = { processPid: 410, processGroupId: 410,
+    processStartedAt: new Date("2026-01-01T00:00:00.000Z"),
+    finishedAt: new Date("2026-01-01T00:01:00.500Z") };
+  const leader = { pid: 410, parentPid: 1, processGroupId: 410,
+    startedAt: "2026-01-01T00:02:00.000Z" };
+  const descendant = { pid: 411, parentPid: 410, processGroupId: 410,
+    startedAt: "2026-01-01T00:02:01.000Z" };
+  const absent = () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); };
+  const options = (rows = [leader, descendant]) => ({ platform: "darwin" as const,
+    signal: () => {}, readSnapshot: async () => rows });
+
+  it("settles known absent PID and group without guessing a generation", async () => {
+    expect(await hasLocalPredecessorProcessOwnership(prior, {
+      signal: absent, readSnapshot: async () => { throw new Error("must not read"); },
+    })).toBe(false);
+  });
+  it("settles a stable later Darwin leader and its entire observed child group", async () => {
+    expect(await hasLocalPredecessorProcessOwnership(prior, options())).toBe(false);
+  });
+  it.each([
+    ["same second", [{ ...leader, startedAt: "2026-01-01T00:01:00.000Z" }]],
+    ["old surviving child", [leader, { ...descendant, startedAt: "2026-01-01T00:00:30.000Z" }]],
+    ["later orphan continuing old work", [leader, { ...descendant, parentPid: 1 }]],
+    ["missing timestamp", [{ ...leader, startedAt: null }]],
+    ["missing group leader", [descendant]],
+    ["ancestry cycle", [leader, { ...descendant, parentPid: 412 },
+      { ...descendant, pid: 412, parentPid: 411 }]],
+  ])("holds %s", async (_name, rows) => {
+    expect(await hasLocalPredecessorProcessOwnership(prior,
+      options(rows as typeof leader[]))).toBe(true);
+  });
+  it("holds a different surviving PGID despite the replacement PID", async () => {
+    expect(await hasLocalPredecessorProcessOwnership({ ...prior, processGroupId: 400 },
+      options())).toBe(true);
+  });
+  it("holds unknown observation, unstable membership, and unvalidated platforms", async () => {
+    expect(await hasLocalPredecessorProcessOwnership(prior, { ...options(),
+      signal: () => { throw Object.assign(new Error("denied"), {code:"EPERM"}); } })).toBe(true);
+    expect(await hasLocalPredecessorProcessOwnership(prior, { ...options(),
+      readSnapshot: async () => { throw new Error("truncated or denied"); } })).toBe(true);
+    let reads = 0;
+    expect(await hasLocalPredecessorProcessOwnership(prior, { ...options(),
+      readSnapshot: async () => ++reads === 1 ? [leader] : [leader, descendant] })).toBe(true);
+    expect(await hasLocalPredecessorProcessOwnership(prior,
+      { ...options(), platform: "linux" })).toBe(true);
+    expect(await hasLocalPredecessorProcessOwnership({ ...prior, processStartedAt: null },
+      options())).toBe(true);
   });
 });

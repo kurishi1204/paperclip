@@ -809,6 +809,126 @@ function createFakeAdmissionHelpers(
 
 describe("admitWakeBehindIssueExecution", () => {
   it.each(["running", "queued"])(
+    "keeps ordinary input separate from a %s QA execution",
+    async (status) => {
+      const writer = createFakeAdmissionWriter();
+      const target = {
+        ...ACTIVE_EXECUTION_RUN,
+        status,
+        contextSnapshot: { qaDecisionId: "qa-decision-1" },
+      };
+      const snapshot = structuredClone(target);
+      const admit = createAdmitWakeBehindIssueExecution({
+        reader: createFakeAdmissionReader(), writer, helpers: createFakeAdmissionHelpers(),
+      });
+
+      expect(await admit(SCOPE, admissionInput({ activeExecutionRun: target })))
+        .toEqual({ kind: "deferred" });
+      expect(writer.coalesceIntoActiveExecutionRun).not.toHaveBeenCalled();
+      expect(writer.insertNewDeferredWake).toHaveBeenCalledExactlyOnceWith(
+        SCOPE, expect.objectContaining({ payload: {
+          issueId: "issue-1", _paperclipWakeContext: { wakeReason: "issue_commented" },
+        } }),
+      );
+      expect(target).toEqual(snapshot);
+    },
+  );
+
+  it.each(["payload", "context", "idempotencyKey"])(
+    "does not merge ordinary input into a deferred QA %s identity",
+    async (identity) => {
+      const qa = {
+        id: "qa-deferred", payload: identity === "payload" ? { qaDecisionId: "qa-decision-1" } : {},
+        deferredContext: identity === "context" ? { qaDecisionId: "qa-decision-1" } : {},
+        idempotencyKey: identity === "idempotencyKey" ? "qa-decision:qa-decision-1" : null,
+        coalescedCount: 0,
+      };
+      const snapshot = structuredClone(qa);
+      const writer = createFakeAdmissionWriter();
+      const admit = createAdmitWakeBehindIssueExecution({
+        reader: createFakeAdmissionReader({
+          isSameExecutionAgent: vi.fn(async () => false),
+          findExistingDeferredWake: vi.fn(async () => qa),
+        }),
+        writer, helpers: createFakeAdmissionHelpers(),
+      });
+
+      expect(await admit(SCOPE, admissionInput())).toEqual({ kind: "deferred" });
+      expect(writer.mergeIntoExistingDeferredWake).not.toHaveBeenCalled();
+      expect(writer.insertNewDeferredWake).toHaveBeenCalledOnce();
+      expect(qa).toEqual(snapshot);
+    },
+  );
+
+  it.each(["payload", "context", "idempotencyKey"])(
+    "keeps incoming QA %s identity dedicated even without the optional coalescing flag",
+    async (identity) => {
+      const writer = createFakeAdmissionWriter();
+      const reader = createFakeAdmissionReader();
+      const admit = createAdmitWakeBehindIssueExecution({
+        reader, writer, helpers: createFakeAdmissionHelpers(),
+      });
+      const input = admissionInput({
+        payload: identity === "payload" ? { qaDecisionId: "qa-decision-1" } : {},
+        contextSnapshot: identity === "context" ? { qaDecisionId: "qa-decision-1" } : {},
+        idempotencyKey: identity === "idempotencyKey" ? "qa-decision:qa-decision-1" : null,
+      });
+
+      expect(await admit(SCOPE, input)).toEqual({ kind: "deferred" });
+      expect(writer.coalesceIntoActiveExecutionRun).not.toHaveBeenCalled();
+      expect(reader.findExistingDeferredWake).not.toHaveBeenCalled();
+      expect(writer.insertNewDeferredWake).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("keeps a QA return wake separate while an older document receipt is deferred", async () => {
+    const oldMixed = {
+      id: "old-document-deferred", payload: { issueId: "issue-1", savedText: "old mixed" },
+      deferredContext: { paperclipSelfTaskDocumentToolsOnly: true }, coalescedCount: 0,
+    };
+    const oldSnapshot = structuredClone(oldMixed);
+    const reader = createFakeAdmissionReader({
+      findExistingDeferredWake: vi.fn(async () => oldMixed),
+    });
+    const writer = createFakeAdmissionWriter();
+    const admit = createAdmitWakeBehindIssueExecution({
+      reader, writer, helpers: createFakeAdmissionHelpers(),
+    });
+    const input = admissionInput({
+      activeExecutionRun: { ...ACTIVE_EXECUTION_RUN, status: "running" },
+      reason: "execution_changes_requested",
+      source: "assignment",
+      requestedByActorType: "agent",
+      requestedByActorId: "qa-reviewer",
+      idempotencyKey: "qa-decision:11111111-1111-4111-8111-111111111111",
+      allowRunCoalescing: false,
+      forceFreshSession: true,
+      contextSnapshot: {
+        issueId: "issue-1", wakeReason: "execution_changes_requested",
+        qaDecisionId: "11111111-1111-4111-8111-111111111111",
+        forceFreshSession: true,
+      },
+    });
+
+    expect(await admit(SCOPE, input)).toEqual({ kind: "deferred" });
+    expect(writer.insertNewDeferredWake).toHaveBeenCalledExactlyOnceWith(
+      SCOPE, expect.objectContaining({
+        idempotencyKey: input.idempotencyKey,
+        payload: expect.objectContaining({
+          _paperclipWakeContext: expect.objectContaining({
+            qaDecisionId: "11111111-1111-4111-8111-111111111111",
+            forceFreshSession: true,
+          }),
+        }),
+      }),
+    );
+    expect(writer.coalesceIntoActiveExecutionRun).not.toHaveBeenCalled();
+    expect(writer.mergeIntoExistingDeferredWake).not.toHaveBeenCalled();
+    expect(reader.findExistingDeferredWake).not.toHaveBeenCalled();
+    expect(oldMixed).toEqual(oldSnapshot);
+  });
+
+  it.each(["running", "queued"])(
     "keeps a dedicated durable continuation separate from a %s execution and an existing deferred wake",
     async (status) => {
       const durableReceipt = {

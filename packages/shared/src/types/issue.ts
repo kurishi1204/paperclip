@@ -718,6 +718,14 @@ export interface IssueExecutionState {
   lastDecisionId: string | null;
   lastDecisionOutcome: IssueExecutionDecisionOutcome | null;
   monitor?: IssueExecutionMonitorState | null;
+  /** Exact result handed to the configured review; only the server may bind it. */
+  submittedDocument?: {
+    documentId: string;
+    key: string;
+    revisionId: string;
+    bodySha256: string;
+    submittedByRunId: string;
+  };
   /** Consecutive agent-initiated changes-requested rounds on the current stage. */
   changesRequestedCount?: number;
 }

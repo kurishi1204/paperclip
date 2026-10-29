@@ -10,7 +10,7 @@ import { retryNativeWorkspaceExport } from "../services/native-runtime/native-wo
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
-import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { getExecutionBlocker, getQaPredecessorWaitBlocker } from "../services/execution-blocker.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -18,6 +18,7 @@ import {
 } from "../services/execution-recovery-resolution.js";
 import {
   storedSteeringAcknowledgement,
+  captureRunIdentity,
   reconcileSteeredIdentity,
   reserveSteeredIdentity,
   acceptSteeredIdentity,
@@ -52,6 +53,7 @@ import {
   chatPublications,
   companyMemberships,
   documents,
+  documentRevisions,
   executionWorkspaces,
   heartbeatRuns,
   issueApprovals,
@@ -227,6 +229,8 @@ import type {
   taskWatchdogService,
 } from "../services/task-watchdogs.js";
 import { logger } from "../middleware/logger.js";
+import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
+import { SELF_TASK_DOCUMENT_CONTEXT_KEY, selfTaskDocumentModeAllowed } from "../services/project-tools.js";
 import {
   badRequest,
   conflict,
@@ -381,6 +385,15 @@ const updateIssueRouteSchema = updateIssueSchema.extend({
     stageId: z.string().uuid(),
     statusVersion: z.number().int().nonnegative(),
     revision: z.number().int().nonnegative(),
+    lastDecisionId: z.string().uuid().nullable(),
+  }).strict().optional(),
+  selfTaskReviewExpected: z.object({
+    key: issueDocumentKeySchema,
+    documentId: z.string().uuid(),
+    revisionId: z.string().uuid(),
+    bodySha256: z.string().regex(/^[0-9a-f]{64}$/),
+    revision: z.number().int().nonnegative(),
+    statusVersion: z.number().int().nonnegative(),
     lastDecisionId: z.string().uuid().nullable(),
   }).strict().optional(),
 });
@@ -8955,7 +8968,10 @@ export function issueRoutes(
       relations, recoveryActionsByRelationIssue,
     );
     // Recovery revalidation may change the blocker; read it afterwards.
-    const executionBlocker = await timing.time("execution_blocker", () => getExecutionBlocker(db, issue.companyId, issue.id));
+    const executionBlocker = await timing.time("execution_blocker", async () =>
+      await getExecutionBlocker(db, issue.companyId, issue.id)
+        ?? getQaPredecessorWaitBlocker(db, issue.companyId, issue.id,
+          () => heartbeat.readQaPredecessorOwnershipHold(issue.companyId, issue.id)));
     res.setHeader("Server-Timing", timing.header());
     res.json({
       ...issue,
@@ -9524,6 +9540,8 @@ export function issueRoutes(
             });
             Object.assign(updateFields, transition.patch);
             if (transition.decision) {
+              if (transition.decision.outcome === "approved")
+                await assertLockedSubmittedDocumentApproval(tx as unknown as Db, lockedIssue);
               const decisionId = randomUUID();
               const nextExecutionState = updateFields.executionState;
               if (
@@ -9856,7 +9874,129 @@ export function issueRoutes(
     res.json(docs);
   });
 
+  function isSelfTaskDocumentRequest(req: Request) {
+    const mode = req.header("X-Paperclip-Document-Mode");
+    if (mode !== undefined && mode !== "self-task") throw badRequest("Invalid document mode");
+    return mode === "self-task";
+  }
+
+  /** Keep task, run and target document identity stable through a bounded write. */
+  async function withSelfTaskDocument<T>(
+    req: Request, res: Response, write: boolean,
+    action: (issue: typeof issueRows.$inferSelect, executor: Db) => Promise<T>,
+    options?: { operation: "submit"; key: string; query: Db },
+  ): Promise<T> {
+    const actor = req.actor;
+    if (actor.type !== "agent" || actor.source !== "agent_jwt" || !actor.companyId || !actor.agentId || !actor.runId)
+      throw forbidden("Self-task documents require an authenticated agent run");
+    const issueId = req.params.id as string;
+    const binding = { companyId: actor.companyId, agentId: actor.agentId, runId: actor.runId };
+    try {
+      return await (options?.query ?? db).transaction(async tx => {
+        const executor = tx as unknown as Db;
+        const [issue] = await tx.select().from(issueRows).where(and(
+          eq(issueRows.id, issueId), eq(issueRows.companyId, binding.companyId),
+        )).for(write ? "update" : "no key update");
+        const [run] = await tx.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, binding.runId), eq(heartbeatRuns.companyId, binding.companyId),
+          eq(heartbeatRuns.agentId, binding.agentId),
+        )).for("no key update");
+        if (!issue || !run || run.status !== "running") throw forbidden("Self-task run is unavailable");
+        if (run.contextSnapshot?.[SELF_TASK_DOCUMENT_CONTEXT_KEY] !== true)
+          throw forbidden("Task document tools require explicit run opt-in");
+        const aliases = [run.nativeIssueId, run.contextSnapshot?.issueId, run.contextSnapshot?.taskId]
+          .filter(value => value !== null && value !== undefined);
+        if (aliases.length === 0 || aliases.some(value => value !== issue.id))
+          throw forbidden("Document task does not match the authenticated run");
+        if (issue.assigneeAgentId !== actor.agentId || issue.status !== "in_progress" ||
+            issue.checkoutRunId !== actor.runId ||
+            (issue.executionRunId !== null && issue.executionRunId !== actor.runId))
+          throw forbidden("Run does not own this task's checkout");
+        if (!selfTaskDocumentModeAllowed(issue.workMode, write))
+          throw forbidden("Document operation is unavailable in this work mode");
+        if (issue.conversationAgentId && Number(run.contextSnapshot?.conversationSessionGeneration ?? 0) !== issue.conversationSessionGeneration)
+          throw conflict("Conversation session has changed");
+        if (isStatusOnlyRecoveryContext(run.contextSnapshot))
+          throw forbidden("Status-only recovery runs cannot update task documents");
+        const identity = await captureRunIdentity(executor, binding);
+        if ((actor.identityContextId ?? null) !== identity.run.activeIdentityContextId ||
+            (actor.onBehalfOfUserId ?? null) !== identity.run.responsibleUserId)
+          throw conflict("Run identity changed before document access");
+        if (write) await assertAgentRunWriteAllowed(executor, binding.companyId, binding);
+        // The request's membership projection predates these locks. Let the
+        // transaction-backed evaluator load current grants instead.
+        const authorizedActor = { ...actor, onBehalfOfMemberships: undefined };
+        const decision = await accessService(executor).decide({
+          actor: authorizedActor, action: write ? "issue:mutate" : "issue:read",
+          resource: { type: "issue", companyId: issue.companyId, issueId: issue.id,
+            projectId: issue.projectId, parentIssueId: issue.parentId,
+            assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId, status: issue.status },
+          scope: { issueId: issue.id, projectId: issue.projectId, parentIssueId: issue.parentId,
+            assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId },
+        });
+        if (!decision.allowed) throw forbidden("Task document is outside this actor's authorization boundary");
+        if (write) {
+          const key = issueDocumentKeySchema.parse(String(options?.key ?? req.params.key ?? "").trim().toLowerCase());
+          const [target] = await tx.select({ id: documents.id }).from(documents)
+            .innerJoin(issueDocuments, eq(issueDocuments.documentId, documents.id))
+            .where(and(eq(issueDocuments.issueId, issue.id), eq(issueDocuments.key, key)))
+            .for("no key update", { of: documents });
+          const expected = req.header("X-Paperclip-Expected-Document-Id");
+          if (!expected || expected !== (target?.id ?? "new"))
+            throw conflict("Document identity changed before the bounded write");
+          // The run lock serializes concurrent writes by this same run. No
+          // second document revision may be created under one run authority.
+          if (options?.operation !== "submit") {
+            const [prior] = await tx.select({ id: documentRevisions.id }).from(documentRevisions)
+              .where(and(eq(documentRevisions.companyId, issue.companyId), eq(documentRevisions.createdByRunId, run.id))).limit(1);
+            if (prior) throw conflict("This run already saved a document revision");
+          }
+        }
+        return action(issue, executor);
+      });
+    } catch (error) {
+      // A known pre-commit HTTP denial is a rejection. Post-commit failures
+      // never receive this marker, so the transport reports unknown.
+      if (error instanceof HttpError) res.setHeader("X-Paperclip-Document-Outcome", "rejected");
+      throw error;
+    }
+  }
+
+  /** An approval must concern the exact saved result handed to this workflow.
+   * The Issue lock also serializes linked document changes through the existing
+   * requirement-revision triggers. A changes-requested decision need not match.
+   */
+  async function assertLockedSubmittedDocumentApproval(query: Db, expected: {
+    id: string; companyId: string; revision: number; statusVersion: number; executionState?: unknown;
+  }) {
+    const locked = await svc.getByIdForUpdate(expected.id, query);
+    const submitted = parseIssueExecutionState(locked?.executionState)?.submittedDocument;
+    const expectedSubmission = parseIssueExecutionState(expected.executionState)?.submittedDocument;
+    if (!submitted && !expectedSubmission) return;
+    if (!locked || locked.companyId !== expected.companyId || !submitted ||
+        locked.revision !== expected.revision || locked.statusVersion !== expected.statusVersion) {
+      throw conflict("Task changed before submitted-document approval; read the current review again");
+    }
+    const document = await documentService(query).getIssueDocumentByKey(locked.id, submitted.key);
+    const [revision] = await query.select().from(documentRevisions).where(and(
+      eq(documentRevisions.id, submitted.revisionId), eq(documentRevisions.companyId, locked.companyId),
+    ));
+    if (!document || document.id !== submitted.documentId || document.latestRevisionId !== submitted.revisionId ||
+        typeof document.body !== "string" ||
+        createHash("sha256").update(Buffer.from(document.body, "utf8")).digest("hex") !== submitted.bodySha256 ||
+        !revision || revision.documentId !== submitted.documentId || revision.createdByRunId !== submitted.submittedByRunId) {
+      throw conflict("Submitted document changed after review handoff; request changes instead of approving a replacement");
+    }
+  }
+
   router.get("/issues/:id/documents/:key", async (req, res) => {
+    if (isSelfTaskDocumentRequest(req)) {
+      const document = await withSelfTaskDocument(req, res, false, async (issue, executor) =>
+        documentService(executor).getIssueDocumentByKey(issue.id, String(req.params.key ?? "")));
+      if (!document) throw notFound("Document not found");
+      res.json(document);
+      return;
+    }
     const id = req.params.id as string;
     const issue = await getAccessibleResource(
       req,
@@ -10202,16 +10342,33 @@ export function issueRoutes(
     "/issues/:id/documents/:key",
     validate(upsertIssueDocumentSchema),
     async (req, res) => {
+      const bounded = isSelfTaskDocumentRequest(req);
+      const prepared = bounded ? await withSelfTaskDocument(req, res, true, async (issue, executor) => {
+        const key = issueDocumentKeySchema.parse(String(req.params.key ?? "").trim().toLowerCase());
+        const actor = getActorInfo(req);
+        const sourceTrust = await resolveActorSourceTrustForIssue({ db: executor, issue, actor });
+        const referenceSummaryBefore = await issueReferenceService(executor).listIssueReferenceSummary(issue.id);
+        const result = await documentService(executor).upsertIssueDocument({
+          issueId: issue.id, key, title: req.body.title ?? null, format: req.body.format,
+          body: req.body.body, changeSummary: req.body.changeSummary ?? null,
+          baseRevisionId: req.body.baseRevisionId ?? null,
+          createdByAgentId: actor.agentId ?? null,
+          createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+          createdByRunId: actor.runId ?? null, sourceTrust, lockedDocumentStrategy: "conflict",
+        });
+        return { issue, actor, referenceSummaryBefore, result };
+      }) : null;
+      if (bounded && !prepared) return;
       const id = req.params.id as string;
-      const issue = await getAccessibleResource(
+      const issue = prepared?.issue ?? await getAccessibleResource(
         req,
         res,
         svc.getById(id),
         "Issue not found",
       );
       if (!issue) return;
-      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-      if (
+      if (!bounded && !(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      if (!bounded &&
         !(await assertDeliverableMutationAllowedByRunContext(req, res, issue))
       )
         return;
@@ -10229,10 +10386,10 @@ export function issueRoutes(
       }
 
       const actor = getActorInfo(req);
-      const sourceTrust = await sourceTrustForActorWrite(issue, actor);
-      const referenceSummaryBefore =
+      const sourceTrust = prepared ? null : await sourceTrustForActorWrite(issue, actor);
+      const referenceSummaryBefore = prepared?.referenceSummaryBefore ??
         await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      const result = await documentsSvc.upsertIssueDocument({
+      const result = prepared?.result ?? await documentsSvc.upsertIssueDocument({
         issueId: issue.id,
         key: keyParsed.data,
         title: req.body.title ?? null,
@@ -10480,6 +10637,12 @@ export function issueRoutes(
   });
 
   router.get("/issues/:id/documents/:key/revisions", async (req, res) => {
+    if (isSelfTaskDocumentRequest(req)) {
+      const revisions = await withSelfTaskDocument(req, res, false, async (issue, executor) =>
+        documentService(executor).listIssueDocumentRevisions(issue.id, String(req.params.key ?? "")));
+      res.json(revisions);
+      return;
+    }
     const id = req.params.id as string;
     const issue = await getAccessibleResource(
       req,
@@ -12950,6 +13113,12 @@ export function issueRoutes(
 
   const handleIssuePatch = async (req: Request, res: Response, formalApprovalExpected?: NativeApprovalStageDecision) => {
       const id = req.params.id as string;
+      const selfTaskReviewExpected = req.body.selfTaskReviewExpected as z.infer<typeof updateIssueRouteSchema>["selfTaskReviewExpected"];
+      if (selfTaskReviewExpected && (req.body.status !== "in_review" ||
+          Object.keys(req.body).some(key => !["status", "selfTaskReviewExpected"].includes(key)) ||
+          !isSelfTaskDocumentRequest(req))) {
+        throw forbidden("Task document submission can only enter the configured review");
+      }
       // Conditional edits must fail before run cancellation, wake, or workspace work.
       const expectedRevision = req.body.expectedRevision as number | undefined;
       if (
@@ -13115,6 +13284,7 @@ export function issueRoutes(
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         expectedRevision: _expectedRevision,
         qaReviewExpected: _qaReviewExpected,
+        selfTaskReviewExpected: _selfTaskReviewExpected,
         boardReviewExpected: _boardReviewExpected,
         ...updateFields
       } = req.body;
@@ -13719,20 +13889,28 @@ export function issueRoutes(
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
       if (!boardReviewExpected && !formalApprovalExpected && req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
-        await stopRunnerGoalForOwnershipChange({
+        const ownershipChange = {
           companyId: existing.companyId,
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
-        });
+        };
+        if (selfTaskReviewExpected) {
+          // A document submission is not permission to pause/clear a goal.
+          // Reject it without sending a control action, including before CAS.
+          const goal = await runnerGoals.projection(ownershipChange.companyId, ownershipChange.issueId, ownershipChange.agentId);
+          if (goal?.pendingAction || goal?.goal && goal.goal.status !== "complete")
+            throw conflict("Finish the active goal before submitting the saved document for review");
+        } else await stopRunnerGoalForOwnershipChange(ownershipChange);
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
-        // A formal QA request_changes is submitted by the run being reassigned.
+        // A formal QA request_changes or exact self-document submission comes
+        // from the run being reassigned.
         // Cancelling that run before the locked verdict write can kill the
         // response and make its run-bound receipt unreachable. After the
         // transition, QA tools expose only this run's receipt; let the CLI
         // receive it and finish normally while assignment dispatch proceeds.
-        const qaVerdictFromActiveRun = Boolean(qaReviewExpected && actor.runId &&
+        const responseFromActiveRun = Boolean((qaReviewExpected || selfTaskReviewExpected) && actor.runId &&
           runToStopForReassignment?.id === actor.runId);
-        if (runToStopForReassignment && !qaVerdictFromActiveRun) {
+        if (runToStopForReassignment && !responseFromActiveRun) {
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
             "Cancelled before issue reassignment",
@@ -14007,10 +14185,39 @@ export function issueRoutes(
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
         reviewPolicySensitiveMutationRequested ||
-        Boolean(qaReviewExpected) || Boolean(boardReviewExpected) || Boolean(formalApprovalExpected);
+        Boolean(qaReviewExpected) || Boolean(boardReviewExpected) || Boolean(formalApprovalExpected) || Boolean(selfTaskReviewExpected);
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
+            if (selfTaskReviewExpected) await withSelfTaskDocument(req, res, true, async (locked, executor) => {
+              const expected = selfTaskReviewExpected;
+              if (locked.revision !== expected.revision || locked.statusVersion !== expected.statusVersion ||
+                  (parseIssueExecutionState(locked.executionState)?.lastDecisionId ?? null) !== expected.lastDecisionId ||
+                  locked.revision !== existing.revision || locked.statusVersion !== existing.statusVersion)
+                throw conflict("Task changed after the saved document was read; reconcile before review submission");
+              const policy = normalizeIssueExecutionPolicy(locked.executionPolicy);
+              if (!policy?.stages.length || !policy.stages.some(stage => stage.type === "review"))
+                throw conflict("Configure a review stage before submitting this task document");
+              const document = await documentService(executor).getIssueDocumentByKey(locked.id, expected.key);
+              const [saved] = await executor.select().from(documentRevisions)
+                .where(and(eq(documentRevisions.id, expected.revisionId), eq(documentRevisions.companyId, locked.companyId)));
+              if (!document || document.id !== expected.documentId || document.latestRevisionId !== expected.revisionId ||
+                  !saved || saved.documentId !== document.id || saved.createdByRunId !== req.actor.runId ||
+                  typeof document.body !== "string" ||
+                  createHash("sha256").update(Buffer.from(document.body, "utf8")).digest("hex") !== expected.bodySha256)
+                throw conflict("Only the current revision saved by this run can enter review");
+              const nextState = parseIssueExecutionState(updateFields.executionState ?? locked.executionState);
+              if (!nextState || nextState.status !== "pending" || !nextState.currentStageId)
+                throw conflict("Saved document submission requires an active configured review stage");
+              const submittedState = { ...nextState, submittedDocument: {
+                documentId: document.id, key: expected.key, revisionId: expected.revisionId,
+                bodySha256: expected.bodySha256, submittedByRunId: req.actor.runId!,
+              } };
+              updateFields.executionState = submittedState;
+              // issueUpdateData was copied before this transaction. Persist the
+              // checked pointer there too, rather than only in activity details.
+              issueUpdateData.executionState = submittedState;
+            }, { operation: "submit", key: selfTaskReviewExpected.key, query: tx as unknown as Db });
             if (boardReviewExpected) await assertBoardReviewStart(tx, await svc.getByIdForUpdate(id, tx));
             if (formalApprovalExpected) {
               const locked = await svc.getByIdForUpdate(id, tx);
@@ -14019,6 +14226,8 @@ export function issueRoutes(
               await assertLockedNativeApprovalGoal(tx as unknown as Db, req, locked);
             }
             await assertLockedQaReviewExpectation(tx);
+            if (decision?.outcome === "approved")
+              await assertLockedSubmittedDocumentApproval(tx as unknown as Db, existing);
             if (
               reviewPolicySensitiveMutationRequested &&
               !(await assertLockedReviewPolicyAllowsMutation(tx))
@@ -14060,6 +14269,8 @@ export function issueRoutes(
                 actorAgentId: actor.agentId ?? null,
                 actorUserId: actor.actorType === "user" ? actor.actorId : null,
                 outcome: decision.outcome,
+                freshEpisodeWakeRequested: decision.stageType === "review" && decision.outcome === "changes_requested" &&
+                  updated.status === "in_progress",
                 body: decision.body,
                 createdByRunId: actor.runId ?? null,
               });
@@ -14840,6 +15051,13 @@ export function issueRoutes(
         requestedByActorType: actor.actorType,
         requestedByActorId: actor.actorId,
       });
+      if (executionStageWakeup?.wakeup.reason === "execution_changes_requested" &&
+          decision?.stageType === "review" && decision.outcome === "changes_requested" && decisionId) {
+        Object.assign(executionStageWakeup.wakeup, {
+          qaDecisionId: decisionId,
+          allowRunCoalescing: false,
+        });
+      }
 
       // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
       void (async () => {
@@ -18044,6 +18262,8 @@ export function issueRoutes(
         const postCommitIssueActions: IssuePostCommitAction[] = [];
         try {
           txResult = await db.transaction(async (tx) => {
+            if (transition.decision?.outcome === "approved")
+              await assertLockedSubmittedDocumentApproval(tx as unknown as Db, currentIssue);
             const insertedComment = await svc.addComment(
               id,
               req.body.body,

@@ -1,3 +1,4 @@
+import { hasSelfTaskDocumentReplayHold } from "../self-task-document-runtime.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { hasCommittedNativePlanWait } from "../native-runtime/native-plan-wait.js";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
@@ -1910,6 +1911,38 @@ export function recoveryService(
     return Boolean(comment || attachment);
   }
 
+  // Source-derived automatic recovery reservation lanes share this persisted gate.
+  // An unavailable named predecessor is unknown, never proof of no side effect.
+  // This is a replay hold, not an exhausted retry budget or a terminal outcome.
+  async function holdAutomaticDocumentReplay(input: {
+    companyId: string; issueId: string; sourceRunId: string | null | undefined; lane: string;
+    sourceRun?: typeof heartbeatRuns.$inferSelect | null;
+  }) {
+    if (!input.sourceRunId) return false; // A first assignment has no prior episode.
+    const source = input.sourceRun !== undefined ? input.sourceRun : await db.select().from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, input.sourceRunId), eq(heartbeatRuns.companyId, input.companyId)))
+      .limit(1).then(rows => rows[0] ?? null);
+    const reason = !source ? "source_run_unavailable" : hasSelfTaskDocumentReplayHold(source)
+      ? "self_task_document_no_automatic_replay" : null;
+    if (!reason) return false;
+    const recorded = await db.select({ id: activityLog.id }).from(activityLog).where(and(
+      eq(activityLog.companyId, input.companyId), eq(activityLog.entityId, input.issueId),
+      eq(activityLog.action, "issue.automatic_replay_held"),
+      sql`${activityLog.details} ->> 'sourceRunId' = ${input.sourceRunId}`,
+      sql`${activityLog.details} ->> 'lane' = ${input.lane}`,
+    )).limit(1).then(rows => rows[0] ?? null);
+    if (recorded) return true;
+    await logActivity(db, {
+      companyId: input.companyId, actorType: "system", actorId: "recovery",
+      action: "issue.automatic_replay_held", entityType: "issue", entityId: input.issueId,
+      runId: source?.id ?? null,
+      details: { sourceRunId: input.sourceRunId, lane: input.lane, reason,
+        nextAction: "Inspect the source episode and document revision, then explicitly choose a new episode if appropriate.",
+        automaticRetryAllowed: false, retryBudgetSpent: false },
+    });
+    return true;
+  }
+
   async function enqueueStrandedIssueRecovery(input: {
     issueId: string;
     agentId: string;
@@ -1933,6 +1966,12 @@ export function recoveryService(
     outcome?: { retryExhausted?: boolean };
   }) {
     if (input.retryOfRunId) {
+      const sourceIssue = await db.select({ companyId: issues.companyId }).from(issues)
+        .where(eq(issues.id, input.issueId)).limit(1).then(rows => rows[0] ?? null);
+      if (!sourceIssue || await holdAutomaticDocumentReplay({
+        companyId: sourceIssue.companyId, issueId: input.issueId,
+        sourceRunId: input.retryOfRunId, lane: "stranded_issue_recovery",
+      })) return null;
       const [predecessor] = await db
         .select()
         .from(heartbeatRuns)
@@ -2633,6 +2672,8 @@ export function recoveryService(
     actionId: string;
     agentId: string;
   }) {
+    if (await holdAutomaticDocumentReplay({ companyId: input.issue.companyId, issueId: input.issue.id,
+      sourceRunId: input.latestRun?.id, lane: "provider_quota_reservation" })) return null;
     const existing = await db
       .select()
       .from(heartbeatRuns)
@@ -3162,6 +3203,8 @@ export function recoveryService(
     const sourceRun = input.latestRun?.id ? await db.select()
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.latestRun.id), eq(heartbeatRuns.companyId, input.issue.companyId)))
       .limit(1).then(rows => rows[0]) : null;
+    if (await holdAutomaticDocumentReplay({ companyId: input.issue.companyId, issueId: input.issue.id,
+      sourceRunId: input.latestRun?.id, sourceRun: sourceRun ?? null, lane: "disposition_repair_reservation" })) return null;
     const timing = dispositionRepairDelayMs(input.attempt, input.fingerprint);
     const now = new Date();
     const retryAt = new Date(now.getTime() + timing.delayMs);
@@ -3797,6 +3840,9 @@ export function recoveryService(
     latestRun: LatestIssueRun,
     options: { historicalAttemptCount?: number; legacyEpisode?: LegacyDispositionEpisode } = {},
   ): Promise<"queued" | "escalated" | "covered" | "skipped"> {
+    // Stop before creating/resetting a repair action or spending its attempt.
+    if (await holdAutomaticDocumentReplay({ companyId: issue.companyId, issueId: issue.id,
+      sourceRunId: latestRun?.id, lane: "disposition_repair" })) return "skipped";
     const current = await db
       .select()
       .from(issues)

@@ -860,11 +860,18 @@ export function createAdmitWakeBehindIssueExecution(deps: {
         requestedByActorType: input.requestedByActorType,
         requestedByActorId: input.requestedByActorId,
       }));
-    // Each resolved card has its own immutable decision and continuation. Never
-    // merge it with comments or another card, in either arrival order.
+    // Resolved cards and QA decisions own independent continuations. Neither
+    // incoming work nor an existing dedicated target may absorb the other.
     const interactionReceipt = Boolean(input.contextSnapshot.interactionId || input.payload?.interactionId);
+    const qaReceipt = Boolean(
+      readNonEmptyString(input.contextSnapshot.qaDecisionId) ||
+      readNonEmptyString(input.payload?.qaDecisionId) ||
+      input.idempotencyKey?.startsWith("qa-decision:"),
+    );
+    const activeContext = parseObject(input.activeExecutionRun.contextSnapshot);
     const decision = decideWakeAdmission({
-      allowRunCoalescing: interactionReceipt || parseObject(input.activeExecutionRun.contextSnapshot).interactionId
+      allowRunCoalescing: interactionReceipt || qaReceipt || activeContext.interactionId ||
+        readNonEmptyString(activeContext.qaDecisionId)
         ? false : input.allowRunCoalescing,
       sameDurableActor,
       isSameExecutionAgent,
@@ -907,7 +914,7 @@ export function createAdmitWakeBehindIssueExecution(deps: {
     // existing deferred wake, so the coalesce path (the common path) never
     // pays for this query.
     const existingDeferred =
-      (interactionReceipt || input.allowRunCoalescing === false)
+      (interactionReceipt || qaReceipt || input.allowRunCoalescing === false)
         ? null
         : await deps.reader.findExistingDeferredWake(scope, {
             companyId: input.companyId,
@@ -923,7 +930,11 @@ export function createAdmitWakeBehindIssueExecution(deps: {
               : {}),
           });
 
-    if (existingDeferred && !existingDeferred.payload?.interactionId && !existingDeferred.deferredContext.interactionId) {
+    if (existingDeferred &&
+        !existingDeferred.payload?.interactionId && !existingDeferred.deferredContext.interactionId &&
+        !readNonEmptyString(existingDeferred.payload?.qaDecisionId) &&
+        !readNonEmptyString(existingDeferred.deferredContext.qaDecisionId) &&
+        !existingDeferred.idempotencyKey?.startsWith("qa-decision:")) {
       const mergedDeferredContext = deps.helpers.mergeCoalescedContextSnapshot(
         existingDeferred.deferredContext,
         input.contextSnapshot,

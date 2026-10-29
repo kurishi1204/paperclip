@@ -1,10 +1,13 @@
 import { projectService } from "../services/projects.js";
 import { callProjectTool } from "../services/project-tools.js";
+import { SELF_TASK_DOCUMENT_CONTEXT_KEY } from "../services/self-task-document-runtime.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
-import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createHash, randomUUID } from "node:crypto";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
+import * as reviewProcesses from "@paperclipai/adapter-utils/server-utils";
 import { eq } from "drizzle-orm";
-import { agents, issues, heartbeatRuns, projects, companyMemberships, executionWorkspaces } from "@paperclipai/db";
+import { agents, issues, heartbeatRuns, projects, companyMemberships, executionWorkspaces, documentRevisions, agentTaskSessions, agentSessionGoalActions } from "@paperclipai/db";
 import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 import { issueService } from "../services/issues.js";
 import { documentService } from "../services/documents.js";
@@ -13,12 +16,363 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { getEmbeddedPostgresTestSupport } from "./helpers/embedded-postgres.js";
 
 const support = await getEmbeddedPostgresTestSupport();
+if (process.env.PAPERCLIP_REQUIRE_EMBEDDED_PG === "1" && !support.supported) {
+  throw new Error(`Embedded PostgreSQL is required for chat project tools: ${support.reason}`);
+}
 (support.supported ? describe : describe.skip)("chat project tool handoff", () => {
   let server: Awaited<ReturnType<typeof startRunnerApiTestServer>>;
   const originalSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
   beforeAll(async () => { process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID(); server = await startRunnerApiTestServer(); }, 60_000);
   afterAll(async () => { await server?.close(); if (originalSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET; else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalSecret; });
   const call = (fixture: Awaited<ReturnType<typeof server.fixture>>, tool: string, args: Record<string, unknown>) => fixture.authority.execute({ tool, arguments: args, callId: randomUUID() });
+  const documentFixture = async () => {
+    const f = await server.fixture({ disableWakeOnDemand: true });
+    const [run] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await server.db.update(heartbeatRuns).set({ contextSnapshot: {
+      ...run!.contextSnapshot, [SELF_TASK_DOCUMENT_CONTEXT_KEY]: true,
+    } }).where(eq(heartbeatRuns.id, f.runId));
+    return f;
+  };
+
+  it.each(["unchanged", "replacement before document read", "replacement before approval"])("saves, enters configured QA, receives changes and resubmits the exact revised document through HTTP: %s", async scenario => {
+    const f = await documentFixture();
+    await server.db.update(documentRevisions).set({ createdByRunId: null })
+      .where(eq(documentRevisions.createdByRunId, f.runId));
+    const [reviewer] = await server.db.insert(agents).values({
+      companyId: f.companyId, name: "Document QA", adapterType: "paperclip_runner", status: "active",
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
+    }).returning();
+    const stageId = randomUUID();
+    await server.db.update(issues).set({ checkoutRunId: f.runId, executionPolicy: { ...normalizeIssueExecutionPolicy({
+      stages: [{ id: stageId, type: "review", participants: [{ type: "agent", agentId: reviewer!.id }] }],
+    })! } }).where(eq(issues.id, f.issueId));
+    const save = async (runId: string, key: string, inputKey: string, body: string, documentId: string | null, baseRevisionId: string | null) => {
+      const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", runId)!;
+      const access = { apiUrl: server.apiUrl, token, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, conversation: false };
+      const input = await callProjectTool({ ...access, name: "read_self_task_document", arguments: { key: inputKey } });
+      expect(input.outcome).toBe("verified");
+      return callProjectTool({ ...access, name: "write_self_task_document", arguments: {
+        key, title: "Document result", format: "markdown", body, documentId, baseRevisionId, submitForReview: true,
+        input: { key: inputKey, documentId: input.documentId, revisionId: input.revisionId, bodySha256: input.bodySha256 },
+      } });
+    };
+    const qa = async (decision: "approve" | "request_changes") => {
+      const runId = randomUUID();
+      await server.db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: reviewer!.id,
+        status: "running", runtimeMode: "native", nativeIssueId: f.issueId, invocationSource: "assignment",
+        contextSnapshot: { issueId: f.issueId }, runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } } });
+      await server.db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, f.issueId));
+      const token = createLocalAgentJwt(reviewer!.id, f.companyId, "paperclip_runner", runId)!;
+      reviewProcesses.runningProcesses.set(runId, {
+        child: { pid: 12345678, exitCode: null, signalCode: null, kill: vi.fn() } as never,
+        graceSec: 10, processGroupId: null,
+      });
+      reviewProcesses.bindQaReviewProcess(runId, 12345678);
+      const rawCall = async (name: string, args: object) => {
+        const response = await fetch(`${server.apiUrl}/api/mcp/qa-review`, { method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: randomUUID(), method: "tools/call", params: { name, arguments: args } }) });
+        expect(response.status).toBe(200);
+        const wire = await response.json();
+        return wire.result;
+      };
+      const call = async (name: string, args: object) => {
+        const result = await rawCall(name, args);
+        expect(result.isError, JSON.stringify(result)).not.toBe(true);
+        return result.structuredContent;
+      };
+      try {
+        if (decision === "request_changes" && scenario !== "unchanged") {
+          // Use the same real document service as board edits, before QA's
+          // first issue read: a fresh issue revision must not bless this body.
+          const current = await documentService(server.db).getIssueDocumentByKey(f.issueId, "result");
+          await documentService(server.db).upsertIssueDocument({ issueId: f.issueId, key: "result",
+            title: "Document result", format: "markdown", body: "Replacement never submitted by the writer",
+            baseRevisionId: current!.latestRevisionId, changeSummary: null, createdByUserId: "synthetic-board-editor" });
+        }
+        const task = await call("read_assigned_issue", {});
+        const submitted = decision === "request_changes" ? first : revised;
+        expect(task.reviewStage.submittedDocument).toMatchObject({
+          documentId: submitted.documentId, key: "result", revisionId: submitted.revisionId,
+          bodySha256: submitted.bodySha256,
+        });
+        if (decision === "request_changes" && scenario !== "unchanged") {
+          const rejected = scenario === "replacement before document read"
+            ? await rawCall("read_assigned_issue_document", { key: "result", expectedRevision: task.revision,
+                offset: 0, limit: 1000 })
+            : await rawCall("submit_review_decision", { decision: "approve", summary: "Must refuse an unsubmitted replacement.",
+                expectedStageId: stageId, expectedStatusVersion: task.statusVersion, expectedRevision: task.revision,
+                expectedLastDecisionId: task.reviewStage.lastDecisionId });
+          expect(rejected.isError, JSON.stringify(rejected)).toBe(true);
+          expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0]?.status).toBe("in_review");
+        }
+        await call("submit_review_decision", { decision, summary: decision === "approve" ? "Corrected result verified." : "Add the missing source.",
+          expectedStageId: stageId, expectedStatusVersion: task.statusVersion, expectedRevision: task.revision,
+          expectedLastDecisionId: task.reviewStage.lastDecisionId });
+      } finally {
+        const active = reviewProcesses.runningProcesses.get(runId);
+        if (active) { active.closed = true; for (const cleanup of active.closeCleanups ?? []) cleanup(); }
+        reviewProcesses.runningProcesses.delete(runId);
+        await server.db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+      }
+    };
+    const first = await save(f.runId, "result", "notes", "First draft", null, null);
+    expect(first).toMatchObject({ outcome: "verified", review: { outcome: "verified", status: "in_review", submittedRevisionId: first.revisionId } });
+    expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0]?.executionState)
+      .toMatchObject({ submittedDocument: { documentId: first.documentId, key: "result", revisionId: first.revisionId,
+        bodySha256: createHash("sha256").update("First draft").digest("hex"), submittedByRunId: f.runId } });
+    await server.db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    await qa("request_changes");
+    expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
+      .toMatchObject({ status: "in_progress", assigneeAgentId: f.agentId });
+    const revisionRunId = randomUUID();
+    await server.db.insert(heartbeatRuns).values({ id: revisionRunId, companyId: f.companyId, agentId: f.agentId,
+      status: "running", runtimeMode: "native", nativeIssueId: f.issueId, invocationSource: "assignment",
+      contextSnapshot: { issueId: f.issueId, [SELF_TASK_DOCUMENT_CONTEXT_KEY]: true } });
+    await server.db.update(issues).set({ executionRunId: revisionRunId, checkoutRunId: revisionRunId }).where(eq(issues.id, f.issueId));
+    const current = await documentService(server.db).getIssueDocumentByKey(f.issueId, "result");
+    const revised = await save(revisionRunId, "result", "result", "Corrected result with source", first.documentId as string, current!.latestRevisionId);
+    expect(revised).toMatchObject({ outcome: "verified", revisionNumber: scenario === "unchanged" ? 2 : 3,
+      review: { outcome: "verified", status: "in_review", submittedRevisionId: revised.revisionId } });
+    expect(revised.revisionId).not.toBe(first.revisionId);
+    await server.db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, revisionRunId));
+    await qa("approve");
+    expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
+      .toMatchObject({ status: "done", executionState: { submittedDocument: {
+        revisionId: revised.revisionId, submittedByRunId: revisionRunId,
+      } } });
+    expect((await documentService(server.db).getIssueDocumentByKey(f.issueId, "result"))?.latestRevisionId).toBe(revised.revisionId);
+  }, 45_000);
+
+  it.each(["task changes", "active goal", "submission response is lost"])("retains the saved revision when %s before review acknowledgement", async scenario => {
+    const f = await documentFixture();
+    await server.db.update(documentRevisions).set({ createdByRunId: null })
+      .where(eq(documentRevisions.createdByRunId, f.runId));
+    const [reviewer] = await server.db.insert(agents).values({ companyId: f.companyId, name: "QA",
+      adapterType: "paperclip_runner", status: "active", runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } } }).returning();
+    await server.db.update(issues).set({ checkoutRunId: f.runId, executionPolicy: { ...normalizeIssueExecutionPolicy({
+      stages: [{ id: randomUUID(), type: "review", participants: [{ type: "agent", agentId: reviewer!.id }] }],
+    })! } }).where(eq(issues.id, f.issueId));
+    const goal = { objective: "Complete the existing goal", status: "active" };
+    const [goalSession] = scenario === "active goal" ? await server.db.insert(agentTaskSessions).values({
+      companyId: f.companyId, agentId: f.agentId, taskKey: f.issueId, adapterType: "paperclip_runner",
+      goalJson: goal, goalStatus: "active", goalDesiredState: "active", goalRevision: 7,
+      goalCapabilityJson: { availability: "available", actions: ["pause", "clear"] },
+    }).returning() : [];
+    const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId)!;
+    const access = { apiUrl: server.apiUrl, token, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, conversation: false };
+    const input = await callProjectTool({ ...access, name: "read_self_task_document", arguments: { key: "notes" } });
+    const originalFetch = globalThis.fetch;
+    let submissions = 0, writes = 0;
+    const intercepted = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      if (init?.method === "PUT") writes++;
+      if (init?.method === "PATCH" && String(url) === `${server.apiUrl}/api/issues/${f.issueId}`) {
+        submissions++;
+        if (scenario === "task changes") {
+          const [current] = await server.db.select().from(issues).where(eq(issues.id, f.issueId));
+          await server.db.update(issues).set({ title: "Updated request", revision: current!.revision + 1 })
+            .where(eq(issues.id, f.issueId));
+        }
+        const response = await originalFetch(url, init);
+        if (scenario === "submission response is lost") throw new Error("Synthetic lost submission acknowledgement");
+        return response;
+      }
+      return originalFetch(url, init);
+    });
+    try {
+      const saved = await callProjectTool({ ...access, name: "write_self_task_document", arguments: {
+        key: "result", title: "Retained result", format: "markdown", body: "Verified draft", documentId: null, baseRevisionId: null,
+        submitForReview: true, input: { key: "notes", documentId: input.documentId, revisionId: input.revisionId, bodySha256: input.bodySha256 },
+      } });
+      expect(saved).toMatchObject({ outcome: "verified", review: { outcome: scenario === "submission response is lost" ? "unknown" : "rejected" } });
+      expect(writes).toBe(1); expect(submissions).toBe(1);
+      const stored = await documentService(server.db).getIssueDocumentByKey(f.issueId, "result");
+      expect(stored).toMatchObject({ body: "Verified draft", latestRevisionId: saved.revisionId, latestRevisionNumber: 1 });
+      expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0]?.status)
+        .toBe(scenario === "submission response is lost" ? "in_review" : "in_progress");
+      if (goalSession) {
+        expect((await server.db.select().from(agentTaskSessions).where(eq(agentTaskSessions.id, goalSession.id)))[0])
+          .toMatchObject({ goalJson: goal, goalRevision: 7, goalDesiredState: "active" });
+        expect(await server.db.select().from(agentSessionGoalActions).where(eq(agentSessionGoalActions.sessionId, goalSession.id))).toEqual([]);
+      }
+    } finally { intercepted.mockRestore(); }
+  });
+
+  it("uses the persisted opt-in flag for both document tool discovery and calls", async () => {
+    const f = await documentFixture();
+    await server.db.update(issues).set({ checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
+    await server.db.update(documentRevisions).set({ createdByRunId: null })
+      .where(eq(documentRevisions.createdByRunId, f.runId));
+    const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.responsibleUserId)!;
+    const [run] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const snapshot = { ...run!.contextSnapshot };
+    delete snapshot[SELF_TASK_DOCUMENT_CONTEXT_KEY];
+    const input = await callProjectTool({ name: "read_self_task_document", arguments: { key: "notes" },
+      apiUrl: server.apiUrl, token, companyId: f.companyId, issueId: f.issueId,
+      agentId: f.agentId, conversation: false });
+    if (input.outcome !== "verified" || typeof input.documentId !== "string" ||
+        typeof input.revisionId !== "string" || typeof input.bodySha256 !== "string") {
+      throw new Error("Fixed synthetic input receipt missing");
+    }
+    const args = { key: "result", title: "Synthetic route result", format: "markdown", body: "One route-bound result",
+      documentId: null, baseRevisionId: null, input: { key: "notes", documentId: input.documentId,
+        revisionId: input.revisionId, bodySha256: input.bodySha256 } };
+    const rpc = async (method: string, params?: Record<string, unknown>) => {
+      const response = await fetch(`${server.apiUrl}/api/mcp/project-tools`, {
+        method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: "synthetic-opt-in", method, params }),
+      });
+      expect(response.status).toBe(200);
+      return response.json();
+    };
+    for (const flag of [undefined, false, "true"]) {
+      await server.db.update(heartbeatRuns).set({ contextSnapshot: {
+        ...snapshot, ...(flag === undefined ? {} : { [SELF_TASK_DOCUMENT_CONTEXT_KEY]: flag }),
+      } }).where(eq(heartbeatRuns.id, f.runId));
+      const listed = await rpc("tools/list");
+      expect(listed.result.tools.map((tool: { name: string }) => tool.name).sort()).toEqual([
+        "create_project", "create_task", "list_project_repositories", "list_projects", "set_task_title",
+      ]);
+      const refused = await rpc("tools/call", { name: "write_self_task_document", arguments: args });
+      expect(refused.result).toMatchObject({ isError: true,
+        content: [{ type: "text", text: "Tool is unavailable in this mode" }] });
+      // The same capability boundary must hold when a caller avoids MCP.
+      const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json",
+        "X-Paperclip-Document-Mode": "self-task", "X-Paperclip-Expected-Document-Id": "new" };
+      const directRead = await fetch(`${server.apiUrl}/api/issues/${f.issueId}/documents/notes`, { headers });
+      expect(directRead.status).toBe(403);
+      const directWrite = await fetch(`${server.apiUrl}/api/issues/${f.issueId}/documents/result`, {
+        method: "PUT", headers, body: JSON.stringify({ title: args.title, format: args.format,
+          body: args.body, baseRevisionId: null }),
+      });
+      expect(directWrite.status).toBe(403);
+      expect(directWrite.headers.get("X-Paperclip-Document-Outcome")).toBe("rejected");
+      expect(await documentService(server.db).getIssueDocumentByKey(f.issueId, "result")).toBeNull();
+    }
+    await server.db.update(heartbeatRuns).set({ contextSnapshot: {
+      ...snapshot, [SELF_TASK_DOCUMENT_CONTEXT_KEY]: true,
+    } }).where(eq(heartbeatRuns.id, f.runId));
+    const listed = await rpc("tools/list");
+    expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
+      "read_self_task_document", "write_self_task_document",
+    ]);
+    const refusedProject = await rpc("tools/call", { name: "list_projects", arguments: {} });
+    expect(refusedProject.result).toMatchObject({ isError: true,
+      content: [{ type: "text", text: "Tool is unavailable in this mode" }] });
+    const saved = await rpc("tools/call", { name: "write_self_task_document", arguments: args });
+    expect(saved.result).toMatchObject({ structuredContent: { outcome: "verified", body: args.body,
+      requests: { reads: 1, puts: 1, readbacks: 1 } } });
+    const stored = await documentService(server.db).getIssueDocumentByKey(f.issueId, "result");
+    expect(stored?.latestRevisionId).toBe(saved.result.structuredContent.revisionId);
+    const revisions = await server.db.select().from(documentRevisions)
+      .where(eq(documentRevisions.documentId, stored!.id));
+    expect(revisions).toHaveLength(1);
+  });
+
+  it("binds a single document write to the active task, then exposes its fixed revision", async () => {
+    const f = await documentFixture();
+    await server.db.update(issues).set({ checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
+    // The fixture input predates this bounded facade; the test run has made no write yet.
+    await server.db.update(documentRevisions).set({ createdByRunId: null }).where(eq(documentRevisions.createdByRunId, f.runId));
+    const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.responsibleUserId)!;
+    const base = { apiUrl: server.apiUrl, token, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId, conversation: false };
+    const read = await callProjectTool({ ...base, name: "read_self_task_document", arguments: { key: "notes" } });
+    expect(read).toMatchObject({ outcome: "verified", taskId: f.issueId, key: "notes" });
+    if (read.outcome !== "verified" || typeof read.documentId !== "string" || typeof read.revisionId !== "string" || typeof read.bodySha256 !== "string") throw new Error("Fixed input missing");
+    const body = "# Verified result\n\nA single synthetic deliverable.";
+    const args = { key: "result", title: "Result", format: "markdown", body,
+      documentId: null, baseRevisionId: null,
+      input: { key: "notes", documentId: read.documentId, revisionId: read.revisionId, bodySha256: read.bodySha256 } };
+    const saved = await callProjectTool({ ...base, name: "write_self_task_document", arguments: args });
+    expect(saved).toMatchObject({ outcome: "verified", taskId: f.issueId, key: "result", bodySha256: createHash("sha256").update(body).digest("hex"), requests: { puts: 1, readbacks: 1 } });
+    if (saved.outcome !== "verified" || typeof saved.revisionId !== "string") throw new Error("Write receipt missing");
+    const fixed = await callProjectTool({ ...base, name: "read_self_task_document", arguments: { key: "result", revisionId: saved.revisionId } });
+    expect(fixed).toMatchObject({ outcome: "verified", revisionId: saved.revisionId, body });
+    const second = await callProjectTool({ ...base, name: "write_self_task_document", arguments: { ...args, key: "another" } });
+    expect(second).toMatchObject({ outcome: "rejected", status: 409, requests: { puts: 1, readbacks: 0 } });
+    expect(await documentService(server.db).getIssueDocumentByKey(f.issueId, "another")).toBeNull();
+  });
+
+  it("does not replay a committed document PUT after its response is lost", async () => {
+    const f = await documentFixture();
+    await server.db.update(issues).set({ checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
+    await server.db.update(documentRevisions).set({ createdByRunId: null })
+      .where(eq(documentRevisions.createdByRunId, f.runId));
+    const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.responsibleUserId)!;
+    const base = { apiUrl: server.apiUrl, token, companyId: f.companyId, issueId: f.issueId,
+      agentId: f.agentId, conversation: false };
+    const fixed = await callProjectTool({ ...base, name: "read_self_task_document", arguments: { key: "notes" } });
+    expect(fixed).toMatchObject({ outcome: "verified" });
+    if (fixed.outcome !== "verified" || typeof fixed.documentId !== "string" ||
+        typeof fixed.revisionId !== "string" || typeof fixed.bodySha256 !== "string")
+      throw new Error("Fixed input missing");
+    const originalFetch = globalThis.fetch;
+    let puts = 0, committedResponses = 0;
+    globalThis.fetch = async (resource, init) => {
+      const response = await originalFetch(resource, init);
+      if (init?.method === "PUT" && String(resource).endsWith(`/api/issues/${f.issueId}/documents/result`)) {
+        puts++;
+        if (response.ok) {
+          committedResponses++;
+          throw new TypeError("synthetic response lost after commit");
+        }
+      }
+      return response;
+    };
+    let result: Awaited<ReturnType<typeof callProjectTool>>;
+    try {
+      result = await callProjectTool({ ...base, name: "write_self_task_document", arguments: {
+        key: "result", title: "Result", format: "markdown", body: "One committed synthetic result",
+        documentId: null, baseRevisionId: null,
+        input: { key: "notes", documentId: fixed.documentId, revisionId: fixed.revisionId,
+          bodySha256: fixed.bodySha256 },
+      } });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    expect(result).toMatchObject({ outcome: "unknown", stage: "put",
+      requests: { reads: 1, puts: 1, readbacks: 0 } });
+    expect([puts, committedResponses]).toEqual([1, 1]);
+    const stored = await documentService(server.db).getIssueDocumentByKey(f.issueId, "result");
+    expect(stored).not.toBeNull();
+    expect(stored?.body).toBe("One committed synthetic result");
+    const revisions = await server.db.select().from(documentRevisions)
+      .where(eq(documentRevisions.documentId, stored!.id));
+    expect(revisions).toHaveLength(1);
+  });
+
+  it("rejects a different task and refuses a locked document without creating another key", async () => {
+    const f = await documentFixture();
+    await server.db.update(issues).set({ checkoutRunId: f.runId }).where(eq(issues.id, f.issueId));
+    await server.db.update(documentRevisions).set({ createdByRunId: null })
+      .where(eq(documentRevisions.createdByRunId, f.runId));
+    const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.responsibleUserId)!;
+    const base = { apiUrl: server.apiUrl, token, companyId: f.companyId,
+      issueId: f.issueId, agentId: f.agentId, conversation: false };
+    expect(await callProjectTool({ ...base, issueId: f.blockerId,
+      name: "read_self_task_document", arguments: { key: "notes" } }))
+      .toMatchObject({ outcome: "rejected", status: 403 });
+    const input = await callProjectTool({ ...base,
+      name: "read_self_task_document", arguments: { key: "notes" } });
+    expect(input.outcome).toBe("verified");
+    if (input.outcome !== "verified" || typeof input.documentId !== "string" ||
+        typeof input.revisionId !== "string" || typeof input.bodySha256 !== "string")
+      throw new Error("Locked-document input receipt missing");
+    const before = await documentService(server.db).listIssueDocuments(f.issueId);
+    await documentService(server.db).lockIssueDocument({ issueId: f.issueId, key: "notes",
+      lockedByAgentId: f.agentId });
+    const denied = await callProjectTool({ ...base, name: "write_self_task_document", arguments: {
+      key: "notes", documentId: input.documentId, baseRevisionId: input.revisionId,
+      title: "Locked replacement", format: "markdown", body: "This must not be saved.",
+      input: { key: "notes", documentId: input.documentId,
+        revisionId: input.revisionId, bodySha256: input.bodySha256 },
+    } });
+    expect(denied).toMatchObject({ outcome: "rejected", status: 409, requests: { puts: 1, readbacks: 0 } });
+    const after = await documentService(server.db).listIssueDocuments(f.issueId);
+    expect(after.map(doc => [doc.key, doc.id])).toEqual(before.map(doc => [doc.key, doc.id]));
+    expect((await documentService(server.db).getIssueDocumentByKey(f.issueId, "notes"))?.latestRevisionId)
+      .toBe(input.revisionId);
+  });
 
   it("pages only visible projects and prefilters low-trust agent and run scopes", async () => {
     const f = await server.fixture({ disableWakeOnDemand: true });
@@ -258,7 +612,7 @@ const support = await getEmbeddedPostgresTestSupport();
       const paths = [`/api/companies/${f.companyId}/issues`, `/api/issues/${f.issueId}/children`];
       const selections = [{ projectWorkspaceId: f.projectWorkspaceId }, { executionWorkspaceId: executionWorkspace.id },
         { inheritExecutionWorkspaceFromIssueId: f.blockerId }];
-      const create = async (path: string, selection: Record<string, string>) => {
+      const create = async (path: string, selection: Record<string, string | undefined>) => {
         const response = await fetch(`${server.apiUrl}${path}`, {
           method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
           body: JSON.stringify({ title: `Workspace scope ${randomUUID()}`, parentId: f.issueId,

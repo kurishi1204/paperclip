@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm } from "node:fs/promises";
 import os from "node:os";
@@ -11,17 +11,41 @@ import { setExpensiveWorkspaceGitExecutor } from "@paperclipai/adapter-utils/git
 import { buildProjectMentionHref } from "@paperclipai/shared";
 import { createWorkspaceGitOperationScheduler, WorkspaceGitScanError } from "../services/workspace-git-operation-scheduler.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { heartbeatService } from "../services/heartbeat.ts";
-import { instanceSettingsService } from "../services/instance-settings.ts";
+import { heartbeatService } from "../services/heartbeat.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { hasSelfTaskDocumentReplayHold, hasSelfTaskDocumentSetupRetryHold } from "../services/self-task-document-runtime.js";
 
 const execute = vi.hoisted(() => vi.fn(async (_input: any) => ({ exitCode: 0, signal: null, timedOut: false })));
+const settledToolDelivery = vi.hoisted(() => vi.fn());
+const rejectDocumentRelease = vi.hoisted(() => new Set<string>());
 vi.mock("../adapters/index.js", () => ({
   getServerAdapter: () => ({ type: "codex_local", execute, supportsLocalAgentJwt: false }),
   findActiveServerAdapter: () => ({ type: "codex_local", execute, supportsLocalAgentJwt: false }),
   runningProcesses: new Map(),
 }));
+vi.mock("../services/tool-action-delivery.js", async importOriginal => {
+  const original = await importOriginal<typeof import("../services/tool-action-delivery.js")>();
+  return { ...original, toolActionDeliveryService: (...args: Parameters<typeof original.toolActionDeliveryService>) => {
+    const service = original.toolActionDeliveryService(...args);
+    return { ...service, deliverForRun: async (input: Parameters<typeof service.deliverForRun>[0]) => {
+      settledToolDelivery(input);
+      return service.deliverForRun(input);
+    } };
+  } };
+});
+vi.mock("../modules/wake-queue/index.js", async importOriginal => {
+  const original = await importOriginal<typeof import("../modules/wake-queue/index.js")>();
+  return { ...original, createWakeQueue: (...args: Parameters<typeof original.createWakeQueue>) => {
+    const queue = original.createWakeQueue(...args);
+    return { ...queue, releaseIssueExecution: async (input: Parameters<typeof queue.releaseIssueExecution>[0]) => {
+      // Target the real release boundary; a SQL error occurs before it commits.
+      if (rejectDocumentRelease.delete(input.runId)) await args[0].execute(sql`select 1 / 0`);
+      return queue.releaseIssueExecution(input);
+    } };
+  } };
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -193,13 +217,21 @@ suite("task project repository provisioning", () => {
 
   it.each([
     { code: "workspace_git_scan_timeout", scenario: "temporary", retryable: true },
+    { code: "workspace_git_scan_timeout", scenario: "temporary", retryable: true, selfTask: true },
+    { code: "workspace_git_scan_timeout", scenario: "proof cleanup rejection", retryable: false, selfTask: true, cleanupFailure: "non_entry_proof" },
+    { code: "workspace_git_scan_timeout", scenario: "release cleanup rejection", retryable: true, selfTask: true, cleanupFailure: "issue_release" },
+    { code: "workspace_git_scan_timeout", scenario: "exhausted", retryable: true, selfTask: true },
+    { code: "workspace_git_scan_timeout", scenario: "paused", retryable: true, selfTask: true },
     { code: "workspace_git_scan_saturated", scenario: "temporary", retryable: true },
     { code: "workspace_git_scan_timeout", scenario: "exhausted", retryable: true },
     { code: "workspace_git_scan_timeout", scenario: "paused", retryable: true },
     { code: "workspace_git_scan_output_limit", scenario: "permanent", retryable: false },
     { code: "workspace_git_scan_cancelled", scenario: "cancelled", retryable: false },
     { code: "workspace_git_scan_failed", scenario: "permanent", retryable: false },
-  ] as const)("handles $scenario $code during local-source preparation", async ({ code, scenario, retryable }) => {
+  ] as const)("handles $scenario $code during local-source preparation ($selfTask)", async (testCase) => {
+    const { code, scenario, retryable } = testCase;
+    const selfTask = "selfTask" in testCase && testCase.selfTask;
+    const cleanupFailure = "cleanupFailure" in testCase ? testCase.cleanupFailure : null;
     const companyId = randomUUID(), projectId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
     const source = path.join(root, companyId, "source");
     await mkdir(source, { recursive: true });
@@ -217,14 +249,20 @@ suite("task project repository provisioning", () => {
       { id: randomUUID(), companyId, projectId, name: "Anchor", sourceType: "local_path", cwd: source, isPrimary: true, createdAt: new Date(Date.now() - 1000) },
       { id: randomUUID(), companyId, projectId, name: "Source copy", sourceType: "git_repo", repoUrl: pathToFileURL(source).href, cwd: source, isPrimary: false },
     ]);
-    await db.insert(agents).values({ id: agentId, companyId, name: "Test", role: "engineer", status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Test", role: "engineer", status: "idle",
+      adapterType: selfTask ? "claude_local" : "codex_local", adapterConfig: selfTask ? { selfTaskDocumentToolsOnly: true } : {}, runtimeConfig: {}, permissions: {} });
     await db.insert(issues).values({ id: issueId, companyId, projectId, title: "Recover startup and use existing work", status: "todo", assigneeAgentId: agentId });
     let inject = true;
+    let releaseScan!: () => void;
+    let signalScan!: () => void;
+    const scanReached = new Promise<void>(resolve => { signalScan = resolve; });
+    const scanRelease = new Promise<void>(resolve => { releaseScan = resolve; });
     const canonicalSource = await realpath(source);
     const scheduler = createWorkspaceGitOperationScheduler();
     setExpensiveWorkspaceGitExecutor(async (input) => {
       if (inject && (input.localDir === source || input.localDir === canonicalSource) && input.operation === "adapter_sync.ignored_files") {
         inject = scenario === "exhausted";
+        if (cleanupFailure) { signalScan(); await scanRelease; }
         throw new WorkspaceGitScanError(code, "Injected temporary scan failure");
       }
       return scheduler.run({
@@ -241,9 +279,60 @@ suite("task project repository provisioning", () => {
       });
     });
     const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", contextSnapshot: { issueId, projectId } });
+    if (cleanupFailure) {
+      const nextIssueId = randomUUID();
+      const trigger = `document_cleanup_${run!.id.replaceAll("-", "")}`;
+      if (cleanupFailure === "non_entry_proof") {
+        await db.execute(sql.raw(`CREATE FUNCTION ${trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+          IF NEW.id = '${run!.id}'::uuid AND NEW.result_json #> '{executionRecovery,selfTaskDocumentPreProvider}' IS NOT NULL
+          THEN RAISE EXCEPTION 'injected document cleanup failure'; END IF; RETURN NEW; END $$`));
+        await db.execute(sql.raw(`CREATE TRIGGER ${trigger} BEFORE UPDATE ON heartbeat_runs FOR EACH ROW EXECUTE FUNCTION ${trigger}()`));
+      } else rejectDocumentRelease.add(run!.id);
+      try {
+        await scanReached;
+        await db.insert(issues).values({ id: nextIssueId, companyId, projectId, title: "Independent next task", status: "todo", assigneeAgentId: agentId });
+        const next = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", contextSnapshot: { issueId: nextIssueId, projectId } });
+        expect(next?.status).toBe("queued");
+        releaseScan();
+        await heartbeat.drainActiveRunExecutions();
+        expect(settledToolDelivery.mock.calls.filter(([input]) => input.runId === run!.id)).toHaveLength(1);
+        expect((await heartbeat.getRun(next!.id))?.status).toBe("succeeded");
+        expect((await db.select().from(issues).where(eq(issues.id, nextIssueId)))[0]?.status).toBe("done");
+        expect(execute.mock.calls.filter(([input]) => input.runId === next!.id)).toHaveLength(1);
+        const failed = await heartbeat.getRun(run!.id);
+        expect(failed).toMatchObject({ status: "failed", errorCode: code });
+        expect(execute.mock.calls.filter(([input]) => input.runId === run!.id)).toHaveLength(0);
+        expect(hasSelfTaskDocumentReplayHold(failed)).toBe(true);
+        expect(hasSelfTaskDocumentSetupRetryHold(failed)).toBe(cleanupFailure === "non_entry_proof");
+        const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run!.id));
+        expect(retries).toHaveLength(cleanupFailure === "non_entry_proof" ? 0 : 1);
+        return;
+      } finally {
+        releaseScan();
+        rejectDocumentRelease.delete(run!.id);
+        if (cleanupFailure === "non_entry_proof") {
+          await db.execute(sql.raw(`DROP TRIGGER ${trigger} ON heartbeat_runs`));
+          await db.execute(sql.raw(`DROP FUNCTION ${trigger}()`));
+        }
+        await heartbeat.drainActiveRunExecutions();
+        // Finish any queued work for teardown after assertions have recorded
+        // whether this executor reached its independent post-cleanup delivery.
+        await heartbeat.resumeQueuedRuns();
+        await heartbeat.drainActiveRunExecutions();
+      }
+    }
     await vi.waitFor(async () => expect((await heartbeat.getRun(run!.id))?.errorCode).toBe(code), { timeout: 15_000 });
     expect(execute.mock.calls.filter(([input]) => input.runId === run!.id)).toHaveLength(0);
     await heartbeat.drainActiveRunExecutions();
+    if (selfTask) {
+      const failed = await heartbeat.getRun(run!.id);
+      expect(failed?.contextSnapshot?.paperclipSelfTaskDocumentToolsOnly).toBe(true);
+      expect(failed?.resultJson?.executionRecovery).toMatchObject({ kind: "bootstrap", providerWorkStarted: false,
+        selfTaskDocumentPreProvider: { schema: "paperclip.self-task-document-pre-provider/v1", runId: run!.id,
+          companyId, agentId, issueId, controllerBootId: failed!.controllerBootId, wakeupRequestId: failed!.wakeupRequestId } });
+      expect(hasSelfTaskDocumentSetupRetryHold(failed)).toBe(false);
+      expect(hasSelfTaskDocumentReplayHold(failed)).toBe(true);
+    }
     if (!retryable) {
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run!.id))).toHaveLength(0);
       expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status).toBe("blocked");
@@ -296,12 +385,37 @@ suite("task project repository provisioning", () => {
     expect(await readFile(path.join(source, "README.md"), "utf8")).toBe("preserved dirty work");
   }, 40_000);
 
+  it("does not accept an adapter's forged non-entry receipt after provider entry", async () => {
+    const companyId = randomUUID(), projectId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Provider boundary", issuePrefix: `P${companyId.slice(0, 6)}`, defaultResponsibleUserId: "responsible-user" });
+    await db.insert(projects).values({ id: projectId, companyId, name: "Documents" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Document writer", role: "engineer", status: "idle",
+      adapterType: "claude_local", adapterConfig: { selfTaskDocumentToolsOnly: true }, runtimeConfig: {}, permissions: {} });
+    await db.insert(issues).values({ id: issueId, companyId, projectId, title: "Create a document", status: "todo", assigneeAgentId: agentId });
+    execute.mockImplementationOnce(async input => {
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId));
+      return { exitCode: 1, signal: null, timedOut: false, errorCode: "workspace_git_scan_timeout",
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false,
+          selfTaskDocumentPreProvider: { schema: "paperclip.self-task-document-pre-provider/v1",
+            runId: input.runId, companyId, agentId, issueId, wakeupRequestId: source!.wakeupRequestId,
+            controllerBootId: source!.controllerBootId, cleanupSettledAt: new Date().toISOString() } } } };
+    });
+    const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", contextSnapshot: { issueId, projectId } });
+    await heartbeat.drainActiveRunExecutions();
+    const failed = await heartbeat.getRun(run!.id);
+    expect(failed?.status).toBe("failed");
+    expect(execute.mock.calls.filter(([input]) => input.runId === run!.id)).toHaveLength(1);
+    expect((failed?.resultJson?.executionRecovery as Record<string, unknown>)?.selfTaskDocumentPreProvider).toBeUndefined();
+    expect(hasSelfTaskDocumentSetupRetryHold(failed)).toBe(true);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run!.id))).toHaveLength(0);
+  });
+
   it.each([1, 2])("gives a task all %i repositories without any configured local folders", async (count) => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
-    const repositoryRows = [];
+    const repositoryRows: Array<typeof projectWorkspaces.$inferInsert> = [];
     for (let index = 0; index < count; index++) {
       const source = path.join(root, companyId, `source-${index}`);
       await mkdir(source, { recursive: true });

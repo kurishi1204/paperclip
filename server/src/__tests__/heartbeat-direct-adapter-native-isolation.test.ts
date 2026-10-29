@@ -38,6 +38,7 @@ import {
 import {captureCommanderHermesClaim,completeCommanderHermesResult,pendingCommanderResultHandoffs} from "../services/commander-result.js";
 import {prepareCommanderAdmission} from "../services/commander-admission.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { SELF_TASK_DOCUMENT_CONTEXT_KEY } from "../services/self-task-document-runtime.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
@@ -349,6 +350,72 @@ describeEmbeddedPostgres("direct adapter native-runner isolation", () => {
       acpToolInventoryComplete: true, acpPendingToolCount: 0,
     } });
     expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it.each(["enabled", "missing_listener", "spoofed_wake"])("self-task document dispatcher: %s", async mode => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const names = ["PAPERCLIP_AGENT_JWT_SECRET", "PAPERCLIP_LISTEN_HOST", "PAPERCLIP_LISTEN_PORT", "PAPERCLIP_API_URL"];
+    const prior = new Map(names.map(name => [name, process.env[name]]));
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID();
+    process.env.PAPERCLIP_LISTEN_HOST = mode === "missing_listener" ? "public-paperclip.invalid" : "127.0.0.1";
+    process.env.PAPERCLIP_LISTEN_PORT = "3317";
+    process.env.PAPERCLIP_API_URL = "https://public-paperclip.invalid";
+    let calls = 0;
+    registerServerAdapter({
+      type: "claude_local", supportsLocalAgentJwt: true,
+      execute: async ctx => {
+        calls++;
+        const enabled = mode !== "spoofed_wake";
+        expect(ctx.context[SELF_TASK_DOCUMENT_CONTEXT_KEY]).toBe(enabled);
+        const [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, ctx.runId));
+        expect(persisted.contextSnapshot?.[SELF_TASK_DOCUMENT_CONTEXT_KEY]).toBe(enabled);
+        const servers = ctx.runtimeMcp?.getServers() ?? [];
+        if (enabled) {
+          expect(ctx.runtimeTools).toBeUndefined();
+          expect(ctx.context.paperclipRuntimeTools).toBeUndefined();
+          expect(ctx.context.paperclipManagedMcp).toBeUndefined();
+          if (mode === "missing_listener") expect(servers).toEqual([]);
+          else {
+            expect(servers).toEqual([expect.objectContaining({ name: "Paperclip projects",
+              connectionId: "paperclip-project-tools", url: "http://127.0.0.1:3317/api/mcp/project-tools" })]);
+            expect(servers[0]?.token).toBeTruthy();
+          }
+        } else {
+          expect(servers).toContainEqual(expect.objectContaining({ name: "Paperclip projects",
+            url: "https://public-paperclip.invalid/api/mcp/project-tools" }));
+        }
+        return { exitCode: 0, signal: null, timedOut: false, summary: "Dispatcher fixture complete" };
+      },
+      testEnvironment: async () => ({ adapterType: "claude_local", status: "pass", checks: [], testedAt: new Date(0).toISOString() }),
+    });
+    try {
+      await db.insert(companies).values({ id: companyId, name: "Document profile", issuePrefix: "SD", defaultResponsibleUserId: "responsible-user" });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Writer", adapterType: "claude_local",
+        role: "engineer", status: "idle", adapterConfig: mode === "spoofed_wake" ? {} : {
+          selfTaskDocumentToolsOnly: true, engine: "cli", dangerouslySkipPermissions: false,
+        }, runtimeConfig: {}, permissions: {} });
+      await db.insert(issues).values({ id: issueId, companyId, issueNumber: 1, identifier: "SD-1",
+        title: "Save assigned result", status: "todo", assigneeAgentId: agentId });
+      const queued = await heartbeat.invoke(agentId, "on_demand", { issueId,
+        [SELF_TASK_DOCUMENT_CONTEXT_KEY]: mode === "spoofed_wake",
+        paperclipRuntimeTools: { injected: true }, paperclipManagedMcp: { injected: true },
+      }, "manual");
+      expect(queued).not.toBeNull();
+      expect((await waitForRunToFinish(heartbeat, queued!.id))?.status).toBe("succeeded");
+      expect(calls).toBe(1);
+      if (mode === "enabled") {
+        const next = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual",
+          requestedByActorType: "user", requestedByActorId: "responsible-user",
+          reason: "owner_new_episode", contextSnapshot: { issueId } });
+        expect(next).not.toBeNull();
+        expect((await waitForRunToFinish(heartbeat, next!.id))?.status).toBe("succeeded");
+        expect(calls).toBe(2);
+      }
+    } finally {
+      for (const [name, value] of prior) {
+        if (value === undefined) delete process.env[name]; else process.env[name] = value;
+      }
+    }
   });
 
   it("delivers only the local run-bound QA MCP to a QA Claude invocation", async () => {

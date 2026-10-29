@@ -43,13 +43,14 @@ import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/papercli
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "./connector-runtime.js";
 import { admitExplicitNativeContinuation, admitExplicitContinuationRetry, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
+import { buildQaChangesRequestedWakeContext, buildQaPreProviderRecovery, QA_PRE_PROVIDER_TERMINAL_STATUSES, isAuthorizedQaDecisionWake, qaDecisionIdFromWakeKey, qaDecisionWakeBlocksDelivery, qaDecisionWakeKey } from "./qa-decision-wake.js";
 import { canRetryStoppedRun, isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, type AiConnectionRouterSelection } from "@paperclipai/shared";
 import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "./ai-connection-session.js";
-import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
+import { executionBlockerPredicate, getExecutionBlocker, isIndependentQaDocumentEpisode } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
@@ -99,6 +100,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { isDeepStrictEqual, promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   and,
   asc,
@@ -114,6 +116,7 @@ import {
   lt,
   lte,
   ne,
+  notExists,
   notInArray,
   or,
   sql,
@@ -148,6 +151,7 @@ import {
 import {
   agents,
   agentConfigRevisions,
+  agentInstructionWorkingCopies,
   agentRuntimeState,
   agentSessionGoalActions,
   agentTaskSessions,
@@ -178,6 +182,7 @@ import {
   issueApprovals,
   issueAttachments,
   issueComments,
+  issueExecutionDecisions,
   issuePlanDecompositions,
   issueRecoveryActions,
   issueRelations,
@@ -315,6 +320,7 @@ import type {
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { createRuntimeToolsToken } from "../runtime-tools-token.js";
 import { QA_REVIEW_MCP_CONNECTION_ID, QA_REVIEW_MCP_NAME, qaReviewLocalApiUrl } from "./qa-review-tools.js";
+import { SELF_TASK_DOCUMENT_CONTEXT_KEY, hasSelfTaskDocumentReplayHold, hasSelfTaskDocumentSetupRetryHold, isSelfTaskDocumentRuntime, selfTaskDocumentMcpServers } from "./self-task-document-runtime.js";
 import {
   parseObject,
   asBoolean,
@@ -638,6 +644,7 @@ import {
   findMissingHotRestartSnapshotRunIds,
   readHotRestartIntent,
   readProcessStartedAt,
+  hasLocalPredecessorProcessOwnership,
   removeHotRestartIntent,
   shouldHonorHotRestartIntentForProcess,
   writeHotRestartReport,
@@ -1299,6 +1306,33 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+type QaProviderObservation = {
+  companyId: string;
+  runId: string;
+  decisionId: string;
+  wakeupRequestId: string;
+  controllerBootId: string | null;
+  claimSucceeded: boolean;
+  preparationStarted: boolean;
+  providerMayHaveStarted: () => boolean;
+};
+// Separate service instances (pause route, shutdown and scheduler) can consult
+// this executing host's observation without inventing evidence from old JSON.
+const qaProviderObservations = new Map<string, QaProviderObservation>();
+const queuedRunStartScope = new AsyncLocalStorage<Array<{ agentId: string; held: boolean }>>();
+
+// Queue effects can request another start while their caller still owns the
+// same lock. Defer only that recursive advance, not unrelated concurrent work.
+// Background executeRun promises inherit the context, so mark the token released
+// when the callback ends rather than leaving a permanently inherited lock flag.
+async function withQueuedRunStartScope<T>(agentId: string, callback: () => Promise<T>): Promise<T> {
+  const inherited = queuedRunStartScope.getStore() ?? [];
+  const token = { agentId, held: true };
+  return withAgentStartLock(agentId, () => queuedRunStartScope.run([...inherited, token], async () => {
+    try { return await callback(); }
+    finally { token.held = false; }
+  }));
+}
 // A legacy process adapter's signal exit can race the operator cancellation CAS while
 // its owned process group is still being joined. Keep that exit from becoming
 // a successful result (or a competing failure) before Stop settles. This is an
@@ -3818,6 +3852,8 @@ function normalizeMaxConcurrentRuns(value: unknown) {
 }
 
 interface WakeupOptions {
+  /** Committed review decision whose return-assignee work this wake carries. */
+  qaDecisionId?: string;
   commanderGuard?: { parentRunId: string; commanderAgentId: string; policy: CommanderPolicy; admission: CommanderAdmission };
   /** Set only by authenticated board wake routes; never copied from caller payloads. */
   manualUserWake?: boolean;
@@ -9939,7 +9975,7 @@ export function heartbeatService(
   // the original release function did before its writes moved into that
   // module: publish + dispatch a promoted or recovery run, log a reopened
   // issue's activity entry.
-  async function applyWakeQueuePostCommitEffects(effects: WakeQueuePostCommitEffect[]) {
+  async function applyWakeQueuePostCommitEffects(effects: WakeQueuePostCommitEffect[], options?: { deferStartForAgentId?: string }) {
     for (const effect of effects) {
       if (effect.kind === "conversation_retry_requested") {
         const [source] = await db.select().from(heartbeatRuns).where(and(
@@ -9958,7 +9994,7 @@ export function heartbeatService(
             // must not retain a terminal claim. Do not request another retry.
             const settled = await wakeQueue.releaseIssueExecution({ companyId: source.companyId,
               runId: source.id, now: new Date(), suppressImmediateRecovery: true });
-            await applyWakeQueuePostCommitEffects(settled.postCommitEffects);
+            await applyWakeQueuePostCommitEffects(settled.postCommitEffects, options);
           }
         }
       } else if (effect.kind === "run_queued") {
@@ -9973,7 +10009,9 @@ export function heartbeatService(
             wakeupRequestId: effect.run.wakeupRequestId,
           },
         });
-        await startNextQueuedRunForAgent(effect.run.agentId);
+        // A gate cancellation can promote a durable receipt while its caller
+        // still holds this agent's start lock. The next queue pass starts it.
+        if (effect.run.agentId !== options?.deferStartForAgentId) await startNextQueuedRunForAgent(effect.run.agentId);
       } else {
         await logActivity(db, {
           companyId: effect.companyId,
@@ -12992,6 +13030,128 @@ export function heartbeatService(
     void reportRunFailure(db, updated, failureReport);
   }
 
+  function reconcileQaProviderEvidence(
+    previous: typeof heartbeatRuns.$inferSelect | null,
+    patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
+    status: string,
+  ) {
+    if (previous && parseObject(previous.contextSnapshot)[SELF_TASK_DOCUMENT_CONTEXT_KEY] === true && patch?.resultJson) {
+      // Adapter output is data, never a post-cleanup non-entry attestation.
+      // Only executeRun's settled CAS below may mint this receipt.
+      const recovery = { ...parseObject(patch.resultJson.executionRecovery) };
+      delete recovery.selfTaskDocumentPreProvider;
+      patch = { ...patch, resultJson: { ...patch.resultJson, executionRecovery: recovery } };
+    }
+    if (!previous || !readNonEmptyString(parseObject(previous.contextSnapshot).qaDecisionId)) return patch;
+    const prior = parseObject(parseObject(previous.resultJson).executionRecovery);
+    const requested = parseObject(parseObject(patch?.resultJson).executionRecovery);
+    const observer = qaProviderObservations.get(previous.id);
+    const observedHere = previous.runtimeMode === "legacy" && observer?.companyId === previous.companyId
+      && observer.runId === previous.id && observer.wakeupRequestId === previous.wakeupRequestId
+      && observer.decisionId === parseObject(previous.contextSnapshot).qaDecisionId
+      && observer.controllerBootId === previous.controllerBootId;
+    const positive = prior.providerWorkStarted === true || requested.providerWorkStarted === true
+      || (observedHere && observer.providerMayHaveStarted());
+    const terminal = (QA_PRE_PROVIDER_TERMINAL_STATUSES as readonly string[]).includes(status);
+    if (!positive && !(observedHere && terminal)) return patch;
+    const recovery: Record<string, unknown> = {
+      ...prior, ...requested,
+      kind: readNonEmptyString(requested.kind) ?? readNonEmptyString(prior.kind) ?? "bootstrap",
+      providerWorkStarted: positive,
+    };
+    // While cleanup is pending this is only an observation. Only the owning
+    // executor's finally block can mint a settled pre-provider delivery proof.
+    delete recovery.qaPreProvider;
+    return { ...patch, resultJson: { ...parseObject(previous.resultJson),
+      ...parseObject(patch?.resultJson), executionRecovery: recovery } };
+  }
+
+  function reserveQaProviderObservation(run: typeof heartbeatRuns.$inferSelect) {
+    const decisionId = qaDecisionIdFromWakeKey(qaDecisionWakeKey(
+      readNonEmptyString(parseObject(run.contextSnapshot).qaDecisionId) ?? "",
+    ));
+    if (!decisionId || !run.wakeupRequestId) return { observation: null };
+    if (qaProviderObservations.has(run.id)) return null;
+    const observation: QaProviderObservation = {
+      companyId: run.companyId, runId: run.id, decisionId,
+      wakeupRequestId: run.wakeupRequestId,
+      controllerBootId: run.runtimeMode === "legacy" ? legacyControllerBootId : run.controllerBootId,
+      claimSucceeded: false, preparationStarted: false,
+      providerMayHaveStarted: () => false,
+    };
+    // Reserve before the claim transaction can commit. A separate pause or
+    // shutdown service must observe this owner throughout claim-to-execute.
+    qaProviderObservations.set(run.id, observation);
+    return { observation };
+  }
+
+  function markQaObservationClaimed(observation: QaProviderObservation | null, run: typeof heartbeatRuns.$inferSelect) {
+    if (observation && qaProviderObservations.get(run.id) === observation &&
+        observation.companyId === run.companyId && observation.runId === run.id &&
+        observation.wakeupRequestId === run.wakeupRequestId &&
+        observation.decisionId === parseObject(run.contextSnapshot).qaDecisionId &&
+        observation.controllerBootId === run.controllerBootId) observation.claimSucceeded = true;
+  }
+
+  async function settleQaPreProviderObservation(observation: QaProviderObservation) {
+    if (qaProviderObservations.get(observation.runId) !== observation ||
+        !observation.claimSucceeded || observation.providerMayHaveStarted() ||
+        !observation.controllerBootId) return null;
+    const current = await getRun(observation.runId);
+    if (!current || current.companyId !== observation.companyId || current.runtimeMode !== "legacy" ||
+        current.wakeupRequestId !== observation.wakeupRequestId ||
+        current.controllerBootId !== observation.controllerBootId ||
+        parseObject(current.contextSnapshot).qaDecisionId !== observation.decisionId ||
+        !(QA_PRE_PROVIDER_TERMINAL_STATUSES as readonly string[]).includes(current.status)) return null;
+    const recovery = buildQaPreProviderRecovery({ run: current,
+      kind: readNonEmptyString(parseObject(current.resultJson?.executionRecovery).kind) ?? "bootstrap",
+      providerMayHaveStarted: false, existingRecovery: parseObject(current.resultJson?.executionRecovery) });
+    if (!recovery.qaPreProvider) return null;
+    return db.update(heartbeatRuns).set({
+      resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb), '{executionRecovery}',
+        coalesce(${heartbeatRuns.resultJson}->'executionRecovery', '{}'::jsonb) || ${JSON.stringify(recovery)}::jsonb)`,
+      updatedAt: new Date(),
+    }).where(and(eq(heartbeatRuns.id, observation.runId), eq(heartbeatRuns.companyId, observation.companyId),
+      eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.controllerBootId, observation.controllerBootId),
+      eq(heartbeatRuns.wakeupRequestId, observation.wakeupRequestId),
+      inArray(heartbeatRuns.status, [...QA_PRE_PROVIDER_TERMINAL_STATUSES]),
+      sql`${heartbeatRuns.contextSnapshot}->>'qaDecisionId' = ${observation.decisionId}`,
+      sql`${heartbeatRuns.contextSnapshot}->'forceFreshSession' = 'true'::jsonb`,
+      isNull(heartbeatRuns.processPid), isNull(heartbeatRuns.processGroupId), isNull(heartbeatRuns.processStartedAt),
+      isNull(heartbeatRuns.externalRunId), isNull(heartbeatRuns.nativeSessionId),
+      sql`(${heartbeatRuns.resultJson} #> '{executionRecovery,providerWorkStarted}') is distinct from 'true'::jsonb`,
+    )).returning().then(rows => rows[0] ?? null);
+  }
+
+  async function closeQaClaimObservation(observation: QaProviderObservation | null) {
+    if (!observation || qaProviderObservations.get(observation.runId) !== observation) return;
+    try {
+      // A successful claim has acquired no runtime resources. Once preparation
+      // starts, only executeRun's existing post-cleanup finally may settle it.
+      if (!observation.preparationStarted) await settleQaPreProviderObservation(observation);
+    } catch (err) {
+      logger.error({ err, runId: observation.runId }, "failed to persist settled QA claim evidence; delivery remains fenced");
+    } finally {
+      if (qaProviderObservations.get(observation.runId) === observation) qaProviderObservations.delete(observation.runId);
+    }
+  }
+
+  function preserveQaDispatchEvidenceAtWrite(
+    previous: typeof heartbeatRuns.$inferSelect | null,
+    patch: Partial<typeof heartbeatRuns.$inferInsert> | undefined,
+  ) {
+    if (!previous || !readNonEmptyString(parseObject(previous.contextSnapshot).qaDecisionId)
+      || !patch?.resultJson) return {};
+    // Recheck at the actual UPDATE, not only the earlier SELECT. Another
+    // controller's positive dispatch must dominate a stale pre-provider patch.
+    return { resultJson: sql`case
+      when ${heartbeatRuns.resultJson} #> '{executionRecovery,providerWorkStarted}' = 'true'::jsonb
+      then ${JSON.stringify(patch.resultJson)}::jsonb || jsonb_build_object('executionRecovery',
+        (${JSON.stringify(parseObject(patch.resultJson.executionRecovery))}::jsonb - 'qaPreProvider')
+          || '{"providerWorkStarted":true}'::jsonb)
+      else ${JSON.stringify(patch.resultJson)}::jsonb end` };
+  }
+
   async function setRunStatus(
     runId: string,
     status: string,
@@ -13024,6 +13184,7 @@ export function heartbeatService(
         },
       };
     }
+    patch = reconcileQaProviderEvidence(previousStatus, patch, status);
     const updated =
       previousStatus &&
       await legacyExecutionNeedsReconciliationWithEvidence(db, {
@@ -13042,6 +13203,7 @@ export function heartbeatService(
             .set({
               status,
               ...patch,
+              ...preserveQaDispatchEvidenceAtWrite(previousStatus, patch),
               executionStatusDeliveryId: randomUUID(),
               updatedAt: new Date(),
             })
@@ -13115,6 +13277,7 @@ export function heartbeatService(
         },
       };
     }
+    patch = reconcileQaProviderEvidence(previousStatus, patch, status);
     const updated =
       previousStatus &&
       await legacyExecutionNeedsReconciliationWithEvidence(db, {
@@ -13134,6 +13297,7 @@ export function heartbeatService(
             .set({
               status,
               ...patch,
+              ...preserveQaDispatchEvidenceAtWrite(previousStatus, patch),
               executionStatusDeliveryId: randomUUID(),
               updatedAt: new Date(),
             })
@@ -14273,6 +14437,14 @@ export function heartbeatService(
     agent: typeof agents.$inferSelect,
     issueId: string,
   ) {
+    if (hasSelfTaskDocumentReplayHold(run)) {
+      await appendRunEvent(run, {
+        eventType: "lifecycle", stream: "system", level: "warn",
+        message: "Task document work requires receipt reconciliation before an explicit new episode.",
+        payload: { reason: "self_task_document_replay_hold", issueId, retrySuppressed: true },
+      });
+      return null;
+    }
     const invokability = await getAgentInvokability(agent);
     if (!invokability.invokable) {
       await appendRunEvent(run, {
@@ -14639,6 +14811,9 @@ export function heartbeatService(
     // A second process-loss retry would compete for the same outbox input.
     if (run.contextSnapshot?.wakeReason === CHAT_COMPLETION_WAKE_REASON &&
         Array.isArray(run.contextSnapshot?.chatCompletionDeliveryIds)) return null;
+    // The committed QA decision owns its next episode. Shutdown must not also
+    // create a retry chain before the executing host has settled preparation.
+    if (readNonEmptyString(parseObject(run.contextSnapshot).qaDecisionId)) return null;
     // Native sessions have their own fenced same-run controller. Legacy
     // bootstrap recovery shares the durable delay and incident counter with
     // transient retries; process loss must not open a second retry budget.
@@ -15521,6 +15696,12 @@ export function heartbeatService(
       delayMs?: number;
     },
   ) {
+    if (hasSelfTaskDocumentSetupRetryHold(run)) {
+      return { outcome: "not_scheduled" as const,
+        reason: "Reconcile task document receipts before an explicit new episode; automatic replay is disabled.",
+        errorCode: "self_task_document_replay_hold" as const,
+        issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
+    }
     if (readQaPagingHold(run)) {
       return { outcome: "not_scheduled" as const, reason: "Repair QA paging before explicit resumption.",
         issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
@@ -15787,8 +15968,12 @@ export function heartbeatService(
       run,
       retryContextSnapshot,
     );
-    const continuationRetryIdempotencyKey =
-      retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
+    // A safe retry is a new run, but still belongs to the same committed QA
+    // decision. Claim revalidates this key and the current decision authority.
+    const qaDecisionId = readNonEmptyString(contextSnapshot.qaDecisionId);
+    const continuationRetryIdempotencyKey = qaDecisionId
+      ? qaDecisionWakeKey(qaDecisionId)
+      : retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
         ? `max-turn-continuation:${run.companyId}:${issueId ?? "no-issue"}:${run.id}:${schedule.attempt}`
         : retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON
           ? `interaction-continuation:${run.companyId}:${issueId ?? "no-issue"}:${run.id}:${schedule.attempt}`
@@ -17490,11 +17675,18 @@ export function heartbeatService(
     companyAgents?: AgentOrgRow[],
   ) {
     if (run.status !== "queued") return run;
+    // A committed QA decision owns recovery of a never-started return. Do not
+    // turn a claim-time gate into an unrelated old-session continuation.
+    const claimCancellation = {
+      suppressImmediateRecovery: Boolean(parseObject(run.contextSnapshot).qaDecisionId),
+      suppressQueueAdvance: true,
+    };
     const agent = await getAgent(run.agentId);
     if (!agent) {
       await cancelRunInternal(
         run.id,
         "Cancelled because the agent no longer exists",
+        claimCancellation,
       );
       return null;
     }
@@ -17505,6 +17697,7 @@ export function heartbeatService(
       await cancelRunInternal(
         run.id,
         `Cancelled because the agent is not invokable: ${invokability.reason}`,
+        claimCancellation,
       );
       return null;
     }
@@ -17519,7 +17712,7 @@ export function heartbeatService(
       },
     );
     if (budgetBlock) {
-      await cancelRunInternal(run.id, budgetBlock.reason);
+      await cancelRunInternal(run.id, budgetBlock.reason, claimCancellation);
       return null;
     }
 
@@ -17574,6 +17767,7 @@ export function heartbeatService(
         await cancelRunInternal(
           run.id,
           "Cancelled because issue is held by an active subtree pause hold",
+          claimCancellation,
         );
         await logActivity(db, {
           companyId: run.companyId,
@@ -17663,6 +17857,49 @@ export function heartbeatService(
       }).from(issues).where(and(
         eq(issues.id, issueId), eq(issues.companyId, run.companyId),
       )).for("update") : [];
+      if (context.qaDecisionId !== undefined) {
+        const decisionId = typeof context.qaDecisionId === "string" ? context.qaDecisionId : "";
+        const [receipt] = run.wakeupRequestId ? await tx.select({
+          idempotencyKey: agentWakeupRequests.idempotencyKey,
+          agentId: agentWakeupRequests.agentId,
+        }).from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.id, run.wakeupRequestId),
+          eq(agentWakeupRequests.companyId, run.companyId),
+        )).limit(1) : [];
+        if (!issueId || !owner || !receipt || receipt.agentId !== run.agentId ||
+            receipt.idempotencyKey !== qaDecisionWakeKey(decisionId) ||
+            qaDecisionIdFromWakeKey(receipt.idempotencyKey) !== decisionId ||
+            !await isAuthorizedQaDecisionWake(tx, {
+              companyId: run.companyId, issueId, agentId: run.agentId, decisionId,
+            })) {
+          // A QA return is bound to one committed decision and assignee. Once
+          // that authority changes, the queued run can never become valid on a
+          // later scan or restart; settle it through permanent claim rejection.
+          throw new HttpError(403, "QA decision wake is no longer current");
+        }
+        if (await hasQaPredecessorOwnershipHold(tx, run.companyId, issueId, run.id)) {
+          const message = "前のAIの停止・後始末が確認できるまで待機しています。実行履歴から停止の受領を確認してください。";
+          const [changed] = await tx.update(agentWakeupRequests).set({
+            payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
+              ${JSON.stringify({ reason: "qa_predecessor_ownership_active", message })}::jsonb)`,
+            updatedAt: new Date(),
+          }).where(and(eq(agentWakeupRequests.id, run.wakeupRequestId!),
+            eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.runId, run.id),
+            sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' is distinct from 'qa_predecessor_ownership_active'`,
+          )).returning({ id: agentWakeupRequests.id });
+          if (changed) await appendHeartbeatRunEvent(tx, {
+            companyId: run.companyId, runId: run.id, agentId: run.agentId,
+            eventType: "lifecycle", stream: "system", level: "warn", message,
+            payload: { reason: "qa_predecessor_ownership_active", providerWorkStarted: false },
+          });
+          return { ownsIssue: owner.assigneeAgentId === run.agentId, blocked: true };
+        }
+        await tx.update(agentWakeupRequests).set({
+          payload: sql`${agentWakeupRequests.payload} - 'executionWait'`, updatedAt: new Date(),
+        }).where(and(eq(agentWakeupRequests.id, run.wakeupRequestId!),
+          eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.runId, run.id),
+          sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' = 'qa_predecessor_ownership_active'`));
+      }
       const ownsIssue = owner?.assigneeAgentId === run.agentId &&
         context.wakeReason !== "source_scoped_recovery_action";
       if (ownsIssue && ["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? "") &&
@@ -17714,9 +17951,44 @@ export function heartbeatService(
       return { ownsIssue, blocked: false };
     }
     async function bindClaimedIssueExecution(tx: Db, ownsIssue: boolean, claimedRun: typeof heartbeatRuns.$inferSelect | null | undefined) {
+      if (claimedRun && context.qaDecisionId !== undefined && run.wakeupRequestId) {
+        const [claimedWake] = await tx.update(agentWakeupRequests).set({
+          status: "claimed", claimedAt, updatedAt: claimedAt,
+        }).where(and(
+          eq(agentWakeupRequests.id, run.wakeupRequestId),
+          eq(agentWakeupRequests.companyId, run.companyId),
+          eq(agentWakeupRequests.agentId, run.agentId),
+          eq(agentWakeupRequests.runId, run.id),
+          eq(agentWakeupRequests.idempotencyKey, qaDecisionWakeKey(String(context.qaDecisionId))),
+          inArray(agentWakeupRequests.status, ["queued", "claimed"]),
+        )).returning({ id: agentWakeupRequests.id });
+        if (!claimedWake) throw conflict("QA wake changed while claiming its execution");
+        if (claimedRun.runtimeMode === "legacy") {
+          // A new, server-bound claim has not entered preparation yet. Its
+          // first executor must consume this fence on the same run row before
+          // allocating resources; an expired, unconsumed claim is recoverable.
+          const [stamped] = await tx.update(heartbeatRuns).set({
+            runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) ||
+              ${JSON.stringify({ qaClaimPreparation: { schema: "paperclip.qa-claim-preparation/v1",
+                runId: claimedRun.id, decisionId: context.qaDecisionId,
+                controllerBootId: claimedRun.controllerBootId, state: "pending" } })}::jsonb`,
+          }).where(and(eq(heartbeatRuns.id, claimedRun.id), eq(heartbeatRuns.companyId, run.companyId)))
+            .returning({ runnerProfileJson: heartbeatRuns.runnerProfileJson });
+          if (!stamped) throw conflict("QA preparation claim changed while binding its execution");
+          // All claim branches return this row, including executeRun's direct
+          // queued-claim path. Never return the pre-stamp profile snapshot.
+          claimedRun.runnerProfileJson = stamped.runnerProfileJson;
+        }
+      }
       if (!claimedRun || !issueId || !ownsIssue) return;
       await tx.update(issues).set({
         executionRunId: claimedRun.id,
+        // A fresh legacy QA return has already passed current decision,
+        // assignee and predecessor-ownership checks under this Issue lock.
+        // Bind both owners in that same claim: document-only workers cannot
+        // call checkout, and execution_* wakes skip ordinary auto-checkout.
+        ...(context.qaDecisionId !== undefined && context.forceFreshSession === true &&
+          claimedRun.runtimeMode === "legacy" ? { checkoutRunId: claimedRun.id } : {}),
         executionAgentNameKey: normalizeAgentNameKey(agent.name),
         executionLockedAt: claimedAt,
         updatedAt: claimedAt,
@@ -18096,7 +18368,7 @@ export function heartbeatService(
     });
     publishRunLifecyclePluginEvent(claimed);
 
-    if (!nativeReviewContext) {
+    if (!nativeReviewContext && context.qaDecisionId === undefined) {
       await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
     }
 
@@ -18106,7 +18378,7 @@ export function heartbeatService(
     const claimedIssueId = readNonEmptyString(claimedContext.issueId);
     const claimedWakeReason = readNonEmptyString(claimedContext.wakeReason);
     if (
-      !nativeReviewContext && claimedIssueId &&
+      !nativeReviewContext && context.qaDecisionId === undefined && claimedIssueId &&
       claimedWakeReason !== "source_scoped_recovery_action"
     ) {
       const claimedAgent = await getAgent(claimed.agentId);
@@ -18169,10 +18441,20 @@ export function heartbeatService(
           status: "queued",
           startedAt: null,
           responsibleUserId: null,
+          // Return the whole pre-provider claim to its unclaimed state. A
+          // later queued cancellation must not inherit an obsolete controller
+          // claim and become indistinguishable from possibly dispatched work.
+          controllerBootId: null,
+          controllerLeaseExpiresAt: null,
+          executionStage: null,
           updatedAt: now,
         })
         .where(
-          and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")),
+          and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running"),
+            isNull(heartbeatRuns.processPid), isNull(heartbeatRuns.processGroupId),
+            isNull(heartbeatRuns.processStartedAt), isNull(heartbeatRuns.externalRunId),
+            isNull(heartbeatRuns.nativeSessionId),
+            sql`(${heartbeatRuns.resultJson} #> '{executionRecovery,providerWorkStarted}') is distinct from 'true'::jsonb`),
         )
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -19188,6 +19470,62 @@ export function heartbeatService(
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
   }
 
+  async function failExpiredQaClaimBeforePreparation(run: typeof heartbeatRuns.$inferSelect, now: Date) {
+    const fence = parseObject(parseObject(run.runnerProfileJson).qaClaimPreparation);
+    const decisionId = qaDecisionIdFromWakeKey(qaDecisionWakeKey(
+      readNonEmptyString(parseObject(run.contextSnapshot).qaDecisionId) ?? ""));
+    if (run.runtimeMode !== "legacy" || !run.controllerBootId || !run.wakeupRequestId || !decisionId ||
+        fence.schema !== "paperclip.qa-claim-preparation/v1" || fence.state !== "pending" ||
+        fence.runId !== run.id || fence.decisionId !== decisionId ||
+        fence.controllerBootId !== run.controllerBootId) return { applicable: false as const, run: null };
+    const recovery = { kind: "bootstrap", providerWorkStarted: false,
+      qaPreProvider: { schema: "paperclip.qa-pre-provider/v1", runId: run.id, decisionId },
+      orphanClaim: { schema: "paperclip.qa-orphan-claim/v1", controllerBootId: run.controllerBootId } };
+    // Terminalize and attest in one conditional write. Expiry alone is not
+    // no-provider evidence: only this new, unconsumed server claim qualifies.
+    // Old terminal UNKNOWNs and all entered/dispatching preparations stay held.
+    const [failed] = await db.update(heartbeatRuns).set({
+      status: "failed", error: buildProcessLossMessage(run), errorCode: "process_lost", finishedAt: now,
+      executionStatusDeliveryId: randomUUID(), updatedAt: now,
+      resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object(
+        'executionRecovery', coalesce(${heartbeatRuns.resultJson}->'executionRecovery', '{}'::jsonb)
+          || ${JSON.stringify(recovery)}::jsonb)`,
+    }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+      eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.runtimeMode, "legacy"),
+      eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.controllerBootId, run.controllerBootId),
+      lte(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`),
+      eq(heartbeatRuns.executionStage, "preparing"), isNull(heartbeatRuns.runtimeModeResolvedAt),
+      eq(heartbeatRuns.wakeupRequestId, run.wakeupRequestId),
+      sql`${heartbeatRuns.runnerProfileJson}->'qaClaimPreparation' = ${JSON.stringify(fence)}::jsonb`,
+      sql`${heartbeatRuns.contextSnapshot}->>'qaDecisionId' = ${decisionId}`,
+      sql`${heartbeatRuns.contextSnapshot}->'forceFreshSession' = 'true'::jsonb`,
+      isNull(heartbeatRuns.processPid), isNull(heartbeatRuns.processGroupId), isNull(heartbeatRuns.processStartedAt),
+      isNull(heartbeatRuns.externalRunId), isNull(heartbeatRuns.nativeSessionId), isNull(heartbeatRuns.sessionIdAfter),
+      sql`(${heartbeatRuns.resultJson} #> '{executionRecovery,providerWorkStarted}') is distinct from 'true'::jsonb`,
+      sql`coalesce(${heartbeatRuns.resultJson}->>'workspaceRestoreFailure', '') = ''`,
+      notExists(db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, run.companyId),
+        eq(issueRecoveryActions.fingerprint, `legacy-execution:${run.id}`)))),
+      exists(db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, run.companyId),
+        eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.runId, run.id),
+        eq(agentWakeupRequests.status, "claimed"), eq(agentWakeupRequests.idempotencyKey, qaDecisionWakeKey(decisionId))))),
+      notExists(db.select({ id: environmentLeases.id }).from(environmentLeases)
+        .where(eq(environmentLeases.heartbeatRunId, run.id))),
+      notExists(db.select({ id: agentInstructionWorkingCopies.runId }).from(agentInstructionWorkingCopies)
+        .where(eq(agentInstructionWorkingCopies.runId, run.id))),
+      notExists(db.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations)
+        .where(eq(nativeRunFinalizations.runId, run.id))),
+    )).returning();
+    if (failed) {
+      publishLiveEvent({ companyId: failed.companyId, type: "heartbeat.run.status",
+        payload: buildHeartbeatRunStatusLiveEventPayload(failed) });
+      publishRunLifecyclePluginEvent(failed);
+      emitTerminalAgentTaskRun(failed, "running");
+    }
+    return { applicable: true as const, run: failed ?? null };
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -19589,11 +19927,15 @@ export function heartbeatService(
         ((tracksLegacyLocalChild &&
           (!!run.processPid || !!run.processGroupId)) ||
           monitorDispatchLostWithoutFutureWake);
-      if (!(await revokeExpiredLegacyController(db, run))) continue;
+      const orphanQaClaim = await failExpiredQaClaimBeforePreparation(run, now);
+      if (orphanQaClaim.applicable && !orphanQaClaim.run) continue;
+      if (!orphanQaClaim.applicable && !(await revokeExpiredLegacyController(db, run))) continue;
       const baseMessage = buildProcessLossMessage(run);
       const conversationContinuationEligible = await runUsedConversationAdapter(db, run);
 
-      const failureWrite = await setRunStatusFromLive(
+      const failureWrite = orphanQaClaim.run
+        ? { run: orphanQaClaim.run, updated: true as const }
+        : await setRunStatusFromLive(
         run.id,
         "failed",
         ["running"],
@@ -19743,8 +20085,105 @@ export function heartbeatService(
     return { reaped: reaped.length, runIds: reaped };
   }
 
+  // Terminal status records the result, not release of the physical executor.
+  // A new QA episode may leave the old UNKNOWN untouched only after ownership
+  // has ended. Check all predecessors, not just the latest recovery action.
+  async function readQaPredecessorOwnershipHold(queryDb: Db, companyId: string, issueId: string, exceptRunId?: string) {
+    const predecessors = await queryDb.select({ id: heartbeatRuns.id, processPid: heartbeatRuns.processPid,
+      processGroupId: heartbeatRuns.processGroupId, processStartedAt: heartbeatRuns.processStartedAt,
+      finishedAt: heartbeatRuns.finishedAt })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+        sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issueId}`,
+        inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+        exceptRunId ? ne(heartbeatRuns.id, exceptRunId) : undefined));
+    if (!predecessors.length) return null;
+    const ids = predecessors.map(run => run.id);
+    // A released sandbox lease does not itself prove that its provider child
+    // stopped. PIDs on this host cannot establish remote ownership release.
+    const remoteLeases = await queryDb.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, ids),
+      isNotNull(environmentLeases.provider), ne(environmentLeases.provider, "local"),
+    ));
+    const remoteHold = remoteLeases.find(lease => !hasRemoteTerminationReceipt(lease));
+    if (remoteHold) return { sourceRunId: remoteHold.heartbeatRunId!,
+      message: "前のAIの遠隔実行について、停止した証拠をまだ確認できません。環境の保持だけでは作業の停止を確認できません。" };
+    const stoppedRemoteRunIds = new Set(remoteLeases.map(lease => lease.heartbeatRunId));
+    const [lease] = await queryDb.select({ id: environmentLeases.id, runId: environmentLeases.heartbeatRunId }).from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, ids),
+      or(and(isNull(environmentLeases.releasedAt),
+        sql`not coalesce(${environmentLeases.status} = 'retained' and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+          and ${environmentLeases.cleanupStatus} = 'success', false)`),
+        eq(environmentLeases.status, "pending_cleanup"), eq(environmentLeases.cleanupStatus, "failed")),
+    )).limit(1);
+    const [finalization] = await queryDb.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.companyId, companyId), inArray(nativeRunFinalizations.runId, ids),
+      or(isNotNull(nativeRunFinalizations.leaseOwner),
+        notInArray(nativeRunFinalizations.phase, ["committed", "applied", "terminal_failure"])),
+    )).limit(1);
+    if (lease) return { sourceRunId: lease.runId!, message: "前のAIの実行環境の後始末が完了していません。停止と後始末の受領を確認してください。" };
+    if (finalization) return { sourceRunId: finalization.id, message: "前のAIの成果保存と終了処理が完了していません。終了の受領を確認してください。" };
+    for (const run of predecessors) {
+      if (liveRunExecutions.has(run.id) || activeRunExecutions.has(run.id) || adapterExecutionControls.has(run.id)) {
+        return { sourceRunId: run.id, message: "前のAIが終了処理中です。処理が完了すると、同じ判断に基づく作業を再開します。" };
+      }
+      // Exact provider receipts settle remote process ownership; identically
+      // numbered PIDs/PGIDs on this host do not belong to that remote run.
+      if (stoppedRemoteRunIds.has(run.id)) continue;
+      // Settle only an absent executor or a proven later local generation.
+      // A surviving/unknown old group remains a hold even if its PID changed.
+      if (await hasLocalPredecessorProcessOwnership(run)) {
+        return { sourceRunId: run.id, message: "前のAIのプロセスが停止した証拠をまだ確認できません。実行履歴から停止の受領を確認してください。" };
+      }
+    }
+    return null;
+  }
+
+  async function hasQaPredecessorOwnershipHold(queryDb: Db, companyId: string, issueId: string, exceptRunId?: string) {
+    return (await readQaPredecessorOwnershipHold(queryDb, companyId, issueId, exceptRunId)) !== null;
+  }
+
+  async function resumeDeferredQaDecisionWakes() {
+    const cutoff = await getWorktreeExecutionCutoff();
+    const before = new Date(Date.now() - 30_000);
+    const pending = await db.select({ wake: agentWakeupRequests })
+      .from(agentWakeupRequests)
+      .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        eq(issues.assigneeAgentId, agentWakeupRequests.agentId)))
+      .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
+      .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        isNull(agentWakeupRequests.runId), eq(issues.status, "in_progress"),
+        sql`${agentWakeupRequests.idempotencyKey} = 'qa-decision:' || (${issues.executionState}->>'lastDecisionId')`,
+        lte(agentWakeupRequests.updatedAt, before),
+        cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
+      .orderBy(asc(agentWakeupRequests.updatedAt), asc(agentWakeupRequests.id)).limit(100);
+    for (const { wake } of pending) {
+      // Rotate held candidates without changing their business issue revision.
+      // Admission re-locks the issue and validates this exact pending receipt.
+      const [claimed] = await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+        eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+        lte(agentWakeupRequests.updatedAt, before),
+      )).returning({ id: agentWakeupRequests.id });
+      const decisionId = qaDecisionIdFromWakeKey(wake.idempotencyKey);
+      if (!claimed || !decisionId) continue;
+      try {
+        await enqueueWakeup(wake.agentId, {
+          source: "assignment", triggerDetail: "system", reason: "execution_changes_requested",
+          qaDecisionId: decisionId, allowRunCoalescing: false,
+          payload: { issueId: wake.payload?.issueId },
+          contextSnapshot: { issueId: wake.payload?.issueId, source: "issue.execution_stage" },
+          requestedByActorType: "system", requestedByActorId: "qa-decision-recovery",
+        }, wake.id);
+      } catch (err) {
+        logger.warn({ err, queueId: wake.id }, "failed to resume deferred QA decision wake");
+      }
+    }
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
+    await resumeDeferredQaDecisionWakes();
     await resumeExecutionWaitComments();
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
@@ -20016,8 +20455,127 @@ export function heartbeatService(
 
   async function reconcileStrandedAssignedIssues() {
     await reconcileCommanderResultHandoffs();
+    // PATCH commits the review decision before its fire-and-forget wake.
+    // Recover that gap from the committed decision itself on startup/periodic reconciliation.
+    const cutoff = await getWorktreeExecutionCutoff();
+    const qaRetryAfter = new Date(Date.now() - 5 * 60_000);
+    const attemptedQaKey = sql`'qa-decision:' || (${issues.executionState}->>'lastDecisionId')`;
+    const pendingQa = await db.select({
+      id: issues.id,
+      companyId: issues.companyId,
+      agentId: issues.assigneeAgentId,
+      executionState: issues.executionState,
+    }).from(issues).innerJoin(companies, and(
+      eq(companies.id, issues.companyId), eq(companies.status, "active"),
+    )).where(and(
+      eq(issues.status, "in_progress"),
+      sql`${issues.executionState}->>'status' = 'changes_requested'`,
+      isNotNull(issues.assigneeAgentId),
+      sql`${issues.executionState}->'returnAssignee'->>'type' = 'agent'`,
+      sql`${issues.executionState}->'returnAssignee'->>'agentId' = ${issues.assigneeAgentId}::text`,
+      cutoff ? gte(issues.createdAt, cutoff) : undefined,
+      exists(db.select({ id: issueExecutionDecisions.id }).from(issueExecutionDecisions).where(and(
+        eq(issueExecutionDecisions.companyId, issues.companyId),
+        eq(issueExecutionDecisions.issueId, issues.id),
+        sql`${issueExecutionDecisions.id}::text = ${issues.executionState}->>'lastDecisionId'`,
+        sql`${issueExecutionDecisions.stageId}::text = ${issues.executionState}->>'currentStageId'`,
+        eq(issueExecutionDecisions.stageType, "review"),
+        eq(issueExecutionDecisions.outcome, "changes_requested"),
+        eq(issueExecutionDecisions.freshEpisodeWakeRequested, true),
+      ))),
+      notExists(db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issues.companyId),
+        sql`${agentWakeupRequests.idempotencyKey} = ${attemptedQaKey}`,
+        sql`${agentWakeupRequests.status} <> 'skipped'`,
+        qaDecisionWakeBlocksDelivery(),
+      ))),
+      // A blocked candidate must not consume the oldest 100 slots every tick.
+      notExists(db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, issues.companyId),
+        eq(agentWakeupRequests.status, "skipped"),
+        gte(agentWakeupRequests.updatedAt, qaRetryAfter),
+        sql`(${agentWakeupRequests.idempotencyKey} = ${attemptedQaKey}
+          or ${agentWakeupRequests.payload}->'executionWait'->>'requestedIdempotencyKey' = ${attemptedQaKey})`,
+      ))),
+    )).orderBy(
+      sql`coalesce((select max(qa_attempt.updated_at) from agent_wakeup_requests qa_attempt
+        where qa_attempt.company_id = ${issues.companyId}
+          and qa_attempt.status = 'skipped'
+          and (qa_attempt.idempotency_key = ${attemptedQaKey}
+            or qa_attempt.payload->'executionWait'->>'requestedIdempotencyKey' = ${attemptedQaKey})), ${issues.updatedAt})`,
+      asc(issues.id),
+    ).limit(100);
+    for (const candidate of pendingQa) {
+      try {
+      const state = parseObject(candidate.executionState);
+      const decisionId = readNonEmptyString(state.lastDecisionId);
+      if (!decisionId || !candidate.agentId || !isUuidLike(decisionId)) continue;
+      const [decision] = await db.select({ id: issueExecutionDecisions.id })
+        .from(issueExecutionDecisions).where(and(
+          eq(issueExecutionDecisions.id, decisionId),
+          eq(issueExecutionDecisions.companyId, candidate.companyId),
+          eq(issueExecutionDecisions.issueId, candidate.id),
+          eq(issueExecutionDecisions.stageType, "review"),
+          eq(issueExecutionDecisions.outcome, "changes_requested"),
+          eq(issueExecutionDecisions.freshEpisodeWakeRequested, true),
+        )).limit(1);
+      if (!decision) continue;
+      const delivered = await enqueueWakeup(candidate.agentId, {
+        source: "assignment", triggerDetail: "system", reason: "execution_changes_requested",
+        qaDecisionId: decisionId, allowRunCoalescing: false,
+        payload: { issueId: candidate.id },
+        requestedByActorType: "system", requestedByActorId: "qa-decision-recovery",
+        contextSnapshot: {
+          issueId: candidate.id, taskId: candidate.id,
+          wakeReason: "execution_changes_requested", source: "issue.execution_stage",
+        },
+      });
+      if (!delivered) {
+        // Admission may return without a receipt (for example, authority changed
+        // after selection). Persist a cursor only when it left no recent wait.
+        await db.transaction(async tx => {
+          await tx.execute(sql`select id from issues where id = ${candidate.id}
+            and company_id = ${candidate.companyId} for update`);
+          const key = qaDecisionWakeKey(decisionId);
+          const [wait] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.companyId, candidate.companyId),
+            eq(agentWakeupRequests.status, "skipped"), gte(agentWakeupRequests.updatedAt, qaRetryAfter),
+            sql`(${agentWakeupRequests.idempotencyKey} = ${key}
+              or ${agentWakeupRequests.payload}->'executionWait'->>'requestedIdempotencyKey' = ${key})`,
+          )).limit(1);
+          if (!wait) await recordExecutionWait(tx as unknown as Db, {
+            issueId: candidate.id, condition: { reason: "qa_decision_recovery_not_delivered" }, coalesce: true,
+            request: { companyId: candidate.companyId, agentId: candidate.agentId!, source: "assignment",
+              triggerDetail: "system", reason: "qa_decision_recovery_not_delivered", payload: { issueId: candidate.id },
+              idempotencyKey: key, requestedByActorType: "system", requestedByActorId: "qa-decision-recovery" },
+          });
+        });
+      }
+      } catch (err) {
+        logger.error({ err, companyId: candidate.companyId, issueId: candidate.id },
+          "QA decision wake recovery failed for one issue; continuing remaining recovery");
+        const decisionId = readNonEmptyString(parseObject(candidate.executionState).lastDecisionId);
+        if (candidate.agentId && decisionId && isUuidLike(decisionId)) {
+          // Admission can roll back before recording a wait. Advance a durable
+          // retry cursor so failed candidates cannot monopolize the first page.
+          await db.transaction(async tx => {
+            await tx.execute(sql`select id from issues where id = ${candidate.id}
+              and company_id = ${candidate.companyId} for update`);
+            await recordExecutionWait(tx as unknown as Db, {
+              issueId: candidate.id, condition: { reason: "qa_decision_recovery_failed" }, coalesce: true,
+              request: { companyId: candidate.companyId, agentId: candidate.agentId!,
+                source: "assignment", triggerDetail: "system", reason: "qa_decision_recovery_failed",
+                payload: { issueId: candidate.id }, status: "skipped", finishedAt: new Date(),
+                idempotencyKey: qaDecisionWakeKey(decisionId),
+                requestedByActorType: "system", requestedByActorId: "qa-decision-recovery" },
+            });
+          }).catch(receiptError => logger.error({ err: receiptError, issueId: candidate.id },
+            "could not persist QA recovery wait; original failure remains unresolved"));
+        }
+      }
+    }
     return recovery.reconcileStrandedAssignedIssues({
-      issueCreatedAtGte: await getWorktreeExecutionCutoff(),
+      issueCreatedAtGte: cutoff,
     });
   }
 
@@ -20187,7 +20745,8 @@ export function heartbeatService(
         await cancelRunInternal(
           run.id,
           `Cancelled because the queued run cannot be claimed: ${err.message}`,
-          { errorCode: "queued_run_claim_rejected" },
+          { errorCode: "queued_run_claim_rejected",
+            suppressImmediateRecovery: Boolean(parseObject(run.contextSnapshot).qaDecisionId) },
         );
       } catch (cancelErr) {
         logger.error(
@@ -20199,13 +20758,14 @@ export function heartbeatService(
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
+    if (queuedRunStartScope.getStore()?.some(lock => lock.agentId === agentId && lock.held)) return [];
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
     // Cancelled after the start lock is released: cancelRunInternal promotes the
     // agent's next queued run, which takes this same lock.
     const rejectedClaims: Array<{ run: typeof heartbeatRuns.$inferSelect; err: HttpError }> = [];
 
-    return withAgentStartLock(agentId, async () => {
+    return withQueuedRunStartScope(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
@@ -20214,6 +20774,8 @@ export function heartbeatService(
           await cancelActiveForAgentInternal(
             agentId,
             `Cancelled because the agent is not invokable: ${invokability.reason}`,
+            "cancelled",
+            { suppressQueueAdvance: true },
           );
         }
         return [];
@@ -20313,6 +20875,20 @@ export function heartbeatService(
       });
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      const pendingQaTransfers = new Map<string, {
+        run: typeof heartbeatRuns.$inferSelect; observation: QaProviderObservation;
+      }>();
+      const startClaimedExecution = (claimedRun: typeof heartbeatRuns.$inferSelect) => {
+        const pending = pendingQaTransfers.get(claimedRun.id);
+        pendingQaTransfers.delete(claimedRun.id);
+        const execution = executeRun(claimedRun.id, pending
+          ? { qaProviderObservation: pending.observation } : {}).catch((err) => {
+          logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
+        });
+        activeRunExecutionPromises.add(execution);
+        void execution.finally(() => activeRunExecutionPromises.delete(execution));
+      };
+      try {
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
         const queuedContext = parseObject(queuedRun.contextSnapshot);
@@ -20326,9 +20902,16 @@ export function heartbeatService(
           const current = await getRun(queuedRun.id);
           if (current?.status !== "queued") continue;
         }
+        const reservation = reserveQaProviderObservation(queuedRun);
+        if (!reservation) continue;
+        const observation = reservation.observation;
         let claimed: typeof heartbeatRuns.$inferSelect | null;
         try {
           claimed = await claimQueuedRun(queuedRun, companyAgents);
+          if (claimed && observation) {
+            markQaObservationClaimed(observation, claimed);
+            pendingQaTransfers.set(claimed.id, { run: claimed, observation });
+          }
         } catch (err) {
           if (isPermanentClaimRejection(err)) {
             rejectedClaims.push({ run: queuedRun, err });
@@ -20340,30 +20923,27 @@ export function heartbeatService(
             "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass",
           );
           continue;
+        } finally {
+          if (observation && !pendingQaTransfers.has(queuedRun.id)) await closeQaClaimObservation(observation);
         }
         if (claimed) claimedRuns.push(claimed);
       }
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
-        const execution = executeRun(claimedRun.id).catch((err) => {
-          logger.error(
-            { err, runId: claimedRun.id },
-            "queued heartbeat execution failed",
-          );
-        });
         // Register the in-flight execution so drainActiveRunExecutions() can await
         // it. executeRun resolves only after its finally block finishes flushing
         // run rows/events, so awaiting this promise guarantees the run's writes
         // have landed before a caller (e.g. a test's afterEach) mutates the DB.
-        activeRunExecutionPromises.add(execution);
-        void execution.finally(() => {
-          // drainActiveRunExecutions loops on activeRunExecutionPromises.size,
-          // so an entry that never clears here would hang it forever.
-          activeRunExecutionPromises.delete(execution);
-        });
+        startClaimedExecution(claimedRun);
       }
       return claimedRuns;
+      } finally {
+        // A later claim can throw after an earlier QA claim committed. Transfer
+        // every already-claimed scope to its normal executor even on that exit;
+        // executeRun rechecks cancellation/suppression before preparation.
+        for (const pending of [...pendingQaTransfers.values()]) startClaimedExecution(pending.run);
+      }
     }).finally(() => cancelRejectedQueuedRuns(rejectedClaims));
   }
 
@@ -20456,13 +21036,39 @@ export function heartbeatService(
     return promise;
   }
 
+  function withQaProviderDispatchGate<T>(
+    run: typeof heartbeatRuns.$inferSelect,
+    dispatchGate: (gate: ReturnType<typeof createRunDispatch>) => Promise<T>,
+  ): Promise<T> {
+    const decisionId = readNonEmptyString(parseObject(run.contextSnapshot).qaDecisionId);
+    if (!decisionId) return dispatchGate(runDispatch);
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId)
+      ?? readNonEmptyString(parseObject(run.contextSnapshot).taskId) ?? run.nativeIssueId;
+    return db.transaction(async tx => {
+      if (!issueId) throw conflict("QA execution has no task");
+      await tx.execute(sql`select id from issues where id = ${issueId} and company_id = ${run.companyId} for update`);
+      if (!await isAuthorizedQaDecisionWake(tx as unknown as Db, {
+        companyId: run.companyId, issueId, agentId: run.agentId, decisionId,
+      }) || await hasQaPredecessorOwnershipHold(tx as unknown as Db, run.companyId, issueId, run.id)) {
+        throw conflict("QA execution is no longer ready for provider dispatch");
+      }
+      // The existing gate must share this transaction/connection. A separate
+      // transaction could outlive a failed outer gate and dispatch after rollback.
+      // Its result wraps the provider promise; neither transaction awaits work.
+      return dispatchGate(createRunDispatch(tx as unknown as Db));
+    });
+  }
+
   async function executeRun(
     runId: string,
     runOptions: {
       nativeLeaseOwner?: string;
       nativeRestartRecovery?: NativeRestartRecoveryClaim;
+      qaProviderObservation?: QaProviderObservation;
     } = {},
   ) {
+    let qaObservation = runOptions.qaProviderObservation ?? null;
+    try {
     const attemptStartedAtMs = Date.now();
     let attestedQuestionResponseAtMs: number | null = null;
     if ((await getSchedulingSuppression()).suppressed) {
@@ -20480,7 +21086,16 @@ export function heartbeatService(
     let legacyAdapterEntered = false;
     let run = await getRun(runId);
     if (!run) return;
+    if (qaObservation && (qaProviderObservations.get(runId) !== qaObservation ||
+        qaObservation.companyId !== run.companyId || qaObservation.runId !== run.id ||
+        qaObservation.wakeupRequestId !== run.wakeupRequestId ||
+        qaObservation.decisionId !== parseObject(run.contextSnapshot).qaDecisionId)) return;
     if (run.status !== "queued" && run.status !== "running") return;
+    if (!qaObservation) {
+      const reservation = reserveQaProviderObservation(run);
+      if (!reservation) return;
+      qaObservation = reservation.observation;
+    }
 
     if (run.status === "queued") {
       const claimed = await claimQueuedRun(run);
@@ -20489,6 +21104,28 @@ export function heartbeatService(
         return;
       }
       run = claimed;
+      markQaObservationClaimed(qaObservation, run);
+    }
+
+    const qaClaimPreparation = parseObject(parseObject(run.runnerProfileJson).qaClaimPreparation);
+    if (run.runtimeMode === "legacy" && qaClaimPreparation.schema === "paperclip.qa-claim-preparation/v1") {
+      // This UPDATE and orphan recovery serialize on the run row. No setup,
+      // file copy, environment lease or provider call may precede consumption.
+      if (qaClaimPreparation.runId !== run.id ||
+          qaClaimPreparation.decisionId !== parseObject(run.contextSnapshot).qaDecisionId ||
+          qaClaimPreparation.controllerBootId !== legacyControllerBootId ||
+          qaClaimPreparation.state !== "pending") return;
+      const [entered] = await db.update(heartbeatRuns).set({
+        runnerProfileJson: sql`jsonb_set(${heartbeatRuns.runnerProfileJson},
+          '{qaClaimPreparation,state}', '"entered"'::jsonb)`, updatedAt: new Date(),
+      }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+        eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.runtimeMode, "legacy"),
+        eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+        gt(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`),
+        sql`${heartbeatRuns.runnerProfileJson}->'qaClaimPreparation' = ${JSON.stringify(qaClaimPreparation)}::jsonb`,
+      )).returning();
+      if (!entered) return;
+      run = entered;
     }
 
     const instructionCleanupRun = run;
@@ -20602,6 +21239,7 @@ export function heartbeatService(
 
     if (run.runtimeMode === "legacy" && run.controllerBootId &&
         run.controllerBootId !== legacyControllerBootId) return;
+    if (qaObservation && qaProviderObservations.get(run.id) !== qaObservation) return;
     activeRunExecutions.add(run.id);
     const executionControl = createAdapterExecutionControl();
     // This coarse scope also covers host finalization after the adapter returns.
@@ -20637,7 +21275,15 @@ export function heartbeatService(
     > | null = null;
     let providerTraceFinalized = false;
     let readFailureReportSecrets: () => string[] = () => [];
+    // Only this live executor can attest a new ordinary document setup failure.
+    // Never reconstruct non-entry from a historical providerWorkStarted:false.
+    let selfTaskSetupFailure: typeof heartbeatRuns.$inferSelect | null = null;
+    let selfTaskSetupCleanupComplete = true;
     let identityRedactor = createAgentIdentityRedactor();
+    if (qaObservation) {
+      qaObservation.preparationStarted = true;
+      qaObservation.providerMayHaveStarted = () => legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld;
+    }
 
     try {
       let agent = await getAgent(run.agentId);
@@ -21977,6 +22623,19 @@ export function heartbeatService(
         resolve: () => resolveAssignedConnectionInstructionsForRun(db, { companyId: agent.companyId, agentId: agent.id, runId: run.id }),
         context, config: connectorDelivery.config, native: agent.adapterType === "paperclip_runner",
       });
+      const selfTaskDocumentMode = isSelfTaskDocumentRuntime(agent.adapterType, runtimeConfig);
+      // Replace caller wake data even when disabled. Both the HTTP tool endpoint
+      // and recovery observe the same server-owned mode before provider work.
+      context[SELF_TASK_DOCUMENT_CONTEXT_KEY] = selfTaskDocumentMode;
+      run = { ...run, contextSnapshot: { ...parseObject(run.contextSnapshot), [SELF_TASK_DOCUMENT_CONTEXT_KEY]: selfTaskDocumentMode } };
+      await db.transaction(async tx => {
+        // Share I -> Run ordering with wake admission, so a source cannot gain
+        // document capability between its replay check and successor creation.
+        if (issueId) await tx.execute(sql`select id from issues where id::text = ${issueId} and company_id = ${agent.companyId} for update`);
+        await tx.update(heartbeatRuns).set({
+          contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ [SELF_TASK_DOCUMENT_CONTEXT_KEY]: selfTaskDocumentMode })}::jsonb`,
+        }).where(eq(heartbeatRuns.id, run.id));
+      });
       const agentIdentity = supportsManagedAgentIdentity(agent.adapterType, agent.adapterConfig, run.runtimeMode === "native" ? run.driverKind : undefined)
         ? await agentIdentityService(db).ensureAgentIdentity(agent.companyId, agent.id)
         : undefined;
@@ -23019,7 +23678,8 @@ export function heartbeatService(
         }
         if (
           !issueId ||
-          (!isResolvedInteractionContinuationWakeContext(context) &&
+          (!readNonEmptyString(context.qaDecisionId) &&
+            !isResolvedInteractionContinuationWakeContext(context) &&
             !["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? ""))
         ) {
           return { dispatched: true, resultPromise: dispatch(() => {}) };
@@ -23033,22 +23693,33 @@ export function heartbeatService(
           runId: run.id,
           issueId,
         });
-        const gate = await runDispatch.dispatchResolvedInteractionIfCurrent({
-          runId: run.id,
-          companyId: run.companyId,
-          expectedStatus: "running",
-          // Synchronous handoff under the ownership lock; the gate commits
-          // without awaiting the adapter's asynchronous bootstrap or finalizer.
-          dispatch,
-        });
+        const handedOff: { resultPromise?: Promise<T> } = {};
+        try {
+          const gate = await withQaProviderDispatchGate(run, currentDispatch => currentDispatch.dispatchResolvedInteractionIfCurrent({
+            runId: run.id,
+            companyId: run.companyId,
+            expectedStatus: "running",
+            // Synchronous handoff under the ownership lock. Retain ownership
+            // outside the transaction so a failed commit cannot orphan work.
+            dispatch: markDispatchStarted => {
+              const resultPromise = dispatch(markDispatchStarted);
+              handedOff.resultPromise = resultPromise;
+              return resultPromise;
+            },
+          }));
 
-        if (gate.dispatched) return gate;
-        if (gate.cancellation.outcome === "cancelled") {
-          applyRunDispatchPostCommitEffects(
-            gate.cancellation.postCommitEffects,
-          );
+          if (gate.dispatched) return gate;
+          if (gate.cancellation.outcome === "cancelled") {
+            applyRunDispatchPostCommitEffects(gate.cancellation.postCommitEffects);
+          }
+          return { dispatched: false };
+        } catch (error) {
+          // Locks have been released/rolled back. Keep the run, controller and
+          // environment owned until dispatched work settles or normal Stop
+          // joins it; finalization must not race an unobserved provider promise.
+          if (handedOff.resultPromise) await handedOff.resultPromise.catch(() => {});
+          throw error;
         }
-        return { dispatched: false };
       };
       if (!executionTarget || executionTarget.kind === "local") {
         try {
@@ -24669,6 +25340,9 @@ export function heartbeatService(
                 else '{}'::jsonb end)
               || (case when ${heartbeatRuns.runnerProfileJson} ? 'adapterDispatch'
                 then jsonb_build_object('adapterDispatch', ${heartbeatRuns.runnerProfileJson}->'adapterDispatch')
+                else '{}'::jsonb end)
+              || (case when ${heartbeatRuns.runnerProfileJson} ? 'qaClaimPreparation'
+                then jsonb_build_object('qaClaimPreparation', ${heartbeatRuns.runnerProfileJson}->'qaClaimPreparation')
                 else '{}'::jsonb end) || ${JSON.stringify(providerTraceRequested ? { providerTrace: { mode: "raw", traceId: providerTraceCapture?.metadata.id ?? null, maxBytes: PROVIDER_TRACE_MAX_BYTES } } : {})}::jsonb`,
               updatedAt: new Date(),
             })
@@ -25022,8 +25696,9 @@ export function heartbeatService(
             );
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
-                (markDispatchStarted) =>
-                  executePaperclipNativeSession({
+                (markDispatchStarted) => {
+                  nativeDispatchStarted = true;
+                  return executePaperclipNativeSession({
                     db,
                     execution: nativeExecution,
                     getFreshSessionHandoff: getNativeFreshSessionHandoff,
@@ -25157,7 +25832,8 @@ export function heartbeatService(
                       markDispatchStarted();
                       await persistRunProcessMetadata(run.id, meta);
                     },
-                  }),
+                  });
+                },
               );
             if (!guardedDispatch.dispatched) return;
             nativeDispatchStarted = true;
@@ -25196,13 +25872,18 @@ export function heartbeatService(
             };
             const qaReviewMode = ["claude_local", "codex_local"].includes(agent.adapterType) && runtimeConfig.qaReviewToolsOnly === true;
             const cycleMode = runtimeConfig.commanderCycleToolsOnly === true;
-            const runtimeTools = qaReviewMode || cycleMode ? undefined : createAdapterRuntimeToolAccess({
+            const isolatedTaskTools = qaReviewMode || cycleMode || selfTaskDocumentMode;
+            if (selfTaskDocumentMode) {
+              delete adapterContext.paperclipRuntimeTools;
+              delete adapterContext.paperclipManagedMcp;
+            }
+            const runtimeTools = isolatedTaskTools ? undefined : createAdapterRuntimeToolAccess({
               agentId: agent.id,
               companyId: agent.companyId,
               runId: run.id,
               responsibleUserId: run.responsibleUserId,
             });
-            if (!runtimeTools && !qaReviewMode && !cycleMode) {
+            if (!runtimeTools && !isolatedTaskTools) {
               logger.warn(
                 {
                   companyId: agent.companyId,
@@ -25212,7 +25893,7 @@ export function heartbeatService(
                 "runtime connection tools could not be delivered",
               );
             }
-            const runtimeMcpServers = qaReviewMode || cycleMode ? [] : await buildPaperclipRuntimeMcpServers({
+            const runtimeMcpServers = isolatedTaskTools ? [] : await buildPaperclipRuntimeMcpServers({
               db,
               agent,
               runId: run.id,
@@ -25227,8 +25908,10 @@ export function heartbeatService(
                 connectionId: "paperclip-runtime-tools",
               });
             }
-            const qaLocalApiUrl = qaReviewMode ? qaReviewLocalApiUrl() : null;
-            if (!cycleMode && authToken && issueRef && (qaReviewMode ? qaLocalApiUrl : configuredPaperclipApiBaseUrl())) {
+            const qaLocalApiUrl = qaReviewMode || selfTaskDocumentMode ? qaReviewLocalApiUrl() : null;
+            if (selfTaskDocumentMode) {
+              runtimeMcpServers.push(...selfTaskDocumentMcpServers({ localApiUrl: qaLocalApiUrl, authToken, hasIssue: !!issueRef }));
+            } else if (!cycleMode && authToken && issueRef && (qaReviewMode ? qaLocalApiUrl : configuredPaperclipApiBaseUrl())) {
               if (qaReviewMode) {
                 runtimeMcpServers.unshift({
                   name: QA_REVIEW_MCP_NAME,
@@ -25245,7 +25928,7 @@ export function heartbeatService(
             if (runtimeTools && runtimeToolDelivery === "invocation_context") {
               adapterContext.paperclipRuntimeTools = runtimeTools;
             }
-            const managedMcpConfig = qaReviewMode || cycleMode ? null : await createManagedMcpRunConfig({
+            const managedMcpConfig = isolatedTaskTools ? null : await createManagedMcpRunConfig({
               db,
               agent,
               runId: run.id,
@@ -25358,6 +26041,14 @@ export function heartbeatService(
               dispatchRunId:dispatch?.id ?? null, outcome:admitted ? dispatch ? "dispatched" : "held" : "idle"}};
           }
           adapterResult = identityRedactor.redact(adapterResult);
+          if (selfTaskDocumentMode) {
+            // Liveness and presentation reuse this source result after the
+            // status write; strip executor-only authority before every reader.
+            delete parseObject(adapterResult.resultJson?.executionRecovery).selfTaskDocumentPreProvider;
+            if (adapterResult.executionRecovery) {
+              delete (adapterResult.executionRecovery as unknown as Record<string, unknown>).selfTaskDocumentPreProvider;
+            }
+          }
           if(commanderResultClaim && adapterResult.exitCode===0 && !adapterResult.timedOut) {
             const handoff=await completeCommanderHermesResult(db,run.id,commanderResultClaim,adapterResult.resultJson ?? {}).catch(error=>{throw new ConfigurationIncompleteFailure(error instanceof Error?error.message:"Commander result handoff changed",{...adapterResult.resultJson,configurationIncomplete:{reason:"commander_handoff_changed",companyId:run.companyId,agentId:run.agentId,responsibleUserId:commanderResultClaim.admission.resultHandoff!.ownerUserId,actionUrl:`/issues/${issueId}`},commanderHandoffHold:{phase:"after_provider_before_handoff",runId:run.id,issueId},executionRecovery:{providerWorkStarted:true}});});
             adapterResult.resultJson={...adapterResult.resultJson,commanderHandoff:handoff.receipt};
@@ -26537,7 +27228,15 @@ export function heartbeatService(
               ...(workspaceValidationFailure?.resultJson ??
                 configurationIncompleteFailure?.resultJson ??
                 {}),
-              ...(!legacyAdapterEntered && run.runtimeMode !== "native"
+              ...(readNonEmptyString(context.qaDecisionId) &&
+                  (legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld)
+                ? {
+                    // The dispatch transaction may have rolled back after the
+                    // synchronous handoff. This executor still observed and
+                    // joined provider work, so preserve that positive fact.
+                    executionRecovery: { kind: "provider_failure", providerWorkStarted: true },
+                  }
+                : !legacyAdapterEntered && run.runtimeMode !== "native"
                 ? {
                     executionRecovery: {
                       kind: "bootstrap",
@@ -26785,7 +27484,8 @@ export function heartbeatService(
             : null);
         const setupFailureResultJson = {
           ...setupFailureDetails,
-          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+          executionRecovery: { kind: "bootstrap",
+            providerWorkStarted: legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld },
         };
         const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {
           error: message,
@@ -26858,6 +27558,13 @@ export function heartbeatService(
           const failedAgent =
             setupFailureAgent ??
             (await getAgent(run.agentId).catch(() => null));
+          if (run.runtimeMode === "legacy" && run.controllerBootId === legacyControllerBootId &&
+              parseObject(run.contextSnapshot)[SELF_TASK_DOCUMENT_CONTEXT_KEY] === true &&
+              !readNonEmptyString(parseObject(run.contextSnapshot).qaDecisionId) &&
+              !legacyAdapterEntered && !nativeDispatchStarted && !nativeOwnershipHeld &&
+              isTransientWorkspaceGitScanCode(livenessRun.errorCode)) {
+            selfTaskSetupFailure = livenessRun;
+          }
           if (failedAgent) {
             await refreshContinuationSummaryForRun(
               livenessRun,
@@ -26874,7 +27581,7 @@ export function heartbeatService(
             // No provider work began. Retry temporary host scan failures with
             // the existing durable failure budget, before releasing execution.
             // Generic recovery must not grant a second budget on exhaustion.
-            await (isTransientWorkspaceGitScanCode(livenessRun.errorCode)
+            if (!selfTaskSetupFailure) await (isTransientWorkspaceGitScanCode(livenessRun.errorCode)
               ? scheduleBoundedRetryForRun(livenessRun, failedAgent)
               : scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, failedAgent)
             ).catch((retryError) => {
@@ -26884,7 +27591,7 @@ export function heartbeatService(
               );
             });
           }
-          await releaseIssueExecutionAndPromote(livenessRun, {
+          if (!selfTaskSetupFailure) await releaseIssueExecutionAndPromote(livenessRun, {
             suppressImmediateRecovery:
               readNonEmptyString(
                 parseObject(livenessRun.contextSnapshot).goalControlRequestId,
@@ -26897,7 +27604,7 @@ export function heartbeatService(
               "failed to release issue execution after heartbeat setup failure",
             );
           });
-          await handleIssueReviewPathDisposition(livenessRun).catch(
+          if (!selfTaskSetupFailure) await handleIssueReviewPathDisposition(livenessRun).catch(
             (reviewPathError) => {
               logger.error(
                 { err: reviewPathError, runId },
@@ -26922,8 +27629,14 @@ export function heartbeatService(
         }
       }
     } finally {
-      await nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
-      if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
+      await nativeInstructionReservation?.release().catch(error => {
+        selfTaskSetupCleanupComplete = false;
+        logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed");
+      });
+      if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => {
+        selfTaskSetupCleanupComplete = false;
+        logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed");
+      });
       let latestRun = await getRun(run.id).catch(() => null);
       try {
         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
@@ -27001,6 +27714,7 @@ export function heartbeatService(
           ) {
             await cleanupGitHubOperationLaunchers(githubLauncherLocation).catch(
               (err) => {
+                selfTaskSetupCleanupComplete = false;
                 logger.warn(
                   { err, runId: run.id },
                   "failed to clean managed GitHub launchers",
@@ -27026,7 +27740,7 @@ export function heartbeatService(
             providerResourceDisposition: providerResourceDispositionForRun,
             nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
           }));
-          await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          await releaseRuntimeServicesForRun(run.id).catch(() => { selfTaskSetupCleanupComplete = false; });
         }
         if (
           runScratch &&
@@ -27044,6 +27758,7 @@ export function heartbeatService(
               isProcessGroupAlive,
             });
           } catch (scratchCleanupError) {
+            selfTaskSetupCleanupComplete = false;
             logger.warn(
               {
                 err: scratchCleanupError,
@@ -27067,6 +27782,7 @@ export function heartbeatService(
             }).catch(() => undefined);
           }
           if (scratchCleanup) {
+            if (!scratchCleanup.removed) selfTaskSetupCleanupComplete = false;
             await appendRunEvent(latestRun, {
               eventType: "lifecycle",
               stream: "system",
@@ -27103,7 +27819,11 @@ export function heartbeatService(
               ${JSON.stringify({ startupPreparationSettledAt: new Date().toISOString() })}::jsonb`,
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled")));
         }
+        if (qaObservation) {
+          latestRun = await settleQaPreProviderObservation(qaObservation) ?? latestRun;
+        }
       } finally {
+        if (qaObservation && qaProviderObservations.get(run.id) === qaObservation) qaProviderObservations.delete(run.id);
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
         // A failed owned Stop remains visible until this exact executor settles,
@@ -27114,6 +27834,76 @@ export function heartbeatService(
         if (adapterExecutionControls.get(run.id) === executionControl) {
           adapterExecutionControls.delete(run.id);
         }
+      }
+      if (selfTaskSetupFailure) {
+        const warnSetupCleanupFailure = (cleanupStep: string, error: unknown) => {
+          // Database errors may contain SQL parameters. Record the failed
+          // boundary without copying those values into the execution log.
+          logger.warn({ runId: run.id, cleanupStep,
+            errorType: error instanceof Error ? error.name : typeof error },
+          "document setup post-cleanup step failed; independent cleanup continues");
+        };
+        // The setup catch owned this failure, and its original execution has
+        // now left the provider/lease/controller boundary. Preserve uncertainty
+        // if cleanup failed, ownership changed, or any positive evidence exists.
+        if (selfTaskSetupCleanupComplete && !legacyAdapterEntered && !nativeDispatchStarted &&
+            !nativeOwnershipHeld && !nativeSessionResumeScheduled && !nativeWorkspaceFinalizeScheduled) {
+          const proof = { schema: "paperclip.self-task-document-pre-provider/v1",
+            companyId: run.companyId, agentId: run.agentId, runId: run.id,
+            wakeupRequestId: run.wakeupRequestId, controllerBootId: legacyControllerBootId,
+            issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
+            cleanupSettledAt: new Date().toISOString() };
+          latestRun = await db.transaction(async tx => {
+            const [pendingLease] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+              eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
+              or(and(isNull(environmentLeases.releasedAt),
+                sql`not coalesce(${environmentLeases.status} = 'retained' and ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+                  and ${environmentLeases.cleanupStatus} = 'success', false)`),
+                eq(environmentLeases.status, "pending_cleanup"), eq(environmentLeases.cleanupStatus, "failed")),
+            )).limit(1);
+            if (pendingLease) return latestRun;
+            const [settled] = await tx.update(heartbeatRuns).set({
+              resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb),
+                '{executionRecovery,selfTaskDocumentPreProvider}', ${JSON.stringify(proof)}::jsonb)`,
+              updatedAt: new Date(),
+            }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+              eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.status, "failed"),
+              eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+              run.wakeupRequestId ? eq(heartbeatRuns.wakeupRequestId, run.wakeupRequestId) : sql`false`,
+              eq(heartbeatRuns.errorCode, selfTaskSetupFailure!.errorCode!),
+              sql`${heartbeatRuns.contextSnapshot}->'paperclipSelfTaskDocumentToolsOnly' = 'true'::jsonb`,
+              sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${proof.issueId}`,
+              sql`${heartbeatRuns.contextSnapshot}->>'qaDecisionId' is null`,
+              sql`${heartbeatRuns.resultJson} #>> '{executionRecovery,kind}' = 'bootstrap'`,
+              sql`${heartbeatRuns.resultJson} #> '{executionRecovery,providerWorkStarted}' = 'false'::jsonb`,
+              isNull(heartbeatRuns.processPid), isNull(heartbeatRuns.processGroupId), isNull(heartbeatRuns.processStartedAt),
+              isNull(heartbeatRuns.externalRunId), isNull(heartbeatRuns.nativeSessionId),
+            )).returning();
+            return settled ?? latestRun;
+          }).catch(error => {
+            // A rejected/uncertain proof write cannot authorize this retry.
+            // Keep the failed run and the default document replay hold.
+            selfTaskSetupCleanupComplete = false;
+            warnSetupCleanupFailure("non_entry_proof", error);
+            return latestRun;
+          });
+        }
+        const settled = latestRun ?? selfTaskSetupFailure;
+        const failedAgent = await getAgent(run.agentId).catch(error => {
+          warnSetupCleanupFailure("agent_lookup", error);
+          return null;
+        });
+        if (selfTaskSetupCleanupComplete && failedAgent) await scheduleBoundedRetryForRun(settled, failedAgent).catch(error => {
+          warnSetupCleanupFailure("bounded_retry", error);
+        });
+        await releaseIssueExecutionAndPromote(settled, { suppressImmediateRecovery:
+          readNonEmptyString(parseObject(settled.contextSnapshot).goalControlRequestId) !== null ||
+          parseObject(settled.contextSnapshot).resumeSessionGoalHeartbeat === true }).catch(error => {
+          warnSetupCleanupFailure("issue_release", error);
+        });
+        await handleIssueReviewPathDisposition(settled).catch(error => {
+          warnSetupCleanupFailure("review_disposition", error);
+        });
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
@@ -27155,6 +27945,11 @@ export function heartbeatService(
         }
         await startNextQueuedRunForAgent(run.agentId);
       }
+    }
+    } finally {
+      // Includes suppression, claim rejection and terminal-before-execute exits.
+      // A prepared executor settles only inside its post-cleanup finally above.
+      await closeQaClaimObservation(qaObservation);
     }
   }
 
@@ -27271,7 +28066,7 @@ export function heartbeatService(
 
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; suppressQueueAdvance?: boolean } = {},
   ) {
     try {
       const source = await getRun(run.id, { unsafeFullResultJson: true });
@@ -27282,9 +28077,15 @@ export function heartbeatService(
         now: new Date(),
         // A durable authentication card owns recovery. This covers the review path,
         // while continuation classification blocks periodic generic retries.
-        suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationBlocked(source),
+        // Every terminal QA path shares this boundary, including setup/pool
+        // failures and exhausted retries. Never turn the committed decision
+        // into a generic old-session continuation because a caller omitted an option.
+        suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationBlocked(source)
+          || Boolean(readNonEmptyString(parseObject(source?.contextSnapshot).qaDecisionId)),
       });
-      await applyWakeQueuePostCommitEffects(postCommitEffects);
+      await applyWakeQueuePostCommitEffects(postCommitEffects, {
+        deferStartForAgentId: options.suppressQueueAdvance ? source?.agentId : undefined,
+      });
       const completed = await getRun(run.id);
       const issueId = readNonEmptyString(completed?.contextSnapshot?.issueId)
         ?? readNonEmptyString(completed?.contextSnapshot?.taskId) ?? completed?.nativeIssueId;
@@ -27307,6 +28108,17 @@ export function heartbeatService(
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
+    if (!opts.qaDecisionId && opts.idempotencyKey?.startsWith("qa-decision:")) {
+      throw new HttpError(403, "QA decision wake requires its committed source");
+    }
+    if (opts.qaDecisionId) {
+      if (opts.reason !== "execution_changes_requested" || opts.source !== "assignment" ||
+          opts.triggerDetail !== "system" || !qaDecisionIdFromWakeKey(qaDecisionWakeKey(opts.qaDecisionId))) {
+        throw new HttpError(403, "Invalid QA decision wake");
+      }
+      opts = { ...opts, idempotencyKey: qaDecisionWakeKey(opts.qaDecisionId), allowRunCoalescing: false };
+    }
+    let authorizedQaDecisionWake = false;
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = {
@@ -27540,6 +28352,33 @@ export function heartbeatService(
           heartbeatSkip: details,
         },
       });
+    };
+
+    // Called under the issue lock. Payload prose and old answers are not new
+    // execution authority: saved user input must re-enter through the existing
+    // authenticated user/durable-request/operator-action admission paths.
+    const documentReplayHold = async (queryDb: Db) => {
+      if (!issueId || opts.requestedByActorType === "user" || durableRequest || executionReconciliationWake || authorizedQaDecisionWake) return null;
+      const [latest] = await queryDb.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agentId),
+        sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issueId}`,
+      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+      const rawSourceIds = [...new Set([enrichedContextSnapshot.retryOfRunId,
+        enrichedContextSnapshot.previousRunId, enrichedContextSnapshot.sourceRunId]
+        .filter((id): id is string => typeof id === "string" && id.length > 0))];
+      const sourceIds = rawSourceIds.filter(isUuidLike);
+      const namedSources = sourceIds.length ? await queryDb.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, agent.companyId), inArray(heartbeatRuns.id, sourceIds),
+      )) : [];
+      // Known sources in another task/worker belong to independent handoffs.
+      const applicable = namedSources.filter(run => run.agentId === agentId &&
+        (run.nativeIssueId ?? readNonEmptyString(run.contextSnapshot?.issueId) ?? readNonEmptyString(run.contextSnapshot?.taskId)) === issueId);
+      const heldSource = [latest, ...applicable].find(hasSelfTaskDocumentReplayHold);
+      const missingSource = rawSourceIds.find(id => !namedSources.some(run => run.id === id));
+      if (missingSource) return {
+        sourceRunId: missingSource, reason: "source_run_unavailable",
+      };
+      return heldSource ? { sourceRunId: heldSource.id, reason: "self_task_document_replay_hold" } : null;
     };
 
     const schedulingSuppression = await getSchedulingSuppression();
@@ -27885,11 +28724,13 @@ export function heartbeatService(
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
               eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
               eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              opts.qaDecisionId ? isNull(agentWakeupRequests.runId) : undefined,
               // A user message can join a queue originally created by a
               // system wake. Admission validates the saved user comment or board click.
-              (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId
+              opts.qaDecisionId || (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId
                 ? undefined : eq(agentWakeupRequests.requestedByActorType, "user"),
-              opts.queuedCommentInterruptId === executionWaitRequestId
+              opts.qaDecisionId ? eq(agentWakeupRequests.idempotencyKey, qaDecisionWakeKey(opts.qaDecisionId))
+                : opts.queuedCommentInterruptId === executionWaitRequestId
                 ? sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${opts.requestedByActorId ?? ""}`
                 : opts.queuedCommentRequestId === executionWaitRequestId ? undefined
                   : eq(agentWakeupRequests.requestedByActorId, opts.requestedByActorId ?? ""),
@@ -27897,7 +28738,7 @@ export function heartbeatService(
             ));
             // The issue lock serializes cleanup callbacks and periodic workers.
             // An adopted, discarded, or edited receipt is no longer authority.
-            if (!pending || (!(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
+            if (!pending || (!opts.qaDecisionId && !(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
                 !(opts.queuedCommentInterruptId && await readQueuedInteractionResponse(tx as unknown as Db,
                   agent.companyId, issueId, pending.payload)))) {
               return { kind: "deferred" as const };
@@ -28092,6 +28933,7 @@ export function heartbeatService(
               conversationUserId: issues.conversationUserId,
               conversationState: issues.conversationState,
               status: issues.status,
+              executionState: issues.executionState,
               statusVersion: issues.statusVersion,
               revision: issues.revision,
               assigneeUserId: issues.assigneeUserId,
@@ -28129,6 +28971,55 @@ export function heartbeatService(
               requestedByActorId: opts.requestedByActorId ?? null,
               idempotencyKey: opts.idempotencyKey ?? null,
               finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
+
+          if (opts.qaDecisionId) {
+            if (issue.id !== issueId || !await isAuthorizedQaDecisionWake(tx as unknown as Db, {
+              companyId: agent.companyId, issueId: issue.id, agentId, decisionId: opts.qaDecisionId,
+            })) {
+              return { kind: "skipped" as const };
+            }
+            const qaState = parseIssueExecutionState(issue.executionState);
+            if (!qaState) return { kind: "skipped" as const };
+            authorizedQaDecisionWake = true;
+            const stageWake = buildQaChangesRequestedWakeContext({ issueId: issue.id,
+              state: qaState,
+              interruptedRunId: readNonEmptyString(enrichedContextSnapshot.interruptedRunId),
+            });
+            payload = { ...payload, ...stageWake.payload };
+            Object.assign(enrichedContextSnapshot, stageWake.contextSnapshot);
+            enrichedContextSnapshot.forceFreshSession = true;
+            enrichedContextSnapshot.qaDecisionId = opts.qaDecisionId;
+            const [priorWake] = await tx.select().from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.idempotencyKey, qaDecisionWakeKey(opts.qaDecisionId)),
+              executionWaitRequestId ? ne(agentWakeupRequests.id, executionWaitRequestId) : undefined,
+              sql`${agentWakeupRequests.status} <> 'skipped'`,
+              qaDecisionWakeBlocksDelivery(),
+            )).limit(1);
+            if (priorWake) {
+              const [priorRun] = priorWake.runId
+                ? await tx.select().from(heartbeatRuns).where(and(
+                    eq(heartbeatRuns.id, priorWake.runId), eq(heartbeatRuns.companyId, agent.companyId),
+                  )).limit(1)
+                : [];
+              return priorRun ? { kind: "replayed" as const, run: priorRun } : { kind: "skipped" as const };
+            }
+          }
+
+          const replayHold = await documentReplayHold(tx as unknown as Db);
+          if (replayHold) {
+            await tx.insert(agentWakeupRequests).values({
+              ...durableReceiptFields, companyId: agent.companyId, agentId, source, triggerDetail,
+              reason: "self_task_document_replay_hold", status: "skipped",
+              payload: { ...(payload ?? {}), heartbeatSkip: { ...replayHold,
+                automaticRetryAllowed: false, retryBudgetSpent: false,
+                nextAction: "Reconcile the source document receipt, then explicitly choose a new episode.",
+              } }, requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null, finishedAt: new Date(),
             });
             return { kind: "skipped" as const };
           }
@@ -28287,6 +29178,33 @@ export function heartbeatService(
           }
 
           let continuationWait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
+          if (authorizedQaDecisionWake && await hasQaPredecessorOwnershipHold(tx as unknown as Db, issue.companyId, issue.id)) {
+            if (executionWaitRequestId) {
+              await tx.update(agentWakeupRequests).set({
+                payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
+                  coalesce(${agentWakeupRequests.payload}->'executionWait', '{}'::jsonb) || ${JSON.stringify({
+                    reason: "qa_predecessor_ownership_active",
+                    message: "Waiting for the previous executor's stop and cleanup receipt. Retaining a remote environment alone does not prove its work stopped.",
+                  })}::jsonb)`,
+                updatedAt: new Date(),
+              }).where(and(
+                eq(agentWakeupRequests.id, executionWaitRequestId),
+                eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                isNull(agentWakeupRequests.runId),
+              ));
+            } else {
+              await recordExecutionWait(tx as unknown as Db, {
+                issueId: issue.id, condition: { reason: "qa_predecessor_ownership_active" }, coalesce: coalesceExecutionWait,
+                request: { ...durableReceiptFields, companyId: issue.companyId, agentId, source, triggerDetail,
+                  reason: "qa_predecessor_ownership_active", payload, status: "skipped",
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  requestedByActorId: opts.requestedByActorId ?? null, idempotencyKey: opts.idempotencyKey ?? null,
+                  finishedAt: new Date() },
+              });
+            }
+            return { kind: "deferred" as const };
+          }
           const deferBlockedExecution = async (
             executionBlocker: NonNullable<Awaited<ReturnType<typeof getExecutionBlocker>>>,
           ) => {
@@ -28340,12 +29258,21 @@ export function heartbeatService(
             tx as unknown as Db, issue.companyId, issue.id,
             { conversationResetCommentId: opts.requestedByActorType === "user" ? wakeCommentId : null },
           );
+          // A committed QA return is new work. It may pass an unresolved,
+          // terminal document episode without settling or replaying that episode.
+          // Unsafe workspace restoration and live predecessor work remain holds.
+          const independentQaDocumentEpisode = authorizedQaDecisionWake &&
+            Boolean(executionBlocker?.runId && executionBlocker.recoveryActionId &&
+              isHeartbeatRunTerminalStatus(executionBlocker.runStatus)) &&
+            await isIndependentQaDocumentEpisode(tx as unknown as Db, {
+              companyId: issue.companyId, issueId: issue.id, agentId, decisionId: opts.qaDecisionId!,
+            });
           // Prove eligibility without retiring the hold. Later gates can still
           // decline this wake; hold retirement and successor creation stay atomic.
           // A bound chat request has already rechecked its current principal
           // above. Treat its new user message like a board comment, but keep
           // failed-run retry actions on their separate exact-request path.
-          if (executionBlocker && !(await admitExplicitNativeContinuation({
+          if (executionBlocker && !independentQaDocumentEpisode && !(await admitExplicitNativeContinuation({
             db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
             agentId, actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
             reason: durableRequest && !failedChatRetry ? "issue_commented" : reason,
@@ -28875,6 +29802,9 @@ export function heartbeatService(
           }
 
           if (activeExecutionRun) {
+            // The same decision already has one durable deferred receipt. A
+            // maintenance retry must not append a second one behind its owner.
+            if (opts.qaDecisionId && executionWaitRequestId) return { kind: "deferred" as const };
             // The resolved action is already a durable retry outbox. Do not merge
             // its fresh-session contract into unrelated work or create a second
             // deferred wake that could later replay the same reconciliation.
@@ -29072,10 +30002,18 @@ export function heartbeatService(
             tx,
           );
           if (dailyCapBlock) {
-            if (executionWaitRequestId && executionBlocker) {
+            if (executionWaitRequestId) {
               continuationWait = { reason: dailyCapBlock.reason,
                 message: "The agent has reached its daily limit. Your message is saved until work can resume." };
-              return deferBlockedExecution(executionBlocker);
+              if (executionBlocker) return deferBlockedExecution(executionBlocker);
+              await tx.update(agentWakeupRequests).set({
+                payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
+                  coalesce(${agentWakeupRequests.payload}->'executionWait', '{}'::jsonb) || ${JSON.stringify(continuationWait)}::jsonb)`,
+                updatedAt: new Date(),
+              }).where(and(eq(agentWakeupRequests.id, executionWaitRequestId),
+                eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)));
+              return { kind: "deferred" as const };
             }
             const now = new Date();
             await tx.insert(agentWakeupRequests).values({
@@ -29112,7 +30050,7 @@ export function heartbeatService(
             return { kind: "skipped" as const };
           }
 
-          const explicitContinuation = await admitExplicitNativeContinuation({
+          const explicitContinuation = independentQaDocumentEpisode ? null : await admitExplicitNativeContinuation({
             db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
             agentId, actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
             reason: durableRequest && !failedChatRetry ? "issue_commented" : reason,
@@ -29120,14 +30058,24 @@ export function heartbeatService(
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
           });
-          if (!explicitContinuation && executionBlocker) return deferBlockedExecution(executionBlocker);
+          if (!explicitContinuation && executionBlocker && !independentQaDocumentEpisode)
+            return deferBlockedExecution(executionBlocker);
           if (explicitContinuation) {
             enrichedContextSnapshot.forceFreshSession = true;
             enrichedContextSnapshot.previousRunId = explicitContinuation.previousRunId;
             enrichedContextSnapshot.explicitUserContinuation = explicitContinuation;
           }
 
-          const wakeupRequest = await tx
+          const wakeupRequest = opts.qaDecisionId && executionWaitRequestId
+            ? await tx.update(agentWakeupRequests).set({ status: "queued", finishedAt: null,
+                updatedAt: new Date(), error: null,
+              }).where(and(eq(agentWakeupRequests.id, executionWaitRequestId),
+                eq(agentWakeupRequests.companyId, agent.companyId),
+                eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.idempotencyKey, qaDecisionWakeKey(opts.qaDecisionId)),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+              )).returning().then(rows => rows[0])
+            : await tx
             .insert(agentWakeupRequests)
             .values({
               ...durableReceiptFields,
@@ -29144,6 +30092,8 @@ export function heartbeatService(
             })
             .returning()
             .then((rows) => rows[0]);
+
+          if (!wakeupRequest) throw conflict("QA decision receipt changed before admission");
 
           // A handoff changes the executor, not the owner of saved user input.
           // Validate its exact stopped source while the issue row is locked;
@@ -29193,6 +30143,8 @@ export function heartbeatService(
               // Durable chat work must keep its receipt, actor, source, and
               // session contract through normal promotion and authorization.
               !wake.idempotencyKey?.startsWith("chat-inbound:") &&
+              !wake.idempotencyKey?.startsWith("qa-decision:") &&
+              !deferredPayload.qaDecisionId && !deferredContext.qaDecisionId &&
               !isInteractionResolutionWakePayload(deferredPayload) &&
               !hasInteractionContinuationWakeContext(deferredContext) &&
               ["issue_commented", "issue_reopened_via_comment"].includes(String(deferredContext.wakeReason ?? wake.reason)) &&
@@ -29231,7 +30183,7 @@ export function heartbeatService(
                     adoptedCommentIds,
                   )
                 : enrichedContextSnapshot,
-              sessionIdBefore: explicitContinuation ? null : sessionBefore,
+              sessionIdBefore: explicitContinuation || authorizedQaDecisionWake ? null : sessionBefore,
               continuationAttempt,
               ...(reconciledSourceRunId
                 ? { retryOfRunId: reconciledSourceRunId }
@@ -29495,7 +30447,7 @@ export function heartbeatService(
           responsibleUserId: await resolveQueuedResponsibleUserId(),
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: enrichedContextSnapshot,
-          sessionIdBefore: sessionBefore,
+          sessionIdBefore: authorizedQaDecisionWake ? null : sessionBefore,
           continuationAttempt,
         })
         .returning()
@@ -29972,6 +30924,8 @@ export function heartbeatService(
     terminationGraceMs?: number;
     /** Caller is immediately scheduling an explicit successor path. */
     suppressImmediateRecovery?: boolean;
+    /** A queue claimant already holds the agent start lock and advances it. */
+    suppressQueueAdvance?: boolean;
   };
 
   function cancellationTerminationGraceMs(
@@ -30284,11 +31238,12 @@ export function heartbeatService(
         });
         await releaseIssueExecutionAndPromote(cancelled, {
           suppressImmediateRecovery: options.suppressImmediateRecovery,
+          suppressQueueAdvance: options.suppressQueueAdvance,
         });
         await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
-        await startNextQueuedRunForAgent(run.agentId);
+        if (!options.suppressQueueAdvance) await startNextQueuedRunForAgent(run.agentId);
       }
       return cancelled;
     } finally {
@@ -30300,6 +31255,7 @@ export function heartbeatService(
     agentId: string,
     reason = "Cancelled due to agent pause",
     errorCode = "cancelled",
+    options: { suppressQueueAdvance?: boolean } = {},
   ) {
     const agent = await getAgent(agentId);
     const runs = await db
@@ -30319,7 +31275,7 @@ export function heartbeatService(
           : undefined;
       try {
         if (stopOwnership?.control) {
-          await cancelRunInternal(run.id, reason, { errorCode });
+          await cancelRunInternal(run.id, reason, { errorCode, ...options });
           continue;
         }
         if (run.runtimeMode === "native") {
@@ -30798,6 +31754,8 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    readQaPredecessorOwnershipHold: (companyId: string, issueId: string) =>
+      readQaPredecessorOwnershipHold(db, companyId, issueId),
 
     scheduleBoundedRetry: async (
       runId: string,

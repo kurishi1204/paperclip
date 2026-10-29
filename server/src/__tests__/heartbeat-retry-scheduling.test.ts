@@ -626,6 +626,99 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       }
     });
 
+  it.each(["transient_failure", "max_turns", "server_shutdown_interrupted"])("does not replay a self-task document run for %s", async retryReason => {
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedRetryFixture({ runId, companyId, agentId, now, errorCode: "overloaded",
+      adapterType: "claude_local", errorFamily: "transient_upstream",
+      resultJson: { errorFamily: "transient_upstream", executionRecovery: { kind: "execution", providerWorkStarted: true } } });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { paperclipSelfTaskDocumentToolsOnly: true } })
+      .where(eq(heartbeatRuns.id, runId));
+    const result = await heartbeat.scheduleBoundedRetry(runId, { now, retryReason, maxAttempts: 9, delayMs: 1 });
+    expect(result).toMatchObject({ outcome: "not_scheduled", errorCode: "self_task_document_replay_hold" });
+    const all = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(all.map(run => run.id)).toEqual([runId]);
+    expect(all[0]).toMatchObject({ status: "failed", scheduledRetryAttempt: 0, scheduledRetryReason: null });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toEqual([]);
+  });
+
+  it.each(["ordinary_signal", "invented_comment", "invented_answer"])("holds a new automatic signal by its source episode: %s", async mode => {
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    await seedRetryFixture({ runId, companyId, agentId, now: new Date(), errorCode: "overloaded",
+      adapterType: PROVIDER_QUOTA_TEST_ADAPTER, errorFamily: "transient_upstream" });
+    await db.insert(issues).values({ id: issueId, companyId, issueNumber: 1, identifier: "DOC-1",
+      title: "Held document episode", status: "in_progress", assigneeAgentId: agentId });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, paperclipSelfTaskDocumentToolsOnly: true } })
+      .where(eq(heartbeatRuns.id, runId));
+    const fakeId = randomUUID();
+    expect(await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system",
+      reason: "a_new_automatic_observation", requestedByActorType: "system", requestedByActorId: "fixture",
+      contextSnapshot: { issueId, ...(mode === "invented_comment" ? { wakeCommentId: fakeId } : {}) },
+      payload: { issueId, ...(mode === "invented_answer" ? {
+        mutation: "interaction", interactionId: fakeId, interactionStatus: "answered",
+      } : {}) },
+    })).toBeNull();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).map(row => row.id)).toEqual([runId]);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)))
+      .toEqual([expect.objectContaining({ status: "skipped", reason: "self_task_document_replay_hold",
+        payload: expect.objectContaining({ heartbeatSkip: expect.objectContaining({ sourceRunId: runId, retryBudgetSpent: false }) }) })]);
+  });
+
+  it.each(["missing", "invalid"])("holds an unverified automatic predecessor even when the current profile is off: %s", async mode => {
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const sourceRunId = mode === "missing" ? randomUUID() : "not-a-run-id";
+    await seedRetryFixture({ runId, companyId, agentId, now: new Date(), errorCode: "overloaded", adapterType: PROVIDER_QUOTA_TEST_ADAPTER });
+    await db.insert(issues).values({ id: issueId, companyId, issueNumber: 1, identifier: "DOC-1",
+      title: "Unknown predecessor", status: "in_progress", assigneeAgentId: agentId });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, paperclipSelfTaskDocumentToolsOnly: false } }).where(eq(heartbeatRuns.id, runId));
+    expect(await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "a_new_automatic_observation",
+      requestedByActorType: "system", contextSnapshot: { issueId, retryOfRunId: sourceRunId } })).toBeNull();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).map(row => row.id)).toEqual([runId]);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)))
+      .toEqual([expect.objectContaining({ reason: "self_task_document_replay_hold", payload: expect.objectContaining({
+        heartbeatSkip: expect.objectContaining({ reason: "source_run_unavailable", sourceRunId }),
+      }) })]);
+  });
+
+  it("rechecks document capability under the issue lock after a source gains it", async () => {
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    await seedRetryFixture({ runId, companyId, agentId, now: new Date(), errorCode: "overloaded", adapterType: PROVIDER_QUOTA_TEST_ADAPTER });
+    await db.insert(issues).values({ id: issueId, companyId, issueNumber: 1, identifier: "DOC-1", title: "Stamp admission race",
+      status: "in_progress", assigneeAgentId: agentId, executionRunId: runId, checkoutRunId: runId });
+    await db.update(heartbeatRuns).set({ status: "running", finishedAt: null, contextSnapshot: { issueId } }).where(eq(heartbeatRuns.id, runId));
+    let release!: () => void, entered!: (pid: number) => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<number>(resolve => { entered = resolve; });
+    const stamping = db.transaction(async tx => {
+      await tx.execute(sql`select id from issues where id = ${issueId} for update`);
+      const pid = await tx.execute(sql`select pg_backend_pid() as pid`);
+      entered(Number(pid[0]!.pid));
+      await gate;
+      await tx.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
+        contextSnapshot: { issueId, paperclipSelfTaskDocumentToolsOnly: true } }).where(eq(heartbeatRuns.id, runId));
+      await tx.update(issues).set({ executionRunId: null, checkoutRunId: null }).where(eq(issues.id, issueId));
+    });
+    const pid = await ready;
+    const wake = heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "a_new_automatic_observation",
+      requestedByActorType: "system", contextSnapshot: { issueId } });
+    try {
+      const deadline = Date.now() + 5_000;
+      let waiting = false;
+      while (!waiting && Date.now() < deadline) {
+        const rows = await db.execute(sql`select pid from pg_stat_activity where datname = current_database()
+          and ${pid} = any(pg_blocking_pids(pid))`);
+        waiting = rows.length > 0;
+        if (!waiting) await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(waiting).toBe(true); // Prove admission reached the lock before publishing the mode.
+    } finally {
+      release();
+      await stamping;
+    }
+    expect(await wake).toBeNull();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).map(row => row.id)).toEqual([runId]);
+  });
+
   it("never schedules invalid provider definitions even when a caller supplies a retry policy", async () => {
     const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID();
     const now = new Date("2026-04-20T12:00:00.000Z");

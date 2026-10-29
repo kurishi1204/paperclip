@@ -501,6 +501,16 @@ export const issueReviewRequestSchema = z
   })
   .strict();
 
+export const issueDocumentKeySchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .regex(
+    /^[a-z0-9][a-z0-9_-]*$/,
+    "Document key must be lowercase letters, numbers, _ or -",
+  );
+
 export const issueExecutionStateSchema = z.object({
   status: z.enum(ISSUE_EXECUTION_STATE_STATUSES),
   currentStageId: z.string().guid().nullable(),
@@ -513,6 +523,13 @@ export const issueExecutionStateSchema = z.object({
   lastDecisionId: z.string().guid().nullable(),
   lastDecisionOutcome: z.enum(ISSUE_EXECUTION_DECISION_OUTCOMES).nullable(),
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
+  submittedDocument: z.object({
+    documentId: z.string().guid(),
+    key: issueDocumentKeySchema,
+    revisionId: z.string().guid(),
+    bodySha256: z.string().regex(/^[0-9a-f]{64}$/),
+    submittedByRunId: z.string().guid(),
+  }).strict().optional(),
   changesRequestedCount: z.number().int().nonnegative().optional().default(0),
 });
 
@@ -1161,16 +1178,6 @@ export const connectionIntentResultSchema = z
       });
     }
   });
-
-export const issueDocumentKeySchema = z
-  .string()
-  .trim()
-  .min(1)
-  .max(64)
-  .regex(
-    /^[a-z0-9][a-z0-9_-]*$/,
-    "Document key must be lowercase letters, numbers, _ or -",
-  );
 
 export const suggestedTaskDraftSchema = z
   .object({
