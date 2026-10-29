@@ -9540,6 +9540,8 @@ export function issueRoutes(
             });
             Object.assign(updateFields, transition.patch);
             if (transition.decision) {
+              if (transition.decision.outcome === "approved")
+                await assertLockedSubmittedDocumentApproval(tx as unknown as Db, lockedIssue);
               const decisionId = randomUUID();
               const nextExecutionState = updateFields.executionState;
               if (
@@ -9957,6 +9959,33 @@ export function issueRoutes(
       // never receive this marker, so the transport reports unknown.
       if (error instanceof HttpError) res.setHeader("X-Paperclip-Document-Outcome", "rejected");
       throw error;
+    }
+  }
+
+  /** An approval must concern the exact saved result handed to this workflow.
+   * The Issue lock also serializes linked document changes through the existing
+   * requirement-revision triggers. A changes-requested decision need not match.
+   */
+  async function assertLockedSubmittedDocumentApproval(query: Db, expected: {
+    id: string; companyId: string; revision: number; statusVersion: number; executionState?: unknown;
+  }) {
+    const locked = await svc.getByIdForUpdate(expected.id, query);
+    const submitted = parseIssueExecutionState(locked?.executionState)?.submittedDocument;
+    const expectedSubmission = parseIssueExecutionState(expected.executionState)?.submittedDocument;
+    if (!submitted && !expectedSubmission) return;
+    if (!locked || locked.companyId !== expected.companyId || !submitted ||
+        locked.revision !== expected.revision || locked.statusVersion !== expected.statusVersion) {
+      throw conflict("Task changed before submitted-document approval; read the current review again");
+    }
+    const document = await documentService(query).getIssueDocumentByKey(locked.id, submitted.key);
+    const [revision] = await query.select().from(documentRevisions).where(and(
+      eq(documentRevisions.id, submitted.revisionId), eq(documentRevisions.companyId, locked.companyId),
+    ));
+    if (!document || document.id !== submitted.documentId || document.latestRevisionId !== submitted.revisionId ||
+        typeof document.body !== "string" ||
+        createHash("sha256").update(Buffer.from(document.body, "utf8")).digest("hex") !== submitted.bodySha256 ||
+        !revision || revision.documentId !== submitted.documentId || revision.createdByRunId !== submitted.submittedByRunId) {
+      throw conflict("Submitted document changed after review handoff; request changes instead of approving a replacement");
     }
   }
 
@@ -14177,6 +14206,17 @@ export function issueRoutes(
                   typeof document.body !== "string" ||
                   createHash("sha256").update(Buffer.from(document.body, "utf8")).digest("hex") !== expected.bodySha256)
                 throw conflict("Only the current revision saved by this run can enter review");
+              const nextState = parseIssueExecutionState(updateFields.executionState ?? locked.executionState);
+              if (!nextState || nextState.status !== "pending" || !nextState.currentStageId)
+                throw conflict("Saved document submission requires an active configured review stage");
+              const submittedState = { ...nextState, submittedDocument: {
+                documentId: document.id, key: expected.key, revisionId: expected.revisionId,
+                bodySha256: expected.bodySha256, submittedByRunId: req.actor.runId!,
+              } };
+              updateFields.executionState = submittedState;
+              // issueUpdateData was copied before this transaction. Persist the
+              // checked pointer there too, rather than only in activity details.
+              issueUpdateData.executionState = submittedState;
             }, { operation: "submit", key: selfTaskReviewExpected.key, query: tx as unknown as Db });
             if (boardReviewExpected) await assertBoardReviewStart(tx, await svc.getByIdForUpdate(id, tx));
             if (formalApprovalExpected) {
@@ -14186,6 +14226,8 @@ export function issueRoutes(
               await assertLockedNativeApprovalGoal(tx as unknown as Db, req, locked);
             }
             await assertLockedQaReviewExpectation(tx);
+            if (decision?.outcome === "approved")
+              await assertLockedSubmittedDocumentApproval(tx as unknown as Db, existing);
             if (
               reviewPolicySensitiveMutationRequested &&
               !(await assertLockedReviewPolicyAllowsMutation(tx))
@@ -18220,6 +18262,8 @@ export function issueRoutes(
         const postCommitIssueActions: IssuePostCommitAction[] = [];
         try {
           txResult = await db.transaction(async (tx) => {
+            if (transition.decision?.outcome === "approved")
+              await assertLockedSubmittedDocumentApproval(tx as unknown as Db, currentIssue);
             const insertedComment = await svc.addComment(
               id,
               req.body.body,

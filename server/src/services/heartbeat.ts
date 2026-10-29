@@ -27830,6 +27830,13 @@ export function heartbeatService(
         }
       }
       if (selfTaskSetupFailure) {
+        const warnSetupCleanupFailure = (cleanupStep: string, error: unknown) => {
+          // Database errors may contain SQL parameters. Record the failed
+          // boundary without copying those values into the execution log.
+          logger.warn({ runId: run.id, cleanupStep,
+            errorType: error instanceof Error ? error.name : typeof error },
+          "document setup post-cleanup step failed; independent cleanup continues");
+        };
         // The setup catch owned this failure, and its original execution has
         // now left the provider/lease/controller boundary. Preserve uncertainty
         // if cleanup failed, ownership changed, or any positive evidence exists.
@@ -27867,17 +27874,30 @@ export function heartbeatService(
               isNull(heartbeatRuns.externalRunId), isNull(heartbeatRuns.nativeSessionId),
             )).returning();
             return settled ?? latestRun;
+          }).catch(error => {
+            // A rejected/uncertain proof write cannot authorize this retry.
+            // Keep the failed run and the default document replay hold.
+            selfTaskSetupCleanupComplete = false;
+            warnSetupCleanupFailure("non_entry_proof", error);
+            return latestRun;
           });
         }
         const settled = latestRun ?? selfTaskSetupFailure;
-        const failedAgent = await getAgent(run.agentId);
-        if (failedAgent) await scheduleBoundedRetryForRun(settled, failedAgent).catch(err => {
-          logger.warn({ err, runId: run.id }, "failed to schedule settled document setup retry");
+        const failedAgent = await getAgent(run.agentId).catch(error => {
+          warnSetupCleanupFailure("agent_lookup", error);
+          return null;
+        });
+        if (selfTaskSetupCleanupComplete && failedAgent) await scheduleBoundedRetryForRun(settled, failedAgent).catch(error => {
+          warnSetupCleanupFailure("bounded_retry", error);
         });
         await releaseIssueExecutionAndPromote(settled, { suppressImmediateRecovery:
           readNonEmptyString(parseObject(settled.contextSnapshot).goalControlRequestId) !== null ||
-          parseObject(settled.contextSnapshot).resumeSessionGoalHeartbeat === true });
-        await handleIssueReviewPathDisposition(settled);
+          parseObject(settled.contextSnapshot).resumeSessionGoalHeartbeat === true }).catch(error => {
+          warnSetupCleanupFailure("issue_release", error);
+        });
+        await handleIssueReviewPathDisposition(settled).catch(error => {
+          warnSetupCleanupFailure("review_disposition", error);
+        });
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.

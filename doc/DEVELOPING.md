@@ -85,23 +85,93 @@ Issue execution may also use project execution workspace policies and workspace 
 
 ### Document-only task delivery
 
-`claude_local` agents explicitly configured with `selfTaskDocumentToolsOnly: true`
-receive only the task-bound read and write document tools. A newly assigned task
-without `initialPlan` preserves its original title/description as the `plan`
-document labelled **Task request**. An explicit initial plan remains unchanged.
+For a local `claude_local` agent, set these **effective adapter settings**
+(including any task override):
 
-When the result is ready, pass `submitForReview: true` to
-`write_self_task_document`. After saving and reading back that revision, the tool
-submits it to the task's existing review policy. The server rechecks the task,
-run, document revision and author under locks; the tool cannot choose a reviewer
-or approve its own result. QA-requested changes use a new run and revision, then
-the same submission path. A submission conflict or lost acknowledgement leaves
-the saved revision intact: inspect `review.outcome` and reconcile before acting;
-do not repeat the document write. Omitting the option still only saves.
+```json
+{
+  "engine": "cli",
+  "selfTaskDocumentToolsOnly": true,
+  "dangerouslySkipPermissions": false
+}
+```
+
+The flag alone is insufficient: the default engine is ACP, and permission bypass
+is enabled by default. Do not combine this mode with `qaReviewToolsOnly` or
+`commanderCycleToolsOnly`, a remote target, or additional `args`/`extraArgs`.
+Use the existing authorized provider connection. The server supplies the sole
+run-bound Paperclip project MCP connection and token; do not add an MCP server
+or copy a run token into agent settings. The CLI receives only the task-bound
+read and write document tools. The adapter checks these prerequisites before
+provider entry; a configuration error requires correcting the settings through
+the normal settings path, not replaying a document effect. A failed run may
+already carry a document-mode stamp. A settings change does not clear its hold
+or authorize a retry, reset, or new call against uncertain earlier work.
+
+#### Fixed input before the worker starts
+
+Automatic request preservation applies only when the task is **created with an
+assigned agent already opted into this mode**. Without `initialPlan`, its
+original title/description becomes the `plan` document labelled **Task request**.
+An explicit `initialPlan` remains unchanged, including for an unassigned task.
+
+Assigning an existing task later does not backfill input. For an existing task
+without an input document, an authorized operator must supply the fixed source
+through the ordinary `PUT /api/issues/:id/documents/:key` endpoint before the
+worker starts. Use an absent key (for example, `plan`), `format: "markdown"`,
+`baseRevisionId: null` and the intended source text. Read the document back and
+record its document ID, revision ID and full-body SHA-256. Do not overwrite an
+existing input just to enable this mode. The worker must pass that exact input
+identity/hash to its save tool. This is explicit input preparation, not automatic
+backfill or a requirement to create a new task for each input.
+
+#### Save, submit, and reconcile separate acknowledgements
+
+Configure the task's review policy before submission. When the result is ready,
+pass `submitForReview: true` to `write_self_task_document`. After saving and
+reading back that revision, the tool submits it through the existing policy.
+The server rechecks task/run ownership, task versions, document identity and the
+revision author under locks. The submitted document ID, key, revision, body hash
+and writer run are stored with the review state. QA exposes this reference and
+refuses to read or approve a different revision, even when the reviewer has not
+yet read the document. Requesting changes remains possible; the corrected
+writer submission replaces the reference. The tool cannot choose a reviewer or approve its
+own result. An unfinished goal must be completed normally; submission does not
+pause or clear it. QA-requested changes use a new run and a new revision, then
+the same submission path. Omitting the option still only saves.
+
+The outer `outcome: "verified"` confirms the document save/readback.
+`review.outcome` independently reports submission as `verified`, `rejected`, or
+`unknown`. An MCP error can therefore include a successful save receipt. Never
+repeat that save to repair a rejected or missing submission acknowledgement;
+one run may save only one revision.
+
+An authorized operator reconciles through the existing board API, without
+borrowing the worker's run token or adding the self-task document-mode header:
+
+1. Read `GET /api/issues/:id/documents/:key` and
+   `GET /api/issues/:id/documents/:key/revisions`. Match the saved document ID,
+   revision ID and full body/hash, including the immutable saved revision.
+   A mismatch or missing evidence is a hold, not permission to restore or PUT it.
+2. Read `GET /api/issues/:id` for status, assignee and execution policy/state.
+   If the matching result is already in review or has a review result, inspect
+   that existing path; do not submit it again. An unknown acknowledgement alone
+   does not prove that submission failed.
+3. Only after confirming that the save exists but submission did not occur,
+   wait for the writer's natural terminal state and lease cleanup. Preserve
+   the saved revision and the separate submission receipt for operator recovery.
+   An ordinary board status PATCH does not create the writer's submitted-document
+   reference and must not be used as an equivalent retry. A conditional operator
+   handoff that preserves that exact reference is not implemented here. Do not
+   rewrite the document, borrow the old run, manufacture a decision or bypass a
+   recovery hold to compensate. A rejected submission remains an explicit
+   operator-recovery case; a successful submission with a lost acknowledgement
+   is observed through its existing review state, without another save or submit.
 
 A temporary workspace scan failure before provider entry may use the existing
 bounded retry only after its owning executor settles cleanup and records exact
-non-entry evidence. Unknown or entered episodes retain their replay hold.
+non-entry evidence. A configuration error is not that workspace-scan exception.
+Unknown or entered episodes retain their replay hold.
 
 ### Mobile-friendly preview (`pnpm dev:mobile`)
 

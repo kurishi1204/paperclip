@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { request as directHttpRequest } from "node:http";
 import { z } from "zod";
 import { and, eq } from "drizzle-orm";
@@ -162,7 +163,7 @@ export const qaReviewToolDefinitions = [
   },
   {
     name: QA_REVIEW_TOOL_NAMES[2],
-    description: "Read a bounded page of one assigned-issue document. When verifying a writer receipt, provide expectedDocumentRevisionId on every page; a changed document is rejected independently of the issue revision.",
+    description: "Read a bounded page of one assigned-issue document. The submitted result must match the server-bound document ID, revision and full-body hash even when expectedDocumentRevisionId is omitted. For other documents, provide expectedDocumentRevisionId when verifying a writer receipt.",
     inputSchema: z.toJSONSchema(documentPageSchema, { io: "input" }),
   },
   {
@@ -448,7 +449,8 @@ function projectAssignedIssue(input: QaToolInput, raw: unknown, stage: ReturnTyp
     descriptionCharacters: Array.from(issue.description ?? "").length,
     status: issue.status, workMode: issue.workMode,
     statusVersion: issue.statusVersion, revision: issue.revision,
-    reviewStage: { stageId: stage.currentStageId, lastDecisionId: stage.lastDecisionId },
+    reviewStage: { stageId: stage.currentStageId, lastDecisionId: stage.lastDecisionId,
+      submittedDocument: stage.submittedDocument ?? null },
     planDocument: issue.planDocument ? {
       id: issue.planDocument.id, key: issue.planDocument.key,
       title: issue.planDocument.title, format: issue.planDocument.format,
@@ -645,6 +647,12 @@ export async function callQaReviewTool(input: QaToolInput) {
     if (typeof doc.latestRevisionId !== "string" ||
         (args.expectedDocumentRevisionId && doc.latestRevisionId !== args.expectedDocumentRevisionId)) {
       throw conflict("Document revision changed during QA evidence read; read the document again");
+    }
+    const submitted = stage.submittedDocument;
+    if (submitted && args.key === submitted.key &&
+        (doc.id !== submitted.documentId || doc.latestRevisionId !== submitted.revisionId ||
+          createHash("sha256").update(Buffer.from(doc.body, "utf8")).digest("hex") !== submitted.bodySha256)) {
+      throw conflict("Submitted document changed after review handoff; request changes instead of approving a replacement");
     }
     const characters = Array.from(doc.body);
     if (args.offset > characters.length) throw conflict("Document offset is beyond the current body");

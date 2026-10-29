@@ -526,6 +526,7 @@ function buildCompletedState(previous: IssueExecutionState | null, currentStage:
     lastDecisionId: previous?.lastDecisionId ?? null,
     lastDecisionOutcome: "approved",
     monitor: previous?.monitor ?? null,
+    ...(previous?.submittedDocument ? { submittedDocument: previous.submittedDocument } : {}),
     changesRequestedCount: 0,
   };
 }
@@ -547,6 +548,7 @@ function buildStateWithCompletedStages(input: {
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
+    ...(input.previous?.submittedDocument ? { submittedDocument: input.previous.submittedDocument } : {}),
   };
 }
 
@@ -567,6 +569,7 @@ function buildSkippedStageCompletedState(input: {
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
+    ...(input.previous?.submittedDocument ? { submittedDocument: input.previous.submittedDocument } : {}),
   };
 }
 
@@ -591,6 +594,7 @@ function buildPendingState(input: {
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
+    ...(input.previous?.submittedDocument ? { submittedDocument: input.previous.submittedDocument } : {}),
     changesRequestedCount: input.changesRequestedCount ?? input.previous?.changesRequestedCount ?? 0,
   };
 }

@@ -34,7 +34,7 @@ if (process.env.PAPERCLIP_REQUIRE_EMBEDDED_PG === "1" && !support.supported) {
     return f;
   };
 
-  it("saves, enters configured QA, receives changes and resubmits the exact revised document through HTTP", async () => {
+  it.each(["unchanged", "replacement before document read", "replacement before approval"])("saves, enters configured QA, receives changes and resubmits the exact revised document through HTTP: %s", async scenario => {
     const f = await documentFixture();
     await server.db.update(documentRevisions).set({ createdByRunId: null })
       .where(eq(documentRevisions.createdByRunId, f.runId));
@@ -68,17 +68,44 @@ if (process.env.PAPERCLIP_REQUIRE_EMBEDDED_PG === "1" && !support.supported) {
         graceSec: 10, processGroupId: null,
       });
       reviewProcesses.bindQaReviewProcess(runId, 12345678);
-      const call = async (name: string, args: object) => {
+      const rawCall = async (name: string, args: object) => {
         const response = await fetch(`${server.apiUrl}/api/mcp/qa-review`, { method: "POST",
           headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
           body: JSON.stringify({ jsonrpc: "2.0", id: randomUUID(), method: "tools/call", params: { name, arguments: args } }) });
         expect(response.status).toBe(200);
         const wire = await response.json();
-        expect(wire.result.isError, JSON.stringify(wire)).not.toBe(true);
-        return wire.result.structuredContent;
+        return wire.result;
+      };
+      const call = async (name: string, args: object) => {
+        const result = await rawCall(name, args);
+        expect(result.isError, JSON.stringify(result)).not.toBe(true);
+        return result.structuredContent;
       };
       try {
+        if (decision === "request_changes" && scenario !== "unchanged") {
+          // Use the same real document service as board edits, before QA's
+          // first issue read: a fresh issue revision must not bless this body.
+          const current = await documentService(server.db).getIssueDocumentByKey(f.issueId, "result");
+          await documentService(server.db).upsertIssueDocument({ issueId: f.issueId, key: "result",
+            title: "Document result", format: "markdown", body: "Replacement never submitted by the writer",
+            baseRevisionId: current!.latestRevisionId, changeSummary: null, createdByUserId: "synthetic-board-editor" });
+        }
         const task = await call("read_assigned_issue", {});
+        const submitted = decision === "request_changes" ? first : revised;
+        expect(task.reviewStage.submittedDocument).toMatchObject({
+          documentId: submitted.documentId, key: "result", revisionId: submitted.revisionId,
+          bodySha256: submitted.bodySha256,
+        });
+        if (decision === "request_changes" && scenario !== "unchanged") {
+          const rejected = scenario === "replacement before document read"
+            ? await rawCall("read_assigned_issue_document", { key: "result", expectedRevision: task.revision,
+                offset: 0, limit: 1000 })
+            : await rawCall("submit_review_decision", { decision: "approve", summary: "Must refuse an unsubmitted replacement.",
+                expectedStageId: stageId, expectedStatusVersion: task.statusVersion, expectedRevision: task.revision,
+                expectedLastDecisionId: task.reviewStage.lastDecisionId });
+          expect(rejected.isError, JSON.stringify(rejected)).toBe(true);
+          expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0]?.status).toBe("in_review");
+        }
         await call("submit_review_decision", { decision, summary: decision === "approve" ? "Corrected result verified." : "Add the missing source.",
           expectedStageId: stageId, expectedStatusVersion: task.statusVersion, expectedRevision: task.revision,
           expectedLastDecisionId: task.reviewStage.lastDecisionId });
@@ -91,6 +118,9 @@ if (process.env.PAPERCLIP_REQUIRE_EMBEDDED_PG === "1" && !support.supported) {
     };
     const first = await save(f.runId, "result", "notes", "First draft", null, null);
     expect(first).toMatchObject({ outcome: "verified", review: { outcome: "verified", status: "in_review", submittedRevisionId: first.revisionId } });
+    expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0]?.executionState)
+      .toMatchObject({ submittedDocument: { documentId: first.documentId, key: "result", revisionId: first.revisionId,
+        bodySha256: createHash("sha256").update("First draft").digest("hex"), submittedByRunId: f.runId } });
     await server.db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
     await qa("request_changes");
     expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
@@ -100,13 +130,17 @@ if (process.env.PAPERCLIP_REQUIRE_EMBEDDED_PG === "1" && !support.supported) {
       status: "running", runtimeMode: "native", nativeIssueId: f.issueId, invocationSource: "assignment",
       contextSnapshot: { issueId: f.issueId, [SELF_TASK_DOCUMENT_CONTEXT_KEY]: true } });
     await server.db.update(issues).set({ executionRunId: revisionRunId, checkoutRunId: revisionRunId }).where(eq(issues.id, f.issueId));
-    const revised = await save(revisionRunId, "result", "result", "Corrected result with source", first.documentId as string, first.revisionId as string);
-    expect(revised).toMatchObject({ outcome: "verified", revisionNumber: 2,
+    const current = await documentService(server.db).getIssueDocumentByKey(f.issueId, "result");
+    const revised = await save(revisionRunId, "result", "result", "Corrected result with source", first.documentId as string, current!.latestRevisionId);
+    expect(revised).toMatchObject({ outcome: "verified", revisionNumber: scenario === "unchanged" ? 2 : 3,
       review: { outcome: "verified", status: "in_review", submittedRevisionId: revised.revisionId } });
     expect(revised.revisionId).not.toBe(first.revisionId);
     await server.db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, revisionRunId));
     await qa("approve");
-    expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0]?.status).toBe("done");
+    expect((await server.db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
+      .toMatchObject({ status: "done", executionState: { submittedDocument: {
+        revisionId: revised.revisionId, submittedByRunId: revisionRunId,
+      } } });
     expect((await documentService(server.db).getIssueDocumentByKey(f.issueId, "result"))?.latestRevisionId).toBe(revised.revisionId);
   }, 45_000);
 

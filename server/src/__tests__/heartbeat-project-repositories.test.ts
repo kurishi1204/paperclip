@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm } from "node:fs/promises";
 import os from "node:os";
@@ -18,11 +18,34 @@ import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.j
 import { hasSelfTaskDocumentReplayHold, hasSelfTaskDocumentSetupRetryHold } from "../services/self-task-document-runtime.js";
 
 const execute = vi.hoisted(() => vi.fn(async (_input: any) => ({ exitCode: 0, signal: null, timedOut: false })));
+const settledToolDelivery = vi.hoisted(() => vi.fn());
+const rejectDocumentRelease = vi.hoisted(() => new Set<string>());
 vi.mock("../adapters/index.js", () => ({
   getServerAdapter: () => ({ type: "codex_local", execute, supportsLocalAgentJwt: false }),
   findActiveServerAdapter: () => ({ type: "codex_local", execute, supportsLocalAgentJwt: false }),
   runningProcesses: new Map(),
 }));
+vi.mock("../services/tool-action-delivery.js", async importOriginal => {
+  const original = await importOriginal<typeof import("../services/tool-action-delivery.js")>();
+  return { ...original, toolActionDeliveryService: (...args: Parameters<typeof original.toolActionDeliveryService>) => {
+    const service = original.toolActionDeliveryService(...args);
+    return { ...service, deliverForRun: async (input: Parameters<typeof service.deliverForRun>[0]) => {
+      settledToolDelivery(input);
+      return service.deliverForRun(input);
+    } };
+  } };
+});
+vi.mock("../modules/wake-queue/index.js", async importOriginal => {
+  const original = await importOriginal<typeof import("../modules/wake-queue/index.js")>();
+  return { ...original, createWakeQueue: (...args: Parameters<typeof original.createWakeQueue>) => {
+    const queue = original.createWakeQueue(...args);
+    return { ...queue, releaseIssueExecution: async (input: Parameters<typeof queue.releaseIssueExecution>[0]) => {
+      // Target the real release boundary; a SQL error occurs before it commits.
+      if (rejectDocumentRelease.delete(input.runId)) await args[0].execute(sql`select 1 / 0`);
+      return queue.releaseIssueExecution(input);
+    } };
+  } };
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -195,6 +218,8 @@ suite("task project repository provisioning", () => {
   it.each([
     { code: "workspace_git_scan_timeout", scenario: "temporary", retryable: true },
     { code: "workspace_git_scan_timeout", scenario: "temporary", retryable: true, selfTask: true },
+    { code: "workspace_git_scan_timeout", scenario: "proof cleanup rejection", retryable: false, selfTask: true, cleanupFailure: "non_entry_proof" },
+    { code: "workspace_git_scan_timeout", scenario: "release cleanup rejection", retryable: true, selfTask: true, cleanupFailure: "issue_release" },
     { code: "workspace_git_scan_timeout", scenario: "exhausted", retryable: true, selfTask: true },
     { code: "workspace_git_scan_timeout", scenario: "paused", retryable: true, selfTask: true },
     { code: "workspace_git_scan_saturated", scenario: "temporary", retryable: true },
@@ -206,6 +231,7 @@ suite("task project repository provisioning", () => {
   ] as const)("handles $scenario $code during local-source preparation ($selfTask)", async (testCase) => {
     const { code, scenario, retryable } = testCase;
     const selfTask = "selfTask" in testCase && testCase.selfTask;
+    const cleanupFailure = "cleanupFailure" in testCase ? testCase.cleanupFailure : null;
     const companyId = randomUUID(), projectId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
     const source = path.join(root, companyId, "source");
     await mkdir(source, { recursive: true });
@@ -227,11 +253,16 @@ suite("task project repository provisioning", () => {
       adapterType: selfTask ? "claude_local" : "codex_local", adapterConfig: selfTask ? { selfTaskDocumentToolsOnly: true } : {}, runtimeConfig: {}, permissions: {} });
     await db.insert(issues).values({ id: issueId, companyId, projectId, title: "Recover startup and use existing work", status: "todo", assigneeAgentId: agentId });
     let inject = true;
+    let releaseScan!: () => void;
+    let signalScan!: () => void;
+    const scanReached = new Promise<void>(resolve => { signalScan = resolve; });
+    const scanRelease = new Promise<void>(resolve => { releaseScan = resolve; });
     const canonicalSource = await realpath(source);
     const scheduler = createWorkspaceGitOperationScheduler();
     setExpensiveWorkspaceGitExecutor(async (input) => {
       if (inject && (input.localDir === source || input.localDir === canonicalSource) && input.operation === "adapter_sync.ignored_files") {
         inject = scenario === "exhausted";
+        if (cleanupFailure) { signalScan(); await scanRelease; }
         throw new WorkspaceGitScanError(code, "Injected temporary scan failure");
       }
       return scheduler.run({
@@ -248,6 +279,48 @@ suite("task project repository provisioning", () => {
       });
     });
     const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", contextSnapshot: { issueId, projectId } });
+    if (cleanupFailure) {
+      const nextIssueId = randomUUID();
+      const trigger = `document_cleanup_${run!.id.replaceAll("-", "")}`;
+      if (cleanupFailure === "non_entry_proof") {
+        await db.execute(sql.raw(`CREATE FUNCTION ${trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+          IF NEW.id = '${run!.id}'::uuid AND NEW.result_json #> '{executionRecovery,selfTaskDocumentPreProvider}' IS NOT NULL
+          THEN RAISE EXCEPTION 'injected document cleanup failure'; END IF; RETURN NEW; END $$`));
+        await db.execute(sql.raw(`CREATE TRIGGER ${trigger} BEFORE UPDATE ON heartbeat_runs FOR EACH ROW EXECUTE FUNCTION ${trigger}()`));
+      } else rejectDocumentRelease.add(run!.id);
+      try {
+        await scanReached;
+        await db.insert(issues).values({ id: nextIssueId, companyId, projectId, title: "Independent next task", status: "todo", assigneeAgentId: agentId });
+        const next = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", contextSnapshot: { issueId: nextIssueId, projectId } });
+        expect(next?.status).toBe("queued");
+        releaseScan();
+        await heartbeat.drainActiveRunExecutions();
+        expect(settledToolDelivery.mock.calls.filter(([input]) => input.runId === run!.id)).toHaveLength(1);
+        expect((await heartbeat.getRun(next!.id))?.status).toBe("succeeded");
+        expect((await db.select().from(issues).where(eq(issues.id, nextIssueId)))[0]?.status).toBe("done");
+        expect(execute.mock.calls.filter(([input]) => input.runId === next!.id)).toHaveLength(1);
+        const failed = await heartbeat.getRun(run!.id);
+        expect(failed).toMatchObject({ status: "failed", errorCode: code });
+        expect(execute.mock.calls.filter(([input]) => input.runId === run!.id)).toHaveLength(0);
+        expect(hasSelfTaskDocumentReplayHold(failed)).toBe(true);
+        expect(hasSelfTaskDocumentSetupRetryHold(failed)).toBe(cleanupFailure === "non_entry_proof");
+        const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run!.id));
+        expect(retries).toHaveLength(cleanupFailure === "non_entry_proof" ? 0 : 1);
+        return;
+      } finally {
+        releaseScan();
+        rejectDocumentRelease.delete(run!.id);
+        if (cleanupFailure === "non_entry_proof") {
+          await db.execute(sql.raw(`DROP TRIGGER ${trigger} ON heartbeat_runs`));
+          await db.execute(sql.raw(`DROP FUNCTION ${trigger}()`));
+        }
+        await heartbeat.drainActiveRunExecutions();
+        // Finish any queued work for teardown after assertions have recorded
+        // whether this executor reached its independent post-cleanup delivery.
+        await heartbeat.resumeQueuedRuns();
+        await heartbeat.drainActiveRunExecutions();
+      }
+    }
     await vi.waitFor(async () => expect((await heartbeat.getRun(run!.id))?.errorCode).toBe(code), { timeout: 15_000 });
     expect(execute.mock.calls.filter(([input]) => input.runId === run!.id)).toHaveLength(0);
     await heartbeat.drainActiveRunExecutions();
