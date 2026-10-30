@@ -33,6 +33,7 @@ import {
   type PrpTerminalState,
 } from "./protocol/replay-contract.js";
 import { parsePaperclipQuestionSet } from "./contracts/question-set.js";
+import { PRP_BLOCK_TOOL_NAME } from "./contracts/completion-result.js";
 import {
   retainedRunnerdCleanupProofIsCurrent,
   type RetainedRunnerdCleanupProof,
@@ -312,6 +313,20 @@ function terminalFromEvent(
     ...states,
     reportedWorkDisposition: disposition,
   };
+}
+
+function governedResultTerminalFromEvent(
+  event: PrpEvent,
+  disposition: PrpTerminalState["reportedWorkDisposition"],
+): PrpTerminalState {
+  return isTurnTerminal(event)
+    ? terminalFromEvent(event, disposition)
+    : {
+        schema: "paperclip.prp.terminal.v1",
+        turnTerminalState: "completed",
+        runTerminalState: "succeeded",
+        reportedWorkDisposition: disposition,
+      };
 }
 
 async function attemptOptionalSessionCancellation(
@@ -870,6 +885,7 @@ async function consumeTurn(
   },
   initialGoal?: HarnessThreadGoal | null,
   resumeInterruptedTurn?: (event: PrpEvent, signal: AbortSignal) => Promise<boolean>,
+  onBlockedHandoffParked?: (event: PrpEvent, result: PrpStructuredRunResult) => void,
 ) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const appendAbort = new AbortController();
@@ -922,6 +938,14 @@ async function consumeTurn(
     let latestSessionGoal: HarnessThreadGoal | null = null;
     let resultSource: "semantic_result" | "governed_wait" | null = null;
     let providerFailure: NativeProviderTerminalFailure | null = null;
+    const pendingTools = new Map<string, {
+      sourceInstanceId: string;
+      turnId: string;
+      isBlock: boolean;
+    }>();
+    let toolObservationComplete = true;
+    let blockedHandoffTool: string | null = null;
+    let blockedHandoffAcknowledged = false;
     const settleDurableResult = (
       event: PrpEvent,
       result: PrpStructuredRunResult,
@@ -982,6 +1006,40 @@ async function consumeTurn(
         highestContiguousSourceSeq,
         receipt.highestContiguousSourceSeq,
       );
+      if (receipt.disposition === "committed" && event.eventType.startsWith("tool.execution.")) {
+        if (payload.schema !== "paperclip.tool.execution.v1" ||
+            typeof payload.executionId !== "string" || !payload.executionId ||
+            typeof event.turnId !== "string" || !event.turnId) {
+          toolObservationComplete = false;
+        } else {
+          const key = JSON.stringify([event.sourceInstanceId, event.turnId, payload.executionId]);
+          const isBlock = payload.transport === "mcp" && payload.namespace === "paperclip" &&
+            payload.name === PRP_BLOCK_TOOL_NAME;
+          if (event.eventType === "tool.execution.started") {
+            if (pendingTools.has(key) || payload.status !== "running") toolObservationComplete = false;
+            pendingTools.set(key, { sourceInstanceId: event.sourceInstanceId, turnId: event.turnId, isBlock });
+          } else if (event.eventType === "tool.execution.completed") {
+            const started = pendingTools.get(key);
+            if (!started) toolObservationComplete = false;
+            blockedHandoffAcknowledged = key === blockedHandoffTool && started?.isBlock === true &&
+              isBlock && payload.status === "completed";
+            pendingTools.delete(key);
+          } else if (event.eventType !== "tool.execution.progressed" ||
+                     payload.status !== "running" || !pendingTools.has(key)) {
+            toolObservationComplete = false;
+          }
+          // Once the block is reported, a new tool call means the provider is
+          // still doing work. Keep the ordinary terminal contract in that case.
+          if (blockedHandoffTool !== null && event.eventType === "tool.execution.started") {
+            blockedHandoffTool = null;
+            blockedHandoffAcknowledged = false;
+          }
+        }
+      }
+      if (event.eventType === "runtime_request.created") {
+        blockedHandoffTool = null;
+        blockedHandoffAcknowledged = false;
+      }
       const eventGoal = goalFromEvent(event);
       const goalChanged = eventGoal !== undefined &&
         goalLifecycleFingerprint(eventGoal) !== goalLifecycleFingerprint(previousGoal);
@@ -1097,6 +1155,13 @@ async function consumeTurn(
         governedResult = validation.result;
         resultSource = "semantic_result";
         semanticResultObserved = true;
+        if (receipt.disposition === "committed" &&
+            governedResult.reportedWorkDisposition === "blocked" &&
+            toolObservationComplete && pendingTools.size === 1) {
+          const [key, pending] = pendingTools.entries().next().value!;
+          if (pending.isBlock && pending.sourceInstanceId === event.sourceInstanceId &&
+              pending.turnId === event.turnId) blockedHandoffTool = key;
+        }
       }
       if (governedResult === null && resolveGovernedWait) {
         if (appendAbort.signal.aborted) {
@@ -1113,6 +1178,16 @@ async function consumeTurn(
       }
       if (governedResult !== null && !isTurnTerminal(event) && !sessionGoalObserved) {
         if (resultSource === "semantic_result") {
+          if (governedResult.reportedWorkDisposition === "blocked" &&
+              blockedHandoffAcknowledged && toolObservationComplete && pendingTools.size === 0 &&
+              providerFailure === null && session.canParkBlockedHandoff?.(event) === true) {
+            onBlockedHandoffParked?.(event, governedResult);
+            return settleDurableResult(
+              event,
+              governedResult,
+              "Paperclip parked this turn after the blocked handoff was acknowledged.",
+            );
+          }
           // A completion tool reports task disposition, not provider termination.
           // Persist the final answer and authoritative terminal before finalizing.
           continue;
@@ -2135,6 +2210,8 @@ export async function executeNativeSession(
     return activeClose;
   };
   let executionSucceeded = false;
+  let blockedHandoffRequiresSuspension = false;
+  let parkedBlockedCheckpoint: Pick<PersistedNativeSession, "semanticResult" | "semanticResultTurnId" | "terminal" | "activeTurnId"> | null = null;
   let goalCheckpointRequiresSuspension = Boolean(
     options.sessionGoalControl || options.resumeSessionGoalHeartbeat || persistedSession?.goal,
   );
@@ -2167,7 +2244,7 @@ export async function executeNativeSession(
     const checkpoint = async (signal?: AbortSignal) => {
       const snapshot = await session.snapshot(signal ? { signal } : undefined);
       signal?.throwIfAborted();
-      await persistCheckpoint(snapshot, signal);
+      await persistCheckpoint(parkedBlockedCheckpoint === null ? snapshot : { ...snapshot, ...parkedBlockedCheckpoint }, signal);
     };
     const recoveredSnapshot = await session.snapshot();
     const restartContinuation = () => ({
@@ -2259,6 +2336,12 @@ export async function executeNativeSession(
               completedSemanticResultTurnId(completionSnapshot),
           }
         : null;
+    // A recovered, already settled blocked turn is not a warm session owner.
+    // Its old remote interrupt may never have reached the provider.
+    blockedHandoffRequiresSuspension ||= Boolean(
+      recovered && completionSnapshot?.activeTurnId === null &&
+      completed?.result.reportedWorkDisposition === "blocked",
+    );
     if (!completed) {
       // A recovered driver is authoritative about whether a provider turn is
       // still active. In particular, drivers normalize the checkpoint race
@@ -2344,6 +2427,12 @@ export async function executeNativeSession(
                 : undefined,
               recoveredSnapshot.goal,
               resumeInterruptedTurn,
+              (event, result) => {
+                blockedHandoffRequiresSuspension = true;
+                parkedBlockedCheckpoint = { semanticResult: structuredClone(result),
+                  semanticResultTurnId: event.turnId ?? null,
+                  terminal: governedResultTerminalFromEvent(event, result.reportedWorkDisposition), activeTurnId: null };
+              },
             )
           : Promise.resolve({
               event: recoveryTerminal,
@@ -2471,17 +2560,10 @@ export async function executeNativeSession(
               ? await session.result()
               : {
                   result: consumed.governedResult,
-                  terminal: isTurnTerminal(terminalEvent)
-                    ? terminalFromEvent(
-                        terminalEvent,
-                        consumed.governedResult.reportedWorkDisposition,
-                      )
-                    : {
-                        schema: "paperclip.prp.terminal.v1",
-                        turnTerminalState: "completed",
-                        runTerminalState: "succeeded",
-                        reportedWorkDisposition: consumed.governedResult.reportedWorkDisposition,
-                      },
+                  terminal: governedResultTerminalFromEvent(
+                    terminalEvent,
+                    consumed.governedResult.reportedWorkDisposition,
+                  ),
                   turnId: terminalEvent.turnId ?? null,
                 };
           signal.throwIfAborted();
@@ -2738,7 +2820,9 @@ export async function executeNativeSession(
           goalCheckpointRequiresSuspension ||= snapshot.goal != null;
           const completedSnapshot = {
             ...snapshot,
+            ...(parkedBlockedCheckpoint ?? {}),
             semanticResult: durableExecutionResult.result,
+            semanticResultTurnId: durableExecutionResult.turnId ?? null,
             terminal: durableExecutionResult.terminal,
           };
           await persistCheckpoint(completedSnapshot, signal);
@@ -2794,7 +2878,8 @@ export async function executeNativeSession(
     throw error;
   } finally {
     const shouldClose =
-      !options.keepSessionOpen || !executionSucceeded || sessionQuarantined || goalCheckpointRequiresSuspension;
+      !options.keepSessionOpen || !executionSucceeded || sessionQuarantined ||
+      goalCheckpointRequiresSuspension || blockedHandoffRequiresSuspension;
     if (shouldClose && options.requireSessionCloseBeforeReturn) {
       if (!failedCleanupDeferred) {
         closeSession(
@@ -2869,6 +2954,9 @@ function completedSemanticResultTurnId(
     return null;
   }
   const semanticFingerprint = canonicalJson(snapshot.semanticResult);
+  if (typeof snapshot.semanticResultTurnId === "string" && snapshot.semanticResultTurnId.length > 0) {
+    return snapshot.semanticResultTurnId;
+  }
   for (const terminal of [...(snapshot.terminalTurns ?? [])].reverse()) {
     try {
       const value: unknown = JSON.parse(terminal.fingerprint);

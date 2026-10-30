@@ -115,6 +115,8 @@ export class CodexSessionState {
   resultCallId: string | null = null;
   resultTurnId: string | null = null;
   turnStartPending = false;
+  toolAuthorityRevoked = false;
+  pendingToolDispatches = 0;
   /**
    * Resolves once a pending turn/start settles, on the accepted path or on a
    * provider rejection. A terminal notification for that turn must wait on

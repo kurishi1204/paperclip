@@ -60,6 +60,8 @@ export interface PersistedNativeSession {
     | "allow_replacement_after_resume_failure";
   cursor?: string | null;
   semanticResult?: PrpStructuredRunResult | null;
+  /** Subject of a persisted semantic result; does not grant active-turn authority. */
+  semanticResultTurnId?: string | null;
   terminal?: PrpTerminalState | null;
   activeTurnId?: string | null;
   terminalTurns?: PersistedHarnessTurnTerminal[];
@@ -184,6 +186,11 @@ export interface NativeSession {
   /** Relinquish controller authority without suspending provider execution. */
   detachControllerForRestart?(): Promise<void>;
   events(input?: { afterCursor?: string | null }): AsyncIterable<PrpEvent>;
+  /** Synchronous producer proof: this event is the current tail after an
+   * acknowledged block. The consumer separately verifies tool quiescence.
+   * Call cancellation in the same turn of the event loop if true. An
+   * unsupported producer retains ordinary provider-terminal handling. */
+  canParkBlockedHandoff?(event: PrpEvent): boolean;
   startTurn(input: {
     message: NativeUserMessage;
     /** Set by orchestration only after successful provider-session recovery. */

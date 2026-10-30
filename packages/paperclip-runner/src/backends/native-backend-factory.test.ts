@@ -2,7 +2,7 @@ import { resolveQualifiedAcpxProfile } from "../drivers/acpx/qualified-profiles.
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parseNativeExecutionInput, type NativeExecutionInput } from "../contracts/native-execution.js";
 import { NATIVE_RUNTIME_ASSET_SCHEMA, PAPERCLIP_EXECUTION_PROMPT, PAPERCLIP_EXECUTION_PROMPT_REVISION, nativeRuntimePromptDigest, canonicalNativeRuntimeContextDigest } from "../contracts/runtime-context.js";
@@ -29,8 +29,12 @@ function preparedExecution(base: NativeExecutionInput): NativeExecutionInput {
 import {
   FakeCodexTransport,
   WORKSPACE,
+  result as completedFixture,
 } from "../drivers/codex/codex-app-server-driver.test-support.js";
 import { createNativeSessionBackend } from "../index.js";
+import { executeNativeSession } from "../native-session-runtime.js";
+import type { PrpEvent, PrpStructuredRunResult } from "../protocol/replay-contract.js";
+import { SemanticToolOutcomeUnknownError } from "../contracts/native-session-backend.js";
 import { createCodexNativeSessionBackend } from "./codex-native-backend.js";
 import { createOpenCodeNativeSessionBackend } from "./opencode-native-backend.js";
 
@@ -210,6 +214,97 @@ function managedExecution(
 }
 
 describe("native backend factory", () => {
+  it("revokes further dispatch after an uncertain tool outcome", async () => {
+    const transport = new FakeCodexTransport();
+    const input = preparedExecution(execution());
+    input.workspace.cwd = WORKSPACE;
+    const unknown = new SemanticToolOutcomeUnknownError("The write outcome is unknown.");
+    const handler = vi.fn(async () => { throw unknown; });
+    const backend = createNativeSessionBackend(input, { codexTransportFactory: () => transport,
+      dynamicTools: [{ name: "save_document", inputSchema: { type: "object" } }], dynamicToolHandler: handler });
+    const session = await backend.openSession({ identity: { ...input.binding, sessionId: "session" }, workingDirectory: WORKSPACE });
+    await session.startTurn({ message: { text: "Save the assigned document." } });
+    const call = (id: string) => transport.invoke({ id, method: "item/tool/call", params: {
+      threadId: "thread-1", turnId: "turn-1", callId: id, tool: "save_document", arguments: {},
+    } });
+    await expect(call("uncertain")).rejects.toBe(unknown);
+    expect(await call("after-uncertain")).toMatchObject({ success: false });
+    expect(handler).toHaveBeenCalledOnce();
+    await session.close({ reason: "uncertain outcome preserved" });
+  });
+
+  it.each([false, true])("parks a Claude runnerd block and fences late tools (in-flight=%s)", async inFlight => {
+    const transport = new FakeCodexTransport();
+    let interruptStarted = false;
+    let releaseInterrupt!: () => void;
+    const interruptGate = new Promise<void>(resolve => { releaseInterrupt = resolve; });
+    const originalRequest = transport.request.bind(transport);
+    transport.request = async (method, params) => {
+      if (method === "turn/interrupt") { interruptStarted = true; await interruptGate; }
+      return originalRequest(method, params);
+    };
+    const legacy = acpxExecution("claude");
+    const { permissionPolicy: _legacyPolicy, qualificationModel: _qualification, reportedModelId: _reported, ...profile } = resolveQualifiedAcpxProfile("claude", "explicit-test-model");
+    const input = preparedExecution({ ...legacy, provider: {
+      kind: "acpx", agent: "claude", model: "explicit-test-model", permissionMode: "approve-paperclip",
+      profile,
+    } });
+    input.workspace.cwd = WORKSPACE;
+    let releaseTool!: () => void;
+    const toolGate = new Promise<void>(resolve => { releaseTool = resolve; });
+    const handler = vi.fn(async () => { await toolGate; return { saved: true }; });
+    const backend = createNativeSessionBackend(input, {
+      codexTransportFactory: () => transport,
+      dynamicTools: [{ name: "save_document", inputSchema: { type: "object" } }],
+      dynamicToolHandler: handler,
+    });
+    const blocked: PrpStructuredRunResult = {
+      ...completedFixture, reportedWorkDisposition: "blocked",
+      completionClaim: { ...completedFixture.completionClaim, contractRevision: "revision", objectiveSatisfied: false,
+        criteria: [{ criterionId: "objective", status: "unknown", evidenceRefs: [] }],
+        remainingWork: [{ description: "Wait for the saved revision review.", blocksCompletion: true }] },
+      blocker: { reasonCode: "dependency", owner: { kind: "agent", name: "reviewer" },
+        unblockAction: "Review the saved revision.", scope: "task_wide" },
+    };
+    const events: PrpEvent[] = [];
+    let settled = false;
+    const execution = executeNativeSession({ input, backend, runnerInstanceId: "runner", controlPlaneInstanceId: "control",
+      timeoutMs: 700, keepSessionOpen: true, requireSessionCloseBeforeReturn: true,
+      controlPlane: {
+        async openRun() {}, async checkpointSession() {},
+        async appendEvent(event) {
+          if (!("sourceSeq" in event) || !("eventType" in event)) throw Error("PRP event required");
+          events.push(event);return { cursor: events.length, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" };
+        },
+        async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; },async completeRun() {},
+      },
+    });
+    let executionError: unknown;
+    void execution.then(() => { settled = true; }, error => { executionError = error; });
+    await vi.waitFor(() => { if (executionError) throw executionError; expect(transport.calls.some(c => c.method === "turn/start")).toBe(true); });
+    const call = (id: string, tool: string, args: unknown) => transport.invoke({ id, method: "item/tool/call",
+      params: { threadId: "thread-1", turnId: "turn-1", callId: id, tool, arguments: args } });
+    const pendingTool = inFlight ? call("write-in-flight", "save_document", {}) : null;
+    if (inFlight) await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce());
+    const tool = (status: "running" | "completed") => transport.push("paperclip/canonicalProviderEvent", {
+      threadId: "thread-1", turnId: "turn-1", eventType: "tool.execution."+(status === "running" ? "started" : "completed"),
+      payload: { schema: "paperclip.tool.execution.v1", executionId: "block-execution", transport: "mcp", namespace: "paperclip", name: "paperclip_block", status },
+    });
+    tool("running");
+    await vi.waitFor(() => expect(events.some(e => e.eventType === "tool.execution.started")).toBe(true));
+    expect(await call("block-call", "paperclip_block", blocked)).toMatchObject({ success: true });
+    tool("completed");
+    await vi.waitFor(() => expect(events.some(e => e.eventType === "tool.execution.completed")).toBe(true));
+    if (inFlight) { expect(settled).toBe(false);releaseTool();await pendingTool; }
+    await vi.waitFor(() => expect(interruptStarted).toBe(true));
+    // The remote interrupt is still unacknowledged and the session is open.
+    expect(await call("late-write", "save_document", {})).toMatchObject({ success: false });
+    expect(handler).toHaveBeenCalledTimes(inFlight ? 1 : 0);
+    releaseInterrupt();
+    await expect(execution).resolves.toMatchObject({ result: blocked });
+    expect(transport.calls.filter(c => c.method === "turn/interrupt")).toHaveLength(1);
+  });
+
   it("constructs the Codex backend without starting its transport", async () => {
     const backend = createNativeSessionBackend(execution(), {
       codexTransportFactory: () => {

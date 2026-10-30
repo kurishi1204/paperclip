@@ -90,6 +90,7 @@ export class HarnessDriverBackend implements NativeSessionBackend {
     const recoveredSemanticTurn = completedSemanticTurn(snapshot);
     const semanticTurnId =
       recoveredSemanticTurn?.turnId ??
+      (snapshot.semanticResult && typeof snapshot.semanticResultTurnId === "string" ? snapshot.semanticResultTurnId : null) ??
       snapshot.activeTurnId ??
       snapshot.terminalTurns?.at(-1)?.turnId ??
       null;
@@ -729,6 +730,13 @@ class HarnessNativeSession implements NativeSession {
     return this.#withProtocolIntegrity(() => this.#session.steer!(input));
   }
 
+  canParkBlockedHandoff(event: PrpEvent): boolean {
+    this.#assertProtocolIntegrity();
+    return !this.#explicitlyCancelled &&
+      this.#session.revokeTurnToolAuthority !== undefined &&
+      this.#session.canParkBlockedHandoff?.(event) === true;
+  }
+
   interrupt(input: { turnId?: string; reason?: string }) {
     if (this.#session.interrupt === undefined)
       throw new Error("interruption is unavailable");
@@ -745,6 +753,7 @@ class HarnessNativeSession implements NativeSession {
     // interruption happens afterward as passive cleanup, so a slow or broken
     // transport cannot synthesize or publish new accepted output for the turn.
     this.#explicitlyCancelled = true;
+    this.#session.revokeTurnToolAuthority?.();
     const interrupt = this.#session.interrupt;
     return {
       cleanup:
@@ -842,6 +851,7 @@ class HarnessNativeSession implements NativeSession {
       semanticResult: this.#explicitlyCancelled
         ? null
         : (snapshot.semanticResult?.result ?? null),
+      semanticResultTurnId: this.#explicitlyCancelled ? null : (snapshot.semanticResult?.turnId ?? null),
       terminal: this.#terminal,
       // Harness snapshots use an explicit null to record a settled turn. Keep
       // the semantic-result fallback solely for legacy snapshots that omitted

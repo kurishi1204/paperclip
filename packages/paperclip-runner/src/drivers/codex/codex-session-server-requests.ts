@@ -32,6 +32,8 @@ export async function handleServerRequest(
     request: CodexRpcServerRequest,
   ): Promise<Record<string, unknown>> {
     const sourceSequenceBefore = state.sourceSequence;
+    const toolDispatch = request.method === "item/tool/call";
+    if (toolDispatch) state.pendingToolDispatches += 1;
     let rejected = false;
     try {
       const response = await handleServerRequestBody(state, request);
@@ -41,6 +43,7 @@ export async function handleServerRequest(
       rejected = true;
       throw error;
     } finally {
+      if (toolDispatch) state.pendingToolDispatches -= 1;
       const correlation = request.paperclipTrace;
       if (correlation !== undefined) {
         const emittedEventIds: string[] = [];
@@ -87,6 +90,9 @@ async function handleServerRequestBody(
       // temporary null/optimistic identity while its start is still pending.
       await state.turnStartSettled;
       state.assertProtocolIntegrity();
+      if (state.toolAuthorityRevoked) {
+        return rejectedToolCall("Paperclip has parked or cancelled this turn; tool authority was revoked.");
+      }
       const tool = text(request.params.tool);
       const threadId = text(request.params.threadId);
       const turnId = text(request.params.turnId);
@@ -151,7 +157,10 @@ async function handleServerRequestBody(
             // Preserve uncertain effects for the durable controller. A normal
             // failed tool response would falsely settle this call and permit
             // the provider to continue as if the write had not happened.
-            if (isSemanticToolOutcomeUnknownError(error)) throw error;
+            if (isSemanticToolOutcomeUnknownError(error)) {
+              state.toolAuthorityRevoked = true;
+              throw error;
+            }
             const message = boundedText(
               error instanceof Error ? error.message : error,
             );

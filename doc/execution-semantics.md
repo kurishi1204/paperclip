@@ -990,6 +990,33 @@ no interruption timer. Existing execution timeouts, cancellation, governed waits
 and active-goal rules still apply. A later failed or cancelled terminal remains
 failed or cancelled even when the agent already reported completed work.
 
+An acknowledged `paperclip_block` can instead park an ordinary turn through the
+existing governed-cancellation path. The runtime must durably observe one
+first-party block tool starting, its validated blocked report, and the matching
+successful tool acknowledgement from the same source and turn. No other tool
+may be in flight when the report is proposed, and starting another tool after
+the report keeps the ordinary terminal contract. Incomplete or ambiguous tool
+observations, a failed acknowledgement, and active session goals also retain
+that contract. A synchronous producer check must also confirm that this event
+is still its current tail and that the blocked result belongs to the active
+turn. Queued later activity, an older result owner, and unsupported backends
+retain ordinary terminal handling. Duplicate receipts during recovery do not
+establish a new park; recovery retains its existing result and terminal rules.
+The runnerd-backed harness checks its local event tail and pending host tool
+dispatches. Native cancellation synchronously revokes new host tool dispatch;
+remote interruption remains asynchronous cleanup, not an atomic remote OS stop.
+The in-process ACPX backend does not implement this shortcut. The runtime
+observes provider cleanup using the existing cleanup grace. A parked block
+always closes the live session, even when warm reuse was requested; its queued
+interrupt and old result owner must not reach the next run. Before finalization,
+the checkpoint preserves the blocked report and the same successful wait
+terminal used by live finalization, with no active turn. Recovery can finalize
+that recorded result without starting the paid phase again. Provider cleanup
+cancellation does not change the recorded wait into a cancelled run. This records a successful wait, not task
+completion or a retried action. The persisted report supplies the response when
+the provider has not yet written a final message. `paperclip_finish` still waits
+for the authoritative provider terminal and persists the final answer.
+
 The final assistant message is the visible task response. Response selection runs
 after preceding event persistence completes; the completion summary cannot replace
 an available final answer. Existing fallback and explicit-comment precedence still

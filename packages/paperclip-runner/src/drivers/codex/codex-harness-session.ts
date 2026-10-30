@@ -79,6 +79,20 @@ export class CodexHarnessSession
     return { steering: this.capabilities.steering, queuedFollowUp: false };
   }
 
+  canParkBlockedHandoff(event: PrpEvent): boolean {
+    this.assertProtocolIntegrity();
+    return !this.protocolFailed && !this.terminal && !this.toolAuthorityRevoked &&
+      !this.turnStartPending && this.activeTurnId !== null &&
+      event.sourceInstanceId === this.runnerInstanceId && event.runId === this.runId &&
+      event.sourceSeq === this.sourceSequence && event.turnId === this.activeTurnId &&
+      this.resultTurnId === this.activeTurnId && this.result?.reportedWorkDisposition === "blocked" &&
+      this.pendingToolDispatches === 0 && this.pendingRuntimeRequestMap.size === 0;
+  }
+
+  revokeTurnToolAuthority(): void {
+    this.toolAuthorityRevoked = true;
+  }
+
   ids(): ReturnType<HarnessSession["ids"]> {
     return {
       driverSessionId: this.opened.threadId,
@@ -91,7 +105,7 @@ export class CodexHarnessSession
     this.assertProtocolIntegrity();
     const transportOwnsQuiescence = this.transport.attachRun !== undefined;
     if (
-      this.turnStartPending ||
+      this.turnStartPending || this.pendingToolDispatches > 0 ||
       (!transportOwnsQuiescence &&
         (this.activeTurnId !== null || this.pendingRuntimeRequestMap.size > 0))
     ) {
@@ -119,6 +133,7 @@ export class CodexHarnessSession
       this.usageSnapshot = codexRunUsage(this.codexUsageBaseline);
     }
     this.runId = input.runId;
+    this.toolAuthorityRevoked = false;
     this.result = null;
     this.resultFingerprint = null;
     this.resultCallId = null;
@@ -159,6 +174,7 @@ export class CodexHarnessSession
       this.terminal ||
       this.protocolFailed ||
       this.activeTurnId !== null ||
+      this.pendingToolDispatches > 0 ||
       this.turnStartPending
     ) {
       throw this.unsupported(
@@ -169,6 +185,7 @@ export class CodexHarnessSession
       );
     }
     const dispositionOnlyRecovery = this.dispositionOnlyRecoveryAvailable;
+    this.toolAuthorityRevoked = false;
     // A native continuation already carries just new events and the current
     // completion IDs. Do not wrap it in the prior task objective/constraints
     // or re-invoke a skill whose instructions are already in this session.

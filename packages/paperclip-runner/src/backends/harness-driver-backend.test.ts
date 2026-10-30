@@ -97,6 +97,27 @@ const driver: HarnessDriver = {
 };
 
 describe("HarnessDriverBackend", () => {
+  it("delegates blocked-handoff proof only before native cancellation", async () => {
+    const canParkBlockedHandoff = vi.fn(() => true);
+    const revokeTurnToolAuthority = vi.fn();
+    const session = Object.assign(new FakeHarnessSession(), { canParkBlockedHandoff, revokeTurnToolAuthority });
+    const backend = new HarnessDriverBackend({ ...driver, openSession: async () => session });
+    const identity = { runId: "run-1", sessionId: "session-1", companyId: "company-1", issueId: "issue-1", agentId: "agent-1" };
+    const opened = await backend.openSession({ identity });
+    const event = prpEvent(1, "tool.execution.completed", {});
+    expect(opened.canParkBlockedHandoff?.(event)).toBe(true);
+    expect(canParkBlockedHandoff).toHaveBeenCalledWith(event);
+    const cancellation = opened.cancel!({ reason: "parked", signal: new AbortController().signal });
+    expect(revokeTurnToolAuthority).toHaveBeenCalledOnce();
+    await cancellation.cleanup;
+    expect(opened.canParkBlockedHandoff?.(event)).toBe(false);
+    expect(canParkBlockedHandoff).toHaveBeenCalledOnce();
+    await opened.close({ reason: "fixture complete" });
+    const unsupported = await new HarnessDriverBackend(driver).openSession({ identity });
+    expect(unsupported.canParkBlockedHandoff?.(event)).toBe(false);
+    await unsupported.close({ reason: "unsupported fixture complete" });
+  });
+
   it("refreshes negotiated controls after a warm handshake and separates follow-ups", async () => {
     let controls = { steering: false, queuedFollowUp: false };
     const steer = vi.fn(async () => {});
