@@ -1045,7 +1045,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     }
   });
 
-  it("visits a ready approval return beyond fifty physical ownership holds without changing them", async () => {
+  it.each(["millisecond", "microsecond"] as const)(
+    "visits a ready approval return beyond fifty physical ownership holds without changing them (%s timestamps)",
+    async (precision) => {
     const { companyId, agentId } = await seedCompanyAndAgent({ heartbeatConfig: { enabled: false } });
     const approver = randomUUID(), now = new Date();
     await db.insert(agents).values({ id: approver, companyId, name: "Native approver", role: "manager",
@@ -1074,11 +1076,64 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         payload: { issueId: row.issueId, mutation: "update", executionStage, _paperclipWakeContext: {
           issueId: row.issueId, source: "issue.execution_stage", wakeReason: "execution_changes_requested", executionStage } } });
     }
+    const ready = seeds[50];
+    if (precision === "microsecond") {
+      // Insert through PostgreSQL rather than Date: the first fifty rows have
+      // one exact timestamp which cannot be represented by a JS millisecond.
+      const second = new Date(Math.floor((now.getTime() - 120_000) / 1000) * 1000)
+        .toISOString().replace(".000Z", "");
+      const heldTimestamp = `${second}.123456Z`;
+      const readyTimestamp = `${second}.124456Z`;
+      await db.update(agentWakeupRequests).set({ requestedAt: sql`
+        CASE WHEN ${agentWakeupRequests.id} = ${ready.wakeId}::uuid
+        THEN ${readyTimestamp}::timestamptz ELSE ${heldTimestamp}::timestamptz END
+      ` }).where(eq(agentWakeupRequests.companyId, companyId));
+      const precisionRows = await db.select({
+        requestedAt: agentWakeupRequests.requestedAt,
+        fractional: sql<string>`to_char(${agentWakeupRequests.requestedAt}, 'US')`,
+      }).from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      expect(precisionRows.filter(row => row.fractional === "123456")).toHaveLength(50);
+      expect(precisionRows.filter(row => row.fractional === "124456")).toHaveLength(1);
+      expect(precisionRows.filter(row => row.fractional === "123456")
+        .every(row => row.requestedAt.getUTCMilliseconds() === 123)).toBe(true);
+    }
+    const observedPages: string[] = [];
+    const observeSelect = (query: unknown): unknown => {
+      if (!query || typeof query !== "object") return query;
+      return new Proxy(query, {
+        get(target, key) {
+          const value = Reflect.get(target, key, target);
+          if (key === "then") return (resolve: (rows: unknown) => unknown, reject: (error: unknown) => unknown) =>
+            value.call(target, (rows: unknown) => {
+              if (Array.isArray(rows) && rows.length && rows[0]?.wake?.id
+                  && rows[0]?.sourceRun?.id && rows[0]?.decisionId) {
+                const page = rows.map(row => row.wake.id).join(",");
+                if (observedPages.includes(page)) {
+                  throw new Error("Native approval cursor repeated a real PostgreSQL page after timestamp truncation");
+                }
+                observedPages.push(page);
+              }
+              return rows;
+            }).then(resolve, reject);
+          if (typeof value === "function") return (...args: unknown[]) => observeSelect(value.apply(target, args));
+          return value;
+        },
+      });
+    };
+    const observedDb = new Proxy(db, {
+      get(target, key) {
+        const value = Reflect.get(target, key, target);
+        if (key === "select") return (...args: unknown[]) => observeSelect(value.apply(target, args));
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const observedHeartbeat = heartbeatService(observedDb, {
+      runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" },
+    });
     const heldIds = seeds.slice(0, 50).map(row => row.wakeId);
     const beforeWakes = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)))
       .filter(w => heldIds.includes(w.id)).sort((a, b) => a.id.localeCompare(b.id));
     const beforeRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, approver));
-    const ready = seeds[50];
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     mockAdapterExecute.mockImplementation(async () => {
@@ -1087,11 +1142,12 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Ready correction saved", provider: "test", model: "test-model" };
     });
     try {
-      await heartbeat.resumeQueuedRuns();
+      await observedHeartbeat.resumeQueuedRuns();
       expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
       expect(run?.wakeupRequestId).toBe(ready.wakeId);
-      await heartbeat.resumeQueuedRuns();
+      observedPages.length = 0;
+      await observedHeartbeat.resumeQueuedRuns();
       expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
       const afterWakes = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)))
         .filter(w => heldIds.includes(w.id)).sort((a, b) => a.id.localeCompare(b.id));
@@ -1099,7 +1155,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, approver))).toEqual(beforeRuns);
     } finally {
       release();
-      await heartbeat.drainActiveRunExecutions();
+      await observedHeartbeat.drainActiveRunExecutions();
     }
   });
 

@@ -20232,7 +20232,8 @@ export function heartbeatService(
   async function resumeCommittedNativeApprovalHandoffs() {
     const cutoff = await getWorktreeExecutionCutoff();
     const scanStartedAt = new Date();
-    const readPage = (after: { requestedAt: Date; id: string } | null) => db.select({ wake: agentWakeupRequests, sourceRun: heartbeatRuns,
+    const readPage = (after: { requestedAt: string; id: string } | null) => db.select({ wake: agentWakeupRequests, sourceRun: heartbeatRuns,
+      cursorRequestedAt: sql<string>`${agentWakeupRequests.requestedAt}::text`,
       decisionId: issueExecutionDecisions.id }).from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
@@ -20250,8 +20251,8 @@ export function heartbeatService(
         isNull(nativeRunFinalizations.leaseOwner)))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
         lte(agentWakeupRequests.requestedAt, scanStartedAt),
-        after ? or(gt(agentWakeupRequests.requestedAt, after.requestedAt),
-          and(eq(agentWakeupRequests.requestedAt, after.requestedAt), gt(agentWakeupRequests.id, after.id))) : undefined,
+        after ? or(sql`${agentWakeupRequests.requestedAt} > ${after.requestedAt}::timestamptz`,
+          and(sql`${agentWakeupRequests.requestedAt} = ${after.requestedAt}::timestamptz`, gt(agentWakeupRequests.id, after.id))) : undefined,
         isNull(issues.executionRunId), isNull(issues.checkoutRunId), isNull(issues.assigneeUserId),
         eq(issues.status, "in_progress"),
         sql`${issues.executionState}->>'status' = 'changes_requested'`,
@@ -20259,14 +20260,16 @@ export function heartbeatService(
         sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'execution_changes_requested'`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).limit(50);
-    let cursor: { requestedAt: Date; id: string } | null = null;
+    let cursor: { requestedAt: string; id: string } | null = null;
     // Page through the fixed-time candidate set instead of revisiting only
     // its oldest held rows. Do not rotate or rewrite those original receipts.
     for (;;) {
       const pending = await readPage(cursor);
       if (!pending.length) return;
-      const last = pending[pending.length - 1].wake;
-      cursor = { requestedAt: last.requestedAt, id: last.id };
+      const last = pending[pending.length - 1];
+      // Keep PostgreSQL's full timestamp precision: Date would round the
+      // cursor down to milliseconds and revisit an unchanged held page.
+      cursor = { requestedAt: last.cursorRequestedAt, id: last.wake.id };
       for (const { wake, sourceRun, decisionId } of pending) {
         if (liveRunExecutions.has(sourceRun.id) || activeRunExecutions.has(sourceRun.id) ||
             adapterExecutionControls.has(sourceRun.id) ||
