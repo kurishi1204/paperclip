@@ -997,8 +997,15 @@ successful tool acknowledgement from the same source and turn. No other tool
 may be in flight when the report is proposed, and starting another tool after
 the report keeps the ordinary terminal contract. Incomplete or ambiguous tool
 observations, a failed acknowledgement, and active session goals also retain
-that contract. The runtime revokes live-turn authority before finalization and
-observes provider cleanup separately. This records a successful wait, not task
+that contract. A synchronous producer check must also confirm that this event
+is still its current tail and that the blocked result belongs to the active
+turn. Queued later activity, an older result owner, and unsupported backends
+retain ordinary terminal handling. Duplicate receipts during recovery do not
+establish a new park; recovery retains its existing result and terminal rules.
+The runtime revokes live-turn authority before finalization and observes
+provider cleanup separately, using the existing cleanup grace. A parked block
+always closes the live session, even when warm reuse was requested; its queued
+interrupt and old result owner must not reach the next run. This records a successful wait, not task
 completion or a retried action. The persisted report supplies the response when
 the provider has not yet written a final message. `paperclip_finish` still waits
 for the authoritative provider terminal and persists the final answer.

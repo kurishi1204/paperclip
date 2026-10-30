@@ -871,6 +871,7 @@ async function consumeTurn(
   },
   initialGoal?: HarnessThreadGoal | null,
   resumeInterruptedTurn?: (event: PrpEvent, signal: AbortSignal) => Promise<boolean>,
+  onBlockedHandoffParked?: () => void,
 ) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const appendAbort = new AbortController();
@@ -930,6 +931,7 @@ async function consumeTurn(
     }>();
     let toolObservationComplete = true;
     let blockedHandoffTool: string | null = null;
+    let blockedHandoffAcknowledged = false;
     const settleDurableResult = (
       event: PrpEvent,
       result: PrpStructuredRunResult,
@@ -990,7 +992,6 @@ async function consumeTurn(
         highestContiguousSourceSeq,
         receipt.highestContiguousSourceSeq,
       );
-      let acknowledgedBlockHandoff = false;
       if (receipt.disposition === "committed" && event.eventType.startsWith("tool.execution.")) {
         if (payload.schema !== "paperclip.tool.execution.v1" ||
             typeof payload.executionId !== "string" || !payload.executionId ||
@@ -1006,7 +1007,7 @@ async function consumeTurn(
           } else if (event.eventType === "tool.execution.completed") {
             const started = pendingTools.get(key);
             if (!started) toolObservationComplete = false;
-            acknowledgedBlockHandoff = key === blockedHandoffTool && started?.isBlock === true &&
+            blockedHandoffAcknowledged = key === blockedHandoffTool && started?.isBlock === true &&
               isBlock && payload.status === "completed";
             pendingTools.delete(key);
           } else if (event.eventType !== "tool.execution.progressed" ||
@@ -1017,8 +1018,13 @@ async function consumeTurn(
           // still doing work. Keep the ordinary terminal contract in that case.
           if (blockedHandoffTool !== null && event.eventType === "tool.execution.started") {
             blockedHandoffTool = null;
+            blockedHandoffAcknowledged = false;
           }
         }
+      }
+      if (event.eventType === "runtime_request.created") {
+        blockedHandoffTool = null;
+        blockedHandoffAcknowledged = false;
       }
       const eventGoal = goalFromEvent(event);
       const goalChanged = eventGoal !== undefined &&
@@ -1159,8 +1165,9 @@ async function consumeTurn(
       if (governedResult !== null && !isTurnTerminal(event) && !sessionGoalObserved) {
         if (resultSource === "semantic_result") {
           if (governedResult.reportedWorkDisposition === "blocked" &&
-              acknowledgedBlockHandoff && toolObservationComplete && pendingTools.size === 0 &&
-              providerFailure === null) {
+              blockedHandoffAcknowledged && toolObservationComplete && pendingTools.size === 0 &&
+              providerFailure === null && session.canParkBlockedHandoff?.(event) === true) {
+            onBlockedHandoffParked?.();
             return settleDurableResult(
               event,
               governedResult,
@@ -1371,7 +1378,7 @@ async function consumeTurn(
       // cleanup retain the short fail-closed boundary.
       const teardownSettled = await settlesWithin(
         passiveTeardownSettlement,
-        semanticResultObserved && !governedCancellationCommitted
+        semanticResultObserved
           ? reusableSessionCancellationGraceMs
           : FAILED_OPERATION_SETTLEMENT_GRACE_MS,
       );
@@ -2189,6 +2196,7 @@ export async function executeNativeSession(
     return activeClose;
   };
   let executionSucceeded = false;
+  let blockedHandoffRequiresSuspension = false;
   let goalCheckpointRequiresSuspension = Boolean(
     options.sessionGoalControl || options.resumeSessionGoalHeartbeat || persistedSession?.goal,
   );
@@ -2398,6 +2406,7 @@ export async function executeNativeSession(
                 : undefined,
               recoveredSnapshot.goal,
               resumeInterruptedTurn,
+              () => { blockedHandoffRequiresSuspension = true; },
             )
           : Promise.resolve({
               event: recoveryTerminal,
@@ -2848,7 +2857,8 @@ export async function executeNativeSession(
     throw error;
   } finally {
     const shouldClose =
-      !options.keepSessionOpen || !executionSucceeded || sessionQuarantined || goalCheckpointRequiresSuspension;
+      !options.keepSessionOpen || !executionSucceeded || sessionQuarantined ||
+      goalCheckpointRequiresSuspension || blockedHandoffRequiresSuspension;
     if (shouldClose && options.requireSessionCloseBeforeReturn) {
       if (!failedCleanupDeferred) {
         closeSession(

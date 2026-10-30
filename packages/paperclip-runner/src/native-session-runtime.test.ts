@@ -4514,6 +4514,10 @@ describe("executeNativeSession recovery", () => {
   it.each([
     { label: "acknowledged block", park: true },
     { label: "slow cleanup", park: true },
+    { label: "tail after acknowledgement", park: true },
+    { label: "producer has queued activity", park: false },
+    { label: "unsupported producer", park: false },
+    { label: "duplicate acknowledgement", park: false },
     { label: "missing acknowledgement", park: false },
     { label: "failed acknowledgement", park: false },
     { label: "different execution", park: false },
@@ -4572,13 +4576,19 @@ describe("executeNativeSession recovery", () => {
         goal: { objective: "Continue the goal", status: "active" },
       })] : []),
       ...(label === "missing acknowledgement" ? [] : [ack]),
+      ...(label === "producer has queued activity" ? [other] : []),
+      ...(label === "tail after acknowledgement" ? [runnerEvent(0, "item.delta", { kind: "agentMessage", text: "Waiting." })] : []),
     ].map((event, index) => ({ ...event, sourceSeq: index + 1, sourceEventId: `block:${label}:${index}` }));
     let releaseProvider!: () => void;
     const providerReleased = new Promise<void>((resolve) => { releaseProvider = resolve; });
     let releaseCleanup!: () => void;
     const cleanup = new Promise<void>((resolve) => { releaseCleanup = resolve; });
     let providerWaiting = false;
-    const cancel = vi.fn(() => { releaseProvider(); return { cleanup: label === "slow cleanup" ? cleanup : Promise.resolve() }; });
+    const cancel = vi.fn(() => {
+      releaseProvider();
+      if (label === "slow cleanup") setTimeout(releaseCleanup, 200);
+      return { cleanup: label === "slow cleanup" ? cleanup : Promise.resolve() };
+    });
     const close = vi.fn(async () => { releaseCleanup(); });
     const events: PrpEvent[] = [];
     let releaseAck!: () => void;
@@ -4600,6 +4610,8 @@ describe("executeNativeSession recovery", () => {
       },
       async startTurn() { return { turnId: "turn-recovery" }; },
       cancel,
+      canParkBlockedHandoff: label === "unsupported producer" ? undefined : event =>
+        event.eventType !== "tool.execution.completed" || !["producer has queued activity", "tail after acknowledgement"].includes(label),
       async result() { return null; },
       async snapshot() {
         return {
@@ -4624,15 +4636,21 @@ describe("executeNativeSession recovery", () => {
           await ackPersistence;
         }
         events.push(event);
-        return { cursor: events.length, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" };
+        return { cursor: events.length, highestContiguousSourceSeq: event.sourceSeq,
+          disposition: label === "duplicate acknowledgement" && event.eventType === "tool.execution.completed" ? "duplicate" : "committed" };
       },
       async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; },
       async completeRun() {},
     };
+    const retained: Array<NativeSession | null> = [];
+    const quarantined = vi.fn();
     const execution = executeNativeSession({
       input, backend, controlPlane: port,
       runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
       timeoutMs: 2_000,
+      keepSessionOpen: true,
+      onSession: (value) => retained.push(value),
+      onSessionQuarantined: quarantined,
     });
     // Observe a rejection immediately, including the old implementation's deadline.
     void execution.catch(() => undefined);
@@ -4644,8 +4662,10 @@ describe("executeNativeSession recovery", () => {
         result: blocked, terminal: { runTerminalState: "succeeded", reportedWorkDisposition: "blocked" },
       });
       expect(cancel).toHaveBeenCalledOnce();
+      expect(retained.at(-1)).toBeNull();
+      expect(quarantined).not.toHaveBeenCalledWith("provider_event_teardown_timed_out");
       expect(events.map((event) => event.eventType)).toEqual([
-        "tool.execution.started", "run.result.proposed", "tool.execution.completed",
+        ...source.map(event => event.eventType),
         "run.result.accepted", "run.terminal",
       ]);
     } else {
@@ -4655,7 +4675,11 @@ describe("executeNativeSession recovery", () => {
       await expect(execution).resolves.toMatchObject({ result: reported });
       expect(cancel).not.toHaveBeenCalled();
     }
-    expect(close).toHaveBeenCalledOnce();
+    if (park) expect(close).toHaveBeenCalledOnce();
+    else {
+      expect(close).not.toHaveBeenCalled();
+      await session.close({ reason: "fixture complete" });
+    }
   });
 
   it("uses the execution timeout when a completion report has no provider terminal", async () => {

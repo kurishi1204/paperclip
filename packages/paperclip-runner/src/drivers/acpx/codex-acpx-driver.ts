@@ -852,6 +852,20 @@ class CodexAcpxSession implements HarnessSession {
     return this.#events;
   }
 
+  canParkBlockedHandoff(event: PrpEvent): boolean {
+    // Check the producer, not only the consumer's last observed event. A tool
+    // start may already be queued behind the acknowledgement. Reaffirming a
+    // result owned by an older turn still requires a normal provider terminal.
+    return !this.#closingStarted && !this.#closed && !this.#eventStreamClosed &&
+      this.#pendingTerminal === null && this.#activeTurnId !== null &&
+      event.sourceInstanceId === this.#sourceInstanceId &&
+      event.sourceSeq === this.#sourceSequence &&
+      event.turnId === this.#activeTurnId &&
+      this.#semanticTurnId === this.#activeTurnId &&
+      this.#semanticResult?.reportedWorkDisposition === "blocked" &&
+      this.#pendingSemanticTransfer === null && this.#pendingRuntimeRequests.size === 0;
+  }
+
   turnControlCapabilities() {
     const capability = acpxCapabilities(this.#agent, this.#host.steeringCapability?.());
     return { steering: capability.steering, queuedFollowUp: capability.queuedFollowUp === true };

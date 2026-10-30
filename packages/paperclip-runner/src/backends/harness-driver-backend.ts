@@ -729,6 +729,12 @@ class HarnessNativeSession implements NativeSession {
     return this.#withProtocolIntegrity(() => this.#session.steer!(input));
   }
 
+  canParkBlockedHandoff(event: PrpEvent): boolean {
+    this.#assertProtocolIntegrity();
+    return !this.#explicitlyCancelled &&
+      this.#session.canParkBlockedHandoff?.(event) === true;
+  }
+
   interrupt(input: { turnId?: string; reason?: string }) {
     if (this.#session.interrupt === undefined)
       throw new Error("interruption is unavailable");

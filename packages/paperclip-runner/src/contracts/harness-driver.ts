@@ -504,6 +504,11 @@ export interface HarnessSession {
     displayId?: string | null;
   };
   events(): AsyncIterable<PrpEvent>;
+  /** True only while this event is the producer's current tail after an
+   * acknowledged block whose semantic result belongs to the active turn.
+   * The consumer separately verifies tool quiescence. No async gap may occur
+   * between this observation and cancellation. */
+  canParkBlockedHandoff?(event: PrpEvent): boolean;
   attachRun?(input: { runId: string }): Promise<void> | void;
   startTurn(input: {
     message: NativeUserMessage;

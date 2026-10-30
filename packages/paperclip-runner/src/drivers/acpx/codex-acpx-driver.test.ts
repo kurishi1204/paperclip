@@ -22,6 +22,54 @@ import type {
 import type { AcpxRecoveryWorkspaceLease } from "./runtime-sandbox.js";
 
 describe("Codex ACPX harness driver", () => {
+  it.each([false, true])("checks the producer tail before parking an acknowledged block (queued=%s)", async queued => {
+    const allowAck = deferred<void>();
+    const activityMapped = deferred<void>();
+    const tool = (status: "pending" | "completed", id = "block-execution") => ({
+      type: "tool_call" as const, toolCallId: id,
+      title: id === "block-execution" ? "mcp__paperclip__paperclip_block" : "mcp__paperclip__save_document",
+      kind: "other" as const, status, tag: status === "pending" ? "tool_call" : "tool_call_update",
+    });
+    const fixture = driverFixture({}, { runtimeEvents: {
+      async *[Symbol.asyncIterator]() {
+        yield tool("pending");
+        await allowAck.promise;
+        yield tool("completed");
+        if (queued) yield tool("pending", "later-execution");
+        activityMapped.resolve();
+      },
+    } });
+    const session = await fixture.driver.openSession({
+      runId: "run-block-tail", normalizedSessionId: "session-1", workingDirectory: "/workspace",
+    });
+    const started = collectUntil(session.events(), "tool.execution.started");
+    await session.startTurn({ message: { text: "Wait for the saved dependency." } });
+    const start = (await started).at(-1)!;
+    expect(start.payload).toMatchObject({ transport: "mcp", namespace: "paperclip", name: "paperclip_block", executionId: "block-execution" });
+    const blocked = {
+      ...completedResult(), reportedWorkDisposition: "blocked",
+      completionClaim: { ...completedResult().completionClaim, objectiveSatisfied: false,
+        remainingWork: [{ description: "Wait for the saved revision review.", blocksCompletion: true }] },
+      blocker: { reasonCode: "dependency", owner: { kind: "agent", name: "reviewer" }, unblockAction: "Review the saved revision.", scope: "task_wide" },
+    };
+    await fixture.hostOptions!.semanticTools!.handler({
+      tool: PRP_BLOCK_TOOL_NAME, callId: "19", arguments: blocked, signal: new AbortController().signal,
+    });
+    const ackEvents = collectUntil(session.events(), "tool.execution.completed");
+    allowAck.resolve();
+    const ack = (await ackEvents).at(-1)!;
+    await activityMapped.promise;
+    expect(ack.payload).toMatchObject({ transport: "mcp", namespace: "paperclip", name: "paperclip_block", status: "completed" });
+    expect(session.canParkBlockedHandoff?.(ack)).toBe(!queued);
+    expect(session.canParkBlockedHandoff?.({ ...ack, sourceInstanceId: "other-source" })).toBe(false);
+    expect(session.canParkBlockedHandoff?.({ ...ack, turnId: "other-turn" })).toBe(false);
+    const terminal = collectUntil(session.events(), "turn.completed");
+    fixture.finishTurn({ status: "completed", stopReason: "end_turn" });
+    await terminal;
+    expect(session.canParkBlockedHandoff?.(ack)).toBe(false);
+    await session.close({ reason: "producer-tail boundary verified" });
+  });
+
   it("delivers negotiated steering and follow-up distinctly, once, for the active turn", async () => {
     const fixture = driverFixture({ agent: "pi", model: "openrouter/deepseek/deepseek-v4-flash-0731", providerPolicy: { readOnly: true } });
     fixture.host.steeringCapability.mockReturnValue({ steering: true, queuedFollowUp: true });
@@ -2670,7 +2718,7 @@ describe("Codex ACPX harness driver", () => {
 function driverFixture(
   overrides: Partial<CodexAcpxDriverOptions> = {},
   fixtureOptions: {
-    runtimeEvents?: readonly AcpRuntimeEvent[];
+    runtimeEvents?: readonly AcpRuntimeEvent[] | AsyncIterable<AcpRuntimeEvent>;
     runtimeEventFailure?: Promise<never>;
     closeSettlementTimeoutMs?: number;
     maxBufferedEvents?: number;
