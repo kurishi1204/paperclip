@@ -1002,10 +1002,15 @@ is still its current tail and that the blocked result belongs to the active
 turn. Queued later activity, an older result owner, and unsupported backends
 retain ordinary terminal handling. Duplicate receipts during recovery do not
 establish a new park; recovery retains its existing result and terminal rules.
-The runtime revokes live-turn authority before finalization and observes
-provider cleanup separately, using the existing cleanup grace. A parked block
+The runnerd-backed harness checks its local event tail and pending host tool
+dispatches. Native cancellation synchronously revokes new host tool dispatch;
+remote interruption remains asynchronous cleanup, not an atomic remote OS stop.
+The in-process ACPX backend does not implement this shortcut. The runtime
+observes provider cleanup using the existing cleanup grace. A parked block
 always closes the live session, even when warm reuse was requested; its queued
-interrupt and old result owner must not reach the next run. This records a successful wait, not task
+interrupt and old result owner must not reach the next run. Before finalization,
+the checkpoint preserves the blocked report and governed cancellation terminal
+with no active turn, so recovery need not start the paid phase again. This records a successful wait, not task
 completion or a retried action. The persisted report supplies the response when
 the provider has not yet written a final message. `paperclip_finish` still waits
 for the authoritative provider terminal and persists the final answer.

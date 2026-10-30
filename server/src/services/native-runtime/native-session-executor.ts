@@ -5990,6 +5990,7 @@ function loadWarmNativeCheckpoint(
         // Its provider identity survives, but run-scoped turn, result, and
         // request authority must not cross into the new heartbeat run.
         semanticResult: null,
+        semanticResultTurnId: null,
         terminal: null,
         activeTurnId: null,
         terminalTurns: [],

@@ -60,6 +60,8 @@ export interface PersistedNativeSession {
     | "allow_replacement_after_resume_failure";
   cursor?: string | null;
   semanticResult?: PrpStructuredRunResult | null;
+  /** Subject of a persisted semantic result; does not grant active-turn authority. */
+  semanticResultTurnId?: string | null;
   terminal?: PrpTerminalState | null;
   activeTurnId?: string | null;
   terminalTurns?: PersistedHarnessTurnTerminal[];

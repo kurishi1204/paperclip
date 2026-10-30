@@ -871,7 +871,7 @@ async function consumeTurn(
   },
   initialGoal?: HarnessThreadGoal | null,
   resumeInterruptedTurn?: (event: PrpEvent, signal: AbortSignal) => Promise<boolean>,
-  onBlockedHandoffParked?: () => void,
+  onBlockedHandoffParked?: (event: PrpEvent, result: PrpStructuredRunResult) => void,
 ) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const appendAbort = new AbortController();
@@ -1167,7 +1167,7 @@ async function consumeTurn(
           if (governedResult.reportedWorkDisposition === "blocked" &&
               blockedHandoffAcknowledged && toolObservationComplete && pendingTools.size === 0 &&
               providerFailure === null && session.canParkBlockedHandoff?.(event) === true) {
-            onBlockedHandoffParked?.();
+            onBlockedHandoffParked?.(event, governedResult);
             return settleDurableResult(
               event,
               governedResult,
@@ -2197,6 +2197,7 @@ export async function executeNativeSession(
   };
   let executionSucceeded = false;
   let blockedHandoffRequiresSuspension = false;
+  let parkedBlockedCheckpoint: Pick<PersistedNativeSession, "semanticResult" | "semanticResultTurnId" | "terminal" | "activeTurnId"> | null = null;
   let goalCheckpointRequiresSuspension = Boolean(
     options.sessionGoalControl || options.resumeSessionGoalHeartbeat || persistedSession?.goal,
   );
@@ -2229,7 +2230,7 @@ export async function executeNativeSession(
     const checkpoint = async (signal?: AbortSignal) => {
       const snapshot = await session.snapshot(signal ? { signal } : undefined);
       signal?.throwIfAborted();
-      await persistCheckpoint(snapshot, signal);
+      await persistCheckpoint(parkedBlockedCheckpoint === null ? snapshot : { ...snapshot, ...parkedBlockedCheckpoint }, signal);
     };
     const recoveredSnapshot = await session.snapshot();
     const restartContinuation = () => ({
@@ -2406,7 +2407,12 @@ export async function executeNativeSession(
                 : undefined,
               recoveredSnapshot.goal,
               resumeInterruptedTurn,
-              () => { blockedHandoffRequiresSuspension = true; },
+              (event, result) => {
+                blockedHandoffRequiresSuspension = true;
+                parkedBlockedCheckpoint = { semanticResult: structuredClone(result),
+                  semanticResultTurnId: event.turnId ?? null,
+                  terminal: terminalFromEvent(event, result.reportedWorkDisposition), activeTurnId: null };
+              },
             )
           : Promise.resolve({
               event: recoveryTerminal,
@@ -2933,6 +2939,9 @@ function completedSemanticResultTurnId(
     return null;
   }
   const semanticFingerprint = canonicalJson(snapshot.semanticResult);
+  if (typeof snapshot.semanticResultTurnId === "string" && snapshot.semanticResultTurnId.length > 0) {
+    return snapshot.semanticResultTurnId;
+  }
   for (const terminal of [...(snapshot.terminalTurns ?? [])].reverse()) {
     try {
       const value: unknown = JSON.parse(terminal.fingerprint);

@@ -509,6 +509,8 @@ export interface HarnessSession {
    * The consumer separately verifies tool quiescence. No async gap may occur
    * between this observation and cancellation. */
   canParkBlockedHandoff?(event: PrpEvent): boolean;
+  /** Revoke new tool dispatch synchronously, before passive remote interrupt. */
+  revokeTurnToolAuthority?(): void;
   attachRun?(input: { runId: string }): Promise<void> | void;
   startTurn(input: {
     message: NativeUserMessage;

@@ -4644,6 +4644,8 @@ describe("executeNativeSession recovery", () => {
     };
     const retained: Array<NativeSession | null> = [];
     const quarantined = vi.fn();
+    const parkedCheckpoints: PersistedNativeSession[] = [];
+    port.checkpointSession = async snapshot => { parkedCheckpoints.push(structuredClone(snapshot)); };
     const execution = executeNativeSession({
       input, backend, controlPlane: port,
       runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
@@ -4664,6 +4666,27 @@ describe("executeNativeSession recovery", () => {
       expect(cancel).toHaveBeenCalledOnce();
       expect(retained.at(-1)).toBeNull();
       expect(quarantined).not.toHaveBeenCalledWith("provider_event_teardown_timed_out");
+      expect(parkedCheckpoints.some(snapshot => snapshot.semanticResult?.reportedWorkDisposition === "blocked" &&
+        snapshot.terminal?.reportedWorkDisposition === "blocked" && snapshot.activeTurnId === null &&
+        snapshot.semanticResultTurnId === "turn-recovery")).toBe(true);
+      if (label === "acknowledged block") {
+        const saved = parkedCheckpoints.find(snapshot => snapshot.semanticResultTurnId === "turn-recovery")!;
+        const startAgain = vi.fn(async () => ({ turnId: "must-not-start" }));
+        const restored: NativeSession = { ...session, startTurn: startAgain, close: vi.fn(async () => undefined),
+          async *events() {}, async snapshot() { return saved; } };
+        const recoveredBackend: NativeSessionBackend = { ...backend,
+          async recoverSession() { return { recovered: true, session: restored }; } };
+        const recoveryEvents: PrpEvent[] = [];
+        await expect(executeNativeSession({ input, backend: recoveredBackend, persistedSession: saved,
+          runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
+          controlPlane: { ...port, async appendEvent(event) {
+            if (!("sourceSeq" in event) || !("eventType" in event)) throw Error("PRP event required");
+            recoveryEvents.push(event);return { cursor: recoveryEvents.length, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" };
+          } }, timeoutMs: 500,
+        })).resolves.toMatchObject({ result: blocked });
+        expect(startAgain).not.toHaveBeenCalled();
+        expect(recoveryEvents.every(event => event.turnId === "turn-recovery")).toBe(true);
+      }
       expect(events.map((event) => event.eventType)).toEqual([
         ...source.map(event => event.eventType),
         "run.result.accepted", "run.terminal",

@@ -564,6 +564,7 @@ export function rebindNativeSessionCheckpoint(input: {
     },
     cursor: null,
     semanticResult: null,
+    semanticResultTurnId: null,
     terminal: null,
     activeTurnId: null,
     terminalTurns: [],
