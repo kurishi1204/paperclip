@@ -52,13 +52,21 @@ from overwriting an existing leaf; the receipt is `verified` only after file,
 comment, row, and final file readback. The `owner-comment-raw-source` data
 handler rechecks current policy and comment version before returning bytes.
 This is a raw receipt, not a normalized source or a published wiki page.
-The existing Paperclip distillation source-bundle path uses this reader for
-opted-in owner comments in the same space and issue. Its `source_ready`
-snapshot records the raw file path, complete body SHA/bytes and comment version
-in each comment's `rawCapture` source reference. An unavailable, pending or
-changed version fails before a source-ready snapshot is inserted. Other
-comments retain their existing path. Creating this local normalization input
-does not invoke a model, mark QA complete, or publish a wiki page.
+The existing Paperclip distillation source-bundle path uses this reader only
+for the same default-wiki space ID and issue. Verified bytes are bound to the
+`source_ready` snapshot by raw path, complete body SHA/bytes and comment version
+in the comment's `rawCapture` source reference. A successful query with no
+receipt (including historical, plugin-proxy and missed-event comments) retains
+the existing current-comment source with an explicit raw-unverified warning;
+it never receives a `rawCapture` label. Known pending or edited captures omit
+that comment with a warning instead of blocking unrelated sources. Corrupt row
+identity, file integrity failures and unknown I/O errors still fail closed.
+A same-slug space in another wiki retains its own existing source and cannot
+borrow a default-wiki receipt. Complete warnings reach the action response,
+snapshot metadata and downstream proposals, and an incomplete-coverage notice
+and warning-set hash appear in the bounded normalization text. Omitted inputs
+mark the bundle partial/clipped. These warnings require review; they do not
+claim full raw receipt, QA, model execution or wiki publication.
 The receipt fingerprint binds the owner, space, internal classification label,
 and company-reader permission. Its claim metadata keeps the original consent
 decision, issue list, and byte cap. Adding another issue to the current opt-in

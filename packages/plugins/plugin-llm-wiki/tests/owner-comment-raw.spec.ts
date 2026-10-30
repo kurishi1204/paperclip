@@ -4,7 +4,8 @@ import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import type { Issue, IssueComment } from "@paperclipai/plugin-sdk";
 import manifest from "../src/manifest.js";
 import plugin from "../src/worker.js";
-import { createPaperclipDistillationRun } from "../src/wiki/core.js";
+import { readOwnerCommentRawForDistillation } from "../src/wiki/owner-comment-raw.js";
+import { createPaperclipDistillationRun, type WikiSpace } from "../src/wiki/core.js";
 
 const company = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const owner = "fixture-owner-not-a-uuid-01";
@@ -109,16 +110,57 @@ describe("owner comment raw receipt through exported plugin",()=>{
     expect(JSON.parse(String(snapshot?.params?.[9]))).toEqual(result.bundle.sourceRefs);
     expect(snapshot?.params?.[10]).toContain(body);
     expect(s.harness.dbExecutes.some(entry=>entry.sql.includes("wiki_pages"))).toBe(false);
-    s.harness.seed({issueComments:[{...comment,body:"Edited after capture",updatedAt:new Date("2026-10-27T10:01:00Z")}]});
+    s.harness.ctx.issues.listComments=async()=>[{...comment,body:"Edited after capture",updatedAt:new Date("2026-10-27T10:01:00Z")}];
     const priorSnapshots=s.harness.dbExecutes.filter(entry=>entry.sql.includes("INSERT INTO") && entry.sql.includes("paperclip_source_snapshots")).length;
-    await expect(createPaperclipDistillationRun(s.harness.ctx,{
+    const partial=await s.harness.performAction<{bundle:{markdown:string;warnings:string[];sourceRefs:Array<{commentId?:string;rawCapture?:unknown}>}}>("create-paperclip-distillation-run",{
       companyId:company,spaceSlug:"owner-notes",rootIssueId:issueId,includeDocuments:false,
-    })).rejects.toThrow("owner_comment_raw_");
-    expect(s.harness.dbExecutes.filter(entry=>entry.sql.includes("INSERT INTO") && entry.sql.includes("paperclip_source_snapshots"))).toHaveLength(priorSnapshots);
+    });
+    expect(partial.bundle.warnings).toContain(`Owner raw coverage: omitted comment ${commentId}: current_version_changed.`);
+    expect(partial.bundle.sourceRefs.some(ref=>ref.commentId===commentId)).toBe(false);
+    expect(partial.bundle.markdown).toContain("Partial source input");
+    expect(partial.bundle.markdown).not.toContain("Edited after capture");
+    expect(s.harness.dbExecutes.filter(entry=>entry.sql.includes("INSERT INTO") && entry.sql.includes("paperclip_source_snapshots"))).toHaveLength(priorSnapshots+1);
+    const latest=s.harness.dbExecutes.filter(entry=>entry.sql.includes("INSERT INTO") && entry.sql.includes("paperclip_source_snapshots")).at(-1)!;
+    expect(JSON.parse(String(latest.params?.[11])).sourceWarnings).toEqual(partial.bundle.warnings);
+  });
+  it.each(["pre-opt-in", "plugin-proxy", "missed-event"])("keeps %s comments usable with explicit unverified raw coverage",async(kind)=>{
+    const s=setup();await plugin.definition.setup(s.harness.ctx);
+    if(kind==="pre-opt-in")s.harness.ctx.issues.listComments=async()=>[{...comment,createdAt:new Date("2026-10-26T10:00:00Z"),updatedAt:new Date("2026-10-26T10:00:00Z")}];
+    if(kind==="plugin-proxy")await s.harness.emit("issue.comment.created",{commentId,agentId:null,runId:null},
+      {companyId:company,entityId:issueId,entityType:"issue",actorId:"synthetic-plugin",actorType:"plugin",occurredAt:now});
+    expect(s.row()).toBeNull();
+    const result=await s.harness.performAction<{status:string;bundle:{markdown:string;warnings:string[];sourceRefs:Array<{commentId?:string;rawCapture?:unknown}>}}>("create-paperclip-distillation-run",{
+      companyId:company,spaceSlug:"owner-notes",rootIssueId:issueId,includeDocuments:false,
+    });
+    expect(result.status).toBe("source_ready");expect(result.bundle.markdown).toContain(body);
+    expect(result.bundle.sourceRefs.find(ref=>ref.commentId===commentId)?.rawCapture).toBeUndefined();
+    expect(result.bundle.warnings).toContain(`Owner raw coverage: comment ${commentId} has no received raw; using the existing comment projection without raw verification.`);
+    expect(result.bundle.markdown).toContain("Raw coverage is incomplete");
+  });
+  it("omits a pending raw comment explicitly while another source remains usable",async()=>{
+    const s=setup();await plugin.definition.setup(s.harness.ctx);await s.emit();s.row()!.status="pending";
+    const result=await createPaperclipDistillationRun(s.harness.ctx,{companyId:company,spaceSlug:"owner-notes",rootIssueId:issueId,includeDocuments:false});
+    expect(result.bundle.warnings).toContain(`Owner raw coverage: omitted comment ${commentId}: raw_pending.`);
+    expect(result.bundle.sourceRefs.some(ref=>ref.commentId===commentId)).toBe(false);
+    expect(result.bundle.markdown).toContain("Partial source input");
+  });
+  it("does not borrow a default-wiki receipt for a same-slug different space",async()=>{
+    const s=setup();await plugin.definition.setup(s.harness.ctx);await s.emit();
+    const otherSpace={id:"66666666-6666-4666-8666-666666666666",companyId:company,wikiId:"another-wiki",slug:"owner-notes"} as WikiSpace;
+    const result=await readOwnerCommentRawForDistillation(s.harness.ctx,{companyId:company,space:otherSpace,issue,comment});
+    expect(result).toMatchObject({kind:"existing"});
+    expect(result).not.toHaveProperty("receipt");
+  });
+  it.each(["integrity", "io"])("does not hide an actual raw %s failure behind a partial source",async(kind)=>{
+    const s=setup();await plugin.definition.setup(s.harness.ctx);await s.emit();
+    if(kind==="integrity")s.files.set([...s.files.keys()][0]!,"Corrupted");
+    else s.harness.ctx.localFolders.readText=async()=>{throw new Error("synthetic unavailable IO")};
+    await expect(createPaperclipDistillationRun(s.harness.ctx,{companyId:company,spaceSlug:"owner-notes",rootIssueId:issueId,includeDocuments:false})).rejects.toThrow(kind==="integrity"?"file_integrity":"synthetic unavailable IO");
+    expect(s.harness.dbExecutes.some(entry=>entry.sql.includes("INSERT INTO") && entry.sql.includes("paperclip_source_snapshots"))).toBe(false);
   });
   it("rejects edited current comment and never returns the old bytes",async()=>{
     const s=setup(); await plugin.definition.setup(s.harness.ctx); await s.emit();
-    s.harness.seed({issueComments:[{...comment,body:"Edited",updatedAt:new Date("2026-10-27T10:01:00Z")}]});
+    s.harness.ctx.issues.listComments=async()=>[{...comment,body:"Edited",updatedAt:new Date("2026-10-27T10:01:00Z")}];
     await expect(s.harness.getData("owner-comment-raw-source",{companyId:company,commentId})).rejects.toThrow();
   });
   it("normalizes incoming UUID case without changing the opaque owner identity",async()=>{

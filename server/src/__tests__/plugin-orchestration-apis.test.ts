@@ -726,6 +726,34 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     const pages = await db.execute(sql`SELECT id FROM ${sql.raw(`"${namespace}"."wiki_pages"`)}
       WHERE company_id=${companyId}`);
     expect(pages).toHaveLength(0);
+    const unreceived = await issueService(db).addComment(issueId, "Synthetic unreceived source", { userId: owner });
+    const direct = await createPaperclipDistillationRun(harness.ctx, {
+      companyId, spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    });
+    expect(direct.bundle.sourceRefs.find(ref => ref.commentId === unreceived.id)?.rawCapture).toBeUndefined();
+    expect(direct.bundle.markdown).toContain("Synthetic unreceived source");
+    expect(direct.bundle.warnings).toContain(`Owner raw coverage: comment ${unreceived.id} has no received raw; using the existing comment projection without raw verification.`);
+    await db.update(issueComments).set({ body: "Synthetic edited source", updatedAt: new Date(Date.now() + 1000) }).where(eq(issueComments.id, comment.id));
+    const partial = await createPaperclipDistillationRun(harness.ctx, {
+      companyId, spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    });
+    expect(partial.bundle.sourceRefs.some(ref => ref.commentId === comment.id)).toBe(false);
+    expect(partial.bundle.markdown).toContain("Partial source input");
+    expect(partial.bundle.markdown).not.toContain("Synthetic edited source");
+    const partialRows = await db.execute(sql`SELECT metadata, bundle_markdown FROM
+      ${sql.raw(`"${namespace}"."paperclip_source_snapshots"`)} WHERE id=${partial.snapshotId}`);
+    expect((partialRows[0]!.metadata as { sourceWarnings: string[] }).sourceWarnings).toEqual(partial.bundle.warnings);
+    expect(partialRows[0]!.bundle_markdown).toBe(partial.bundle.markdown);
+    const otherSpaceId = randomUUID();
+    await db.execute(sql`INSERT INTO ${sql.raw(`"${namespace}"."wiki_spaces"`)}
+      (id, company_id, wiki_id, slug, display_name, path_prefix, settings)
+      VALUES (${otherSpaceId}, ${companyId}, 'other-wiki', 'owner-notes', 'Other notes',
+        'spaces/other-notes', ${JSON.stringify({ paperclipIngestion: profile })}::jsonb)`);
+    const otherWiki = await createPaperclipDistillationRun(harness.ctx, {
+      companyId, wikiId: "other-wiki", spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    });
+    expect(otherWiki.bundle.sourceRefs.filter(ref => ref.kind === "comment").every(ref => !ref.rawCapture)).toBe(true);
+    expect(otherWiki.bundle.markdown).toContain("Synthetic edited source");
     if (process.env.PAPERCLIP_RAW_HANDOFF_RECEIPT) {
       await fs.writeFile(process.env.PAPERCLIP_RAW_HANDOFF_RECEIPT, JSON.stringify({
         syntheticOnly: true, commentId: comment.id, issueId, spaceId,
@@ -734,6 +762,9 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         normalizationRunId: normalization.runId, normalizationSnapshotId: normalization.snapshotId,
         normalizationSourceHash: normalization.bundle.sourceHash, rawReference: sourceRef?.rawCapture,
         persistedSnapshotCount: snapshots.length, sharedWikiPageCount: pages.length,
+        repairedCoverage: { unreceivedWarning: direct.bundle.warnings, partialWarning: partial.bundle.warnings,
+          partialSnapshotId: partial.snapshotId, partialMarkdownSaved: partialRows[0]!.bundle_markdown === partial.bundle.markdown,
+          otherWikiSnapshotId: otherWiki.snapshotId, otherWikiHasNoBorrowedRaw: otherWiki.bundle.sourceRefs.filter(ref => ref.kind === "comment").every(ref => !ref.rawCapture) },
       }, null, 2) + "\n", { mode: 0o600 });
     }
   }, 90_000);

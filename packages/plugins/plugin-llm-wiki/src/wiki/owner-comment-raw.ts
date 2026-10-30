@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Issue, IssueComment, PluginContext, PluginEvent } from "@paperclipai/plugin-sdk";
 import { DEFAULT_MAX_SOURCE_BYTES, PLUGIN_ID, WIKI_ROOT_FOLDER_KEY } from "../manifest.js";
-import { containsDistillationSecret, ownerCommentRawSpacePolicy, spaceRelativePath, type WikiSpace } from "./core.js";
+import { DEFAULT_WIKI_ID, containsDistillationSecret, ownerCommentRawSpacePolicy, spaceRelativePath, type WikiSpace } from "./core.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHA = /^[0-9a-f]{64}$/;
@@ -223,7 +223,7 @@ export async function captureOwnerCommentRaw(ctx: PluginContext, event: PluginEv
   }
 }
 
-export async function readOwnerCommentRaw(ctx: PluginContext, companyId: string, commentId: string) {
+export async function readOwnerCommentRaw(ctx: PluginContext, companyId: string, commentId: string, expectedSpace?: WikiSpace) {
   if (!uuid(companyId) || !uuid(commentId)) hold("reader_identity");
   companyId = companyId.toLowerCase();
   commentId = commentId.toLowerCase();
@@ -231,6 +231,7 @@ export async function readOwnerCommentRaw(ctx: PluginContext, companyId: string,
   if (!config) hold("reader_disabled");
   const space = await ownerCommentRawSpacePolicy(ctx, companyId, config.spaceSlug, config.issueIds)
     .catch(() => hold("space_policy"));
+  if (expectedSpace && (space.id !== expectedSpace.id || space.wikiId !== expectedSpace.wikiId)) hold("reader_space");
   const row = await getRow(ctx, companyId, space.id, commentId);
   if (!row || row.status !== "verified" || !config.issueIds.includes(row.issue_id)
     || row.owner_user_id !== config.ownerUserId || row.policy_sha256 !== config.policySha256
@@ -253,8 +254,9 @@ export async function readOwnerCommentRaw(ctx: PluginContext, companyId: string,
     commentUpdatedAt: current.updatedAt, attribution: "host_user_attributed_no_run_markers", rawPath: row.raw_path } };
 }
 
-/** Bind an opted-in owner comment to its verified immutable raw version.
- * Other spaces, issues and authors keep the existing distillation path.
+/** Only verified raw is labelled as such. Known missing receipts retain the
+ * existing comment source; known stale/pending captures are visibly omitted.
+ * Policy/integrity/unknown I/O failures still propagate, never silently fall back.
  */
 export async function readOwnerCommentRawForDistillation(ctx: PluginContext, input: {
   companyId: string; space: WikiSpace; issue: Issue; comment: IssueComment;
@@ -265,9 +267,37 @@ export async function readOwnerCommentRawForDistillation(ctx: PluginContext, inp
     || !Array.isArray(candidate.issueIds)
     || !candidate.issueIds.some((id) => typeof id === "string" && id.toLowerCase() === input.issue.id.toLowerCase())
     || candidate.ownerUserId !== input.comment.authorUserId) return null;
-  // The reader validates the full config, attribution, current version and file.
-  const received = await readOwnerCommentRaw(ctx, input.companyId, input.comment.id);
+  const existing = (reason: string) => ({kind: "existing" as const, warning: reason});
+  const omitted = (reason: string) => ({kind: "omitted" as const,
+    warning: `Owner raw coverage: omitted comment ${input.comment.id}: ${reason}.`});
+  // Capture v1 belongs to the default wiki. A same-slug space in another wiki
+  // is a separate source and must never borrow that receipt.
+  if (input.space.wikiId !== DEFAULT_WIKI_ID) return existing(
+    `Owner raw coverage: comment ${input.comment.id} is outside the default-wiki capture space; using the existing comment projection without raw verification.`);
+  const config = parseConfig(raw); // Invalid enabled policy is never a fallback.
+  if (!config) hold("invalid_config");
+  const row = await getRow(ctx, input.companyId, input.space.id, input.comment.id);
+  if (!row) return existing(
+    `Owner raw coverage: comment ${input.comment.id} has no received raw; using the existing comment projection without raw verification.`);
+  // Validate the received row's immutable identity before treating any state
+  // as a known omission. Corrupt rows must not become a partial success.
+  if (row.company_id !== input.companyId || row.space_id !== input.space.id
+    || row.comment_id !== input.comment.id || row.issue_id !== input.issue.id
+    || row.owner_user_id !== config.ownerUserId || row.policy_sha256 !== config.policySha256
+    || !SHA.test(row.body_sha256) || dateMs(row.comment_updated_at) === null
+    || row.raw_path !== spaceRelativePath(input.space,
+      `.paperclip/owner-comment-raw/${input.space.id}/${input.comment.id}/${row.body_sha256}.txt`)
+    || !["verified", "pending", "hold"].includes(row.status)) hold("reader_row");
+  if (row.status === "pending" || row.status === "hold") return omitted("raw_pending");
+  const receivedDate = dateMs(row.comment_updated_at), currentDate = dateMs(input.comment.updatedAt);
+  if (receivedDate !== null && currentDate !== null && receivedDate !== currentDate) return omitted("current_version_changed");
+  if (input.comment.createdByRunId != null || input.comment.authorAgentId != null
+    || input.comment.derivedAuthorAgentId != null || input.comment.derivedCreatedByRunId != null
+    || input.comment.derivedAuthorSource != null || input.comment.authorType !== "user"
+    || input.comment.deletedAt != null || input.comment.sourceTrust != null
+    || input.comment.metadata != null || input.comment.presentation != null) return omitted("current_attribution_changed");
+  const received = await readOwnerCommentRaw(ctx, input.companyId, input.comment.id, input.space);
   if (received.issueId !== input.issue.id || received.source !== input.comment.body
-    || dateMs(received.receipt.commentUpdatedAt) !== dateMs(input.comment.updatedAt)) hold("distillation_version");
-  return received;
+    || dateMs(received.receipt.commentUpdatedAt) !== currentDate) hold("distillation_version");
+  return {kind: "verified" as const, ...received};
 }

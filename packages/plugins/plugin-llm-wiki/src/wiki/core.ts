@@ -2756,9 +2756,12 @@ export async function assemblePaperclipSourceBundle(ctx: PluginContext, input: P
         // Deferred import keeps the raw reader's policy dependency acyclic at
         // initialization. A source-ready snapshot must name the captured version.
         const { readOwnerCommentRawForDistillation } = await import("./owner-comment-raw.js");
-        const rawSource = await readOwnerCommentRawForDistillation(ctx, {
+        const rawDecision = await readOwnerCommentRawForDistillation(ctx, {
           companyId: input.companyId, space, issue, comment,
         });
+        if (rawDecision && "warning" in rawDecision) warnings.push(rawDecision.warning);
+        if (rawDecision?.kind === "omitted") continue;
+        const rawSource = rawDecision?.kind === "verified" ? rawDecision : null;
         const protectedComment = protectDistillationSourceBody({
           issue,
           sourceKind: "comment",
@@ -2802,7 +2805,14 @@ export async function assemblePaperclipSourceBundle(ctx: PluginContext, input: P
     }
   }
 
-  const markdown = lines.join("\n").slice(0, maxCharacters);
+  const rawWarnings = warnings.filter(warning => warning.startsWith("Owner raw coverage:"));
+  const hasOmittedRaw = rawWarnings.some(warning => warning.includes("omitted comment "));
+  // Put the incomplete coverage in the actual normalization text as well as the
+  // complete structured tool response. Bind every warning through its hash.
+  const rawCoverageNotice = rawWarnings.length
+    ? `> ${hasOmittedRaw ? "Partial source input. " : ""}Raw coverage is incomplete; ${rawWarnings.length} notice(s). Full details: bundle.warnings / snapshot metadata.sourceWarnings. Notice SHA-256: ${contentHash(JSON.stringify(rawWarnings))}.\n\n`
+    : "";
+  const markdown = (rawCoverageNotice + lines.join("\n")).slice(0, maxCharacters);
   const sourceDates = sourceRefs.map(sourceRefUpdatedAt).filter((date): date is string => Boolean(date)).sort();
   return {
     markdown,
@@ -2810,7 +2820,7 @@ export async function assemblePaperclipSourceBundle(ctx: PluginContext, input: P
     sourceHash: contentHash(markdown),
     sourceWindowStart: sourceDates[0] ?? null,
     sourceWindowEnd: sourceDates[sourceDates.length - 1] ?? null,
-    clipped: warnings.some((warning) => warning.includes("Clipped") || warning.includes("Skipped")) || lines.join("\n").length > maxCharacters,
+    clipped: hasOmittedRaw || warnings.some((warning) => warning.includes("Clipped") || warning.includes("Skipped")) || rawCoverageNotice.length + lines.join("\n").length > maxCharacters,
     warnings,
   };
 }
@@ -2885,6 +2895,7 @@ export async function createPaperclipDistillationRun(ctx: PluginContext, input: 
         spaceSlug: space.slug,
         sourceScope: scope.sourceScope,
         estimatedCostCents,
+        sourceWarnings: bundle.warnings,
         backfillStartAt: isoString(input.backfillStartAt),
         backfillEndAt: isoString(input.backfillEndAt),
       }),
@@ -3422,7 +3433,7 @@ export async function distillPaperclipProjectPage(ctx: PluginContext, input: Pap
       runId: run.runId,
       cursorId: run.cursorId,
       sourceHash: bundle.sourceHash,
-      warnings: ["Skipped low-signal Paperclip source window."],
+      warnings: [...bundle.warnings, "Skipped low-signal Paperclip source window."],
       patches: [] as PaperclipDistillationPatch[],
     };
   }
@@ -3447,7 +3458,7 @@ export async function distillPaperclipProjectPage(ctx: PluginContext, input: Pap
       runId: run.runId,
       cursorId: run.cursorId,
       sourceHash: bundle.sourceHash,
-      warnings: ["Skipped unchanged Paperclip source hash."],
+      warnings: [...bundle.warnings, "Skipped unchanged Paperclip source hash."],
       patches: [] as PaperclipDistillationPatch[],
     };
   }
