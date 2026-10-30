@@ -1,6 +1,7 @@
 import type { AcpPermissionDecision, AcpPermissionRequest } from "acpx/runtime";
 import type { HarnessRuntimeRequestResolution } from "../../contracts/harness-driver.js";
 import { cursorToolIdentity } from "./cursor-plan-tool-identity.js";
+import { redactPaperclipSemanticValue } from "../../semantic-tools/redaction.js";
 
 
 export type AcpxPermissionAction = "accept" | "accept_for_session" | "decline" | "cancel";
@@ -50,8 +51,7 @@ export function normalizeAcpxPermission(request: AcpPermissionRequest, options: 
   bindings.set("cancel", "cancel");
   choices.push({ key: "cancel", label: "Cancel" });
   return {
-    title: typeof call.title === "string" && call.title.trim()
-      ? call.title.slice(0, 4_000) : "Approve provider operation",
+    title: permissionTitle(call.title, call.rawInput),
     kind: request.inferredKind ?? "other",
     // Display/durable identity must match the tool-event boundary. Leave the
     // original request intact for ACPX's exact native response correlation.
@@ -65,4 +65,17 @@ export function normalizeAcpxPermission(request: AcpPermissionRequest, options: 
       return { outcome } as AcpPermissionDecision;
     },
   };
+}
+
+/** Display-only: arguments never change permission choices or authorization. */
+function permissionTitle(title: unknown, input: unknown): string {
+  const heading = typeof title === "string" && title.trim()
+    ? title.slice(0, 4_000) : "Approve provider operation";
+  if (input === undefined) return heading;
+  const inputHeading = heading.slice(0, 2_000);
+  const args = JSON.stringify(redactPaperclipSemanticValue(input));
+  const suffix = `\nArguments: ${args}`;
+  return inputHeading.length + suffix.length <= 4_000
+    ? inputHeading + suffix
+    : `${inputHeading}\nArguments omitted: ${Buffer.byteLength(args)} bytes after redaction exceed the permission display limit.`;
 }

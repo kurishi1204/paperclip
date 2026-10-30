@@ -503,6 +503,29 @@ function stageHasParticipant(stage: IssueExecutionStage, participant: IssueExecu
   return stage.participants.some((candidate) => principalsEqual(candidate, participant));
 }
 
+/** Choose the resume status without advancing or replacing a pending stage. */
+export function resolveIssueResumeStatus(issue: IssueLike): "todo" | "in_review" {
+  // Explicitly reopening completed work retains the existing new-work behavior.
+  if (issue.status === "done" || issue.status === "cancelled") return "todo";
+  const state = parseIssueExecutionState(issue.executionState);
+  if (issue.executionState != null && !state) {
+    throw unprocessable("Execution state is invalid; read the issue before resuming");
+  }
+  if (state?.status !== PENDING_STATUS) return "todo";
+  const policy = normalizeIssueExecutionPolicy(issue.executionPolicy);
+  const stage = policy ? findStageById(policy, state.currentStageId) : null;
+  const participant = state.currentParticipant;
+  const escalatedHold = participant?.type === "user" && stage && policy &&
+    !stageHasParticipant(stage, participant) &&
+    (state.changesRequestedCount ?? 0) >= resolveMaxReviewRounds(policy);
+  if (!stage || stage.type !== state.currentStageType ||
+    !principalsEqual(assigneePrincipal(issue), participant) ||
+    (!stageHasParticipant(stage, participant) && !escalatedHold)) {
+    throw unprocessable("Pending execution stage or participant changed; read the issue before resuming");
+  }
+  return "in_review";
+}
+
 function patchForPrincipal(principal: IssueExecutionStagePrincipal | null) {
   if (!principal) {
     return { assigneeAgentId: null, assigneeUserId: null };

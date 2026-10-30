@@ -531,7 +531,11 @@ export class AcpxRuntimeHost {
       toolBridge = options.semanticTools
         ? await acquireAbortableAdmissionResource({
             signal: options.signal,
-            acquire: () => startRunnerToolBridge(options.semanticTools!),
+            acquire: () => startRunnerToolBridge({
+              ...options.semanticTools!,
+              paperclipApiReadView: options.agent === "claude"
+                && (binding.permissionMode === "approve-reads" || binding.permissionMode === "approve-paperclip"),
+            }),
             resource: "tool_bridge",
             releaseLate: (lateToolBridge) => lateToolBridge.close(),
             reportFailure: (failure) =>

@@ -1,7 +1,7 @@
 import type { NativeAcpxPermissionMode } from "../../contracts/native-execution.js";
 import { paperclipSemanticAction } from "../../catalog/semantic-action-catalog.js";
 import { capabilityCanonicalOperation } from "../../catalog/canonical-operations.js";
-import { canonicalRunnerToolName } from "../runner-tool-bridge.js";
+import { canonicalRunnerToolName, PAPERCLIP_API_READ_VIEW_TOOL } from "../runner-tool-bridge.js";
 import type { QualifiedAcpxAgent } from "./qualified-profiles.js";
 
 export class AcpxApprovalRequiredError extends Error {
@@ -18,8 +18,8 @@ export class AcpxApprovalRequiredError extends Error {
 
 // Review additions explicitly: a newly catalogued mutation must not inherit
 // automatic provider permission. These operations implement the bounded plan,
-// task, and handoff workflow; governance decisions, generic APIs, and workspace
-// controls deliberately stay outside it. Asking a human does not approve work.
+// task, and handoff workflow; general governance approvals, generic API writes,
+// and workspace controls stay outside it. Asking a human does not approve work.
 const AUTOMATIC_PAPERCLIP_WORKFLOW_ACTIONS = new Set([
   "report_progress", "answer_status_question", "write_document",
   "request_human_input", "register_deliverable", "finish_task", "block_task",
@@ -36,6 +36,15 @@ export function claudePaperclipPermissionRules(
   const names = tools.flatMap((tool) => {
     if (typeof tool.name !== "string") return [];
     const name = canonicalRunnerToolName(tool.name);
+    // The host exposes this derived view only when call_api is assigned. The
+    // bridge checks GET-only input before calling the same authenticated server
+    // authority. Never exempt the unrestricted call_api SDK tool.
+    if (name === "call_api") return [`mcp__paperclip__${PAPERCLIP_API_READ_VIEW_TOOL}`];
+    // Server-provided task-stage tool, not a general approval capability. The
+    // server still locks and verifies the current participant, stage, versions,
+    // submitted document and active goals before committing a decision.
+    if (name === "decide_issue_approval_stage") return mode === "approve-paperclip"
+      ? ["mcp__paperclip__decide_issue_approval_stage"] : [];
     // Effects come from Paperclip's implementation catalog, never tool hints
     // or the provider's permission-request metadata. Unknown operations stay
     // subject to approval even when their names or annotations claim a read.

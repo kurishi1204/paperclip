@@ -2229,6 +2229,117 @@ describe("issue comment reopen routes", () => {
     );
   });
 
+  it.each([
+    ["post", "review"], ["post", "approval"],
+    ["patch", "review"], ["patch", "approval"],
+  ] as const)("keeps a blocked pending stage on %s resume (%s)", async (method, stageType) => {
+    const participant = { type: "agent" as const, agentId: "22222222-2222-4222-8222-222222222222" };
+    const policy = (await normalizePolicy({ stages: [{
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", type: stageType, participants: [participant],
+    }] }))!;
+    const pending = {
+      status: "pending" as const, currentStageId: policy.stages[0].id,
+      currentStageIndex: 0, currentStageType: stageType, currentParticipant: participant,
+      returnAssignee: { type: "agent" as const, agentId: "44444444-4444-4444-8444-444444444444" },
+      completedStageIds: [], lastDecisionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      lastDecisionOutcome: null, changesRequestedCount: 0,
+    };
+    let current = { ...makeIssue("blocked"), executionPolicy: policy, executionState: pending };
+    mockIssueService.getById.mockImplementation(async () => current);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
+      current = { ...current, ...makeIssueUpdateReceipt(current, patch) };
+      return current;
+    });
+    const app = await installActor(createApp());
+    const res = method === "post"
+      ? await request(app).post(`/api/issues/${current.id}/comments`).send({ body: "Continue the current stage", resume: true })
+      : await request(app).patch(`/api/issues/${current.id}`).send({ comment: "Continue the current stage", resume: true });
+
+    expect(res.status).toBe(method === "post" ? 201 : 200);
+    expect(current.status).toBe("in_review");
+    expect(current.assigneeAgentId).toBe(participant.agentId);
+    expect(current.assigneeUserId).toBeNull();
+    expect(current.executionPolicy).toEqual(policy);
+    expect(current.executionState).toMatchObject(pending);
+    expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject({ status: "in_review" });
+    expect(mockTxInsertValues).not.toHaveBeenCalled();
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalled());
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(participant.agentId, expect.anything());
+    expect(mockLogActivity.mock.calls).toEqual(expect.arrayContaining([expect.arrayContaining([
+      expect.objectContaining({ action: "issue.updated", details: expect.objectContaining(
+        method === "post" ? { status: "in_review" }
+          : { changes: expect.objectContaining({ status: { from: "blocked", to: "in_review" } }) },
+      ) }),
+    ])]));
+  });
+
+  it.each(["post", "patch"] as const)("rejects an unreadable stage before %s resume effects", async method => {
+    const issue = { ...makeIssue("blocked"), executionState: { status: "pending" } };
+    mockIssueService.getById.mockResolvedValue(issue);
+    const app = await installActor(createApp());
+    const res = method === "post"
+      ? await request(app).post(`/api/issues/${issue.id}/comments`).send({ body: "Continue the current stage", resume: true })
+      : await request(app).patch(`/api/issues/${issue.id}`).send({ comment: "Continue the current stage", resume: true });
+    expect(res.status).toBe(422);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "validates pending-stage PATCH resume before interrupt effects (readable=%s)",
+    async readable => {
+      const participant = { type: "agent" as const, agentId: "22222222-2222-4222-8222-222222222222" };
+      const policy = (await normalizePolicy({ stages: [{
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", type: "approval", participants: [participant],
+      }] }))!;
+      const pending = readable ? {
+        status: "pending", currentStageId: policy.stages[0].id,
+        currentStageIndex: 0, currentStageType: "approval", currentParticipant: participant,
+        returnAssignee: null, completedStageIds: [], lastDecisionId: null,
+        lastDecisionOutcome: null, changesRequestedCount: 0,
+      } : { status: "pending" };
+      const issue = {
+        ...makeIssue("blocked"), executionRunId: "run-1",
+        executionPolicy: policy, executionState: pending,
+      };
+      let runStatus = "running";
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+      );
+      mockHeartbeatService.getRun.mockImplementation(async () => ({
+        id: "run-1", companyId: "company-1", agentId: participant.agentId, status: runStatus,
+      }));
+      mockHeartbeatService.cancelRun.mockImplementation(async () => {
+        runStatus = "cancelled";
+        return { id: "run-1", companyId: "company-1", agentId: participant.agentId, status: runStatus };
+      });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ comment: "Continue the current stage", resume: true, interrupt: true });
+
+      expect(res.status).toBe(readable ? 200 : 422);
+      expect(runStatus).toBe(readable ? "cancelled" : "running");
+      const cancellationLogs = mockLogActivity.mock.calls.filter(([, entry]) =>
+        entry.action === "heartbeat.cancelled",
+      );
+      expect(cancellationLogs).toHaveLength(readable ? 1 : 0);
+      if (!readable) {
+        expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+        expect(mockIssueService.update).not.toHaveBeenCalled();
+        expect(mockIssueService.addComment).not.toHaveBeenCalled();
+        expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      } else {
+        expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+        expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject({ status: "in_review" });
+        expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+        expect(mockTxInsertValues).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   it("explicit same-agent resume works through the PATCH comment path", async () => {
     const issue = makeIssue("done");
     mockIssueService.getById.mockResolvedValue(issue);
