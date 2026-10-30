@@ -25,6 +25,84 @@ The alpha surface includes:
 
 ## Phase 5 Security Gate
 
+### Opt-in owner comment raw capture (local implementation slice)
+
+The `ownerCommentRawCapture` company plugin config is off by default. Version 1
+requires `enabled: true`, a shared active `spaceSlug` with an enabled comments
+profile containing only `root_issues` scopes, one `ownerUserId`, an explicit
+list of at most 25 exact `issueIds`, `allowCompanyReaders: true`, a bounded
+`maxBodyBytes`, and an `internal` classification decision by the same user with
+an ISO decision time and reference. The event must be attributed to that user,
+have no agent/run markers, and identify exactly one unchanged comment. This
+does not prove that the user typed the comment in the UI. The administrator's
+classification input declares an owner decision; it is not authenticated
+evidence of the owner's consent. Configured issue UUIDs and incoming company,
+issue, and comment UUIDs are normalized to lowercase, as are reader lookup
+UUIDs; duplicate configured issue IDs after normalization are rejected. User
+identities remain opaque, case-sensitive strings. Only exact issue IDs are
+in scope. Events attributed to other users or agents are skipped; an
+owner-attributed event with contradictory agent/run markers is held.
+
+Accepted bytes are the complete comment body. A separate
+`paperclip_owner_raw_captures` row claims its version; the file lives under
+`.paperclip/owner-comment-raw/<space UUID>/<comment UUID>/<body SHA-256>.txt`
+within the space prefix. This path is outside ordinary `raw/` and `wiki/`
+readers and writers. A create-only local-folder operation prevents this plugin
+from overwriting an existing leaf; the receipt is `verified` only after file,
+comment, row, and final file readback. The `owner-comment-raw-source` data
+handler rechecks current policy and comment version before returning bytes.
+This is a raw receipt, not a normalized source or a published wiki page.
+The existing Paperclip distillation source-bundle path uses this reader for
+opted-in owner comments in the same space and issue. Its `source_ready`
+snapshot records the raw file path, complete body SHA/bytes and comment version
+in each comment's `rawCapture` source reference. An unavailable, pending or
+changed version fails before a source-ready snapshot is inserted. Other
+comments retain their existing path. Creating this local normalization input
+does not invoke a model, mark QA complete, or publish a wiki page.
+The receipt fingerprint binds the owner, space, internal classification label,
+and company-reader permission. Its claim metadata keeps the original consent
+decision, issue list, and byte cap. Adding another issue to the current opt-in
+does not invalidate the earlier receipt; removing the captured issue or
+changing the owner denies current reads.
+
+The plugin table row is the receipt authority. Its `pending` state has no
+successful capture meaning; the currently unused `hold` enum does not itself
+authorize reads. Separate company-scoped plugin state records the latest
+attempt health (`pending`, `hold`, or `verified`) and is updated after successful
+final readback. Comment attempt health uses a per-comment key; an invalid
+enabled configuration uses one company-scoped `config` key. Out-of-scope
+comments create no raw attempt health. A health write failure returns a fixed
+error and is logged without file path or body. A `verified` row is still insufficient for reading
+when the current comment is edited, deleted, or newly attributed to a run, or
+when the saved file no longer matches its exact bytes and hash.
+
+The Paperclip plugin event bus is in-process and has no durable redelivery.
+An event lost before delivery or a `pending` receipt with no later event has
+no automatic recovery in this slice. Database and filesystem writes are not
+one transaction; unknown I/O outcome remains pending or held and must never
+be reported as captured. Local tests do not establish a production receipt,
+UI origin, retention/deletion behavior, business QA, or permission to send
+these bytes to a model. Existing cursor dedup is independent of this raw
+receipt. Do not enable on a real company until those missing gates are
+separately accepted.
+
+The required enabled comments ingestion profile also admits the same scope to
+the existing cursor and distillation pipeline. Before any real opt-in, keep
+related routines paused and prohibit manual distill and backfill until their
+model-send boundary is separately accepted. The quarantine is a logical
+plugin-tool boundary, not a filesystem sandbox: an agent with direct wiki-root
+filesystem access can still reach the file. The starter `gitignore.template`
+does not exclude `.paperclip/`; verify the actual root's ignore/retention and
+agent filesystem reachability before use. Shared-space reader authorization
+is not a filesystem access restriction. The board data handler is available to
+company-access viewers and does not enforce issue-level ACLs. The secret
+detector may reject harmless text that resembles a token. Create-only writes
+rely on filesystem hard-link support; a filesystem without it cannot complete
+this receipt. The added SDK local-folder method is required by the host/plugin
+interface and must be versioned with external implementations. Company/space
+row deletion cascades in the plugin database, but orphaned raw files and
+retention/deletion are not implemented in this slice.
+
 Paperclip-derived text ingestion stays limited to issue titles/descriptions, issue comments, and issue documents.
 
 - Issue attachments/assets are **metadata-only** in Phase 5.

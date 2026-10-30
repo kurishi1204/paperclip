@@ -318,6 +318,13 @@ type PaperclipSourceRef = {
   documentKey?: string;
   updatedAt?: string;
   createdAt?: string;
+  rawCapture?: {
+    status: "verified";
+    bodySha256: string;
+    bodyBytes: number;
+    commentUpdatedAt: string;
+    rawPath: string;
+  };
   redactionStatus?: "suppressed_sensitive_content";
   redactionReasons?: string[];
 };
@@ -601,6 +608,11 @@ function redactDistillationSensitiveText(input: string): string {
     .replace(DISTILLATION_JWT_RE, DISTILLATION_REDACTED_VALUE);
 }
 
+/** The raw capture boundary rejects text that the existing distillation policy would redact. */
+export function containsDistillationSecret(input: string): boolean {
+  return DISTILLATION_PRIVATE_KEY_BLOCK_TEST_RE.test(input) || redactDistillationSensitiveText(input) !== input;
+}
+
 function protectDistillationSourceBody(input: {
   issue: Issue;
   sourceKind: "comment" | "document";
@@ -827,6 +839,33 @@ function normalizePaperclipIngestionProfile(
 async function profileForSpace(ctx: PluginContext, companyId: string, space: WikiSpace): Promise<PaperclipIngestionProfileV1> {
   const legacySettings = space.slug === DEFAULT_SPACE_SLUG ? await getEventIngestionSettings(ctx, companyId) : null;
   return normalizePaperclipIngestionProfile(space.settings.paperclipIngestion, { space, legacySettings });
+}
+
+export async function ownerCommentRawSpacePolicy(ctx: PluginContext, companyId: string, slug: string, issueIds: string[]) {
+  const space = await resolveSpace(ctx, { companyId, wikiId: DEFAULT_WIKI_ID, spaceSlug: slug });
+  const rawProfile = space.settings.paperclipIngestion;
+  const raw = rawProfile && typeof rawProfile === "object" && !Array.isArray(rawProfile)
+    ? rawProfile as Record<string, unknown> : null;
+  const rawKinds = raw?.sourceKinds && typeof raw.sourceKinds === "object" && !Array.isArray(raw.sourceKinds)
+    ? raw.sourceKinds as Record<string, unknown> : null;
+  const rawScopes = raw?.sourceScopes;
+  if (raw?.version !== 1 || raw.enabled !== true || rawKinds?.comments !== true
+    || !Array.isArray(rawScopes) || rawScopes.length === 0
+    || rawScopes.some((scope) => !scope || typeof scope !== "object" || Array.isArray(scope)
+      || (scope as Record<string, unknown>).kind !== "root_issues"
+      || !Array.isArray((scope as Record<string, unknown>).issueIds)
+      || !(scope as {issueIds: unknown[]}).issueIds.every((id) => typeof id === "string"))) {
+    throw new Error("owner_comment_raw_profile_denied");
+  }
+  const profile = await profileForSpace(ctx, companyId, space);
+  const scopes = profile.sourceScopes;
+  const roots = new Set(scopes.flatMap((scope) => scope.kind === "root_issues" ? scope.issueIds : []));
+  if (space.status !== "active" || space.accessScope !== "shared" || !profile.enabled || !profile.sourceKinds.comments
+    || scopes.length === 0 || scopes.some((scope) => scope.kind !== "root_issues")
+    || !issueIds.every((id) => roots.has(id))) {
+    throw new Error("owner_comment_raw_policy_denied");
+  }
+  return space;
 }
 
 function eventIngestionStateKey(companyId: string) {
@@ -2714,11 +2753,17 @@ export async function assemblePaperclipSourceBundle(ctx: PluginContext, input: P
     if (includeComments && remaining.value > 0) {
       const comments = await ctx.issues.listComments(issue.id, input.companyId);
       for (const comment of [...comments].sort((a, b) => (isoString(a.createdAt) ?? "").localeCompare(isoString(b.createdAt) ?? ""))) {
+        // Deferred import keeps the raw reader's policy dependency acyclic at
+        // initialization. A source-ready snapshot must name the captured version.
+        const { readOwnerCommentRawForDistillation } = await import("./owner-comment-raw.js");
+        const rawSource = await readOwnerCommentRawForDistillation(ctx, {
+          companyId: input.companyId, space, issue, comment,
+        });
         const protectedComment = protectDistillationSourceBody({
           issue,
           sourceKind: "comment",
           sourceId: comment.id,
-          body: comment.body,
+          body: rawSource?.source ?? comment.body,
         });
         if (protectedComment.warning) warnings.push(protectedComment.warning);
         appendBoundedSection({
@@ -2740,6 +2785,13 @@ export async function assemblePaperclipSourceBundle(ctx: PluginContext, input: P
             projectId: issue.projectId ?? null,
             commentId: comment.id,
             createdAt: isoString(comment.createdAt) ?? undefined,
+            ...(rawSource ? { rawCapture: {
+              status: "verified" as const,
+              bodySha256: rawSource.receipt.bodySha256,
+              bodyBytes: rawSource.receipt.bodyBytes,
+              commentUpdatedAt: rawSource.receipt.commentUpdatedAt,
+              rawPath: rawSource.receipt.rawPath,
+            } } : {}),
             ...protectedComment.refPatch,
           },
           remaining,

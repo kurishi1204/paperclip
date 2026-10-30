@@ -114,6 +114,7 @@ export interface HostServices {
     list(params: WorkerToHostMethods["localFolders.list"][0]): Promise<WorkerToHostMethods["localFolders.list"][1]>;
     readText(params: WorkerToHostMethods["localFolders.readText"][0]): Promise<WorkerToHostMethods["localFolders.readText"][1]>;
     writeTextAtomic(params: WorkerToHostMethods["localFolders.writeTextAtomic"][0]): Promise<WorkerToHostMethods["localFolders.writeTextAtomic"][1]>;
+    createTextExclusive(params: WorkerToHostMethods["localFolders.createTextExclusive"][0]): Promise<WorkerToHostMethods["localFolders.createTextExclusive"][1]>;
     deleteFile(params: WorkerToHostMethods["localFolders.deleteFile"][0]): Promise<WorkerToHostMethods["localFolders.deleteFile"][1]>;
   };
 
@@ -389,6 +390,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "localFolders.list": "local.folders",
   "localFolders.readText": "local.folders",
   "localFolders.writeTextAtomic": "local.folders",
+  "localFolders.createTextExclusive": "local.folders",
   "localFolders.deleteFile": "local.folders",
 
   // State
@@ -731,6 +733,9 @@ export function createHostClientHandlers(
     }),
     "localFolders.writeTextAtomic": gated("localFolders.writeTextAtomic", async (params) => {
       return services.localFolders.writeTextAtomic(params);
+    }),
+    "localFolders.createTextExclusive": gated("localFolders.createTextExclusive", async (params) => {
+      return services.localFolders.createTextExclusive(params);
     }),
     "localFolders.deleteFile": gated("localFolders.deleteFile", async (params) => {
       return services.localFolders.deleteFile(params);

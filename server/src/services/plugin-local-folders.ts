@@ -296,7 +296,13 @@ async function ensureDirectoryInsideRoot(rootRealPath: string, relativePath: str
     } catch (error) {
       const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : "";
       if (code !== "ENOENT") throw error;
-      await fs.mkdir(nextPath);
+      try {
+        await fs.mkdir(nextPath);
+      } catch (mkdirError) {
+        if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST" || !(await fs.stat(nextPath)).isDirectory()) {
+          throw mkdirError;
+        }
+      }
     }
 
     const nextRealPath = await fs.realpath(nextPath);
@@ -540,6 +546,70 @@ export async function writePluginLocalFolderTextAtomic(
       access: "readWrite",
     },
   });
+}
+
+/**
+ * Publish a new UTF-8 leaf without replacing an existing name. The hard link
+ * is the no-clobber point; rename would overwrite an existing capture. This
+ * protects cooperating writers, not against another same-owner process that
+ * changes ancestor symlinks or removes the published file between checks.
+ */
+export async function createPluginLocalFolderTextExclusive(
+  rootPath: string,
+  relativePath: string,
+  contents: string,
+): Promise<{ created: boolean }> {
+  const rootRealPath = await fs.realpath(rootPath);
+  const normalized = normalizeRelativePath(relativePath);
+  const parentRelativePath = path.dirname(normalized);
+  if (parentRelativePath !== ".") {
+    await ensureDirectoryInsideRoot(rootRealPath, parentRelativePath);
+  }
+  const resolved = await resolvePluginLocalFolderPath(rootRealPath, normalized, { allowMissingLeaf: true });
+  const parentPath = path.dirname(resolved.absolutePath);
+  await assertPathInsideRoot(rootRealPath, parentPath);
+
+  const existingRegular = async (): Promise<boolean> => {
+    try {
+      const stat = await fs.lstat(resolved.absolutePath);
+      if (!stat.isFile()) throw badRequest("Local folder create target must be a regular file");
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  };
+  if (await existingRegular()) return { created: false };
+
+  const tempPath = path.join(parentPath, `.paperclip-${path.basename(resolved.absolutePath)}-${process.pid}-${randomUUID()}.tmp`);
+  const handle = await fs.open(tempPath, "wx", 0o600);
+  try {
+    await assertPathInsideRoot(rootRealPath, tempPath);
+    await handle.writeFile(contents, "utf8");
+    await handle.sync();
+    await handle.close();
+    await assertPathInsideRoot(rootRealPath, parentPath);
+    try {
+      await fs.link(tempPath, resolved.absolutePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST" && await existingRegular()) {
+        return { created: false };
+      }
+      throw error;
+    }
+    if (process.platform !== "win32") {
+      const dirHandle = await fs.open(parentPath, "r");
+      try {
+        await dirHandle.sync();
+      } finally {
+        await dirHandle.close();
+      }
+    }
+    return { created: true };
+  } finally {
+    await handle.close();
+    await fs.rm(tempPath, { force: true });
+  }
 }
 
 export async function deletePluginLocalFolderFile(

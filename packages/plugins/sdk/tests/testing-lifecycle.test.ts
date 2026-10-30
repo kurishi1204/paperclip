@@ -8,6 +8,21 @@ const manifest: PaperclipPluginManifestV1 = {
 };
 
 describe("Lifecycle inbox test harness", () => {
+  it("keeps exclusive local-folder files separate by company", async () => {
+    const folderManifest: PaperclipPluginManifestV1 = {
+      ...manifest,
+      capabilities: ["local.folders"],
+      localFolders: [{ folderKey: "raw", displayName: "Raw", access: "readWrite" }],
+    };
+    const harness = createTestHarness({ manifest: folderManifest });
+    await harness.ctx.localFolders.configure({ companyId: "a", folderKey: "raw", path: "/tmp/a" });
+    await harness.ctx.localFolders.configure({ companyId: "b", folderKey: "raw", path: "/tmp/b" });
+    expect((await harness.ctx.localFolders.createTextExclusive("a", "raw", "one.txt", "a")).created).toBe(true);
+    expect((await harness.ctx.localFolders.createTextExclusive("a", "raw", "one.txt", "other")).created).toBe(false);
+    expect((await harness.ctx.localFolders.createTextExclusive("b", "raw", "one.txt", "b")).created).toBe(true);
+    expect(await harness.ctx.localFolders.readText("a", "raw", "one.txt")).toBe("a");
+    expect(await harness.ctx.localFolders.readText("b", "raw", "one.txt")).toBe("b");
+  });
   it("delivers project creation, archive, and restore in order", async () => {
     const harness = createTestHarness({ manifest });
     const event: ResourceLifecycleEvent = { id: "1", companyId: "a", resourceType: "project", resourceId: "project", action: "create", createdAt: new Date(0).toISOString() };

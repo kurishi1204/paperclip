@@ -60,6 +60,7 @@ import {
   writeTemplate,
   writeWikiPage,
 } from "./wiki.js";
+import { captureOwnerCommentRaw, OwnerCommentRawHold, readOwnerCommentRaw } from "./wiki/owner-comment-raw.js";
 
 function stringField(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -190,18 +191,45 @@ const plugin = definePlugin({
 
     for (const eventName of PAPERCLIP_EVENT_INGESTION_EVENTS) {
       ctx.events.on(eventName, async (event) => {
-        const result = await handlePaperclipEventIngestion(ctx, event);
-        if (result.status === "recorded") {
+        // Cursor discovery and raw receipt are independent. Attempt both before surfacing either failure.
+        const [cursor, raw] = await Promise.allSettled([
+          handlePaperclipEventIngestion(ctx, event),
+          captureOwnerCommentRaw(ctx, event),
+        ]);
+        if (raw.status === "fulfilled" && raw.value === "verified") {
+          ctx.logger.info("Owner comment raw receipt verified", { companyId: event.companyId, eventId: event.eventId });
+        }
+        if (cursor.status === "fulfilled" && cursor.value.status === "recorded") {
           ctx.logger.info("LLM Wiki recorded Paperclip event for cursor discovery", {
             eventType: event.eventType,
             companyId: event.companyId,
-            sourceKind: result.sourceKind,
-            sourceId: result.sourceId,
-            cursorId: result.cursorId,
+            sourceKind: cursor.value.sourceKind,
+            sourceId: cursor.value.sourceId,
+            cursorId: cursor.value.cursorId,
           });
         }
+        if (cursor.status === "rejected" && raw.status === "rejected") {
+          ctx.logger.error("Wiki cursor observation failed", { eventId: event.eventId, reason: "cursor_failed" });
+          ctx.logger.error("Owner comment raw capture failed", { eventId: event.eventId,
+            reason: raw.reason instanceof OwnerCommentRawHold ? raw.reason.code : "raw_failed" });
+          throw new AggregateError([new Error("wiki_cursor_failed"), new Error("owner_comment_raw_failed")],
+            "Wiki cursor and raw event processing both failed");
+        }
+        if (cursor.status === "rejected") throw cursor.reason;
+        if (raw.status === "rejected") throw raw.reason;
       });
     }
+
+    ctx.data.register("owner-comment-raw-source", async (params) => {
+      const companyId = readCompanyIdFromParams(params);
+      const commentId = stringField(params.commentId);
+      if (!commentId) throw new Error("commentId is required");
+      try { return await readOwnerCommentRaw(ctx, companyId, commentId); }
+      catch (error) {
+        if (error instanceof OwnerCommentRawHold) throw error;
+        throw new Error("owner_comment_raw_reader_unavailable");
+      }
+    });
 
     ctx.data.register("overview", async (params) => {
       const companyId = readCompanyIdFromParams(params);
