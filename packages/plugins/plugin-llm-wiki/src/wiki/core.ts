@@ -841,8 +841,7 @@ async function profileForSpace(ctx: PluginContext, companyId: string, space: Wik
   return normalizePaperclipIngestionProfile(space.settings.paperclipIngestion, { space, legacySettings });
 }
 
-export async function ownerCommentRawSpacePolicy(ctx: PluginContext, companyId: string, slug: string, issueIds: string[]) {
-  const space = await resolveSpace(ctx, { companyId, wikiId: DEFAULT_WIKI_ID, spaceSlug: slug });
+export function evaluateOwnerCommentRawSpacePolicy(space: WikiSpace, issueIds: string[]) {
   const rawProfile = space.settings.paperclipIngestion;
   const raw = rawProfile && typeof rawProfile === "object" && !Array.isArray(rawProfile)
     ? rawProfile as Record<string, unknown> : null;
@@ -855,16 +854,28 @@ export async function ownerCommentRawSpacePolicy(ctx: PluginContext, companyId: 
       || (scope as Record<string, unknown>).kind !== "root_issues"
       || !Array.isArray((scope as Record<string, unknown>).issueIds)
       || !(scope as {issueIds: unknown[]}).issueIds.every((id) => typeof id === "string"))) {
-    throw new Error("owner_comment_raw_profile_denied");
+    return { allowed: false as const, reason: "profile_denied" };
   }
-  const profile = await profileForSpace(ctx, companyId, space);
+  const profile = normalizePaperclipIngestionProfile(rawProfile, { space });
   const scopes = profile.sourceScopes;
   const roots = new Set(scopes.flatMap((scope) => scope.kind === "root_issues" ? scope.issueIds : []));
   if (space.status !== "active" || space.accessScope !== "shared" || !profile.enabled || !profile.sourceKinds.comments
     || scopes.length === 0 || scopes.some((scope) => scope.kind !== "root_issues")
     || !issueIds.every((id) => roots.has(id))) {
-    throw new Error("owner_comment_raw_policy_denied");
+    return { allowed: false as const, reason: "policy_denied" };
   }
+  return { allowed: true as const };
+}
+
+export class OwnerCommentRawSpacePolicyDenied extends Error {
+  constructor(readonly reason: string) { super(`owner_comment_raw_${reason}`); }
+}
+
+export async function ownerCommentRawSpacePolicy(ctx: PluginContext, companyId: string, slug: string, issueIds: string[]) {
+  // Resolution/DB exceptions are not policy decisions and must propagate.
+  const space = await resolveSpace(ctx, { companyId, wikiId: DEFAULT_WIKI_ID, spaceSlug: slug });
+  const decision = evaluateOwnerCommentRawSpacePolicy(space, issueIds);
+  if (!decision.allowed) throw new OwnerCommentRawSpacePolicyDenied(decision.reason);
   return space;
 }
 

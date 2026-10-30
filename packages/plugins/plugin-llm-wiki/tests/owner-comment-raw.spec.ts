@@ -115,7 +115,7 @@ describe("owner comment raw receipt through exported plugin",()=>{
     const partial=await s.harness.performAction<{bundle:{markdown:string;warnings:string[];sourceRefs:Array<{commentId?:string;rawCapture?:unknown}>}}>("create-paperclip-distillation-run",{
       companyId:company,spaceSlug:"owner-notes",rootIssueId:issueId,includeDocuments:false,
     });
-    expect(partial.bundle.warnings).toContain(`Owner raw coverage: omitted comment ${commentId}: current_version_changed.`);
+    expect(partial.bundle.warnings.some(warning=>warning.startsWith(`Owner raw coverage: omitted comment ${commentId}: `))).toBe(true);
     expect(partial.bundle.sourceRefs.some(ref=>ref.commentId===commentId)).toBe(false);
     expect(partial.bundle.markdown).toContain("Partial source input");
     expect(partial.bundle.markdown).not.toContain("Edited after capture");
@@ -151,8 +151,31 @@ describe("owner comment raw receipt through exported plugin",()=>{
     expect(result).toMatchObject({kind:"existing"});
     expect(result).not.toHaveProperty("receipt");
   });
+  it.each(["lower-cap", "changed-projection", "profile-update-order", "policy-fingerprint"])("omits a known current %s refusal without stopping unrelated sources",async(kind)=>{
+    const s=setup();await plugin.definition.setup(s.harness.ctx);await s.emit();
+    if(kind==="lower-cap")s.harness.setConfig({ownerCommentRawCapture:{...config.ownerCommentRawCapture,maxBodyBytes:1}});
+    if(kind==="changed-projection")s.harness.ctx.issues.listComments=async()=>[{...comment,body:"Synthetic username projection changed"}];
+    if(kind==="profile-update-order")s.harness.setConfig({ownerCommentRawCapture:{...config.ownerCommentRawCapture,issueIds:[issueId,"99999999-9999-4999-8999-999999999999"]}});
+    if(kind==="policy-fingerprint")s.row()!.policy_sha256="0".repeat(64);
+    const result=await s.harness.performAction<{status:string;bundle:{markdown:string;warnings:string[];sourceRefs:Array<{commentId?:string}>}}>("create-paperclip-distillation-run",{
+      companyId:company,spaceSlug:"owner-notes",rootIssueId:issueId,includeDocuments:false,
+    });
+    expect(result.status).toBe("source_ready");expect(result.bundle.sourceRefs.some(ref=>ref.commentId===commentId)).toBe(false);
+    expect(result.bundle.markdown).toContain("Partial source input");
+    expect(result.bundle.warnings.some(warning=>warning.startsWith(`Owner raw coverage: omitted comment ${commentId}: current_`))).toBe(true);
+    expect([...s.files.values()]).toEqual([body]);
+    await expect(s.harness.getData("owner-comment-raw-source",{companyId:company,commentId})).rejects.toThrow();
+  });
+  it("rejects a malformed stored policy fingerprint as storage corruption",async()=>{
+    const s=setup();await plugin.definition.setup(s.harness.ctx);await s.emit();
+    s.row()!.policy_sha256="malformed";
+    await expect(createPaperclipDistillationRun(s.harness.ctx,{companyId:company,spaceSlug:"owner-notes",rootIssueId:issueId,includeDocuments:false})).rejects.toThrow("owner_comment_raw_reader_row");
+    await expect(s.harness.getData("owner-comment-raw-source",{companyId:company,commentId})).rejects.toThrow("owner_comment_raw_reader_row");
+  });
   it.each(["integrity", "io"])("does not hide an actual raw %s failure behind a partial source",async(kind)=>{
     const s=setup();await plugin.definition.setup(s.harness.ctx);await s.emit();
+    // A known projection refusal must not short-circuit real storage checks.
+    s.harness.setConfig({ownerCommentRawCapture:{...config.ownerCommentRawCapture,maxBodyBytes:1}});
     if(kind==="integrity")s.files.set([...s.files.keys()][0]!,"Corrupted");
     else s.harness.ctx.localFolders.readText=async()=>{throw new Error("synthetic unavailable IO")};
     await expect(createPaperclipDistillationRun(s.harness.ctx,{companyId:company,spaceSlug:"owner-notes",rootIssueId:issueId,includeDocuments:false})).rejects.toThrow(kind==="integrity"?"file_integrity":"synthetic unavailable IO");

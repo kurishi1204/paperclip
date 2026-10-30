@@ -726,6 +726,38 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     const pages = await db.execute(sql`SELECT id FROM ${sql.raw(`"${namespace}"."wiki_pages"`)}
       WHERE company_id=${companyId}`);
     expect(pages).toHaveLength(0);
+    const originalConfig = await harness.ctx.config.get(companyId);
+    const optin = originalConfig.ownerCommentRawCapture as Record<string, unknown>;
+    harness.setConfig({ ...originalConfig, ownerCommentRawCapture: { ...optin, maxBodyBytes: 1 } });
+    const capped = await createPaperclipDistillationRun(harness.ctx, {
+      companyId, spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    });
+    expect(capped.bundle.sourceRefs.some(ref => ref.commentId === comment.id)).toBe(false);
+    expect(capped.bundle.warnings.some(w => w.includes("current_projection_denied:body_denied"))).toBe(true);
+    // Even a known policy refusal cannot hide independently corrupted storage.
+    await fs.writeFile(leaf, "Synthetic corrupted file");
+    await expect(createPaperclipDistillationRun(harness.ctx, {
+      companyId, spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    })).rejects.toThrow("file_integrity");
+    await fs.writeFile(leaf, body);
+    harness.setConfig(originalConfig);
+    const originalListComments = harness.ctx.issues.listComments;
+    harness.ctx.issues.listComments = async (...args) => (await originalListComments(...args)).map(c =>
+      c.id === comment.id ? { ...c, body: "Synthetic redacted current projection" } : c);
+    const projected = await createPaperclipDistillationRun(harness.ctx, {
+      companyId, spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    });
+    expect(projected.bundle.sourceRefs.some(ref => ref.commentId === comment.id)).toBe(false);
+    expect(projected.bundle.warnings.some(w => w.includes("current_projection_denied:reader_version"))).toBe(true);
+    harness.ctx.issues.listComments = originalListComments;
+    harness.setConfig({ ...originalConfig, ownerCommentRawCapture: { ...optin, issueIds: [issueId, randomUUID()] } });
+    const policyChanged = await createPaperclipDistillationRun(harness.ctx, {
+      companyId, spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    });
+    expect(policyChanged.bundle.sourceRefs.some(ref => ref.commentId === comment.id)).toBe(false);
+    expect(policyChanged.bundle.warnings.some(w => w.includes("current_policy_denied"))).toBe(true);
+    harness.setConfig(originalConfig);
+    expect(await fs.readFile(leaf, "utf8")).toBe(body);
     const unreceived = await issueService(db).addComment(issueId, "Synthetic unreceived source", { userId: owner });
     const direct = await createPaperclipDistillationRun(harness.ctx, {
       companyId, spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
@@ -764,7 +796,10 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         persistedSnapshotCount: snapshots.length, sharedWikiPageCount: pages.length,
         repairedCoverage: { unreceivedWarning: direct.bundle.warnings, partialWarning: partial.bundle.warnings,
           partialSnapshotId: partial.snapshotId, partialMarkdownSaved: partialRows[0]!.bundle_markdown === partial.bundle.markdown,
-          otherWikiSnapshotId: otherWiki.snapshotId, otherWikiHasNoBorrowedRaw: otherWiki.bundle.sourceRefs.filter(ref => ref.kind === "comment").every(ref => !ref.rawCapture) },
+          otherWikiSnapshotId: otherWiki.snapshotId, otherWikiHasNoBorrowedRaw: otherWiki.bundle.sourceRefs.filter(ref => ref.kind === "comment").every(ref => !ref.rawCapture),
+          currentProjectionPolicy: { capSnapshotId: capped.snapshotId, projectionSnapshotId: projected.snapshotId,
+            policySnapshotId: policyChanged.snapshotId, knownRefusalsArePartial: [capped, projected, policyChanged].every(r => r.bundle.clipped && r.bundle.markdown.includes("Partial source input")),
+            storageCorruptionRejectedEvenWithKnownPolicyRefusal: true, originalRawRestoredAndUnchanged: await fs.readFile(leaf, "utf8") === body } },
       }, null, 2) + "\n", { mode: 0o600 });
     }
   }, 90_000);

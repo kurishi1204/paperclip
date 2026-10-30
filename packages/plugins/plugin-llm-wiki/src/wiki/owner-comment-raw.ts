@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Issue, IssueComment, PluginContext, PluginEvent } from "@paperclipai/plugin-sdk";
 import { DEFAULT_MAX_SOURCE_BYTES, PLUGIN_ID, WIKI_ROOT_FOLDER_KEY } from "../manifest.js";
-import { DEFAULT_WIKI_ID, containsDistillationSecret, ownerCommentRawSpacePolicy, spaceRelativePath, type WikiSpace } from "./core.js";
+import { DEFAULT_WIKI_ID, containsDistillationSecret, evaluateOwnerCommentRawSpacePolicy, OwnerCommentRawSpacePolicyDenied, ownerCommentRawSpacePolicy, spaceRelativePath, type WikiSpace } from "./core.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHA = /^[0-9a-f]{64}$/;
@@ -33,9 +33,9 @@ type Config = {
   consentDecision: { label: "internal"; decidedByUserId: string; decidedAt: string; decisionRef: string };
 };
 
-function parseConfig(raw: Record<string, unknown>): Config | null {
+function evaluateConfig(raw: Record<string, unknown>) {
   const input = record(raw.ownerCommentRawCapture);
-  if (!input || input.enabled !== true) return null;
+  if (!input || input.enabled !== true) return { kind: "disabled" as const };
   const classification = record(input.classification);
   const ids = input.issueIds;
   const maxGlobal = typeof raw.maxSourceBytes === "number" && Number.isSafeInteger(raw.maxSourceBytes) && raw.maxSourceBytes > 0
@@ -50,12 +50,12 @@ function parseConfig(raw: Record<string, unknown>): Config | null {
     || typeof classification.decisionRef !== "string" || !classification.decisionRef.trim()
     || typeof classification.decidedAt !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(classification.decidedAt)
     || !Number.isFinite(Date.parse(classification.decidedAt))) {
-    hold("invalid_config");
+    return { kind: "refused" as const, reason: "invalid_config" };
   }
   const ownerUserId = input.ownerUserId as string;
   const spaceSlug = input.spaceSlug as string;
   const issueIds = (ids as string[]).map((id) => id.toLowerCase());
-  return {
+  const config: Config = {
     ownerUserId, spaceSlug, issueIds,
     maxBodyBytes: input.maxBodyBytes as number,
     policySha256: hash(JSON.stringify({version: 1, ownerUserId: input.ownerUserId, spaceSlug: input.spaceSlug,
@@ -63,12 +63,20 @@ function parseConfig(raw: Record<string, unknown>): Config | null {
     consentDecision: {label:"internal",decidedByUserId:ownerUserId,
       decidedAt:classification.decidedAt as string,decisionRef:classification.decisionRef as string},
   };
+  return { kind: "accepted" as const, config };
+}
+function parseConfig(raw: Record<string, unknown>): Config | null {
+  const decision = evaluateConfig(raw);
+  if (decision.kind === "disabled") return null;
+  if (decision.kind === "refused") hold(decision.reason);
+  return decision.config;
 }
 
-function exactComment(comments: IssueComment[], commentId: string, companyId: string, issue: Issue, owner: string,
-  occurredAt: number, maxBytes: number): { comment: IssueComment; bodyHash: string; updatedAt: string } {
+function evaluateCommentProjection(comments: IssueComment[], commentId: string, companyId: string, issue: Issue, owner: string,
+  occurredAt: number, maxBytes: number, expected?: { bodyHash: string; updatedAt: string }) {
+  const refused = (reason: string) => ({ accepted: false as const, reason });
   const matches = comments.filter((comment) => comment.id === commentId);
-  if (matches.length !== 1) hold("comment_missing_or_ambiguous");
+  if (matches.length !== 1) return refused("comment_missing_or_ambiguous");
   const comment = matches[0]!;
   if (comment.companyId !== companyId || comment.issueId !== issue.id || comment.authorType !== "user"
     || comment.authorUserId !== owner || comment.authorAgentId !== null
@@ -76,15 +84,22 @@ function exactComment(comments: IssueComment[], commentId: string, companyId: st
     || comment.createdByRunId != null || comment.derivedAuthorAgentId != null
     || comment.derivedCreatedByRunId != null || comment.derivedAuthorSource != null
     || comment.deletedAt != null || comment.sourceTrust != null || comment.metadata != null || comment.presentation != null) {
-    hold("comment_attribution");
+    return refused("comment_attribution");
   }
   const created = dateMs(comment.createdAt), updated = dateMs(comment.updatedAt);
   if (created === null || updated === null || created !== updated || created > occurredAt + MAX_SKEW_MS
-    || occurredAt - created > MAX_SKEW_MS) hold("comment_version");
+    || occurredAt - created > MAX_SKEW_MS) return refused("comment_version");
   if (typeof comment.body !== "string" || !comment.body.trim()
-    || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(comment.body)) hold("body_invalid");
-  if (Buffer.byteLength(comment.body, "utf8") > maxBytes || containsDistillationSecret(comment.body)) hold("body_denied");
-  return { comment, bodyHash: hash(comment.body), updatedAt: new Date(updated).toISOString() };
+    || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(comment.body)) return refused("body_invalid");
+  if (Buffer.byteLength(comment.body, "utf8") > maxBytes || containsDistillationSecret(comment.body)) return refused("body_denied");
+  const bodyHash = hash(comment.body), updatedAt = new Date(updated).toISOString();
+  if (expected && (bodyHash !== expected.bodyHash || dateMs(updatedAt) !== dateMs(expected.updatedAt))) return refused("reader_version");
+  return { accepted: true as const, comment, bodyHash, updatedAt };
+}
+function exactComment(...args: Parameters<typeof evaluateCommentProjection>) {
+  const decision = evaluateCommentProjection(...args);
+  if (!decision.accepted) hold(decision.reason);
+  return decision;
 }
 
 type Row = { company_id: string; space_id: string; comment_id: string; issue_id: string; owner_user_id: string;
@@ -104,9 +119,33 @@ function rowMatches(row: Row, input: {companyId: string; space: WikiSpace; comme
     && dateMs(row.comment_updated_at) === dateMs(input.updatedAt) && row.raw_path === input.path
     && row.policy_sha256 === input.policyHash && ["pending", "verified"].includes(row.status);
 }
-async function readExactFile(ctx: PluginContext, companyId: string, path: string, body: string, bodyHash: string) {
+async function readStoredFile(ctx: PluginContext, companyId: string, path: string, bodyHash: string) {
   const actual = await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, path);
-  if (actual !== body || hash(actual) !== bodyHash || Buffer.byteLength(actual, "utf8") !== Buffer.byteLength(body, "utf8")) hold("file_integrity");
+  if (hash(actual) !== bodyHash) hold("file_integrity");
+  return actual;
+}
+async function readExactFile(ctx: PluginContext, companyId: string, path: string, body: string, bodyHash: string) {
+  const actual = await readStoredFile(ctx, companyId, path, bodyHash);
+  if (actual !== body || Buffer.byteLength(actual, "utf8") !== Buffer.byteLength(body, "utf8")) hold("file_integrity");
+}
+function assertStoredRow(row: Row, companyId: string, space: WikiSpace, commentId: string, issueId?: string) {
+  if (row.company_id !== companyId || row.space_id !== space.id || row.comment_id !== commentId
+    || !uuid(row.issue_id) || (issueId !== undefined && row.issue_id !== issueId)
+    || !opaqueUserId(row.owner_user_id) || !SHA.test(row.body_sha256)
+    || !SHA.test(row.policy_sha256) || dateMs(row.comment_updated_at) === null
+    || !["verified", "pending", "hold"].includes(row.status)
+    || row.raw_path !== spaceRelativePath(space,
+      `.paperclip/owner-comment-raw/${space.id}/${commentId}/${row.body_sha256}.txt`)) hold("reader_row");
+}
+function rawReadResult(companyId: string, commentId: string, issueId: string, source: string, row: Row, updatedAt: string) {
+  return { companyId, commentId, issueId, source, receipt: { status: "verified", bodySha256: row.body_sha256,
+    bodyBytes: Buffer.byteLength(source,"utf8"), readbackAt: new Date().toISOString(), qa: false,
+    companyAdoption: false, wikiPublished: false, commentUpdatedAt: updatedAt,
+    attribution: "host_user_attributed_no_run_markers", rawPath: row.raw_path } };
+}
+async function readSpacePolicy(ctx: PluginContext, companyId: string, config: Config) {
+  try { return await ownerCommentRawSpacePolicy(ctx, companyId, config.spaceSlug, config.issueIds); }
+  catch (error) { if (error instanceof OwnerCommentRawSpacePolicyDenied) hold("space_policy"); throw error; }
 }
 
 async function writeHealth(ctx: PluginContext, event: PluginEvent, commentId: string | null,
@@ -168,8 +207,7 @@ export async function captureOwnerCommentRaw(ctx: PluginContext, event: PluginEv
     const issue = await ctx.issues.get(event.entityId, event.companyId);
     if (!issue || issue.companyId !== event.companyId || issue.id !== event.entityId
       || (typeof issue.originKind === "string" && issue.originKind.startsWith(`plugin:${PLUGIN_ID}:operation`))) hold("issue_identity");
-    const space = await ownerCommentRawSpacePolicy(ctx, event.companyId, config.spaceSlug, config.issueIds)
-      .catch(() => hold("space_policy"));
+    const space = await readSpacePolicy(ctx, event.companyId, config);
     const folder = await ctx.localFolders.status(event.companyId, WIKI_ROOT_FOLDER_KEY);
     if (!folder.configured || !folder.readable || !folder.writable || !folder.healthy || folder.access !== "readWrite") {
       hold("folder_unhealthy");
@@ -225,38 +263,32 @@ export async function captureOwnerCommentRaw(ctx: PluginContext, event: PluginEv
 
 export async function readOwnerCommentRaw(ctx: PluginContext, companyId: string, commentId: string, expectedSpace?: WikiSpace) {
   if (!uuid(companyId) || !uuid(commentId)) hold("reader_identity");
-  companyId = companyId.toLowerCase();
-  commentId = commentId.toLowerCase();
+  companyId = companyId.toLowerCase(); commentId = commentId.toLowerCase();
   const config = parseConfig(await ctx.config.get(companyId));
   if (!config) hold("reader_disabled");
-  const space = await ownerCommentRawSpacePolicy(ctx, companyId, config.spaceSlug, config.issueIds)
-    .catch(() => hold("space_policy"));
+  const space = await readSpacePolicy(ctx, companyId, config);
   if (expectedSpace && (space.id !== expectedSpace.id || space.wikiId !== expectedSpace.wikiId)) hold("reader_space");
   const row = await getRow(ctx, companyId, space.id, commentId);
-  if (!row || row.status !== "verified" || !config.issueIds.includes(row.issue_id)
-    || row.owner_user_id !== config.ownerUserId || row.policy_sha256 !== config.policySha256
-    || !SHA.test(row.body_sha256) || row.raw_path !== spaceRelativePath(space,
-      `.paperclip/owner-comment-raw/${space.id}/${commentId}/${row.body_sha256}.txt`)) hold("reader_row");
+  if (!row || row.status !== "verified") hold("reader_row");
+  assertStoredRow(row, companyId, space, commentId);
+  if (!config.issueIds.includes(row.issue_id) || row.owner_user_id !== config.ownerUserId
+    || row.policy_sha256 !== config.policySha256) hold("reader_row");
   const issue = await ctx.issues.get(row.issue_id, companyId);
   if (!issue || issue.companyId !== companyId || issue.id !== row.issue_id) hold("reader_issue");
   const comments = await ctx.issues.listComments(issue.id, companyId);
-  const selected = comments.filter((comment) => comment.id === commentId);
-  if (selected.length !== 1) hold("reader_comment");
-  const body = selected[0]!.body;
-  const created = dateMs(selected[0]!.createdAt);
-  if (created === null) hold("reader_version");
-  const current = exactComment(comments, commentId, companyId, issue, config.ownerUserId, created, config.maxBodyBytes);
-  if (current.bodyHash !== row.body_sha256 || dateMs(current.updatedAt) !== dateMs(row.comment_updated_at)) hold("reader_version");
-  await readExactFile(ctx, companyId, row.raw_path, body, row.body_sha256);
-  return { companyId, commentId, issueId: issue.id, source: body, receipt: { status: "verified", bodySha256: row.body_sha256,
-    bodyBytes: Buffer.byteLength(body,"utf8"), readbackAt: new Date().toISOString(), qa: false,
-    companyAdoption: false, wikiPublished: false,
-    commentUpdatedAt: current.updatedAt, attribution: "host_user_attributed_no_run_markers", rawPath: row.raw_path } };
+  const selected = comments.filter(comment => comment.id === commentId);
+  const occurredAt = selected.length === 1 ? dateMs(selected[0]!.createdAt) : null;
+  if (occurredAt === null) hold("reader_comment");
+  const stored = await readStoredFile(ctx, companyId, row.raw_path, row.body_sha256);
+  const current = exactComment(comments, commentId, companyId, issue, config.ownerUserId, occurredAt,
+    config.maxBodyBytes, { bodyHash: row.body_sha256, updatedAt: row.comment_updated_at });
+  return rawReadResult(companyId, commentId, issue.id, stored, row, current.updatedAt);
 }
 
 /** Only verified raw is labelled as such. Known missing receipts retain the
  * existing comment source; known stale/pending captures are visibly omitted.
- * Policy/integrity/unknown I/O failures still propagate, never silently fall back.
+ * Current policy/projection refusals are explicit omissions. Stored corruption
+ * and unknown I/O failures propagate, never silently fall back.
  */
 export async function readOwnerCommentRawForDistillation(ctx: PluginContext, input: {
   companyId: string; space: WikiSpace; issue: Issue; comment: IssueComment;
@@ -274,30 +306,24 @@ export async function readOwnerCommentRawForDistillation(ctx: PluginContext, inp
   // is a separate source and must never borrow that receipt.
   if (input.space.wikiId !== DEFAULT_WIKI_ID) return existing(
     `Owner raw coverage: comment ${input.comment.id} is outside the default-wiki capture space; using the existing comment projection without raw verification.`);
-  const config = parseConfig(raw); // Invalid enabled policy is never a fallback.
-  if (!config) hold("invalid_config");
   const row = await getRow(ctx, input.companyId, input.space.id, input.comment.id);
   if (!row) return existing(
     `Owner raw coverage: comment ${input.comment.id} has no received raw; using the existing comment projection without raw verification.`);
-  // Validate the received row's immutable identity before treating any state
-  // as a known omission. Corrupt rows must not become a partial success.
-  if (row.company_id !== input.companyId || row.space_id !== input.space.id
-    || row.comment_id !== input.comment.id || row.issue_id !== input.issue.id
-    || row.owner_user_id !== config.ownerUserId || row.policy_sha256 !== config.policySha256
-    || !SHA.test(row.body_sha256) || dateMs(row.comment_updated_at) === null
-    || row.raw_path !== spaceRelativePath(input.space,
-      `.paperclip/owner-comment-raw/${input.space.id}/${input.comment.id}/${row.body_sha256}.txt`)
-    || !["verified", "pending", "hold"].includes(row.status)) hold("reader_row");
-  if (row.status === "pending" || row.status === "hold") return omitted("raw_pending");
-  const receivedDate = dateMs(row.comment_updated_at), currentDate = dateMs(input.comment.updatedAt);
-  if (receivedDate !== null && currentDate !== null && receivedDate !== currentDate) return omitted("current_version_changed");
-  if (input.comment.createdByRunId != null || input.comment.authorAgentId != null
-    || input.comment.derivedAuthorAgentId != null || input.comment.derivedCreatedByRunId != null
-    || input.comment.derivedAuthorSource != null || input.comment.authorType !== "user"
-    || input.comment.deletedAt != null || input.comment.sourceTrust != null
-    || input.comment.metadata != null || input.comment.presentation != null) return omitted("current_attribution_changed");
-  const received = await readOwnerCommentRaw(ctx, input.companyId, input.comment.id, input.space);
-  if (received.issueId !== input.issue.id || received.source !== input.comment.body
-    || dateMs(received.receipt.commentUpdatedAt) !== currentDate) hold("distillation_version");
-  return {kind: "verified" as const, ...received};
+  assertStoredRow(row, input.companyId, input.space, input.comment.id, input.issue.id);
+  if (row.status !== "verified") return omitted("raw_pending");
+  // Storage is checked independently even when current policy/projection will
+  // refuse use. A known omission must never hide damaged or unavailable raw.
+  const stored = await readStoredFile(ctx, input.companyId, row.raw_path, row.body_sha256);
+  const config = evaluateConfig(raw);
+  if (config.kind !== "accepted") return omitted("current_policy_denied");
+  const policy = evaluateOwnerCommentRawSpacePolicy(input.space, config.config.issueIds);
+  if (!policy.allowed || row.owner_user_id !== config.config.ownerUserId
+    || row.policy_sha256 !== config.config.policySha256) return omitted("current_policy_denied");
+  const occurredAt = dateMs(input.comment.createdAt) ?? NaN;
+  const current = evaluateCommentProjection([input.comment], input.comment.id, input.companyId,
+    input.issue, config.config.ownerUserId, occurredAt, config.config.maxBodyBytes,
+    { bodyHash: row.body_sha256, updatedAt: row.comment_updated_at });
+  if (!current.accepted) return omitted(`current_projection_denied:${current.reason}`);
+  return {kind: "verified" as const,
+    ...rawReadResult(input.companyId, input.comment.id, input.issue.id, stored, row, current.updatedAt)};
 }

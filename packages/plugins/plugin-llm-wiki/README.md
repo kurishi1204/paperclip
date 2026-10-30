@@ -58,9 +58,14 @@ for the same default-wiki space ID and issue. Verified bytes are bound to the
 in the comment's `rawCapture` source reference. A successful query with no
 receipt (including historical, plugin-proxy and missed-event comments) retains
 the existing current-comment source with an explicit raw-unverified warning;
-it never receives a `rawCapture` label. Known pending or edited captures omit
-that comment with a warning instead of blocking unrelated sources. Corrupt row
-identity, file integrity failures and unknown I/O errors still fail closed.
+it never receives a `rawCapture` label. Known pending captures omit that comment with a warning. For a verified row,
+stored file bytes are first checked against the row's immutable SHA independently
+of the current comment. Capture and both readers share one pure comment
+projection decision (body hash, current cap/secret policy, version and attribution)
+and one pure space-policy decision. A known current refusal omits only that
+comment in distillation; the public raw reader still rejects it. Corrupt row
+identity, actual file integrity failures and unknown DB/I/O exceptions still fail
+closed, including when the current projection would otherwise be omitted.
 A same-slug space in another wiki retains its own existing source and cannot
 borrow a default-wiki receipt. Complete warnings reach the action response,
 snapshot metadata and downstream proposals, and an incomplete-coverage notice
@@ -68,10 +73,14 @@ and warning-set hash appear in the bounded normalization text. Omitted inputs
 mark the bundle partial/clipped. These warnings require review; they do not
 claim full raw receipt, QA, model execution or wiki publication.
 The receipt fingerprint binds the owner, space, internal classification label,
-and company-reader permission. Its claim metadata keeps the original consent
-decision, issue list, and byte cap. Adding another issue to the current opt-in
-does not invalidate the earlier receipt; removing the captured issue or
-changing the owner denies current reads.
+and company-reader permission. Claim metadata retains the original consent
+decision, issue list and capture byte cap; this does not freeze later reader
+policy. Current readers re-evaluate the current cap, secret filter, projection
+and space policy. A lower cap, changed projection or partially updated profile
+keeps the stored receipt/file intact but makes that comment explicitly omitted
+from distillation, without a verified raw reference. Strict raw reads remain
+denied until the current policy and source again agree. Adding a raw issue
+before updating the profile is such a policy refusal, not storage corruption.
 
 The plugin table row is the receipt authority. Its `pending` state has no
 successful capture meaning; the currently unused `hold` enum does not itself
