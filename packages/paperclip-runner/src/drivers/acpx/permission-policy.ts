@@ -45,6 +45,12 @@ export function claudePaperclipPermissionRules(
     // submitted document and active goals before committing a decision.
     if (name === "decide_issue_approval_stage") return mode === "approve-paperclip"
       ? ["mcp__paperclip__decide_issue_approval_stage"] : [];
+    // The server exposes this tool only to the bound native completion
+    // reviewer. Its authority checks still verify the exact review, intent,
+    // company, agent and active run before accepting or rejecting the work.
+    // It is not a general governance approval or an ACP metadata exemption.
+    if (name === "resolve_review") return mode === "approve-paperclip"
+      ? ["mcp__paperclip__resolve_review"] : [];
     // Effects come from Paperclip's implementation catalog, never tool hints
     // or the provider's permission-request metadata. Unknown operations stay
     // subject to approval even when their names or annotations claim a read.

@@ -8,6 +8,14 @@ import {
 } from "./permission-policy.js";
 
 describe("ACPX permission policy", () => {
+  it("allows only the assigned native completion review decision in approve-paperclip", () => {
+    const tools = ["resolve_review", "paperclip__resolve_review", "mcp__other__resolve_review",
+      "resolve_review_any", "decide_approval"].map(name => ({ name, annotations: { readOnlyHint: true } }));
+    expect(claudePaperclipPermissionRules(tools, "approve-paperclip")).toEqual(["mcp__paperclip__resolve_review"]);
+    expect(claudePaperclipPermissionRules(tools, "approve-reads")).toEqual([]);
+    expect(claudePaperclipPermissionRules(tools, "deny-all")).toEqual([]);
+    expect(claudePaperclipPermissionRules([], "approve-paperclip")).toEqual([]);
+  });
   it("allows the assigned task approval-stage tool only in approve-paperclip, keeping general approvals closed", () => {
     const tools = ["decide_issue_approval_stage", "decide_approval", "mcp__other__decide_issue_approval_stage"].map(name => ({ name }));
     expect(claudePaperclipPermissionRules(tools, "approve-paperclip")).toEqual(["mcp__paperclip__decide_issue_approval_stage"]);
