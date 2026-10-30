@@ -20231,7 +20231,8 @@ export function heartbeatService(
 
   async function resumeCommittedNativeApprovalHandoffs() {
     const cutoff = await getWorktreeExecutionCutoff();
-    const pending = await db.select({ wake: agentWakeupRequests, sourceRun: heartbeatRuns,
+    const scanStartedAt = new Date();
+    const readPage = (after: { requestedAt: Date; id: string } | null) => db.select({ wake: agentWakeupRequests, sourceRun: heartbeatRuns,
       decisionId: issueExecutionDecisions.id }).from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
@@ -20248,6 +20249,9 @@ export function heartbeatService(
         eq(nativeRunFinalizations.runId, heartbeatRuns.id), eq(nativeRunFinalizations.phase, "committed"),
         isNull(nativeRunFinalizations.leaseOwner)))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+        lte(agentWakeupRequests.requestedAt, scanStartedAt),
+        after ? or(gt(agentWakeupRequests.requestedAt, after.requestedAt),
+          and(eq(agentWakeupRequests.requestedAt, after.requestedAt), gt(agentWakeupRequests.id, after.id))) : undefined,
         isNull(issues.executionRunId), isNull(issues.checkoutRunId), isNull(issues.assigneeUserId),
         eq(issues.status, "in_progress"),
         sql`${issues.executionState}->>'status' = 'changes_requested'`,
@@ -20255,14 +20259,24 @@ export function heartbeatService(
         sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'execution_changes_requested'`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).limit(50);
-    for (const { wake, sourceRun, decisionId } of pending) {
-      if (liveRunExecutions.has(sourceRun.id) || activeRunExecutions.has(sourceRun.id) ||
-          adapterExecutionControls.has(sourceRun.id) ||
-          await readQaPredecessorOwnershipHold(db, wake.companyId, String(wake.payload?.issueId), undefined, sourceRun.id)) continue;
-      await releaseIssueExecutionAndPromote(sourceRun, { suppressImmediateRecovery: true,
-        nativeStageHandoff: { wakeId: wake.id, decisionId } }).catch(err => {
-        logger.warn({ err, queueId: wake.id }, "failed to promote committed native approval handoff");
-      });
+    let cursor: { requestedAt: Date; id: string } | null = null;
+    // Page through the fixed-time candidate set instead of revisiting only
+    // its oldest held rows. Do not rotate or rewrite those original receipts.
+    for (;;) {
+      const pending = await readPage(cursor);
+      if (!pending.length) return;
+      const last = pending[pending.length - 1].wake;
+      cursor = { requestedAt: last.requestedAt, id: last.id };
+      for (const { wake, sourceRun, decisionId } of pending) {
+        if (liveRunExecutions.has(sourceRun.id) || activeRunExecutions.has(sourceRun.id) ||
+            adapterExecutionControls.has(sourceRun.id) ||
+            await readQaPredecessorOwnershipHold(db, wake.companyId, String(wake.payload?.issueId), undefined, sourceRun.id)) continue;
+        await releaseIssueExecutionAndPromote(sourceRun, { suppressImmediateRecovery: true,
+          nativeStageHandoff: { wakeId: wake.id, decisionId } }).catch(err => {
+          logger.warn({ err, queueId: wake.id }, "failed to promote committed native approval handoff");
+        });
+      }
+      if (pending.length < 50) return;
     }
   }
 

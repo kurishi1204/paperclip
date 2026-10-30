@@ -2286,6 +2286,60 @@ describe("issue comment reopen routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])(
+    "validates pending-stage PATCH resume before interrupt effects (readable=%s)",
+    async readable => {
+      const participant = { type: "agent" as const, agentId: "22222222-2222-4222-8222-222222222222" };
+      const policy = (await normalizePolicy({ stages: [{
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", type: "approval", participants: [participant],
+      }] }))!;
+      const pending = readable ? {
+        status: "pending", currentStageId: policy.stages[0].id,
+        currentStageIndex: 0, currentStageType: "approval", currentParticipant: participant,
+        returnAssignee: null, completedStageIds: [], lastDecisionId: null,
+        lastDecisionOutcome: null, changesRequestedCount: 0,
+      } : { status: "pending" };
+      const issue = {
+        ...makeIssue("blocked"), executionRunId: "run-1",
+        executionPolicy: policy, executionState: pending,
+      };
+      let runStatus = "running";
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+      );
+      mockHeartbeatService.getRun.mockImplementation(async () => ({
+        id: "run-1", companyId: "company-1", agentId: participant.agentId, status: runStatus,
+      }));
+      mockHeartbeatService.cancelRun.mockImplementation(async () => {
+        runStatus = "cancelled";
+        return { id: "run-1", companyId: "company-1", agentId: participant.agentId, status: runStatus };
+      });
+
+      const res = await request(await installActor(createApp()))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ comment: "Continue the current stage", resume: true, interrupt: true });
+
+      expect(res.status).toBe(readable ? 200 : 422);
+      expect(runStatus).toBe(readable ? "cancelled" : "running");
+      const cancellationLogs = mockLogActivity.mock.calls.filter(([, entry]) =>
+        entry.action === "heartbeat.cancelled",
+      );
+      expect(cancellationLogs).toHaveLength(readable ? 1 : 0);
+      if (!readable) {
+        expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+        expect(mockIssueService.update).not.toHaveBeenCalled();
+        expect(mockIssueService.addComment).not.toHaveBeenCalled();
+        expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      } else {
+        expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+        expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject({ status: "in_review" });
+        expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+        expect(mockTxInsertValues).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   it("explicit same-agent resume works through the PATCH comment path", async () => {
     const issue = makeIssue("done");
     mockIssueService.getById.mockResolvedValue(issue);

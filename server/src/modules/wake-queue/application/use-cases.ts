@@ -810,6 +810,15 @@ export type { AdmitWakeBehindIssueExecutionResult };
  * it into that run (coalesce), hold it behind the run (defer), or leave it
  * for the caller to queue as an ordinary wake (proceed).
  */
+// A committed approval return is an independent stage continuation. Its
+// requester is evidence, so neither ordinary input nor the stage wake may
+// absorb the other's durable receipt. This classification grants no authority.
+function isApprovalReturnReceipt(context: Record<string, unknown>): boolean {
+  const stage = parseObject(context.executionStage);
+  return context.source === "issue.execution_stage" && context.wakeReason === "execution_changes_requested" &&
+    stage.stageType === "approval" && stage.wakeRole === "executor";
+}
+
 export function createAdmitWakeBehindIssueExecution(deps: {
   reader: WakeAdmissionReader;
   writer: WakeAdmissionWriter;
@@ -871,9 +880,11 @@ export function createAdmitWakeBehindIssueExecution(deps: {
       readNonEmptyString(input.payload?.qaDecisionId) ||
       input.idempotencyKey?.startsWith("qa-decision:"),
     );
+    const approvalReturnReceipt = isApprovalReturnReceipt(input.contextSnapshot);
     const activeContext = parseObject(input.activeExecutionRun.contextSnapshot);
     const decision = decideWakeAdmission({
-      allowRunCoalescing: interactionReceipt || qaReceipt || activeContext.interactionId ||
+      allowRunCoalescing: interactionReceipt || qaReceipt || approvalReturnReceipt ||
+        isApprovalReturnReceipt(activeContext) || activeContext.interactionId ||
         readNonEmptyString(activeContext.qaDecisionId)
         ? false : input.allowRunCoalescing,
       sameDurableActor,
@@ -917,7 +928,7 @@ export function createAdmitWakeBehindIssueExecution(deps: {
     // existing deferred wake, so the coalesce path (the common path) never
     // pays for this query.
     const existingDeferred =
-      (interactionReceipt || qaReceipt || input.allowRunCoalescing === false)
+      (interactionReceipt || qaReceipt || approvalReturnReceipt || input.allowRunCoalescing === false)
         ? null
         : await deps.reader.findExistingDeferredWake(scope, {
             companyId: input.companyId,

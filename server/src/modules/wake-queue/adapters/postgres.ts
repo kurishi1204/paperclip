@@ -885,6 +885,14 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             sql`btrim(coalesce(${agentWakeupRequests.payload} ->> 'qaDecisionId', '')) = ''`,
             sql`btrim(coalesce(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'qaDecisionId', '')) = ''`,
             sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'qa-decision:%'`,
+            // Approval return receipts must also survive later ordinary input.
+            // Match the application projection; this is isolation, not authority.
+            sql`not (
+              coalesce(${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,source}', '') = 'issue.execution_stage'
+              and coalesce(${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}', '') = 'execution_changes_requested'
+              and coalesce(${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,executionStage,stageType}', '') = 'approval'
+              and coalesce(${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,executionStage,wakeRole}', '') = 'executor'
+            )`,
             ...(durableActor
               ? [
                   durableActor.type === null

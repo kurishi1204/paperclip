@@ -13512,6 +13512,17 @@ export function issueRoutes(
       )
         return;
 
+      if (
+        commentBody &&
+        effectiveMoveToTodoRequested &&
+        (isClosed ||
+          (isBlocked && !hasUnresolvedFirstClassBlockers) ||
+          shouldResumeInProgressScheduledRetry) &&
+        updateFields.status === undefined
+      ) {
+        updateFields.status = resolveIssueResumeStatus(existing);
+      }
+
       if (interruptRequested) {
         if (!commentBody) {
           res.status(400).json({
@@ -13566,16 +13577,6 @@ export function issueRoutes(
 
       if (hiddenAtRaw !== undefined) {
         updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
-      }
-      if (
-        commentBody &&
-        effectiveMoveToTodoRequested &&
-        (isClosed ||
-          (isBlocked && !hasUnresolvedFirstClassBlockers) ||
-          shouldResumeInProgressScheduledRetry) &&
-        updateFields.status === undefined
-      ) {
-        updateFields.status = resolveIssueResumeStatus(existing);
       }
       let cancelledScheduledRetryRunId: string | null = null;
       if (
