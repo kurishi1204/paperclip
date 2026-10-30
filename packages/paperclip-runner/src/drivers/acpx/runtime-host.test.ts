@@ -299,6 +299,60 @@ describe("ACPX runtime host", () => {
     await host.close({ reason: "read permission verified" });
   });
 
+  it.each([
+    ["resolve_review", true],
+    ["paperclip__resolve_review", true],
+    ["mcp__other__resolve_review", false],
+    ["get_task_context", false],
+  ] as const)("keeps bounded reviewer %s out of the interactive permission queue", async (name, reviewer) => {
+    const fixture = await hostFixture();
+    let receivedTurn: Parameters<AcpxRuntimePort["startTurn"]>[0] | undefined;
+    let receivedPolicy: AcpxRuntimePortOpenOptions["permissionPolicy"] | undefined;
+    const delegate = vi.fn(async () => ({ outcome: "reject_once" as const }));
+    const host = await AcpxRuntimeHost.open({
+      ...fixture.options, agent: "claude", model: "claude-sonnet-5",
+      permissionMode: "approve-paperclip",
+      semanticTools: { tools: [{ name, inputSchema: { type: "object" } }], handler: async () => ({}) },
+    }, fixture.dependencies({ openRuntime: async options => {
+      receivedPolicy = options.permissionPolicy;
+      return runtimePort({
+        getStatus: async () => ({ models: { currentModelId: "claude-sonnet-5" } }),
+        startTurn: input => { receivedTurn = input; return runtimeTurn(); },
+      });
+    } }));
+    try {
+      host.startTurn({ text: "Review the assigned document", requestId: "review-turn", onPermissionRequest: delegate });
+      const handler = receivedTurn!.onPermissionRequest!;
+      const controller = new AbortController();
+      for (const toolName of ["Terminal", "mcp__paperclip__resolve_review"]) {
+        const request = { sessionId: "backend-1", inferredKind: "read", raw: {
+          options: [{ kind: "reject_once", optionId: "deny-once", name: "Deny" }],
+          toolCall: { toolCallId: "test-call", name: toolName, rawInput: { command: "jq . mcp.json" } },
+        } } as Parameters<typeof handler>[0];
+        expect(await handler(request, { signal: controller.signal } as Parameters<typeof handler>[1]))
+          .toEqual({ outcome: "reject_once" });
+      }
+      // Provider-supplied names cannot reach a human or acquire authority in
+      // the bounded review. Normal workers keep their existing callback.
+      expect(delegate).toHaveBeenCalledTimes(reviewer ? 0 : 2);
+      expect(receivedPolicy!.defaultAction).toBe(reviewer ? "deny" : "escalate");
+      if (reviewer) {
+        for (const options of [[], [{ kind: "allow_once", optionId: "allow", name: "Allow" }],
+          [{ kind: "reject_always", optionId: "reject-always", name: "Reject always" }]]) {
+          expect(await handler({ sessionId: "backend-1", raw: { options,
+            toolCall: { toolCallId: "unsupported-reject", title: "Terminal" },
+          } } as Parameters<typeof handler>[0], { signal: controller.signal } as Parameters<typeof handler>[1]))
+            .toEqual({ outcome: "cancel" });
+        }
+        expect(delegate).not.toHaveBeenCalled();
+        controller.abort();
+        expect(await handler({} as Parameters<typeof handler>[0], {
+          signal: controller.signal,
+        } as Parameters<typeof handler>[1])).toEqual({ outcome: "cancel" });
+      }
+    } finally { await host.close({ reason: "reviewer permission checked" }); }
+  });
+
   it("loads assigned Claude skills before launch and refreshes them when reopening", async () => {
     const fixture = await hostFixture();
     const skillRoot = join(fixture.root, "assigned-source");

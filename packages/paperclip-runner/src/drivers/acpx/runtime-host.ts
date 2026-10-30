@@ -40,7 +40,8 @@ import {
   requireVerifiedAcpxModel,
   type AcpxModelStatus,
 } from "./model-verification.js";
-import { acpxRuntimePermissionPolicy } from "./permission-policy.js";
+import { acpxRuntimePermissionPolicy, hasNativeCompletionReviewTool } from "./permission-policy.js";
+import { normalizeAcpxPermission } from "./acp-permission-adapter.js";
 import {
   resolveQualifiedAcpxProfile,
   type QualifiedAcpxAgent,
@@ -284,6 +285,7 @@ export class AcpxRuntimeHost {
   readonly #command: VerifiedAcpxCommandLease;
   readonly #toolBridge: RunnerToolBridge | null;
   readonly #claudeSkillNames: readonly string[];
+  readonly #rejectAdditionalPermissions: boolean;
   readonly #assertAgentFilesHeld: (() => void) | undefined;
   #activeTurn: AcpxRuntimeTurn | null = null;
   #activeTurnInterruption: AcpxRuntimeTurn["cancel"] | null = null;
@@ -300,6 +302,7 @@ export class AcpxRuntimeHost {
     command: VerifiedAcpxCommandLease;
     toolBridge: RunnerToolBridge | null;
     claudeSkillNames: readonly string[];
+    rejectAdditionalPermissions: boolean;
     assertAgentFilesHeld?: () => void;
   }) {
     this.#runtime = input.runtime;
@@ -310,6 +313,7 @@ export class AcpxRuntimeHost {
     this.#command = input.command;
     this.#toolBridge = input.toolBridge;
     this.#claudeSkillNames = [...input.claudeSkillNames];
+    this.#rejectAdditionalPermissions = input.rejectAdditionalPermissions;
     this.#assertAgentFilesHeld = input.assertAgentFilesHeld;
   }
 
@@ -348,6 +352,11 @@ export class AcpxRuntimeHost {
     if (options.expectedIdentity) {
       verifyExpectedAcpxIdentity(options.expectedIdentity, binding, null);
     }
+    // Use the admitted mode, as the sandbox's SDK rules do. The trusted
+    // server-assigned catalog, never provider metadata, identifies a reviewer.
+    const rejectAdditionalPermissions = options.agent === "claude"
+      && binding.permissionMode === "approve-paperclip"
+      && hasNativeCompletionReviewTool(options.semanticTools?.tools ?? []);
     options.assertWorkspaceHeld?.();
     if (
       options.agent !== "codex" &&
@@ -564,7 +573,7 @@ export class AcpxRuntimeHost {
             providerSessionKey: binding.profileSessionKey,
             permissionMode: binding.permissionMode,
             mode: binding.mode,
-            permissionPolicy: acpxRuntimePermissionPolicy(
+            permissionPolicy: rejectAdditionalPermissions ? { defaultAction: "deny" } : acpxRuntimePermissionPolicy(
               binding.permissionMode,
             ),
             launchEnvironment,
@@ -650,6 +659,7 @@ export class AcpxRuntimeHost {
         credential,
         command,
         toolBridge,
+        rejectAdditionalPermissions,
         assertAgentFilesHeld: agentFiles?.assertHeld,
         claudeSkillNames: options.agent === "claude"
           ? (options.runtimeContext?.skills.map((skill) => skill.runtimeName) ?? [])
@@ -793,7 +803,20 @@ export class AcpxRuntimeHost {
       requestId,
       ...(input.signal ? { signal: input.signal } : {}),
       ...(input.onElicitation ? { onElicitation: input.onElicitation } : {}),
-      ...(input.onPermissionRequest ? { onPermissionRequest: input.onPermissionRequest } : {}),
+      // ACPX invokes this callback before its defaultAction policy. Replacing
+      // only the latter would still enqueue a human approval and hang QA.
+      ...(this.#rejectAdditionalPermissions
+        ? { onPermissionRequest: async (request, context) => {
+            if (context.signal.aborted) return { outcome: "cancel" as const };
+            try {
+              return normalizeAcpxPermission(request).resolve({ action: "decline" });
+            } catch {
+              // Missing, ambiguous or malformed reject options cannot grant
+              // authority or enter the human queue. Cancel this request only.
+              return { outcome: "cancel" as const };
+            }
+          } }
+        : input.onPermissionRequest ? { onPermissionRequest: input.onPermissionRequest } : {}),
       ...(input.onExtensionRequest ? { onExtensionRequest: input.onExtensionRequest } : {}),
       ...(input.onExtensionNotification ? { onExtensionNotification: input.onExtensionNotification } : {}),
     });
