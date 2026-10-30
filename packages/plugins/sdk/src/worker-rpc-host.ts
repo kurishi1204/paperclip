@@ -519,6 +519,10 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           });
         },
 
+        async createTextExclusive(companyId: string, folderKey: string, relativePath: string, contents: string) {
+          return callHost("localFolders.createTextExclusive", { companyId, folderKey, relativePath, contents });
+        },
+
         async deleteFile(companyId: string, folderKey: string, relativePath: string) {
           return callHost("localFolders.deleteFile", { companyId, folderKey, relativePath });
         },

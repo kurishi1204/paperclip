@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
+import type { Issue, IssueComment } from "@paperclipai/plugin-sdk";
 import {
   activityLog,
   agentWakeupRequests,
@@ -23,6 +25,8 @@ import {
   issueThreadInteractions,
   issues,
   pluginManagedResources,
+  pluginDatabaseNamespaces,
+  pluginMigrations,
   plugins,
   projects,
 } from "@paperclipai/db";
@@ -31,8 +35,14 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
+import { derivePluginDatabaseNamespace, pluginDatabaseService } from "../services/plugin-database.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import wikiManifest, { WIKI_ROOT_FOLDER_KEY } from "../../../packages/plugins/plugin-llm-wiki/src/manifest.js";
+import { issueService } from "../services/issues.js";
+import { logActivity, type ActivityPublication } from "../services/activity-log.js";
+import { createPaperclipDistillationRun } from "../../../packages/plugins/plugin-llm-wiki/src/wiki/core.js";
+import { captureOwnerCommentRaw, readOwnerCommentRaw } from "../../../packages/plugins/plugin-llm-wiki/src/wiki/owner-comment-raw.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -56,6 +66,15 @@ if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres plugin orchestration API tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
+}
+
+// This new SQL receipt is a required CI acceptance test. Keep the older suite's
+// local unsupported-host skip policy, but fail CI rather than report zero SQL
+// assertions as a successful run when the embedded engine cannot start.
+if (process.env.CI && process.env.CI !== "false" && !embeddedPostgresSupport.supported) {
+  it("requires embedded PostgreSQL for the owner comment raw SQL contract in CI", () => {
+    throw new Error(`Owner comment raw SQL contract did not run: ${embeddedPostgresSupport.reason ?? "embedded PostgreSQL unsupported"}`);
+  });
 }
 
 describeEmbeddedPostgres("plugin orchestration APIs", () => {
@@ -94,8 +113,6 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
   }
 
   afterEach(async () => {
-    await Promise.all(tempRoots.map((root) => fs.rm(root, { recursive: true, force: true })));
-    tempRoots.length = 0;
     // Await every in-flight background heartbeat run to quiescence before the
     // deletes below. A createComment-triggered wakeup dispatches its run
     // fire-and-forget (void heartbeat.wakeup(...)), so a run or wakeup can still
@@ -104,6 +121,21 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     // promises in module state shared across service instances, so a fresh
     // instance here drains the runs the per-test host services dispatched.
     await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await Promise.all(tempRoots.map((root) => fs.rm(root, { recursive: true, force: true })));
+    tempRoots.length = 0;
+    // Installations are recreated per test. Removing their ledger rows alone
+    // leaves SQL objects behind and makes the next real migration collide.
+    // Enumerate registered namespaces in this isolated test database before
+    // deleting the installations that own them.
+    const namespaces = await db.select().from(pluginDatabaseNamespaces);
+    for (const { namespaceName } of namespaces) {
+      if (!/^plugin_[a-z0-9_]+$/.test(namespaceName)) {
+        throw new Error("Unexpected plugin test namespace");
+      }
+      await db.execute(sql`DROP SCHEMA IF EXISTS ${sql.identifier(namespaceName)} CASCADE`);
+    }
+    await db.delete(pluginMigrations);
+    await db.delete(pluginDatabaseNamespaces);
     await db.delete(costEvents);
     await deleteHeartbeatRunsWithDependents();
     await db.delete(agentWakeupRequests);
@@ -421,7 +453,356 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await expect(fs.stat(path.join(root, "raw"))).resolves.toMatchObject({});
     await expect(fs.stat(path.join(root, "wiki/concepts"))).resolves.toMatchObject({});
     await expect(fs.readFile(path.join(root, "WIKI.md"), "utf8")).resolves.toBe("# Wiki\n");
+    const exclusiveFirst = await services.localFolders.createTextExclusive({
+      companyId, folderKey: "wiki-root", relativePath: "raw/capture.txt", contents: "first",
+    });
+    const exclusiveSecond = await services.localFolders.createTextExclusive({
+      companyId, folderKey: "wiki-root", relativePath: "raw/capture.txt", contents: "different",
+    });
+    expect([exclusiveFirst.created, exclusiveSecond.created]).toEqual([true, false]);
+    expect(exclusiveFirst.status.folderKey).toBe("wiki-root");
+    await expect(fs.readFile(path.join(root, "raw/capture.txt"), "utf8")).resolves.toBe("first");
+    await expect(services.localFolders.createTextExclusive({
+      companyId: randomUUID(), folderKey: "wiki-root", relativePath: "raw/other.txt", contents: "other",
+    })).rejects.toThrow();
   });
+
+  it("applies owner raw migration and enforces real SQL capture, readback, and tenant constraints", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({
+      id: otherCompanyId, name: "Other synthetic company", issuePrefix: issuePrefix(otherCompanyId),
+      requireBoardApprovalForNewAgents: false,
+    });
+    const pluginId = randomUUID();
+    await db.insert(plugins).values({
+      id: pluginId, pluginKey: wikiManifest.id, packageName: "@paperclipai/plugin-llm-wiki",
+      version: wikiManifest.version, apiVersion: wikiManifest.apiVersion,
+      categories: wikiManifest.categories, manifestJson: wikiManifest, status: "installed", installOrder: 1,
+    });
+    const repoRoot = path.basename(process.cwd()) === "server" ? path.resolve(process.cwd(), "..") : process.cwd();
+    const pluginRoot = path.join(repoRoot, "packages/plugins/plugin-llm-wiki");
+    const pluginDb = pluginDatabaseService(db);
+    const applied = await pluginDb.applyMigrations(pluginId, wikiManifest, pluginRoot);
+    const namespace = derivePluginDatabaseNamespace(wikiManifest.id, wikiManifest.database?.namespaceSlug);
+    expect(applied?.namespaceName).toBe(namespace);
+    expect((await db.select().from(pluginMigrations).where(eq(pluginMigrations.pluginId, pluginId)))
+      .map((row) => row.migrationKey)).toContain("004_owner_comment_raw.sql");
+
+    const issueId = randomUUID(), commentId = randomUUID(), spaceId = randomUUID(), otherSpaceId = randomUUID();
+    const owner = "synthetic-owner", body = "Synthetic owner note for SQL receipt verification.";
+    const occurredAt = new Date().toISOString();
+    const ingestionProfile = { version: 1, enabled: true,
+      sourceScopes: [{ kind: "root_issues", issueIds: [issueId] }],
+      sourceKinds: { issues: false, comments: true, documents: false, attachments: "off", workProducts: "off" },
+      cursor: { maxWindowCharacters: 60000, maxCharactersPerSource: 12000, minSourceAgeMinutes: 15,
+        maxWindowsPerRun: 6, staleAfterHours: 72 }, backfill: { requireManualQueue: true } };
+    for (const [spaceCompanyId, id] of [[companyId, spaceId], [otherCompanyId, otherSpaceId]] as const) {
+      await db.execute(sql`INSERT INTO ${sql.raw(`"${namespace}"."wiki_spaces"`)}
+        (id, company_id, wiki_id, slug, display_name, settings)
+        VALUES (${id}, ${spaceCompanyId}, 'default', 'owner-notes', 'Owner notes',
+          ${JSON.stringify({ paperclipIngestion: ingestionProfile })}::jsonb)`);
+    }
+    const issue: Issue = {
+      id: issueId, companyId, projectId: null, projectWorkspaceId: null, goalId: null, parentId: null,
+      title: "Synthetic owner note", description: null, status: "todo", workMode: "standard",
+      priority: "medium", reviewPolicy: null, assigneeAgentId: null, assigneeUserId: null,
+      checkoutRunId: null, executionRunId: null, executionAgentNameKey: null, executionLockedAt: null,
+      createdByAgentId: null, createdByUserId: null, responsibleUserId: null, issueNumber: null,
+      identifier: null, requestDepth: 0, billingCode: null, assigneeAdapterOverrides: null,
+      executionWorkspaceId: null, executionWorkspacePreference: null, executionWorkspaceSettings: null,
+      startedAt: null, completedAt: null, cancelledAt: null, hiddenAt: null,
+      createdAt: new Date(occurredAt), updatedAt: new Date(occurredAt),
+    };
+    const comment: IssueComment = { id: commentId, companyId, issueId, authorType: "user", authorUserId: owner,
+      authorAgentId: null, onBehalfOfUserId: null, createdByRunId: null, derivedAuthorAgentId: null,
+      derivedCreatedByRunId: null, derivedAuthorSource: null, deletedAt: null, sourceTrust: null,
+      metadata: null, presentation: null, createdAt: new Date(occurredAt), updatedAt: new Date(occurredAt),
+      body };
+    const harness = createTestHarness({ manifest: wikiManifest,
+      config: { ownerCommentRawCapture: { version: 1, enabled: true, spaceSlug: "owner-notes",
+        ownerUserId: owner, issueIds: [issueId], maxBodyBytes: 250000, allowCompanyReaders: true,
+        classification: { label: "internal", decidedByUserId: owner, decidedAt: occurredAt,
+          decisionRef: "synthetic-sql-receipt" } } } });
+    harness.seed({ issues: [issue], issueComments: [comment] });
+    harness.ctx.db.namespace = namespace;
+    harness.ctx.db.query = <T,>(statement: string, params?: unknown[]) => pluginDb.query<T>(pluginId, statement, params);
+    harness.ctx.db.execute = (statement, params) => pluginDb.execute(pluginId, statement, params);
+    const files = new Map<string, string>();
+    let creates = 0;
+    harness.ctx.localFolders.status = async () => ({ folderKey: "wiki-root", configured: true,
+      path: "/synthetic/wiki", realPath: "/synthetic/wiki", access: "readWrite", readable: true,
+      writable: true, requiredDirectories: [], requiredFiles: [], missingDirectories: [], missingFiles: [],
+      healthy: true, problems: [], checkedAt: occurredAt });
+    harness.ctx.localFolders.createTextExclusive = async (_company, _folder, relativePath, contents) => {
+      if (files.has(relativePath)) return { created: false, status: {} as never };
+      creates += 1;
+      files.set(relativePath, contents);
+      return { created: true, status: {} as never };
+    };
+    harness.ctx.localFolders.readText = async (_company, _folder, relativePath) => {
+      const content = files.get(relativePath);
+      if (content === undefined) throw new Error("synthetic missing file");
+      return content;
+    };
+    const event = { eventId: randomUUID(), eventType: "issue.comment.created" as const,
+      companyId, entityId: issueId, entityType: "issue", actorType: "user" as const,
+      actorId: owner, occurredAt,
+      payload: { commentId, agentId: null, runId: null, responsibleUserId: null } };
+    expect(await captureOwnerCommentRaw(harness.ctx, event)).toBe("verified");
+    expect(await captureOwnerCommentRaw(harness.ctx, event)).toBe("verified");
+    expect(creates).toBe(1);
+    expect((await readOwnerCommentRaw(harness.ctx, companyId, commentId)).source).toBe(body);
+    await expect(readOwnerCommentRaw(harness.ctx, otherCompanyId, commentId))
+      .rejects.toThrow("owner_comment_raw_reader_row");
+
+    const table = sql.raw(`"${namespace}"."paperclip_owner_raw_captures"`);
+    const rows = await db.execute(sql`SELECT company_id, space_id, comment_id, status,
+      body_sha256, policy_sha256,
+      to_char(comment_updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS comment_updated_at
+      FROM ${table} WHERE company_id=${companyId}`);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ company_id: companyId, space_id: spaceId, comment_id: commentId,
+      status: "verified", comment_updated_at: occurredAt });
+    await expect(db.execute(sql`UPDATE ${table} SET status='invalid' WHERE company_id=${companyId}`)).rejects.toThrow();
+    await expect(db.execute(sql`INSERT INTO ${table}
+      (company_id,space_id,comment_id,issue_id,owner_user_id,body_sha256,comment_updated_at,raw_path,policy_sha256,status)
+      SELECT company_id,space_id,comment_id,issue_id,owner_user_id,body_sha256,comment_updated_at,
+        raw_path,policy_sha256,status FROM ${table} WHERE company_id=${companyId}`)).rejects.toThrow();
+    await db.execute(sql`UPDATE ${table} SET status='pending' WHERE company_id=${companyId}`);
+    const guardedUpdate = `UPDATE "${namespace}"."paperclip_owner_raw_captures"
+      SET status='verified',updated_at=now() WHERE company_id=$1 AND space_id=$2 AND comment_id=$3
+      AND body_sha256=$4 AND policy_sha256=$5 AND status='pending'`;
+    const wrongPredicate = await pluginDb.execute(pluginId, guardedUpdate,
+      [companyId, spaceId, commentId, "0".repeat(64), rows[0]!.policy_sha256]);
+    expect(wrongPredicate.rowCount).toBe(0);
+    expect((await db.execute(sql`SELECT status FROM ${table} WHERE company_id=${companyId}`))[0]?.status).toBe("pending");
+    const rightPredicate = await pluginDb.execute(pluginId, guardedUpdate,
+      [companyId, spaceId, commentId, rows[0]!.body_sha256, rows[0]!.policy_sha256]);
+    expect(rightPredicate.rowCount).toBe(1);
+    expect((await readOwnerCommentRaw(harness.ctx, companyId, commentId)).source).toBe(body);
+
+    const otherCommentId = randomUUID();
+    await db.execute(sql`INSERT INTO ${table}
+      (company_id,space_id,comment_id,issue_id,owner_user_id,body_sha256,comment_updated_at,raw_path,policy_sha256,status)
+      SELECT ${otherCompanyId}, ${otherSpaceId}, ${otherCommentId}, issue_id, owner_user_id,
+        body_sha256,comment_updated_at,raw_path,policy_sha256,status
+      FROM ${table} WHERE company_id=${companyId}`);
+    expect(await db.execute(sql`SELECT comment_id FROM ${table} WHERE company_id=${otherCompanyId}`)).toHaveLength(1);
+    await db.execute(sql`DELETE FROM ${sql.raw(`"${namespace}"."wiki_spaces"`)} WHERE id=${otherSpaceId}`);
+    expect(await db.execute(sql`SELECT comment_id FROM ${table} WHERE company_id=${otherCompanyId}`)).toHaveLength(0);
+    await db.delete(agents).where(eq(agents.id, agentId));
+    expect(await db.execute(sql`SELECT comment_id FROM ${table} WHERE company_id=${companyId}`)).toHaveLength(1);
+    await db.delete(companies).where(eq(companies.id, companyId));
+    expect(await db.execute(sql`SELECT comment_id FROM ${table} WHERE company_id=${companyId}`)).toHaveLength(0);
+  }, 90_000);
+
+  it("captures a real board-user comment through activity, host file, and PostgreSQL receipt", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const owner = "synthetic-owner";
+    const issueId = randomUUID();
+    const spaceId = randomUUID();
+    const body = "A synthetic owner note with no external data.";
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Synthetic owner capture", status: "todo", priority: "medium",
+    });
+    const pluginId = randomUUID();
+    await db.insert(plugins).values({
+      id: pluginId, pluginKey: wikiManifest.id, packageName: "@paperclipai/plugin-llm-wiki",
+      version: wikiManifest.version, apiVersion: wikiManifest.apiVersion,
+      categories: wikiManifest.categories, manifestJson: wikiManifest, status: "installed", installOrder: 1,
+    });
+    const repoRoot = path.basename(process.cwd()) === "server" ? path.resolve(process.cwd(), "..") : process.cwd();
+    const pluginRoot = path.join(repoRoot, "packages/plugins/plugin-llm-wiki");
+    const pluginDb = pluginDatabaseService(db);
+    await pluginDb.applyMigrations(pluginId, wikiManifest, pluginRoot);
+    const namespace = derivePluginDatabaseNamespace(wikiManifest.id, wikiManifest.database?.namespaceSlug);
+    const profile = { version: 1, enabled: true,
+      sourceScopes: [{ kind: "root_issues", issueIds: [issueId] }],
+      sourceKinds: { issues: false, comments: true, documents: false, attachments: "off", workProducts: "off" },
+      cursor: { maxWindowCharacters: 60000, maxCharactersPerSource: 12000, minSourceAgeMinutes: 15,
+        maxWindowsPerRun: 6, staleAfterHours: 72 }, backfill: { requireManualQueue: true } };
+    await db.execute(sql`INSERT INTO ${sql.raw(`"${namespace}"."wiki_spaces"`)}
+      (id, company_id, wiki_id, slug, display_name, path_prefix, settings)
+      VALUES (${spaceId}, ${companyId}, 'default', 'owner-notes', 'Owner notes',
+        'spaces/owner-notes',
+        ${JSON.stringify({ paperclipIngestion: profile })}::jsonb)`);
+
+    const root = await makeLocalRoot();
+    const folder = wikiManifest.localFolders?.find((item) => item.folderKey === WIKI_ROOT_FOLDER_KEY);
+    if (!folder) throw new Error("Wiki root declaration missing");
+    for (const directory of folder.requiredDirectories ?? []) {
+      await fs.mkdir(path.join(root, directory), { recursive: true });
+    }
+    for (const file of folder.requiredFiles ?? []) {
+      const absolute = path.join(root, file);
+      await fs.mkdir(path.dirname(absolute), { recursive: true });
+      await fs.writeFile(absolute, "# Synthetic fixture\n");
+    }
+    const host = buildHostServices(db, pluginId, wikiManifest.id, createEventBusStub(), undefined,
+      { manifest: wikiManifest });
+    const configured = await host.localFolders.configure({
+      companyId, folderKey: WIKI_ROOT_FOLDER_KEY, path: root, access: "readWrite",
+      requiredDirectories: folder.requiredDirectories, requiredFiles: folder.requiredFiles,
+    });
+    expect(configured.healthy).toBe(true);
+    const comment = await issueService(db).addComment(issueId, body, { userId: owner });
+    const savedComment = (await host.issues.listComments({ issueId, companyId }))
+      .find((item) => item.id === comment.id);
+    expect(savedComment).toMatchObject({
+      id: comment.id, companyId, issueId, authorType: "user", authorUserId: owner,
+      authorAgentId: null, createdByRunId: null, metadata: null, presentation: null,
+      sourceTrust: null, body,
+    });
+    expect(new Date(savedComment!.createdAt).getTime()).toBe(new Date(savedComment!.updatedAt).getTime());
+    const publications: ActivityPublication[] = [];
+    await logActivity(db, {
+      companyId, actorType: "user", actorId: owner, action: "issue.comment_added",
+      entityType: "issue", entityId: issueId, details: { commentId: comment.id },
+    }, publications);
+    expect(publications).toHaveLength(1);
+    const event = publications[0]!.pluginEvent;
+    expect(event).toMatchObject({ eventType: "issue.comment.created", companyId,
+      entityType: "issue", entityId: issueId, actorType: "user", actorId: owner,
+      payload: { commentId: comment.id, agentId: null, runId: null, responsibleUserId: owner },
+    });
+    if (!event) throw new Error("Activity did not create a plugin event");
+
+    const harness = createTestHarness({ manifest: wikiManifest, config: {
+      ownerCommentRawCapture: { version: 1, enabled: true, spaceSlug: "owner-notes",
+        ownerUserId: owner, issueIds: [issueId], maxBodyBytes: 250000, allowCompanyReaders: true,
+        classification: { label: "internal", decidedByUserId: owner,
+          decidedAt: event.occurredAt, decisionRef: "synthetic-real-path" } },
+    } });
+    harness.ctx.db.namespace = namespace;
+    harness.ctx.db.query = <T,>(statement: string, params?: unknown[]) => pluginDb.query<T>(pluginId, statement, params);
+    harness.ctx.db.execute = (statement, params) => pluginDb.execute(pluginId, statement, params);
+    harness.ctx.issues.get = (id, company) => host.issues.get({ issueId: id, companyId: company });
+    harness.ctx.issues.listComments = (id, company) => host.issues.listComments({ issueId: id, companyId: company });
+    harness.ctx.localFolders.status = (company, folderKey) => host.localFolders.status({ companyId: company, folderKey });
+    harness.ctx.localFolders.createTextExclusive = (company, folderKey, relativePath, contents) =>
+      host.localFolders.createTextExclusive({ companyId: company, folderKey, relativePath, contents });
+    harness.ctx.localFolders.readText = (company, folderKey, relativePath) =>
+      host.localFolders.readText({ companyId: company, folderKey, relativePath });
+
+    expect(await Promise.all([
+      captureOwnerCommentRaw(harness.ctx, event),
+      captureOwnerCommentRaw(harness.ctx, event),
+    ])).toEqual(["verified", "verified"]);
+    const received = await readOwnerCommentRaw(harness.ctx, companyId, comment.id);
+    expect(received.source).toBe(body);
+    expect(received.receipt.status).toBe("verified");
+    expect(received.receipt.rawPath).toBe(
+      `spaces/owner-notes/.paperclip/owner-comment-raw/${spaceId}/${comment.id}/${received.receipt.bodySha256}.txt`,
+    );
+    const leaf = path.join(root, received.receipt.rawPath);
+    expect(await fs.readFile(leaf, "utf8")).toBe(body);
+    expect((await fs.stat(leaf)).mode & 0o777).toBe(0o600);
+    const rows = await db.execute(sql`SELECT status, comment_id FROM
+      ${sql.raw(`"${namespace}"."paperclip_owner_raw_captures"`)} WHERE company_id=${companyId}`);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: "verified", comment_id: comment.id });
+    expect(await fs.readdir(path.dirname(leaf))).toEqual([path.basename(leaf)]);
+    harness.ctx.issues.getSubtree = async () => ({
+      rootIssueId: issueId, issues: [await host.issues.get({ issueId, companyId })],
+      relations: [], documents: [], assignees: [],
+    } as never);
+    const normalization = await createPaperclipDistillationRun(harness.ctx, {
+      companyId, spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    });
+    expect(normalization.status).toBe("source_ready");
+    const sourceRef = normalization.bundle.sourceRefs.find(ref => ref.commentId === comment.id);
+    expect(sourceRef?.rawCapture).toMatchObject({ status: "verified",
+      bodySha256: received.receipt.bodySha256, bodyBytes: Buffer.byteLength(body),
+      commentUpdatedAt: received.receipt.commentUpdatedAt, rawPath: received.receipt.rawPath });
+    const snapshots = await db.execute(sql`SELECT source_hash, source_refs, bundle_markdown FROM
+      ${sql.raw(`"${namespace}"."paperclip_source_snapshots"`)}
+      WHERE company_id=${companyId} AND id=${normalization.snapshotId}`);
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]!.source_hash).toBe(normalization.bundle.sourceHash);
+    expect(snapshots[0]!.source_refs).toEqual(normalization.bundle.sourceRefs);
+    expect(snapshots[0]!.bundle_markdown).toContain(body);
+    expect(await fs.readFile(leaf, "utf8")).toBe(received.source);
+    const pages = await db.execute(sql`SELECT id FROM ${sql.raw(`"${namespace}"."wiki_pages"`)}
+      WHERE company_id=${companyId}`);
+    expect(pages).toHaveLength(0);
+    const originalConfig = await harness.ctx.config.get(companyId);
+    const optin = originalConfig.ownerCommentRawCapture as Record<string, unknown>;
+    harness.setConfig({ ...originalConfig, ownerCommentRawCapture: { ...optin, maxBodyBytes: 1 } });
+    const capped = await createPaperclipDistillationRun(harness.ctx, {
+      companyId, spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    });
+    expect(capped.bundle.sourceRefs.some(ref => ref.commentId === comment.id)).toBe(false);
+    expect(capped.bundle.warnings.some(w => w.includes("current_projection_denied:body_denied"))).toBe(true);
+    // Even a known policy refusal cannot hide independently corrupted storage.
+    await fs.writeFile(leaf, "Synthetic corrupted file");
+    await expect(createPaperclipDistillationRun(harness.ctx, {
+      companyId, spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    })).rejects.toThrow("file_integrity");
+    await fs.writeFile(leaf, body);
+    harness.setConfig(originalConfig);
+    const originalListComments = harness.ctx.issues.listComments;
+    harness.ctx.issues.listComments = async (...args) => (await originalListComments(...args)).map(c =>
+      c.id === comment.id ? { ...c, body: "Synthetic redacted current projection" } : c);
+    const projected = await createPaperclipDistillationRun(harness.ctx, {
+      companyId, spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    });
+    expect(projected.bundle.sourceRefs.some(ref => ref.commentId === comment.id)).toBe(false);
+    expect(projected.bundle.warnings.some(w => w.includes("current_projection_denied:reader_version"))).toBe(true);
+    harness.ctx.issues.listComments = originalListComments;
+    harness.setConfig({ ...originalConfig, ownerCommentRawCapture: { ...optin, issueIds: [issueId, randomUUID()] } });
+    const policyChanged = await createPaperclipDistillationRun(harness.ctx, {
+      companyId, spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    });
+    expect(policyChanged.bundle.sourceRefs.some(ref => ref.commentId === comment.id)).toBe(false);
+    expect(policyChanged.bundle.warnings.some(w => w.includes("current_policy_denied"))).toBe(true);
+    harness.setConfig(originalConfig);
+    expect(await fs.readFile(leaf, "utf8")).toBe(body);
+    const unreceived = await issueService(db).addComment(issueId, "Synthetic unreceived source", { userId: owner });
+    const direct = await createPaperclipDistillationRun(harness.ctx, {
+      companyId, spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    });
+    expect(direct.bundle.sourceRefs.find(ref => ref.commentId === unreceived.id)?.rawCapture).toBeUndefined();
+    expect(direct.bundle.markdown).toContain("Synthetic unreceived source");
+    expect(direct.bundle.warnings).toContain(`Owner raw coverage: comment ${unreceived.id} has no received raw; using the existing comment projection without raw verification.`);
+    await db.update(issueComments).set({ body: "Synthetic edited source", updatedAt: new Date(Date.now() + 1000) }).where(eq(issueComments.id, comment.id));
+    const partial = await createPaperclipDistillationRun(harness.ctx, {
+      companyId, spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    });
+    expect(partial.bundle.sourceRefs.some(ref => ref.commentId === comment.id)).toBe(false);
+    expect(partial.bundle.markdown).toContain("Partial source input");
+    expect(partial.bundle.markdown).not.toContain("Synthetic edited source");
+    const partialRows = await db.execute(sql`SELECT metadata, bundle_markdown FROM
+      ${sql.raw(`"${namespace}"."paperclip_source_snapshots"`)} WHERE id=${partial.snapshotId}`);
+    expect((partialRows[0]!.metadata as { sourceWarnings: string[] }).sourceWarnings).toEqual(partial.bundle.warnings);
+    expect(partialRows[0]!.bundle_markdown).toBe(partial.bundle.markdown);
+    const otherSpaceId = randomUUID();
+    await db.execute(sql`INSERT INTO ${sql.raw(`"${namespace}"."wiki_spaces"`)}
+      (id, company_id, wiki_id, slug, display_name, path_prefix, settings)
+      VALUES (${otherSpaceId}, ${companyId}, 'other-wiki', 'owner-notes', 'Other notes',
+        'spaces/other-notes', ${JSON.stringify({ paperclipIngestion: profile })}::jsonb)`);
+    const otherWiki = await createPaperclipDistillationRun(harness.ctx, {
+      companyId, wikiId: "other-wiki", spaceSlug: "owner-notes", rootIssueId: issueId, includeDocuments: false,
+    });
+    expect(otherWiki.bundle.sourceRefs.filter(ref => ref.kind === "comment").every(ref => !ref.rawCapture)).toBe(true);
+    expect(otherWiki.bundle.markdown).toContain("Synthetic edited source");
+    if (process.env.PAPERCLIP_RAW_HANDOFF_RECEIPT) {
+      await fs.writeFile(process.env.PAPERCLIP_RAW_HANDOFF_RECEIPT, JSON.stringify({
+        syntheticOnly: true, commentId: comment.id, issueId, spaceId,
+        rawBodySha256: received.receipt.bodySha256, rawBodyBytes: Buffer.byteLength(body),
+        rawPath: received.receipt.rawPath, rawFileMode: (await fs.stat(leaf)).mode & 0o777,
+        normalizationRunId: normalization.runId, normalizationSnapshotId: normalization.snapshotId,
+        normalizationSourceHash: normalization.bundle.sourceHash, rawReference: sourceRef?.rawCapture,
+        persistedSnapshotCount: snapshots.length, sharedWikiPageCount: pages.length,
+        repairedCoverage: { unreceivedWarning: direct.bundle.warnings, partialWarning: partial.bundle.warnings,
+          partialSnapshotId: partial.snapshotId, partialMarkdownSaved: partialRows[0]!.bundle_markdown === partial.bundle.markdown,
+          otherWikiSnapshotId: otherWiki.snapshotId, otherWikiHasNoBorrowedRaw: otherWiki.bundle.sourceRefs.filter(ref => ref.kind === "comment").every(ref => !ref.rawCapture),
+          currentProjectionPolicy: { capSnapshotId: capped.snapshotId, projectionSnapshotId: projected.snapshotId,
+            policySnapshotId: policyChanged.snapshotId, knownRefusalsArePartial: [capped, projected, policyChanged].every(r => r.bundle.clipped && r.bundle.markdown.includes("Partial source input")),
+            storageCorruptionRejectedEvenWithKnownPolicyRefusal: true, originalRawRestoredAndUnchanged: await fs.readFile(leaf, "utf8") === body } },
+      }, null, 2) + "\n", { mode: 0o600 });
+    }
+  }, 90_000);
 
   it("rejects worker local-folder access for undeclared manifest keys", async () => {
     const { companyId } = await seedCompanyAndAgent();
@@ -489,6 +870,12 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await expect(services.localFolders.readText({ companyId, folderKey: "ssh", relativePath: "id_rsa" }))
       .rejects.toThrow("Local folder key is not declared");
     await expect(services.localFolders.writeTextAtomic({
+      companyId,
+      folderKey: "ssh",
+      relativePath: "id_rsa",
+      contents: "secret",
+    })).rejects.toThrow("Local folder key is not declared");
+    await expect(services.localFolders.createTextExclusive({
       companyId,
       folderKey: "ssh",
       relativePath: "id_rsa",

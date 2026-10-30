@@ -855,6 +855,17 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         localFolderFiles.set(localFolderFileKey(companyId, folderKey, normalizeLocalFolderRelativePath(relativePath)), contents);
         return status;
       },
+      async createTextExclusive(companyId, folderKey, relativePath, contents) {
+        requireCapability(manifest, capabilitySet, "local.folders");
+        const status = localFolderStatuses.get(localFolderKey(companyId, folderKey)) ?? notConfiguredLocalFolderStatus(folderKey);
+        if (!status.configured || status.access !== "readWrite" || !status.writable) {
+          throw new Error("Local folder is not configured for writes");
+        }
+        const key = localFolderFileKey(companyId, folderKey, normalizeLocalFolderRelativePath(relativePath));
+        if (localFolderFiles.has(key)) return { created: false, status };
+        localFolderFiles.set(key, contents);
+        return { created: true, status };
+      },
       async deleteFile(companyId, folderKey, relativePath) {
         requireCapability(manifest, capabilitySet, "local.folders");
         const status = localFolderStatuses.get(localFolderKey(companyId, folderKey)) ?? notConfiguredLocalFolderStatus(folderKey);

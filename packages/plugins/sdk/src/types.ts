@@ -533,6 +533,18 @@ export interface PluginLocalFoldersClient {
     relativePath: string,
     contents: string,
   ): Promise<PluginLocalFolderStatus>;
+  /**
+   * Create a UTF-8 leaf only if its name is absent; an existing regular leaf is
+   * never overwritten. This is an atomic no-clobber publication among
+   * cooperating writers, not isolation from a same-owner process changing
+   * ancestor symlinks or deleting the published name concurrently.
+   */
+  createTextExclusive(
+    companyId: string,
+    folderKey: string,
+    relativePath: string,
+    contents: string,
+  ): Promise<{ created: boolean; status: PluginLocalFolderStatus }>;
   /** Delete a file below a configured folder after containment checks. Missing files are treated as already deleted. */
   deleteFile(companyId: string, folderKey: string, relativePath: string): Promise<PluginLocalFolderStatus>;
 }
