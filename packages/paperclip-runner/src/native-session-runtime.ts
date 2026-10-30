@@ -315,6 +315,20 @@ function terminalFromEvent(
   };
 }
 
+function governedResultTerminalFromEvent(
+  event: PrpEvent,
+  disposition: PrpTerminalState["reportedWorkDisposition"],
+): PrpTerminalState {
+  return isTurnTerminal(event)
+    ? terminalFromEvent(event, disposition)
+    : {
+        schema: "paperclip.prp.terminal.v1",
+        turnTerminalState: "completed",
+        runTerminalState: "succeeded",
+        reportedWorkDisposition: disposition,
+      };
+}
+
 async function attemptOptionalSessionCancellation(
   session: NativeSession,
   reason: string,
@@ -2322,6 +2336,12 @@ export async function executeNativeSession(
               completedSemanticResultTurnId(completionSnapshot),
           }
         : null;
+    // A recovered, already settled blocked turn is not a warm session owner.
+    // Its old remote interrupt may never have reached the provider.
+    blockedHandoffRequiresSuspension ||= Boolean(
+      recovered && completionSnapshot?.activeTurnId === null &&
+      completed?.result.reportedWorkDisposition === "blocked",
+    );
     if (!completed) {
       // A recovered driver is authoritative about whether a provider turn is
       // still active. In particular, drivers normalize the checkpoint race
@@ -2411,7 +2431,7 @@ export async function executeNativeSession(
                 blockedHandoffRequiresSuspension = true;
                 parkedBlockedCheckpoint = { semanticResult: structuredClone(result),
                   semanticResultTurnId: event.turnId ?? null,
-                  terminal: terminalFromEvent(event, result.reportedWorkDisposition), activeTurnId: null };
+                  terminal: governedResultTerminalFromEvent(event, result.reportedWorkDisposition), activeTurnId: null };
               },
             )
           : Promise.resolve({
@@ -2540,17 +2560,10 @@ export async function executeNativeSession(
               ? await session.result()
               : {
                   result: consumed.governedResult,
-                  terminal: isTurnTerminal(terminalEvent)
-                    ? terminalFromEvent(
-                        terminalEvent,
-                        consumed.governedResult.reportedWorkDisposition,
-                      )
-                    : {
-                        schema: "paperclip.prp.terminal.v1",
-                        turnTerminalState: "completed",
-                        runTerminalState: "succeeded",
-                        reportedWorkDisposition: consumed.governedResult.reportedWorkDisposition,
-                      },
+                  terminal: governedResultTerminalFromEvent(
+                    terminalEvent,
+                    consumed.governedResult.reportedWorkDisposition,
+                  ),
                   turnId: terminalEvent.turnId ?? null,
                 };
           signal.throwIfAborted();
@@ -2807,7 +2820,9 @@ export async function executeNativeSession(
           goalCheckpointRequiresSuspension ||= snapshot.goal != null;
           const completedSnapshot = {
             ...snapshot,
+            ...(parkedBlockedCheckpoint ?? {}),
             semanticResult: durableExecutionResult.result,
+            semanticResultTurnId: durableExecutionResult.turnId ?? null,
             terminal: durableExecutionResult.terminal,
           };
           await persistCheckpoint(completedSnapshot, signal);

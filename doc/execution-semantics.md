@@ -1009,8 +1009,10 @@ The in-process ACPX backend does not implement this shortcut. The runtime
 observes provider cleanup using the existing cleanup grace. A parked block
 always closes the live session, even when warm reuse was requested; its queued
 interrupt and old result owner must not reach the next run. Before finalization,
-the checkpoint preserves the blocked report and governed cancellation terminal
-with no active turn, so recovery need not start the paid phase again. This records a successful wait, not task
+the checkpoint preserves the blocked report and the same successful wait
+terminal used by live finalization, with no active turn. Recovery can finalize
+that recorded result without starting the paid phase again. Provider cleanup
+cancellation does not change the recorded wait into a cancelled run. This records a successful wait, not task
 completion or a retried action. The persisted report supplies the response when
 the provider has not yet written a final message. `paperclip_finish` still waits
 for the authoritative provider terminal and persists the final answer.

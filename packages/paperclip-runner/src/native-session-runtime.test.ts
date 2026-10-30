@@ -4667,25 +4667,43 @@ describe("executeNativeSession recovery", () => {
       expect(retained.at(-1)).toBeNull();
       expect(quarantined).not.toHaveBeenCalledWith("provider_event_teardown_timed_out");
       expect(parkedCheckpoints.some(snapshot => snapshot.semanticResult?.reportedWorkDisposition === "blocked" &&
-        snapshot.terminal?.reportedWorkDisposition === "blocked" && snapshot.activeTurnId === null &&
+        snapshot.terminal?.reportedWorkDisposition === "blocked" &&
+        snapshot.terminal.turnTerminalState === "completed" && snapshot.terminal.runTerminalState === "succeeded" &&
+        snapshot.activeTurnId === null &&
         snapshot.semanticResultTurnId === "turn-recovery")).toBe(true);
       if (label === "acknowledged block") {
         const saved = parkedCheckpoints.find(snapshot => snapshot.semanticResultTurnId === "turn-recovery")!;
-        const startAgain = vi.fn(async () => ({ turnId: "must-not-start" }));
-        const restored: NativeSession = { ...session, startTurn: startAgain, close: vi.fn(async () => undefined),
-          async *events() {}, async snapshot() { return saved; } };
-        const recoveredBackend: NativeSessionBackend = { ...backend,
-          async recoverSession() { return { recovered: true, session: restored }; } };
-        const recoveryEvents: PrpEvent[] = [];
-        await expect(executeNativeSession({ input, backend: recoveredBackend, persistedSession: saved,
-          runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
-          controlPlane: { ...port, async appendEvent(event) {
-            if (!("sourceSeq" in event) || !("eventType" in event)) throw Error("PRP event required");
-            recoveryEvents.push(event);return { cursor: recoveryEvents.length, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" };
-          } }, timeoutMs: 500,
-        })).resolves.toMatchObject({ result: blocked });
-        expect(startAgain).not.toHaveBeenCalled();
-        expect(recoveryEvents.every(event => event.turnId === "turn-recovery")).toBe(true);
+        const completedCheckpoint = parkedCheckpoints.at(-1)!;
+        const controlEvents = events.filter(event => event.sourceKind === "control_plane");
+        expect(controlEvents.map(event => event.eventType)).toEqual(["run.result.accepted", "run.terminal"]);
+        // Both a crash before completeRun and a later same-run reconciliation
+        // must preserve the result subject and replay the already written facts.
+        for (const checkpointToRecover of [saved, completedCheckpoint]) {
+          const startAgain = vi.fn(async () => ({ turnId: "must-not-start" }));
+          const closeRecovered = vi.fn(async () => undefined);
+          const restored: NativeSession = { ...session, startTurn: startAgain, close: closeRecovered,
+            async *events() {}, async snapshot() { return checkpointToRecover; } };
+          const recoveredBackend: NativeSessionBackend = { ...backend,
+            async recoverSession() { return { recovered: true, session: restored }; } };
+          const appendAgain = vi.fn(port.appendEvent);
+          const completeAgain = vi.fn(port.completeRun);
+          await expect(executeNativeSession({ input, backend: recoveredBackend, persistedSession: checkpointToRecover,
+            runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
+            keepSessionOpen: true, requireSessionCloseBeforeReturn: true,
+            controlPlane: { ...port, appendEvent: appendAgain, completeRun: completeAgain,
+              async replayEvents(query) {
+                const recorded = events.filter(event => event.sourceInstanceId === query.sourceInstanceId);
+                return { events: recorded.filter(event => event.sourceSeq > query.afterSourceSeq).slice(0, query.limit),
+                  highestContiguousSourceSeq: recorded.at(-1)?.sourceSeq ?? 0 };
+              },
+            }, timeoutMs: 500,
+          })).resolves.toMatchObject({ result: blocked, turnId: "turn-recovery",
+            terminal: { turnTerminalState: "completed", runTerminalState: "succeeded", reportedWorkDisposition: "blocked" } });
+          expect(startAgain).not.toHaveBeenCalled();
+          expect(appendAgain).not.toHaveBeenCalled();
+          expect(completeAgain).toHaveBeenCalledWith(expect.objectContaining({ turnId: "turn-recovery" }), expect.anything());
+          expect(closeRecovered).toHaveBeenCalledOnce();
+        }
       }
       expect(events.map((event) => event.eventType)).toEqual([
         ...source.map(event => event.eventType),
