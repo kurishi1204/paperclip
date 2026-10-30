@@ -990,6 +990,19 @@ no interruption timer. Existing execution timeouts, cancellation, governed waits
 and active-goal rules still apply. A later failed or cancelled terminal remains
 failed or cancelled even when the agent already reported completed work.
 
+An acknowledged `paperclip_block` can instead park an ordinary turn through the
+existing governed-cancellation path. The runtime must durably observe one
+first-party block tool starting, its validated blocked report, and the matching
+successful tool acknowledgement from the same source and turn. No other tool
+may be in flight when the report is proposed, and starting another tool after
+the report keeps the ordinary terminal contract. Incomplete or ambiguous tool
+observations, a failed acknowledgement, and active session goals also retain
+that contract. The runtime revokes live-turn authority before finalization and
+observes provider cleanup separately. This records a successful wait, not task
+completion or a retried action. The persisted report supplies the response when
+the provider has not yet written a final message. `paperclip_finish` still waits
+for the authoritative provider terminal and persists the final answer.
+
 The final assistant message is the visible task response. Response selection runs
 after preceding event persistence completes; the completion summary cannot replace
 an available final answer. Existing fallback and explicit-comment precedence still

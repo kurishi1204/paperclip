@@ -4511,6 +4511,153 @@ describe("executeNativeSession recovery", () => {
     ]);
   });
 
+  it.each([
+    { label: "acknowledged block", park: true },
+    { label: "slow cleanup", park: true },
+    { label: "missing acknowledgement", park: false },
+    { label: "failed acknowledgement", park: false },
+    { label: "different execution", park: false },
+    { label: "different turn", park: false },
+    { label: "different source", park: false },
+    { label: "foreign namespace", park: false },
+    { label: "concurrent tool", park: false },
+    { label: "later tool", park: false },
+    { label: "unmatched tool event", park: false },
+    { label: "malformed tool event", park: false },
+    { label: "active goal", park: false },
+    { label: "done report", park: false },
+  ])("parks only an acknowledged blocked phase: $label", async ({ label, park }) => {
+    const blocked: PrpStructuredRunResult = {
+      ...yieldedResult,
+      reportedWorkDisposition: "blocked",
+      blocker: {
+        reasonCode: "dependency_pending",
+        owner: { kind: "agent", name: "reviewer" },
+        unblockAction: "Review the saved document revision.",
+        scope: "task_wide",
+      },
+    };
+    delete blocked.continuation;
+    const reported = label === "done report" ? result : blocked;
+    const tool = (type: "tool.execution.started" | "tool.execution.completed", overrides = {}) => ({
+      ...runnerEvent(0, type, {
+        schema: "paperclip.tool.execution.v1",
+        executionId: "tool-block",
+        transport: "mcp", operation: "execute", namespace: "paperclip",
+        name: "paperclip_block",
+        status: type === "tool.execution.started" ? "running" : "completed",
+        ...overrides,
+      }),
+      // ACPX item ids do not correlate the proposal with its tool execution.
+      itemId: "generic-provider-item",
+    });
+    const start = tool("tool.execution.started", label === "foreign namespace" ? { namespace: "other" } : {});
+    const proposal = { ...runnerEvent(0, "run.result.proposed", reported), itemId: "19" };
+    const ack = tool("tool.execution.completed", {
+      ...(label === "failed acknowledgement" ? { status: "failed" } : {}),
+      ...(label === "different execution" ? { executionId: "other-execution" } : {}),
+      ...(label === "foreign namespace" ? { namespace: "other" } : {}),
+    });
+    if (label === "different turn") ack.turnId = "other-turn";
+    if (label === "different source") ack.sourceInstanceId = "other-runner";
+    const other = tool("tool.execution.started", { executionId: "other-tool", name: "save_document" });
+    const source = [
+      ...(label === "unmatched tool event" ? [tool("tool.execution.completed", { executionId: "unobserved" })] : []),
+      ...(label === "malformed tool event" ? [tool("tool.execution.started", { schema: "unknown" })] : []),
+      start,
+      ...(label === "concurrent tool" ? [other] : []),
+      proposal,
+      ...(label === "later tool" ? [other] : []),
+      ...(label === "active goal" ? [runnerEvent(0, "session.goal.updated", {
+        goal: { objective: "Continue the goal", status: "active" },
+      })] : []),
+      ...(label === "missing acknowledgement" ? [] : [ack]),
+    ].map((event, index) => ({ ...event, sourceSeq: index + 1, sourceEventId: `block:${label}:${index}` }));
+    let releaseProvider!: () => void;
+    const providerReleased = new Promise<void>((resolve) => { releaseProvider = resolve; });
+    let releaseCleanup!: () => void;
+    const cleanup = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+    let providerWaiting = false;
+    const cancel = vi.fn(() => { releaseProvider(); return { cleanup: label === "slow cleanup" ? cleanup : Promise.resolve() }; });
+    const close = vi.fn(async () => { releaseCleanup(); });
+    const events: PrpEvent[] = [];
+    let releaseAck!: () => void;
+    const ackPersistence = new Promise<void>((resolve) => { releaseAck = resolve; });
+    let persistingAck = false;
+    const session: NativeSession = {
+      identity: () => identity,
+      async capabilities() {
+        return { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+      },
+      async *events() {
+        for (const event of source) yield event;
+        providerWaiting = true;
+        await providerReleased;
+        if (label === "active goal") yield runnerEvent(source.length + 1, "session.goal.updated", {
+          goal: { objective: "Continue the goal", status: "complete" },
+        });
+        yield runnerEvent(source.length + 2, "turn.completed");
+      },
+      async startTurn() { return { turnId: "turn-recovery" }; },
+      cancel,
+      async result() { return null; },
+      async snapshot() {
+        return {
+          backendKind: "mock", sessionId: identity.sessionId, identity,
+          providerSessionId: "provider-recovery", cursor: null,
+          activeTurnId: "turn-recovery", pendingRuntimeRequests: [], lineage: [],
+        };
+      },
+      close,
+    };
+    const backend: NativeSessionBackend = {
+      async descriptor() { return { kind: "mock", name: "blocked-phase", version: "1", capabilities: await session.capabilities() }; },
+      async openSession() { return session; },
+    };
+    const port: ControlPlanePort = {
+      async openRun() {},
+      async checkpointSession() {},
+      async appendEvent(event) {
+        if (!("eventType" in event) || !("sourceSeq" in event)) throw new Error("PRP event required");
+        if (park && event.eventType === "tool.execution.completed") {
+          persistingAck = true;
+          await ackPersistence;
+        }
+        events.push(event);
+        return { cursor: events.length, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" };
+      },
+      async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; },
+      async completeRun() {},
+    };
+    const execution = executeNativeSession({
+      input, backend, controlPlane: port,
+      runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
+      timeoutMs: 2_000,
+    });
+    // Observe a rejection immediately, including the old implementation's deadline.
+    void execution.catch(() => undefined);
+    if (park) {
+      await vi.waitFor(() => expect(persistingAck).toBe(true));
+      expect(cancel).not.toHaveBeenCalled();
+      releaseAck();
+      await expect(execution).resolves.toMatchObject({
+        result: blocked, terminal: { runTerminalState: "succeeded", reportedWorkDisposition: "blocked" },
+      });
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(events.map((event) => event.eventType)).toEqual([
+        "tool.execution.started", "run.result.proposed", "tool.execution.completed",
+        "run.result.accepted", "run.terminal",
+      ]);
+    } else {
+      await vi.waitFor(() => expect(providerWaiting).toBe(true));
+      expect(cancel).not.toHaveBeenCalled();
+      releaseProvider();
+      await expect(execution).resolves.toMatchObject({ result: reported });
+      expect(cancel).not.toHaveBeenCalled();
+    }
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   it("uses the execution timeout when a completion report has no provider terminal", async () => {
     const lifecycle: string[] = [];
     let releaseProvider = () => {};

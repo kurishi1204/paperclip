@@ -33,6 +33,7 @@ import {
   type PrpTerminalState,
 } from "./protocol/replay-contract.js";
 import { parsePaperclipQuestionSet } from "./contracts/question-set.js";
+import { PRP_BLOCK_TOOL_NAME } from "./contracts/completion-result.js";
 import {
   retainedRunnerdCleanupProofIsCurrent,
   type RetainedRunnerdCleanupProof,
@@ -922,6 +923,13 @@ async function consumeTurn(
     let latestSessionGoal: HarnessThreadGoal | null = null;
     let resultSource: "semantic_result" | "governed_wait" | null = null;
     let providerFailure: NativeProviderTerminalFailure | null = null;
+    const pendingTools = new Map<string, {
+      sourceInstanceId: string;
+      turnId: string;
+      isBlock: boolean;
+    }>();
+    let toolObservationComplete = true;
+    let blockedHandoffTool: string | null = null;
     const settleDurableResult = (
       event: PrpEvent,
       result: PrpStructuredRunResult,
@@ -982,6 +990,36 @@ async function consumeTurn(
         highestContiguousSourceSeq,
         receipt.highestContiguousSourceSeq,
       );
+      let acknowledgedBlockHandoff = false;
+      if (receipt.disposition === "committed" && event.eventType.startsWith("tool.execution.")) {
+        if (payload.schema !== "paperclip.tool.execution.v1" ||
+            typeof payload.executionId !== "string" || !payload.executionId ||
+            typeof event.turnId !== "string" || !event.turnId) {
+          toolObservationComplete = false;
+        } else {
+          const key = JSON.stringify([event.sourceInstanceId, event.turnId, payload.executionId]);
+          const isBlock = payload.transport === "mcp" && payload.namespace === "paperclip" &&
+            payload.name === PRP_BLOCK_TOOL_NAME;
+          if (event.eventType === "tool.execution.started") {
+            if (pendingTools.has(key) || payload.status !== "running") toolObservationComplete = false;
+            pendingTools.set(key, { sourceInstanceId: event.sourceInstanceId, turnId: event.turnId, isBlock });
+          } else if (event.eventType === "tool.execution.completed") {
+            const started = pendingTools.get(key);
+            if (!started) toolObservationComplete = false;
+            acknowledgedBlockHandoff = key === blockedHandoffTool && started?.isBlock === true &&
+              isBlock && payload.status === "completed";
+            pendingTools.delete(key);
+          } else if (event.eventType !== "tool.execution.progressed" ||
+                     payload.status !== "running" || !pendingTools.has(key)) {
+            toolObservationComplete = false;
+          }
+          // Once the block is reported, a new tool call means the provider is
+          // still doing work. Keep the ordinary terminal contract in that case.
+          if (blockedHandoffTool !== null && event.eventType === "tool.execution.started") {
+            blockedHandoffTool = null;
+          }
+        }
+      }
       const eventGoal = goalFromEvent(event);
       const goalChanged = eventGoal !== undefined &&
         goalLifecycleFingerprint(eventGoal) !== goalLifecycleFingerprint(previousGoal);
@@ -1097,6 +1135,13 @@ async function consumeTurn(
         governedResult = validation.result;
         resultSource = "semantic_result";
         semanticResultObserved = true;
+        if (receipt.disposition === "committed" &&
+            governedResult.reportedWorkDisposition === "blocked" &&
+            toolObservationComplete && pendingTools.size === 1) {
+          const [key, pending] = pendingTools.entries().next().value!;
+          if (pending.isBlock && pending.sourceInstanceId === event.sourceInstanceId &&
+              pending.turnId === event.turnId) blockedHandoffTool = key;
+        }
       }
       if (governedResult === null && resolveGovernedWait) {
         if (appendAbort.signal.aborted) {
@@ -1113,6 +1158,15 @@ async function consumeTurn(
       }
       if (governedResult !== null && !isTurnTerminal(event) && !sessionGoalObserved) {
         if (resultSource === "semantic_result") {
+          if (governedResult.reportedWorkDisposition === "blocked" &&
+              acknowledgedBlockHandoff && toolObservationComplete && pendingTools.size === 0 &&
+              providerFailure === null) {
+            return settleDurableResult(
+              event,
+              governedResult,
+              "Paperclip parked this turn after the blocked handoff was acknowledged.",
+            );
+          }
           // A completion tool reports task disposition, not provider termination.
           // Persist the final answer and authoritative terminal before finalizing.
           continue;
@@ -1317,7 +1371,7 @@ async function consumeTurn(
       // cleanup retain the short fail-closed boundary.
       const teardownSettled = await settlesWithin(
         passiveTeardownSettlement,
-        semanticResultObserved
+        semanticResultObserved && !governedCancellationCommitted
           ? reusableSessionCancellationGraceMs
           : FAILED_OPERATION_SETTLEMENT_GRACE_MS,
       );
