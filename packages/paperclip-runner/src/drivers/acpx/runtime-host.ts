@@ -41,6 +41,7 @@ import {
   type AcpxModelStatus,
 } from "./model-verification.js";
 import { acpxRuntimePermissionPolicy, hasNativeCompletionReviewTool } from "./permission-policy.js";
+import { normalizeAcpxPermission } from "./acp-permission-adapter.js";
 import {
   resolveQualifiedAcpxProfile,
   type QualifiedAcpxAgent,
@@ -321,12 +322,6 @@ export class AcpxRuntimeHost {
     dependencies: AcpxRuntimeHostDependencies,
   ): Promise<AcpxRuntimeHost> {
     options.signal?.throwIfAborted();
-    // The server-assigned review catalog is the boundary, never a provider's
-    // claimed tool name/kind. Assigned MCP calls use exact SDK permissions;
-    // anything reaching ACP permission fallback is outside this review.
-    const rejectAdditionalPermissions = options.agent === "claude"
-      && options.permissionMode === "approve-paperclip"
-      && hasNativeCompletionReviewTool(options.semanticTools?.tools ?? []);
     if (options.agent === "pi" && typeof options.providerPolicy?.readOnly !== "boolean") {
       throw new Error("Pi admission requires an explicit task execution policy");
     }
@@ -357,6 +352,11 @@ export class AcpxRuntimeHost {
     if (options.expectedIdentity) {
       verifyExpectedAcpxIdentity(options.expectedIdentity, binding, null);
     }
+    // Use the admitted mode, as the sandbox's SDK rules do. The trusted
+    // server-assigned catalog, never provider metadata, identifies a reviewer.
+    const rejectAdditionalPermissions = options.agent === "claude"
+      && binding.permissionMode === "approve-paperclip"
+      && hasNativeCompletionReviewTool(options.semanticTools?.tools ?? []);
     options.assertWorkspaceHeld?.();
     if (
       options.agent !== "codex" &&
@@ -806,9 +806,16 @@ export class AcpxRuntimeHost {
       // ACPX invokes this callback before its defaultAction policy. Replacing
       // only the latter would still enqueue a human approval and hang QA.
       ...(this.#rejectAdditionalPermissions
-        ? { onPermissionRequest: async (_request, context) => ({
-            outcome: context.signal.aborted ? "cancel" as const : "reject_once" as const,
-          }) }
+        ? { onPermissionRequest: async (request, context) => {
+            if (context.signal.aborted) return { outcome: "cancel" as const };
+            try {
+              return normalizeAcpxPermission(request).resolve({ action: "decline" });
+            } catch {
+              // Missing, ambiguous or malformed reject options cannot grant
+              // authority or enter the human queue. Cancel this request only.
+              return { outcome: "cancel" as const };
+            }
+          } }
         : input.onPermissionRequest ? { onPermissionRequest: input.onPermissionRequest } : {}),
       ...(input.onExtensionRequest ? { onExtensionRequest: input.onExtensionRequest } : {}),
       ...(input.onExtensionNotification ? { onExtensionNotification: input.onExtensionNotification } : {}),

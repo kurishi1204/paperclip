@@ -326,6 +326,7 @@ describe("ACPX runtime host", () => {
       const controller = new AbortController();
       for (const toolName of ["Terminal", "mcp__paperclip__resolve_review"]) {
         const request = { sessionId: "backend-1", inferredKind: "read", raw: {
+          options: [{ kind: "reject_once", optionId: "deny-once", name: "Deny" }],
           toolCall: { toolCallId: "test-call", name: toolName, rawInput: { command: "jq . mcp.json" } },
         } } as Parameters<typeof handler>[0];
         expect(await handler(request, { signal: controller.signal } as Parameters<typeof handler>[1]))
@@ -336,6 +337,14 @@ describe("ACPX runtime host", () => {
       expect(delegate).toHaveBeenCalledTimes(reviewer ? 0 : 2);
       expect(receivedPolicy!.defaultAction).toBe(reviewer ? "deny" : "escalate");
       if (reviewer) {
+        for (const options of [[], [{ kind: "allow_once", optionId: "allow", name: "Allow" }],
+          [{ kind: "reject_always", optionId: "reject-always", name: "Reject always" }]]) {
+          expect(await handler({ sessionId: "backend-1", raw: { options,
+            toolCall: { toolCallId: "unsupported-reject", title: "Terminal" },
+          } } as Parameters<typeof handler>[0], { signal: controller.signal } as Parameters<typeof handler>[1]))
+            .toEqual({ outcome: "cancel" });
+        }
+        expect(delegate).not.toHaveBeenCalled();
         controller.abort();
         expect(await handler({} as Parameters<typeof handler>[0], {
           signal: controller.signal,
