@@ -40,7 +40,7 @@ import {
   requireVerifiedAcpxModel,
   type AcpxModelStatus,
 } from "./model-verification.js";
-import { acpxRuntimePermissionPolicy } from "./permission-policy.js";
+import { acpxRuntimePermissionPolicy, hasNativeCompletionReviewTool } from "./permission-policy.js";
 import {
   resolveQualifiedAcpxProfile,
   type QualifiedAcpxAgent,
@@ -284,6 +284,7 @@ export class AcpxRuntimeHost {
   readonly #command: VerifiedAcpxCommandLease;
   readonly #toolBridge: RunnerToolBridge | null;
   readonly #claudeSkillNames: readonly string[];
+  readonly #rejectAdditionalPermissions: boolean;
   readonly #assertAgentFilesHeld: (() => void) | undefined;
   #activeTurn: AcpxRuntimeTurn | null = null;
   #activeTurnInterruption: AcpxRuntimeTurn["cancel"] | null = null;
@@ -300,6 +301,7 @@ export class AcpxRuntimeHost {
     command: VerifiedAcpxCommandLease;
     toolBridge: RunnerToolBridge | null;
     claudeSkillNames: readonly string[];
+    rejectAdditionalPermissions: boolean;
     assertAgentFilesHeld?: () => void;
   }) {
     this.#runtime = input.runtime;
@@ -310,6 +312,7 @@ export class AcpxRuntimeHost {
     this.#command = input.command;
     this.#toolBridge = input.toolBridge;
     this.#claudeSkillNames = [...input.claudeSkillNames];
+    this.#rejectAdditionalPermissions = input.rejectAdditionalPermissions;
     this.#assertAgentFilesHeld = input.assertAgentFilesHeld;
   }
 
@@ -318,6 +321,12 @@ export class AcpxRuntimeHost {
     dependencies: AcpxRuntimeHostDependencies,
   ): Promise<AcpxRuntimeHost> {
     options.signal?.throwIfAborted();
+    // The server-assigned review catalog is the boundary, never a provider's
+    // claimed tool name/kind. Assigned MCP calls use exact SDK permissions;
+    // anything reaching ACP permission fallback is outside this review.
+    const rejectAdditionalPermissions = options.agent === "claude"
+      && options.permissionMode === "approve-paperclip"
+      && hasNativeCompletionReviewTool(options.semanticTools?.tools ?? []);
     if (options.agent === "pi" && typeof options.providerPolicy?.readOnly !== "boolean") {
       throw new Error("Pi admission requires an explicit task execution policy");
     }
@@ -564,7 +573,7 @@ export class AcpxRuntimeHost {
             providerSessionKey: binding.profileSessionKey,
             permissionMode: binding.permissionMode,
             mode: binding.mode,
-            permissionPolicy: acpxRuntimePermissionPolicy(
+            permissionPolicy: rejectAdditionalPermissions ? { defaultAction: "deny" } : acpxRuntimePermissionPolicy(
               binding.permissionMode,
             ),
             launchEnvironment,
@@ -650,6 +659,7 @@ export class AcpxRuntimeHost {
         credential,
         command,
         toolBridge,
+        rejectAdditionalPermissions,
         assertAgentFilesHeld: agentFiles?.assertHeld,
         claudeSkillNames: options.agent === "claude"
           ? (options.runtimeContext?.skills.map((skill) => skill.runtimeName) ?? [])
@@ -793,7 +803,13 @@ export class AcpxRuntimeHost {
       requestId,
       ...(input.signal ? { signal: input.signal } : {}),
       ...(input.onElicitation ? { onElicitation: input.onElicitation } : {}),
-      ...(input.onPermissionRequest ? { onPermissionRequest: input.onPermissionRequest } : {}),
+      // ACPX invokes this callback before its defaultAction policy. Replacing
+      // only the latter would still enqueue a human approval and hang QA.
+      ...(this.#rejectAdditionalPermissions
+        ? { onPermissionRequest: async (_request, context) => ({
+            outcome: context.signal.aborted ? "cancel" as const : "reject_once" as const,
+          }) }
+        : input.onPermissionRequest ? { onPermissionRequest: input.onPermissionRequest } : {}),
       ...(input.onExtensionRequest ? { onExtensionRequest: input.onExtensionRequest } : {}),
       ...(input.onExtensionNotification ? { onExtensionNotification: input.onExtensionNotification } : {}),
     });

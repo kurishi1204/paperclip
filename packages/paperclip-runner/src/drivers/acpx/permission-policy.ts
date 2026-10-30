@@ -3,6 +3,12 @@ import { paperclipSemanticAction } from "../../catalog/semantic-action-catalog.j
 import { capabilityCanonicalOperation } from "../../catalog/canonical-operations.js";
 import { canonicalRunnerToolName, PAPERCLIP_API_READ_VIEW_TOOL } from "../runner-tool-bridge.js";
 import type { QualifiedAcpxAgent } from "./qualified-profiles.js";
+import { PRP_BLOCK_TOOL_NAME, PRP_COMPLETION_TOOL_NAME } from "../../contracts/completion-result.js";
+
+/** The authenticated server assigns this tool only to a bound completion reviewer. */
+export function hasNativeCompletionReviewTool(tools: readonly Readonly<Record<string, unknown>>[]): boolean {
+  return tools.some(tool => typeof tool.name === "string" && canonicalRunnerToolName(tool.name) === "resolve_review");
+}
 
 export class AcpxApprovalRequiredError extends Error {
   readonly code = "approval_required";
@@ -70,6 +76,13 @@ export function claudePaperclipPermissionRules(
       ? [`mcp__paperclip__${name}`]
       : [];
   });
+  // The bridge adds these reserved exits after the server-assigned catalog.
+  // Bounded reviewers must be able to finish/block without falling back to an
+  // interactive permission queue. Exact rules apply only to our MCP server;
+  // bridge schema validation and controller authority remain unchanged.
+  if (mode === "approve-paperclip" && hasNativeCompletionReviewTool(tools)) {
+    names.push(`mcp__paperclip__${PRP_COMPLETION_TOOL_NAME}`, `mcp__paperclip__${PRP_BLOCK_TOOL_NAME}`);
+  }
   return [...new Set(names)].sort();
 }
 
