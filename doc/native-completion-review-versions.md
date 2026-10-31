@@ -59,3 +59,7 @@ Workspace recovery uses its existing ownership and failure policy before evidenc
 reassessment. A handoff lookup, candidate transaction or retirement publication
 failure is logged and isolated so unrelated normal recovery continues; a committed
 withdrawal remains durable even if its live publication fails.
+
+An authoritative later issue status change retains precedence over new evidence.
+Saved-result final arbitration does not replace a detected later authoritative
+status change. The selected arbitration path also selects its matching commit guard.

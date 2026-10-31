@@ -843,7 +843,8 @@ export async function reconcileNativeFinalizations(
         if (!assessment || !reassessment || !resultRow || !contractRow) {
           throw new Error("native_reconciliation_reassessment_missing");
         }
-        const needsFinalArbitration = retiredReview || newEvidenceSatisfiesContract;
+        const needsFinalArbitration = !authoritativeStatusChanged
+          && (retiredReview || newEvidenceSatisfiesContract);
         const currentIssue = needsFinalArbitration
           ? await db.select().from(issues).where(and(eq(issues.id, row.issueId), eq(issues.companyId, row.companyId))).then((entries) => entries[0])
           : null;
@@ -925,7 +926,7 @@ export async function reconcileNativeFinalizations(
               ? row.decisionId ?? undefined
               : undefined,
           };
-          committed = retiredReview || newEvidenceSatisfiesContract
+          committed = needsFinalArbitration
             ? await commitVersionBoundReconciliation({ commit: commitInput, expectedAssigneeAgentId: row.agentId,
                 contractId: contractRow.id, requireNoPendingGovernance: !retiredReview })
             : await commitNativeStatusDecision(commitInput);

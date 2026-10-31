@@ -2378,6 +2378,19 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     expect((await issueService(db).getById(seeded.issueId))!.status).toBe("done");
   }, 30_000);
 
+  it.each(["blocked", "in_progress"] as const)("new evidence preserves a later authoritative %s edit", async (status) => {
+    const seeded = await seedAutomaticReview();
+    await db.update(issueThreadInteractions).set({ status: "cancelled", result: {} }).where(eq(issueThreadInteractions.id, seeded.interaction.id));
+    const [assessment] = await db.select().from(workAssessments).where(eq(workAssessments.id, seeded.assessmentId));
+    await db.update(workAssessments).set({ assessmentJson: { ...assessment!.assessmentJson, allCriteriaSatisfied: false } })
+      .where(eq(workAssessments.id, seeded.assessmentId));
+    await issueService(db).update(seeded.issueId, { status });
+    await db.update(issueWorkProducts).set({ reviewState: "approved", updatedAt: new Date(Date.now() + 1000) })
+      .where(eq(issueWorkProducts.id, seeded.workProductId));
+    await reconcileNativeFinalizations(db, [seeded.runId]);
+    expect((await issueService(db).getById(seeded.issueId))!.status).toBe(status);
+  }, 30_000);
+
   it("new evidence retains an unresolved durable dependency", async () => {
     const seeded = await seedAutomaticReview();
     await db.update(issueThreadInteractions).set({ status: "cancelled", result: {} }).where(eq(issueThreadInteractions.id, seeded.interaction.id));
