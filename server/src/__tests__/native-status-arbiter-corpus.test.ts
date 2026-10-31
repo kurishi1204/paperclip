@@ -2052,7 +2052,7 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     return { ...seeded, decision: decision!, interaction: interaction! };
   }
 
-  async function seedReviewVersionHandoff() {
+  async function seedReviewVersionHandoff(options: { advanceContract?: boolean } = {}) {
     const seeded = await seedFixture({ ...corpus.fixtures.find((entry) => entry.mode === "native")!,
       id: `review-version-${randomUUID()}`, given: { priorIssueStatus: "in_progress" } });
     const [original] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.id, seeded.resultId!));
@@ -2068,12 +2068,19 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     const [oldCard] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId));
     const [sourceRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
     const [sourceResult] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.id, seeded.resultId!));
+    const [sourceContract] = await db.select().from(completionContracts).where(eq(completionContracts.id, seeded.contractId!));
+    const nextContract = options.advanceContract
+      ? (await db.insert(completionContracts).values({ ...sourceContract!, id: randomUUID(), revision: sourceContract!.revision + 1,
+          contractJson: { ...sourceContract!.contractJson, revision: "corpus-followup-v2" },
+          canonicalSha256: `contract:followup:${randomUUID()}`, supersedesContractId: sourceContract!.id }).returning())[0]!
+      : sourceContract!;
     const nextRunId = randomUUID(), nextResultId = randomUUID();
     await db.insert(heartbeatRuns).values({ ...sourceRun!, id: nextRunId, status: "running", resultJson: {},
+      completionContractId: nextContract.id, completionContractSha256: nextContract.canonicalSha256,
       contextSnapshot: { issueId: seeded.issueId, wakeReason: "issue_commented" },
       startedAt: new Date(Date.now() - 2000), finishedAt: null });
     await db.insert(nativeRunResults).values({ ...sourceResult!, id: nextResultId, runId: nextRunId,
-      serverFingerprint: randomUUID(), canonicalSha256: randomUUID() });
+      completionContractId: nextContract.id, serverFingerprint: randomUUID(), canonicalSha256: randomUUID() });
     await db.insert(nativeRunFinalizations).values({ runId: nextRunId, companyId, issueId: seeded.issueId,
       phase: "assessing", resultId: nextResultId });
     await db.insert(workspaceOperations).values({ companyId, heartbeatRunId: nextRunId, issueId: seeded.issueId,
@@ -2089,7 +2096,7 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
       status: "cancelled", runtimeMode: "legacy", errorCode: "issue_assignee_changed", finishedAt: new Date(),
       contextSnapshot: { issueId: seeded.issueId, nativeReviewInteractionId: oldCard!.id,
         nativeReviewDecisionId: (oldCard!.payload as { target: { revisionId: string } }).target.revisionId } });
-    return { ...seeded, oldCard: oldCard!, nextRunId, nextResultId, cancelledReviewRunId, decision: decision! };
+    return { ...seeded, oldCard: oldCard!, nextRunId, nextResultId, cancelledReviewRunId, decision: decision!, nextContract };
   }
 
   it("review version handoff retires the old request and binds the saved continuation exactly once", async () => {
@@ -2121,6 +2128,42 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
       {}, { agentId: delegateAgentId, runId: reviewerRunId });
     expect(accepted.interaction.status).toBe("accepted");
     expect((await issueService(db).getById(seeded.issueId))!.status).toBe("done");
+  }, 30_000);
+
+  it("review handoff follows the real v1-to-v2 contract continuation and accepts only its current review", async () => {
+    const seeded = await seedReviewVersionHandoff({ advanceContract: true });
+    expect(seeded.nextContract.revision).toBe(2);
+    expect(seeded.nextContract.supersedesContractId).toBe(seeded.contractId);
+    const originalResults = await db.select().from(nativeRunResults).where(eq(nativeRunResults.issueId, seeded.issueId));
+    const originalDecision = await db.select().from(statusDecisions).where(eq(statusDecisions.id, seeded.decision.id));
+    await reconcileNativeFinalizations(db, [seeded.nextRunId]);
+    const cards = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId));
+    expect(cards).toHaveLength(2);
+    expect(cards.find((c) => c.id === seeded.oldCard.id)!.status).toBe("cancelled");
+    const next = cards.find((c) => c.id !== seeded.oldCard.id)!;
+    expect(next).toMatchObject({ status: "pending", sourceRunId: seeded.nextRunId, addresseeAgentId: delegateAgentId });
+    const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, seeded.nextRunId));
+    const [assessment] = await db.select().from(workAssessments).where(eq(workAssessments.id, coordinator!.assessmentId!));
+    expect(assessment).toMatchObject({ contractId: seeded.nextContract.id, resultId: seeded.nextResultId });
+    expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.issueId, seeded.issueId))).toEqual(originalResults);
+    expect(await db.select().from(statusDecisions).where(eq(statusDecisions.id, seeded.decision.id))).toEqual(originalDecision);
+    const contextSnapshot = { issueId: seeded.issueId, nativeReviewInteractionId: next.id,
+      nativeReviewDecisionId: (next.payload as { target: { revisionId: string } }).target.revisionId };
+    const reviewerRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: reviewerRunId, companyId, agentId: delegateAgentId,
+      status: "running", runtimeMode: "native", nativeIssueId: seeded.issueId, contextSnapshot });
+    expect(await claimNativeReviewExecutionLock(db, { companyId, issueId: seeded.issueId, agentId: delegateAgentId,
+      runId: reviewerRunId, contextSnapshot, agentNameKey: "independent-reviewer", claimedAt: new Date() })).toBe(true);
+    await issueThreadInteractionService(db).acceptInteraction((await issueService(db).getById(seeded.issueId))!, next.id, {},
+      { agentId: delegateAgentId, runId: reviewerRunId });
+    expect((await issueService(db).getById(seeded.issueId))!.status).toBe("done");
+  }, 30_000);
+
+  it("an unrelated contract revision cannot retire an old named review", async () => {
+    const seeded = await seedReviewVersionHandoff({ advanceContract: true });
+    await db.update(completionContracts).set({ supersedesContractId: null }).where(eq(completionContracts.id, seeded.nextContract.id));
+    await reconcileNativeFinalizations(db, [seeded.nextRunId]);
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId))).toEqual([seeded.oldCard]);
   }, 30_000);
 
   it.each(["confirmation", "child"] as const)("named handoff retains its trigger across an intervening %s wait", async (wait) => {

@@ -109,7 +109,19 @@ export async function retireSupersededCompletionReviews(db: Db, runIds?: string[
         eq(workAssessments.companyId, scope.companyId), eq(workAssessments.issueId, scope.issueId),
         eq(workAssessments.runId, card.sourceRunId)));
       if (!binding || !priorRun || priorRun.status !== "succeeded" || priorRun.agentId !== run.agentId
-        || !priorRun.finishedAt || priorRun.finishedAt > run.startedAt || priorAssessment?.contractId !== assessment.contractId) return;
+        || !priorRun.finishedAt || priorRun.finishedAt > run.startedAt || !priorAssessment) return;
+      // An ordinary continuation can legitimately advance the completion
+      // contract. Accept only the current contract's explicit owner-bound,
+      // strictly older ancestry; an unrelated revision cannot retire a gate.
+      let ancestor = contract;
+      while (ancestor.id !== priorAssessment.contractId) {
+        if (!ancestor.supersedesContractId) return;
+        const [previous] = await tx.select().from(completionContracts).where(and(
+          eq(completionContracts.id, ancestor.supersedesContractId),
+          eq(completionContracts.companyId, scope.companyId), eq(completionContracts.issueId, scope.issueId)));
+        if (!previous || previous.revision >= ancestor.revision) return;
+        ancestor = previous;
+      }
       const priorRequests = priorAssessment.assessmentJson.attentionRequests;
       if (!Array.isArray(priorRequests) || priorRequests.length !== 1) return;
       const priorRequest = record(priorRequests[0]);
