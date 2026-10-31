@@ -69,3 +69,8 @@ materialize the requested named review. An intervening confirmation or
 unread child that prevents replacement keeps that marker pending. Governance and child delivery are
 rechecked inside the commit, so clearing another wait can resume the same saved
 result without a replacement writer run.
+
+Saved-result recovery isolates each coordinator after the adopted pending-effect
+integrity checks, including replacement creation and post-commit publication. An unavailable named reviewer leaves the original
+coordinator and withdrawal marker recoverable; the failure is logged with the
+run and issue, never reported as completion. Other coordinators continue.

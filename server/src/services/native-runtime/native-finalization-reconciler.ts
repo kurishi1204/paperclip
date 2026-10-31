@@ -644,6 +644,7 @@ export async function reconcileNativeFinalizations(
       results.push({ runId: row.runId, phase: "committed", deliveredEffectIds });
       continue;
     }
+    try {
     const resumeWorkspace = async () => {
       const recoveryDecision = resolveNativeReconciliationStatus({
         facts: { workspaceOperationPending: true },
@@ -1053,6 +1054,13 @@ export async function reconcileNativeFinalizations(
         error,
         projectRunStatus: true,
       }));
+    }
+    } catch (err) {
+      // This coordinator keeps its own durable retry/withdrawal state. Never
+      // let an unavailable reviewer or a live publication failure starve a
+      // different issue, and never mark this candidate completed on failure.
+      logger.warn({ err, runId: row.runId, issueId: row.issueId },
+        "Native finalization candidate failed; durable state retained and other recovery continues");
     }
   }
   return results;

@@ -2456,13 +2456,33 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
       if (details?.source === "native_status_decision") throw new Error("replacement publication unavailable");
     });
     try {
-      await expect(reconcileNativeFinalizations(db, [seeded.nextRunId])).rejects.toThrow("replacement publication unavailable");
+      await expect(reconcileNativeFinalizations(db, [seeded.nextRunId])).resolves.toEqual([]);
     } finally { publish.mockRestore(); }
     const cards = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId));
     expect(cards).toHaveLength(2);
     expect(cards.filter((entry) => entry.status === "pending")).toHaveLength(1);
     await reconcileNativeFinalizations(db, [seeded.nextRunId]);
     expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId))).toEqual(cards);
+  }, 30_000);
+
+  it("an unavailable named reviewer cannot starve unrelated recovery", async () => {
+    const handoff = await seedReviewVersionHandoff(), unrelated = await seedAutomaticReview();
+    const [reviewer] = await db.select().from(agents).where(eq(agents.id, delegateAgentId));
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, handoff.issueId));
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, delegateAgentId));
+    try {
+      await expect(reconcileNativeFinalizations(db, [handoff.nextRunId, unrelated.runId])).resolves.toBeDefined();
+      expect((await issueService(db).getById(unrelated.issueId))!.status).toBe("done");
+      expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, handoff.nextRunId)))[0]!.decisionId).toBe(handoff.decision.id);
+      const cards = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, handoff.issueId));
+      expect(cards).toHaveLength(1);expect(cards[0]!.status).toBe("cancelled");
+    } finally { await db.update(agents).set({ status: reviewer!.status }).where(eq(agents.id, delegateAgentId)); }
+    await reconcileNativeFinalizations(db, [handoff.nextRunId]);
+    const cards = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, handoff.issueId));
+    expect(cards).toHaveLength(2);expect(cards.filter((x) => x.status === "pending")).toEqual([expect.objectContaining({ addresseeAgentId: delegateAgentId, sourceRunId: handoff.nextRunId })]);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, handoff.issueId))).toEqual(runs);
+    await reconcileNativeFinalizations(db, [handoff.nextRunId]);
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, handoff.issueId))).toEqual(cards);
   }, 30_000);
 
   it("new evidence cannot bypass a pending named independent review", async () => {
