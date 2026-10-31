@@ -436,7 +436,7 @@ export function createPluginToolDispatcher(
           registered.pluginDbId, runContext.companyId,
         );
         if (settings?.configJson && Object.prototype.hasOwnProperty.call(settings.configJson, "publicationReadback")) {
-          const args = parameters as Record<string, unknown>;
+          const resolvedPage = result.result.data as Record<string, unknown>;
           const documents = documentService(db);
           const interactions = issueThreadInteractionService(db);
           result.result = await applyWikiPublicationReadback(
@@ -447,8 +447,8 @@ export function createPluginToolDispatcher(
                   key: "page-content", companyId: runContext.companyId,
                   params: {
                     companyId: runContext.companyId,
-                    wikiId: args.wikiId ?? "default",
-                    spaceSlug: args.spaceSlug ?? "default", path,
+                    wikiId: resolvedPage.wikiId,
+                    spaceSlug: resolvedPage.spaceSlug, path,
                   },
                 },
               ) as Record<string, unknown>,

@@ -36,7 +36,7 @@ test("mismatched worker tool body is rejected after the records pass", async () 
 test("another company cannot use the configured publication registry", async () => { const f = fixture(); f.registry.companyId = "other"; await assert.rejects(f.run(), /registry_scope/); assert.equal(f.reads(), 0); });
 test("source document company mismatch is rejected", async () => { const f = fixture(); f.documents.source!.companyId = "other"; await assert.rejects(f.run(), /document_changed/); });
 test("caller parameters cannot change company", async () => { const f = fixture(); await assert.rejects(f.run({ companyId: "other", path: "synthesis" }), /request_scope/); assert.equal(f.reads(), 0); });
-test("unregistered pages explicitly retain unverified status", async () => { const f = fixture(); const out = await f.run({ companyId: "company", path: "not-registered" }); assert.match(out.content, /unverified source material/); assert.equal(((out.data as JsonObject).publicationReadback as JsonObject).state, "unregistered"); assert.equal(f.reads(), 0); });
+test("unregistered pages explicitly retain unverified status", async () => { const f = fixture(); f.result.data.path = "not-registered"; const out = await f.run({ companyId: "company", path: "not-registered" }); assert.match(out.content, /unverified source material/); assert.equal(((out.data as JsonObject).publicationReadback as JsonObject).state, "unregistered"); assert.equal(f.reads(), 0); });
 test("malformed configured registry is not silently disabled", async () => { const f = fixture(); f.registry.entries[0]!.wikiSHA256 = "invalid"; await assert.rejects(f.run(), /registry_hash/); });
 test("self-reviewed publication cannot pass", async () => { const f = fixture(); f.registry.entries[0]!.producerAgentId = "qa"; await assert.rejects(f.run(), /review_not_independent/); });
 test("database Date receipts hash like their API JSON representation", async () => { const f = fixture(); f.reviews.source!.resolvedAt = new Date(f.reviews.source!.resolvedAt as string); await f.run(); });
@@ -101,5 +101,45 @@ test("duplicate document publication bindings are refused before record reads", 
   const f = fixture();
   f.registry.entries.push({ ...f.registry.entries[0]!, path: "alternate-source-path" });
   await assert.rejects(f.run(), /registry_document_ambiguous/);
+  assert.equal(f.reads(), 0);
+});
+
+
+for (const [label, args] of [
+  ["leading slash", { companyId: "company", path: "/synthesis" }],
+  ["Wiki whitespace", { companyId: "company", path: "synthesis", wikiId: " default " }],
+  ["space case", { companyId: "company", path: "synthesis", spaceSlug: "DEFAULT" }],
+] as const) {
+  test(`resolved alias ${label} receives the registered proof`, async () => {
+    const f = fixture(); const result = await f.run(args);
+    assert.equal(((result.data as JsonObject).publicationReadback as JsonObject).state, "verified");
+    assert.equal(result.content, f.result.content); assert.equal(f.reads(), 2);
+  });
+  test(`resolved alias ${label} cannot skip a changed source`, async () => {
+    const f = fixture(); f.documents.source!.latestRevisionId = "changed";
+    await assert.rejects(f.run(args), /document_changed/);
+  });
+  test(`resolved alias ${label} cannot skip revoked QA`, async () => {
+    const f = fixture(); f.reviews.source!.status = "rejected";
+    await assert.rejects(f.run(args), /review_not_accepted/);
+  });
+}
+
+test("a resolved page in another Wiki remains unregistered", async () => {
+  const f = fixture(); f.result.data.wikiId = "another-wiki";
+  const result = await f.run({ companyId: "company", path: "synthesis", wikiId: "another-wiki" });
+  assert.equal(((result.data as JsonObject).publicationReadback as JsonObject).state, "unregistered");
+  assert.equal(f.reads(), 0);
+});
+
+test("an unregistered read cannot return another company's metadata", async () => {
+  const f = fixture(); f.result.data.companyId = "other"; f.result.data.path = "not-registered";
+  await assert.rejects(f.run({ companyId: "company", path: "not-registered" }), /tool_metadata_changed/);
+  assert.equal(f.reads(), 0);
+});
+
+test("missing resolved metadata cannot silently opt out of verification", async () => {
+  const f = fixture(); delete (f.result as { data?: unknown }).data;
+  await assert.rejects(f.run({ companyId: "company", path: "/synthesis" }), /tool_metadata_changed/);
   assert.equal(f.reads(), 0);
 });

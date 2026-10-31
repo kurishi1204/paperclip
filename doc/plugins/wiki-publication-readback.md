@@ -50,6 +50,12 @@ representation. The review basis contains `id`, `companyId`, `issueId`,
 
 ## Read behavior
 
+The host selects a receipt using the worker's resolved company, Wiki, space,
+and page metadata. Equivalent request spellings (such as a leading slash or
+normalized Wiki/space identifiers) therefore use the same verification path.
+Missing or cross-company resolved metadata is an error. A canonical registered
+request cannot be redirected to a different page by returned metadata.
+
 For a registered page, the host checks the complete Wiki body and references,
 the current document revision and body, the exact accepted QA interaction and
 its distinct reviewer/run, and every referenced registered parent recursively.

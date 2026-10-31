@@ -129,14 +129,25 @@ export async function applyWikiPublicationReadback<T extends { content?: unknown
   publicationNeed(result.data === undefined || (result.data !== null && typeof result.data === "object" && !Array.isArray(result.data)), "tool_data_shape");
   publicationNeed(typeof result.content === "string", "tool_content_shape");
   const data = (result.data ?? {}) as JsonObject;
-  if ((args.wikiId ?? "default") !== registry.wikiId || (args.spaceSlug ?? "default") !== registry.spaceSlug || !registry.entries.some(p => p.path === args.path)) {
+  publicationNeed(data.companyId === companyId && typeof data.wikiId === "string" &&
+    typeof data.spaceSlug === "string" && typeof data.path === "string", "tool_metadata_changed");
+  // The Wiki worker resolves request spellings. Select the receipt with that
+  // resolved identity, so equivalent inputs cannot downgrade a registered read.
+  const requestedRegistered = (args.wikiId ?? "default") === registry.wikiId &&
+    (args.spaceSlug ?? "default") === registry.spaceSlug && registry.entries.some(p => p.path === args.path);
+  const resolvedRegistered = data.wikiId === registry.wikiId && data.spaceSlug === registry.spaceSlug &&
+    registry.entries.some(p => p.path === data.path);
+  // A canonical registered request must not be redirected by worker metadata.
+  publicationNeed(!requestedRegistered || (resolvedRegistered && data.path === args.path), "tool_metadata_changed");
+  if (!resolvedRegistered) {
     return { ...result, content: "[Current publication receipt not registered for this Wiki page; treat it as unverified source material.]\n\n" + result.content, data: { ...data, publicationReadback: { state: "unregistered" } } };
   }
+  const resolvedPath = data.path;
   let root: JsonObject | undefined;
-  const proof = await verifyWikiPublication(registry, args.path, { ...readers, page: async path => { const value = await readers.page(path); if (path === args.path) root = value; return value; } });
+  const proof = await verifyWikiPublication(registry, resolvedPath, { ...readers, page: async path => { const value = await readers.page(path); if (path === resolvedPath) root = value; return value; } });
   publicationNeed(result.content === root?.contents, "tool_body_changed");
   publicationNeed(data.companyId === companyId && data.wikiId === registry.wikiId &&
-    data.spaceSlug === registry.spaceSlug && data.path === args.path &&
+    data.spaceSlug === registry.spaceSlug && data.path === resolvedPath &&
     data.hash === proof.citation.wikiSHA256, "tool_metadata_changed");
   return { ...result, data: { ...data, publicationReadback: proof } };
 }

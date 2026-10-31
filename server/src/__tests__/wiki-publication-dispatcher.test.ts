@@ -51,7 +51,7 @@ function setup() {
   const workerManager = { isRunning: () => true, call } as unknown as PluginWorkerManager;
   const dispatcher = createPluginToolDispatcher({ db: {} as Db, workerManager });
   dispatcher.registerPluginTools(pluginKey, { id: pluginKey, tools: [{ name: "wiki_read_page", displayName: "Read", description: "Read", parametersSchema: { type: "object" } }] } as unknown as PaperclipPluginManifestV1, pluginDbId);
-  const run = () => dispatcher.executeTool(name, { companyId: "company", path: page.path }, context);
+  const run = (args = { companyId: "company", path: page.path } as Record<string, unknown>) => dispatcher.executeTool(name, args, context);
   return { run, call, body, workerResult };
 }
 
@@ -78,4 +78,15 @@ test("an existing worker error is preserved without looking up publication data"
   const f = setup(); Object.assign(f.workerResult, { error: "read failed" });
   const result = await f.run(); expect(result.result.error).toBe("read failed");
   expect(state.settingsReads).toHaveLength(0); expect(f.call).toHaveBeenCalledTimes(1);
+});
+
+
+test("dispatcher verifies resolved aliases with canonical worker read scope", async () => {
+  const f = setup();
+  const args = { companyId: "company", path: "/wiki/note.md", wikiId: " default ", spaceSlug: "DEFAULT" };
+  const result = await f.run(args);
+  expect(result.result.data).toMatchObject({ publicationReadback: { state: "verified" } });
+  expect(f.call).toHaveBeenCalledWith(pluginDbId, "getData", { key: "page-content", companyId: "company", params: { companyId: "company", wikiId: "default", spaceSlug: "default", path: "wiki/note.md" } });
+  state.review.status = "rejected";
+  await expect(f.run(args)).rejects.toThrow("wiki_publication_review_not_accepted");
 });
