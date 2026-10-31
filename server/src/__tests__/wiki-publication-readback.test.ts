@@ -1,6 +1,6 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
-import { applyWikiPublicationReadback, publicationCanonical, publicationHash, type JsonObject, type PublicationRegistry } from "../services/wiki-publication-readback.js";
+import { applyWikiPublicationReadback, verifyWikiPublication, publicationCanonical, publicationHash, type JsonObject, type PublicationRegistry } from "../services/wiki-publication-readback.js";
 
 function fixture() {
   const documents: Record<string, JsonObject> = {}; const reviews: Record<string, JsonObject> = {}; const pages: Record<string, JsonObject> = {};
@@ -42,3 +42,56 @@ test("self-reviewed publication cannot pass", async () => { const f = fixture();
 test("database Date receipts hash like their API JSON representation", async () => { const f = fixture(); f.reviews.source!.resolvedAt = new Date(f.reviews.source!.resolvedAt as string); await f.run(); });
 
 test("tool metadata cannot point at another page under a verified body", async () => { const f = fixture(); f.result.data.path = "other"; await assert.rejects(f.run(), /tool_metadata_changed/); });
+
+
+test("canonical receipt JSON sorts integer-like keys lexically", () => {
+  assert.equal(publicationCanonical({ "2": "two", "10": "ten" }), '{\n  "10": "ten",\n  "2": "two"\n}\n');
+});
+
+test("canonical receipt JSON orders full Unicode code points", () => {
+  assert.equal(publicationCanonical({ "😀": "astral", "\uE000": "bmp" }), '{\n  "\uE000": "bmp",\n  "😀": "astral"\n}\n');
+});
+
+test("a shared ancestor is checked once in a single dependency read", async () => {
+  const pages: Record<string, JsonObject> = {};
+  const documents: Record<string, JsonObject> = {};
+  const reviews: Record<string, JsonObject> = {};
+  const registry: PublicationRegistry = { schema: "colo.shared-wiki-publication-readback/v1", companyId: "company", wikiId: "default", spaceSlug: "default", qaAgentId: "qa", entries: [] };
+  const add = (name: string, parents: string[]) => {
+    const ref = { kind: "document", issueId: name, documentId: "doc-" + name, documentKey: name, revisionId: "rev-" + name };
+    const body = "Body for " + name;
+    const review: JsonObject = { id: "qa-" + name, companyId: "company", issueId: name, status: "accepted", sourceRunId: "writer-run", resolvedByAgentId: "qa", resolvedByRunId: "qa-run", resolvedAt: null, payload: {}, result: { outcome: "accepted" } };
+    documents[name] = { id: ref.documentId, companyId: "company", issueId: name, latestRevisionId: ref.revisionId, body };
+    reviews[review.id as string] = review;
+    pages[name] = { path: name, wikiId: "default", spaceSlug: "default", contents: body, hash: publicationHash(body), sourceRefs: [ref, ...parents.map(p => (pages[p]!.sourceRefs as unknown[])[0])] };
+    registry.entries.push({ path: name, ...ref, producerAgentId: "writer", reviewId: review.id as string, wikiSHA256: pages[name]!.hash as string, documentBodySHA256: publicationHash(body), reviewRecordSHA256: publicationHash(publicationCanonical(review)), sourceRefsSHA256: publicationHash(publicationCanonical(pages[name]!.sourceRefs)) });
+  };
+  let previous: string[] = [];
+  for (let level = 0; level < 7; level++) {
+    const names = [`level-${level}-a`, `level-${level}-b`];
+    for (const name of names) add(name, previous);
+    previous = names;
+  }
+  add("root", previous);
+  const pageReads: string[] = [], documentReads: string[] = [], reviewReads: string[] = [];
+  const readers = {
+    page: async (path: string) => { pageReads.push(path); return pages[path]!; },
+    document: async (id: string) => { documentReads.push(id); return documents[id]!; },
+    review: async (_id: string, id: string) => { reviewReads.push(id); return reviews[id]!; },
+  };
+  await verifyWikiPublication(registry, "root", readers);
+  for (const reads of [pageReads, documentReads, reviewReads]) {
+    assert.equal(new Set(reads).size, registry.entries.length);
+    assert.equal(reads.length, registry.entries.length);
+  }
+  // A later tool call must check current records again, not reuse a global cache.
+  documents["level-0-a"]!.latestRevisionId = "changed";
+  await assert.rejects(verifyWikiPublication(registry, "root", readers), /document_changed/);
+});
+
+test("dependency cycles are still rejected with per-read caching", async () => {
+  const f = fixture();
+  (f.pages.source!.sourceRefs as unknown[]).push((f.pages.synthesis!.sourceRefs as unknown[])[0]);
+  f.registry.entries[0]!.sourceRefsSHA256 = publicationHash(publicationCanonical(f.pages.source!.sourceRefs));
+  await assert.rejects(f.run(), /dependency_cycle/);
+});

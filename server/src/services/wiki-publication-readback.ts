@@ -23,15 +23,30 @@ export function publicationNeed(ok: unknown, reason: string): asserts ok {
 export function publicationHash(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
-function sortJson(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortJson);
-  if (value !== null && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([k, v]) => [k, sortJson(v)]));
+function compareUnicodeKeys(a: string, b: string): number {
+  const left = Array.from(a, c => c.codePointAt(0)!);
+  const right = Array.from(b, c => c.codePointAt(0)!);
+  for (let i = 0; i < Math.min(left.length, right.length); i++) {
+    if (left[i] !== right[i]) return left[i]! - right[i]!;
   }
-  return value;
+  return left.length - right.length;
+}
+function canonicalJson(value: unknown, depth = 0): string {
+  const pad = (level: number) => "  ".repeat(level);
+  if (Array.isArray(value)) {
+    return value.length === 0 ? "[]" : "[\n" + value.map(v => pad(depth + 1) + canonicalJson(v, depth + 1)).join(",\n") + "\n" + pad(depth) + "]";
+  }
+  if (value !== null && typeof value === "object") {
+    const record = value as JsonObject;
+    const keys = Object.keys(record).sort(compareUnicodeKeys);
+    return keys.length === 0 ? "{}" : "{\n" + keys.map(k => pad(depth + 1) + JSON.stringify(k) + ": " + canonicalJson(record[k], depth + 1)).join(",\n") + "\n" + pad(depth) + "}";
+  }
+  return JSON.stringify(value)!;
 }
 export function publicationCanonical(value: unknown): string {
-  return JSON.stringify(sortJson(JSON.parse(JSON.stringify(value))), null, 2) + "\n";
+  // Normalize Dates and JSON-only values first, then write the sorted keys
+  // directly: JSON.stringify(object) would reorder integer-like keys again.
+  return canonicalJson(JSON.parse(JSON.stringify(value))) + "\n";
 }
 function object(value: unknown): JsonObject {
   publicationNeed(value !== null && typeof value === "object" && !Array.isArray(value), "invalid_record");
@@ -57,35 +72,50 @@ export interface PublicationCitation {
   path: string; wikiSHA256: string; documentId: string; revisionId: string;
   documentBodySHA256: string; bodyByteStart: number; bodyByteEndExclusive: number; reviewId: string;
 }
-export async function verifyWikiPublication(registry: PublicationRegistry, path: string, readers: PublicationReaders, seen = new Set<string>()): Promise<{ state: "verified"; citation: PublicationCitation; dependencies: PublicationCitation[] }> {
-  publicationNeed(!seen.has(path), "dependency_cycle");
-  const nextSeen = new Set(seen).add(path);
-  const matches = registry.entries.filter(p => p.path === path);
-  publicationNeed(matches.length === 1, "unregistered_page");
-  const pin = matches[0]!; const page = await readers.page(path);
-  publicationNeed(page.path === path && page.wikiId === registry.wikiId && page.spaceSlug === registry.spaceSlug && typeof page.contents === "string", "page_scope");
-  publicationNeed(publicationHash(page.contents) === pin.wikiSHA256 && page.hash === pin.wikiSHA256, "page_changed");
-  publicationNeed(Array.isArray(page.sourceRefs) && publicationHash(publicationCanonical(page.sourceRefs)) === pin.sourceRefsSHA256, "references_changed");
-  const document = await readers.document(pin.issueId, pin.documentKey);
-  publicationNeed(document && document.companyId === registry.companyId && document.issueId === pin.issueId && document.id === pin.documentId && document.latestRevisionId === pin.revisionId && typeof document.body === "string" && publicationHash(document.body) === pin.documentBodySHA256, "document_changed");
-  const bytes = Buffer.from(page.contents); const body = Buffer.from(document.body as string); const start = bytes.indexOf(body);
-  publicationNeed(body.length > 0 && start >= 0 && bytes.indexOf(body, start + 1) === -1, "body_not_unique_exact_copy");
-  const review = await readers.review(pin.issueId, pin.reviewId);
-  publicationNeed(review && review.id === pin.reviewId && review.companyId === registry.companyId && review.issueId === pin.issueId && review.status === "accepted" && object(review.result).outcome === "accepted", "review_not_accepted");
-  publicationNeed(review.resolvedByAgentId === registry.qaAgentId && review.resolvedByAgentId !== pin.producerAgentId && review.resolvedByRunId && review.resolvedByRunId !== review.sourceRunId, "review_not_independent");
-  publicationNeed(publicationHash(publicationCanonical(reviewBasis(review))) === pin.reviewRecordSHA256, "review_changed");
-  const refs = page.sourceRefs.map(object); const own = refs.filter(r => r.kind === "document" && r.documentId === pin.documentId);
-  publicationNeed(own.length === 1 && ["issueId", "documentId", "documentKey", "revisionId"].every(k => own[0]![k] === pin[k as keyof PublicationPin]), "own_reference_changed");
-  const dependencies: PublicationCitation[] = [];
-  for (const ref of refs) {
-    publicationNeed(ref.kind === "document", "unregistered_source_kind");
-    if (ref.documentId === pin.documentId) continue;
-    const parents = registry.entries.filter(p => ["issueId", "documentId", "documentKey", "revisionId"].every(k => p[k as keyof PublicationPin] === ref[k]));
-    publicationNeed(parents.length === 1, "unregistered_dependency");
-    const parent = await verifyWikiPublication(registry, parents[0]!.path, readers, nextSeen); dependencies.push(parent.citation);
+export interface PublicationProof {
+  state: "verified";
+  citation: PublicationCitation;
+  dependencies: PublicationCitation[];
+}
+export async function verifyWikiPublication(registry: PublicationRegistry, path: string, readers: PublicationReaders, initialSeen = new Set<string>()): Promise<PublicationProof> {
+  const verified = new Map<string, PublicationProof>();
+  async function visit(path: string, seen: Set<string>): Promise<PublicationProof> {
+    publicationNeed(!seen.has(path), "dependency_cycle");
+    const cached = verified.get(path);
+    if (cached) return cached;
+    const nextSeen = new Set(seen).add(path);
+    const matches = registry.entries.filter(p => p.path === path);
+    publicationNeed(matches.length === 1, "unregistered_page");
+    const pin = matches[0]!; const page = await readers.page(path);
+    publicationNeed(page.path === path && page.wikiId === registry.wikiId && page.spaceSlug === registry.spaceSlug && typeof page.contents === "string", "page_scope");
+    publicationNeed(publicationHash(page.contents) === pin.wikiSHA256 && page.hash === pin.wikiSHA256, "page_changed");
+    publicationNeed(Array.isArray(page.sourceRefs) && publicationHash(publicationCanonical(page.sourceRefs)) === pin.sourceRefsSHA256, "references_changed");
+    const document = await readers.document(pin.issueId, pin.documentKey);
+    publicationNeed(document && document.companyId === registry.companyId && document.issueId === pin.issueId && document.id === pin.documentId && document.latestRevisionId === pin.revisionId && typeof document.body === "string" && publicationHash(document.body) === pin.documentBodySHA256, "document_changed");
+    const bytes = Buffer.from(page.contents); const body = Buffer.from(document.body as string); const start = bytes.indexOf(body);
+    publicationNeed(body.length > 0 && start >= 0 && bytes.indexOf(body, start + 1) === -1, "body_not_unique_exact_copy");
+    const review = await readers.review(pin.issueId, pin.reviewId);
+    publicationNeed(review && review.id === pin.reviewId && review.companyId === registry.companyId && review.issueId === pin.issueId && review.status === "accepted" && object(review.result).outcome === "accepted", "review_not_accepted");
+    publicationNeed(review.resolvedByAgentId === registry.qaAgentId && review.resolvedByAgentId !== pin.producerAgentId && review.resolvedByRunId && review.resolvedByRunId !== review.sourceRunId, "review_not_independent");
+    publicationNeed(publicationHash(publicationCanonical(reviewBasis(review))) === pin.reviewRecordSHA256, "review_changed");
+    const refs = page.sourceRefs.map(object); const own = refs.filter(r => r.kind === "document" && r.documentId === pin.documentId);
+    publicationNeed(own.length === 1 && ["issueId", "documentId", "documentKey", "revisionId"].every(k => own[0]![k] === pin[k as keyof PublicationPin]), "own_reference_changed");
+    const dependencies: PublicationCitation[] = [];
+    for (const ref of refs) {
+      publicationNeed(ref.kind === "document", "unregistered_source_kind");
+      if (ref.documentId === pin.documentId) continue;
+      const parents = registry.entries.filter(p => ["issueId", "documentId", "documentKey", "revisionId"].every(k => p[k as keyof PublicationPin] === ref[k]));
+      publicationNeed(parents.length === 1, "unregistered_dependency");
+      const parent = await visit(parents[0]!.path, nextSeen); dependencies.push(parent.citation);
+    }
+    publicationNeed(new Set(dependencies.map(p => p.path)).size === dependencies.length, "duplicate_dependency");
+    const proof: PublicationProof = { state: "verified", citation: { path, wikiSHA256: pin.wikiSHA256, documentId: pin.documentId, revisionId: pin.revisionId, documentBodySHA256: pin.documentBodySHA256, bodyByteStart: start, bodyByteEndExclusive: start + body.length, reviewId: pin.reviewId }, dependencies };
+    // Only successful proofs are reused, only within this tool call. A later
+    // employee read always checks current documents and QA records again.
+    verified.set(path, proof);
+    return proof;
   }
-  publicationNeed(new Set(dependencies.map(p => p.path)).size === dependencies.length, "duplicate_dependency");
-  return { state: "verified", citation: { path, wikiSHA256: pin.wikiSHA256, documentId: pin.documentId, revisionId: pin.revisionId, documentBodySHA256: pin.documentBodySHA256, bodyByteStart: start, bodyByteEndExclusive: start + body.length, reviewId: pin.reviewId }, dependencies };
+  return visit(path, initialSeen);
 }
 
 export async function applyWikiPublicationReadback<T extends { content?: unknown; data?: unknown }>(configuration: unknown, companyId: string, parameters: unknown, result: T, readers: PublicationReaders): Promise<T> {
