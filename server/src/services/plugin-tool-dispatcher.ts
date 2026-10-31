@@ -39,6 +39,9 @@ import {
 } from "./plugin-tool-registry.js";
 import { pluginRegistryService } from "./plugin-registry.js";
 import { logger } from "../middleware/logger.js";
+import { documentService } from "./documents.js";
+import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { applyWikiPublicationReadback, publicationNeed } from "./wiki-publication-readback.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -418,6 +421,47 @@ export function createPluginToolDispatcher(
         parameters,
         runContext,
       );
+
+      // Both the native tool gateway and /plugins/tools/execute converge here.
+      // Configuration is company-scoped operator data; agent arguments cannot
+      // supply or replace publication receipts, and existing tool policy runs first.
+      if (
+        db && workerManager &&
+        namespacedName === "paperclipai.plugin-llm-wiki:wiki_read_page" &&
+        !result.result.error
+      ) {
+        const registered = registry.getTool(namespacedName);
+        publicationNeed(registered, "tool_unregistered");
+        const settings = await pluginRegistryService(db).getConfig(
+          registered.pluginDbId, runContext.companyId,
+        );
+        if (settings?.configJson && Object.prototype.hasOwnProperty.call(settings.configJson, "publicationReadback")) {
+          const resolvedPage = result.result.data as Record<string, unknown>;
+          const documents = documentService(db);
+          const interactions = issueThreadInteractionService(db);
+          result.result = await applyWikiPublicationReadback(
+            settings.configJson.publicationReadback, runContext.companyId,
+            parameters, result.result, {
+              page: async (path) => await workerManager.call(
+                registered.pluginDbId, "getData", {
+                  key: "page-content", companyId: runContext.companyId,
+                  params: {
+                    companyId: runContext.companyId,
+                    wikiId: resolvedPage.wikiId,
+                    spaceSlug: resolvedPage.spaceSlug, path,
+                  },
+                },
+              ) as Record<string, unknown>,
+              document: async (issueId, key) => await documents.getIssueDocumentByKey(
+                issueId, key,
+              ) as Record<string, unknown> | null,
+              review: async (issueId, id) => (
+                (await interactions.listForIssue(issueId)).find(r => r.id === id) ?? null
+              ) as unknown as Record<string, unknown> | null,
+            },
+          );
+        }
+      }
 
       log.debug(
         {
