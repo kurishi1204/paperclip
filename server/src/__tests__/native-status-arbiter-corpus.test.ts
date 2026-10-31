@@ -2116,9 +2116,16 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, seeded.issueId))).toHaveLength(2);
   }, 30_000);
 
-  it.each(["answered", "review_started", "worker_running", "human_review", "new_contract", "new_status", "workspace_failed", "malformed_target", "different_reviewer"])(
+  it.each(["answered", "review_started", "worker_running", "human_review", "new_contract", "new_status", "workspace_failed", "malformed_target", "different_reviewer", "old_approval"])(
     "review version handoff preserves authority when %s", async (guard) => {
       const seeded = await seedReviewVersionHandoff();
+      if (guard === "old_approval") {
+        const [prior] = await db.select().from(statusDecisions).where(eq(statusDecisions.runId, seeded.runId));
+        const [assessment] = await db.select().from(workAssessments).where(eq(workAssessments.id, prior!.assessmentId));
+        await db.update(workAssessments).set({ assessmentJson: { ...assessment!.assessmentJson,
+          attentionRequests: [{ kind: "approval", ownerClass: "agent", targetAgentId: delegateAgentId, summary: "Approve release" }] } })
+          .where(eq(workAssessments.id, assessment!.id));
+      }
       if (guard === "malformed_target") await db.update(issueThreadInteractions).set({ payload: { ...seeded.oldCard.payload,
         target: { type: "custom", key: "native_completion_review", revisionId: "not-a-decision-id" } } }).where(eq(issueThreadInteractions.id, seeded.oldCard.id));
       if (guard === "different_reviewer") {

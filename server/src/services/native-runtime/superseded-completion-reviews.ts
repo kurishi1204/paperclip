@@ -103,6 +103,11 @@ export async function retireSupersededCompletionReviews(db: Db, runIds?: string[
         eq(workAssessments.runId, card.sourceRunId)));
       if (!binding || !priorRun || priorRun.status !== "succeeded" || priorRun.agentId !== run.agentId
         || !priorRun.finishedAt || priorRun.finishedAt > run.startedAt || priorAssessment?.contractId !== assessment.contractId) return;
+      const priorRequests = priorAssessment.assessmentJson.attentionRequests;
+      if (!Array.isArray(priorRequests) || priorRequests.length !== 1) return;
+      const priorRequest = record(priorRequests[0]);
+      if (priorRequest.kind !== "review" || priorRequest.ownerClass !== "agent"
+        || priorRequest.targetAgentId !== request.targetAgentId) return;
       // A scoped review can still have legacy/unresolved mode before its first
       // dispatch, so inspect all modes and both persisted issue identities.
       const runs = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, scope.companyId), or(
