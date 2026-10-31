@@ -90,3 +90,18 @@ test("dispatcher verifies resolved aliases with canonical worker read scope", as
   state.review.status = "rejected";
   await expect(f.run(args)).rejects.toThrow("wiki_publication_review_not_accepted");
 });
+
+
+test("the ordinary dispatcher binds an explicit publication reviewer without replacing the default", async () => {
+  const f = setup();
+  const registry = state.config!.publicationReadback as {qaAgentId: string; entries: Record<string, unknown>[]};
+  registry.entries[0]!.qaAgentId = "new-qa";
+  await expect(f.run()).rejects.toThrow("wiki_publication_review_not_independent");
+  state.review.resolvedByAgentId = "new-qa";
+  registry.entries[0]!.reviewRecordSHA256 = publicationHash(publicationCanonical(state.review));
+  const result = await f.run();
+  expect(registry.qaAgentId).toBe("qa");
+  expect(result.result.data).toMatchObject({publicationReadback:{state:"verified"}});
+  state.review.status = "rejected";
+  await expect(f.run()).rejects.toThrow("wiki_publication_review_not_accepted");
+});

@@ -48,6 +48,14 @@ representation. The review basis contains `id`, `companyId`, `issueId`,
 `status`, `sourceRunId`, `resolvedByAgentId`, `resolvedByRunId`, `resolvedAt`,
 `payload`, and `result`; missing values are null and dates use API ISO strings.
 
+An entry can include `qaAgentId` to bind that publication to a different named
+independent reviewer. Entries without this field keep the registry-level
+reviewer. An empty, null, or malformed explicit value is an error; it does not
+fall back to the default. Each recursive parent uses its own entry's reviewer.
+This lets new publications use a new QA employee while existing publications
+keep their original QA. It does not permit self-review or change any actor's
+permissions. Keep the exact review record hash for each entry.
+
 ## Read behavior
 
 The host selects a receipt using the worker's resolved company, Wiki, space,
