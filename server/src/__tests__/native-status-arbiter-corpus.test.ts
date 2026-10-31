@@ -2079,8 +2079,12 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
       completionContractId: nextContract.id, completionContractSha256: nextContract.canonicalSha256,
       contextSnapshot: { issueId: seeded.issueId, wakeReason: "issue_commented" },
       startedAt: new Date(Date.now() - 2000), finishedAt: null });
+    const sourceClaim = (sourceResult!.resultJson.result as { completionClaim: Record<string, unknown> }).completionClaim;
     await db.insert(nativeRunResults).values({ ...sourceResult!, id: nextResultId, runId: nextRunId,
-      completionContractId: nextContract.id, serverFingerprint: randomUUID(), canonicalSha256: randomUUID() });
+      completionContractId: nextContract.id, resultJson: { ...sourceResult!.resultJson,
+        result: { ...sourceResult!.resultJson.result as object,
+          completionClaim: { ...sourceClaim, contractRevision: nextContract.contractJson.revision } } },
+      serverFingerprint: randomUUID(), canonicalSha256: randomUUID() });
     await db.insert(nativeRunFinalizations).values({ runId: nextRunId, companyId, issueId: seeded.issueId,
       phase: "assessing", resultId: nextResultId });
     await db.insert(workspaceOperations).values({ companyId, heartbeatRunId: nextRunId, issueId: seeded.issueId,
@@ -2145,6 +2149,7 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, seeded.nextRunId));
     const [assessment] = await db.select().from(workAssessments).where(eq(workAssessments.id, coordinator!.assessmentId!));
     expect(assessment).toMatchObject({ contractId: seeded.nextContract.id, resultId: seeded.nextResultId });
+    expect(assessment!.assessmentJson).toMatchObject({ contractRevisionMatches: true, allCriteriaSatisfied: true });
     expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.issueId, seeded.issueId))).toEqual(originalResults);
     expect(await db.select().from(statusDecisions).where(eq(statusDecisions.id, seeded.decision.id))).toEqual(originalDecision);
     const contextSnapshot = { issueId: seeded.issueId, nativeReviewInteractionId: next.id,
