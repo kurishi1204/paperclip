@@ -95,3 +95,11 @@ test("dependency cycles are still rejected with per-read caching", async () => {
   f.registry.entries[0]!.sourceRefsSHA256 = publicationHash(publicationCanonical(f.pages.source!.sourceRefs));
   await assert.rejects(f.run(), /dependency_cycle/);
 });
+
+
+test("duplicate document publication bindings are refused before record reads", async () => {
+  const f = fixture();
+  f.registry.entries.push({ ...f.registry.entries[0]!, path: "alternate-source-path" });
+  await assert.rejects(f.run(), /registry_document_ambiguous/);
+  assert.equal(f.reads(), 0);
+});

@@ -38,9 +38,13 @@ migration, plugin capability, or employee permission change is required.
 ```
 
 Build the registry from existing publication and accepted independent QA
-receipts. Registering a receipt does not approve new content. Canonical JSON
+receipts. Each document version (`issueId`, `documentId`, `documentKey`,
+`revisionId`) must have exactly one registered publication path. Duplicate paths
+or document-version bindings are rejected before record reads; publication
+aliases are not supported. Registering a receipt does not approve new content. Canonical JSON
 uses recursively sorted object keys, two-space indentation, unescaped Unicode,
-and a trailing newline. The review basis contains `id`, `companyId`, `issueId`,
+and a trailing newline. Use `publicationCanonical` for the exact receipt
+representation. The review basis contains `id`, `companyId`, `issueId`,
 `status`, `sourceRunId`, `resolvedByAgentId`, `resolvedByRunId`, `resolvedAt`,
 `payload`, and `result`; missing values are null and dates use API ISO strings.
 

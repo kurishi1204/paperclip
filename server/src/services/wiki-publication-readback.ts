@@ -63,6 +63,11 @@ export function parsePublicationRegistry(value: unknown, companyId: string): Pub
     for (const field of ["wikiSHA256", "documentBodySHA256", "reviewRecordSHA256", "sourceRefsSHA256"]) publicationNeed(typeof pin[field] === "string" && /^[0-9a-f]{64}$/.test(pin[field] as string), "registry_hash");
   }
   publicationNeed(new Set(record.entries.map((p: PublicationPin) => p.path)).size === record.entries.length, "duplicate_pin");
+  // Source references identify a document version, not a choice of aliases.
+  // Keep the publication binding one-to-one rather than picking an arbitrary copy.
+  const versions = record.entries.map((p: PublicationPin) =>
+    JSON.stringify([p.issueId, p.documentId, p.documentKey, p.revisionId]));
+  publicationNeed(new Set(versions).size === versions.length, "registry_document_ambiguous");
   return record as unknown as PublicationRegistry;
 }
 function reviewBasis(review: JsonObject) {
