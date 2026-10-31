@@ -143,3 +143,45 @@ test("missing resolved metadata cannot silently opt out of verification", async 
   await assert.rejects(f.run({ companyId: "company", path: "/synthesis" }), /tool_metadata_changed/);
   assert.equal(f.reads(), 0);
 });
+
+
+test("each publication keeps its own named reviewer across recursive dependencies", async () => {
+  const f = fixture();
+  f.registry.entries[1]!.qaAgentId = "new-qa";
+  f.reviews.synthesis!.resolvedByAgentId = "new-qa";
+  f.registry.entries[1]!.reviewRecordSHA256 = publicationHash(publicationCanonical(f.reviews.synthesis));
+  await f.run();
+  assert.equal(f.registry.qaAgentId, "qa");
+  assert.equal(f.reviews.source!.resolvedByAgentId, "qa");
+  f.reviews.source!.resolvedByAgentId = "new-qa";
+  await assert.rejects(f.run(), /review_not_independent/);
+});
+
+test("an explicit reviewer does not accept the registry default or self-review", async () => {
+  const f = fixture();
+  f.registry.entries[1]!.qaAgentId = "new-qa";
+  await assert.rejects(f.run(), /review_not_independent/);
+  f.registry.entries[1]!.qaAgentId = "producer";
+  f.reviews.synthesis!.resolvedByAgentId = "producer";
+  f.registry.entries[1]!.reviewRecordSHA256 = publicationHash(publicationCanonical(f.reviews.synthesis));
+  await assert.rejects(f.run(), /review_not_independent/);
+});
+
+for (const value of [null, undefined, "", " ", " qa ", 42, [], {}]) {
+  test(`invalid explicit reviewer ${JSON.stringify(value)} cannot fall back to the default`, async () => {
+    const f = fixture();
+    Object.assign(f.registry.entries[1]!, { qaAgentId: value });
+    await assert.rejects(f.run(), /registry_pin_reviewer/);
+    assert.equal(f.reads(), 0);
+  });
+}
+
+test("a new reviewer's revoked receipt still blocks the dependent page", async () => {
+  const f = fixture();
+  f.registry.entries[0]!.qaAgentId = "new-qa";
+  f.reviews.source!.resolvedByAgentId = "new-qa";
+  f.registry.entries[0]!.reviewRecordSHA256 = publicationHash(publicationCanonical(f.reviews.source));
+  await f.run();
+  f.reviews.source!.status = "rejected";
+  await assert.rejects(f.run(), /review_not_accepted/);
+});

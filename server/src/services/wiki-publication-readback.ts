@@ -6,6 +6,7 @@ export interface PublicationPin {
   revisionId: string; producerAgentId: string; reviewId: string;
   wikiSHA256: string; documentBodySHA256: string; reviewRecordSHA256: string;
   sourceRefsSHA256: string;
+  qaAgentId?: string;
 }
 export interface PublicationRegistry {
   schema: "colo.shared-wiki-publication-readback/v1";
@@ -61,6 +62,7 @@ export function parsePublicationRegistry(value: unknown, companyId: string): Pub
     const pin = object(item);
     for (const field of ["path", "issueId", "documentId", "documentKey", "revisionId", "producerAgentId", "reviewId"]) publicationNeed(typeof pin[field] === "string" && pin[field], "registry_pin");
     for (const field of ["wikiSHA256", "documentBodySHA256", "reviewRecordSHA256", "sourceRefsSHA256"]) publicationNeed(typeof pin[field] === "string" && /^[0-9a-f]{64}$/.test(pin[field] as string), "registry_hash");
+    if (Object.hasOwn(pin, "qaAgentId")) publicationNeed(typeof pin.qaAgentId === "string" && pin.qaAgentId.trim().length > 0 && pin.qaAgentId === pin.qaAgentId.trim(), "registry_pin_reviewer");
   }
   publicationNeed(new Set(record.entries.map((p: PublicationPin) => p.path)).size === record.entries.length, "duplicate_pin");
   // Source references identify a document version, not a choice of aliases.
@@ -101,7 +103,12 @@ export async function verifyWikiPublication(registry: PublicationRegistry, path:
     publicationNeed(body.length > 0 && start >= 0 && bytes.indexOf(body, start + 1) === -1, "body_not_unique_exact_copy");
     const review = await readers.review(pin.issueId, pin.reviewId);
     publicationNeed(review && review.id === pin.reviewId && review.companyId === registry.companyId && review.issueId === pin.issueId && review.status === "accepted" && object(review.result).outcome === "accepted", "review_not_accepted");
-    publicationNeed(review.resolvedByAgentId === registry.qaAgentId && review.resolvedByAgentId !== pin.producerAgentId && review.resolvedByRunId && review.resolvedByRunId !== review.sourceRunId, "review_not_independent");
+    // The registry default preserves existing publications. An explicit pin
+    // binds this page (including a recursive parent) to its own named reviewer.
+    // An invalid explicit value must never fall back to the registry default.
+    const qaAgentId = Object.hasOwn(pin, "qaAgentId") ? pin.qaAgentId : registry.qaAgentId;
+    publicationNeed(typeof qaAgentId === "string" && qaAgentId.trim().length > 0 && qaAgentId === qaAgentId.trim(), "registry_pin_reviewer");
+    publicationNeed(review.resolvedByAgentId === qaAgentId && review.resolvedByAgentId !== pin.producerAgentId && review.resolvedByRunId && review.resolvedByRunId !== review.sourceRunId, "review_not_independent");
     publicationNeed(publicationHash(publicationCanonical(reviewBasis(review))) === pin.reviewRecordSHA256, "review_changed");
     const refs = page.sourceRefs.map(object); const own = refs.filter(r => r.kind === "document" && r.documentId === pin.documentId);
     publicationNeed(own.length === 1 && ["issueId", "documentId", "documentKey", "revisionId"].every(k => own[0]![k] === pin[k as keyof PublicationPin]), "own_reference_changed");
