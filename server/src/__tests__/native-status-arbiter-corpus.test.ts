@@ -1,3 +1,5 @@
+import { retireSupersededCompletionReviews } from "../services/native-runtime/superseded-completion-reviews.js";
+import { getNativeReviewAssignment } from "../services/native-runtime/native-review-participant.js";
 import { dismissAutomaticCompletionReviews } from "../services/native-runtime/automatic-completion-reviews.js";
 import * as childCompletionDelivery from "../services/native-runtime/native-child-completion-delivery.js";
 import { nativeCompletionFeedback } from "../services/native-runtime/native-completion-feedback.js";
@@ -2045,6 +2047,101 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     });
     return { ...seeded, decision: decision!, interaction: interaction! };
   }
+
+  async function seedReviewVersionHandoff() {
+    const seeded = await seedFixture({ ...corpus.fixtures.find((entry) => entry.mode === "native")!,
+      id: `review-version-${randomUUID()}`, given: { priorIssueStatus: "in_progress" } });
+    const [original] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.id, seeded.resultId!));
+    const attention = { kind: "review", ownerClass: "agent", targetAgentId: delegateAgentId,
+      summary: "Independently review the current saved document revision." };
+    await db.update(nativeRunResults).set({ resultJson: { ...original!.resultJson,
+      result: { ...original!.resultJson.result as object, reportedWorkDisposition: "needs_review", attentionRequests: [attention] } } })
+      .where(eq(nativeRunResults.id, seeded.resultId!));
+    const oldStart = new Date(Date.now() - 4000), oldEnd = new Date(Date.now() - 3000);
+    await db.update(heartbeatRuns).set({ startedAt: oldStart }).where(eq(heartbeatRuns.id, seeded.runId));
+    await finalizeNativeRun({ db, runId: seeded.runId, workspaceFinalizeStatus: "succeeded" });
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: oldEnd }).where(eq(heartbeatRuns.id, seeded.runId));
+    const [oldCard] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId));
+    const [sourceRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    const [sourceResult] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.id, seeded.resultId!));
+    const nextRunId = randomUUID(), nextResultId = randomUUID();
+    await db.insert(heartbeatRuns).values({ ...sourceRun!, id: nextRunId, status: "running", resultJson: {},
+      contextSnapshot: { issueId: seeded.issueId, wakeReason: "issue_commented" },
+      startedAt: new Date(Date.now() - 2000), finishedAt: null });
+    await db.insert(nativeRunResults).values({ ...sourceResult!, id: nextResultId, runId: nextRunId,
+      serverFingerprint: randomUUID(), canonicalSha256: randomUUID() });
+    await db.insert(nativeRunFinalizations).values({ runId: nextRunId, companyId, issueId: seeded.issueId,
+      phase: "assessing", resultId: nextResultId });
+    await db.insert(workspaceOperations).values({ companyId, heartbeatRunId: nextRunId, issueId: seeded.issueId,
+      phase: "workspace_finalize", status: "succeeded", exitCode: 0, finishedAt: new Date() });
+    await db.update(issues).set({ executionRunId: nextRunId }).where(eq(issues.id, seeded.issueId));
+    await finalizeNativeRun({ db, runId: nextRunId, workspaceFinalizeStatus: "succeeded" });
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, nextRunId));
+    const [currentIssue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    const [decision] = await db.select().from(statusDecisions).where(eq(statusDecisions.id, currentIssue!.lastStatusDecisionId!));
+    expect(decision!.reasonCode).toBe("governed_gate_pending");
+    const cancelledReviewRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: cancelledReviewRunId, companyId, agentId: delegateAgentId,
+      status: "cancelled", runtimeMode: "legacy", errorCode: "issue_assignee_changed", finishedAt: new Date(),
+      contextSnapshot: { issueId: seeded.issueId, nativeReviewInteractionId: oldCard!.id,
+        nativeReviewDecisionId: (oldCard!.payload as { target: { revisionId: string } }).target.revisionId } });
+    return { ...seeded, oldCard: oldCard!, nextRunId, nextResultId, cancelledReviewRunId, decision: decision! };
+  }
+
+  it("review version handoff retires the old request and binds the saved continuation exactly once", async () => {
+    const seeded = await seedReviewVersionHandoff();
+    await reconcileNativeFinalizations(db, [seeded.nextRunId]);
+    const cards = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId));
+    expect(cards).toHaveLength(2);
+    expect(cards.find((entry) => entry.id === seeded.oldCard.id)).toMatchObject({ status: "cancelled",
+      result: { outcome: "withdrawn", reason: "native_completion_review_superseded_by_writer_result" } });
+    const next = cards.find((entry) => entry.id !== seeded.oldCard.id)!;
+    expect(next).toMatchObject({ status: "pending", sourceRunId: seeded.nextRunId, addresseeAgentId: delegateAgentId });
+    expect(await getNativeReviewAssignment(db, { companyId, issueId: seeded.issueId, agentId: delegateAgentId,
+      contextSnapshot: { nativeReviewInteractionId: next.id, nativeReviewDecisionId: (next.payload as { target: { revisionId: string } }).target.revisionId },
+    })).not.toBeNull();
+    expect((await issueService(db).getById(seeded.issueId))!.status).toBe("in_review");
+    await reconcileNativeFinalizations(db, [seeded.nextRunId]);
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId))).toEqual(cards);
+  }, 30_000);
+
+  it("review version handoff survives retirement before a restart without resending the writer", async () => {
+    const seeded = await seedReviewVersionHandoff();
+    await retireSupersededCompletionReviews(db, [seeded.nextRunId]);
+    expect((await issueThreadInteractionService(db).getById(seeded.oldCard.id))!.status).toBe("cancelled");
+    await reconcileNativeFinalizations(db, [seeded.nextRunId]);
+    const cards = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId));
+    expect(cards.filter((entry) => entry.status === "pending")).toHaveLength(1);
+    expect(cards.find((entry) => entry.status === "pending")!.sourceRunId).toBe(seeded.nextRunId);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, seeded.issueId))).toHaveLength(2);
+  }, 30_000);
+
+  it.each(["answered", "review_started", "worker_running", "human_review", "new_contract", "new_status", "workspace_failed", "malformed_target", "different_reviewer"])(
+    "review version handoff preserves authority when %s", async (guard) => {
+      const seeded = await seedReviewVersionHandoff();
+      if (guard === "malformed_target") await db.update(issueThreadInteractions).set({ payload: { ...seeded.oldCard.payload,
+        target: { type: "custom", key: "native_completion_review", revisionId: "not-a-decision-id" } } }).where(eq(issueThreadInteractions.id, seeded.oldCard.id));
+      if (guard === "different_reviewer") {
+        const [assessment] = await db.select().from(workAssessments).where(eq(workAssessments.id, seeded.decision.assessmentId));
+        await db.update(workAssessments).set({ assessmentJson: { ...assessment!.assessmentJson,
+          attentionRequests: [{ kind: "review", ownerClass: "agent", targetAgentId: outsideAgentId, summary: "Wrong reviewer" }] } })
+          .where(eq(workAssessments.id, assessment!.id));
+      }
+      if (guard === "answered") await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, seeded.oldCard.id));
+      if (guard === "review_started") await db.update(heartbeatRuns).set({ startedAt: new Date() }).where(eq(heartbeatRuns.id, seeded.cancelledReviewRunId));
+      if (guard === "worker_running") await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, seeded.nextRunId));
+      if (guard === "human_review") await db.update(issueThreadInteractions).set({ addresseeAgentId: null, resolverPolicy: "human_only" }).where(eq(issueThreadInteractions.id, seeded.oldCard.id));
+      if (guard === "new_status") await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, seeded.issueId));
+      if (guard === "workspace_failed") await db.update(workspaceOperations).set({ status: "failed" }).where(eq(workspaceOperations.heartbeatRunId, seeded.nextRunId));
+      if (guard === "new_contract") {
+        const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.id, seeded.contractId!));
+        await db.insert(completionContracts).values({ ...contract!, id: randomUUID(), revision: 2, canonicalSha256: randomUUID() });
+      }
+      await retireSupersededCompletionReviews(db, [seeded.nextRunId]);
+      expect((await issueThreadInteractionService(db).getById(seeded.oldCard.id))!.status).toBe(guard === "answered" ? "accepted" : "pending");
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId))).toHaveLength(1);
+    }, 30_000,
+  );
 
   async function seedAutomaticReview() {
     const seeded = await seedPolicyReview();

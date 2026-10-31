@@ -1,3 +1,4 @@
+import { retireSupersededCompletionReviews, decisionHasSupersededCompletionReview } from "./superseded-completion-reviews.js";
 import { recoverLegacyUnsafeWorkspaceExports } from "./native-workspace-export-recovery.js";
 import { hasPendingNativeChildCompletion } from "./native-child-completion-delivery.js";
 import { dismissAutomaticCompletionReviews, decisionHasRetiredAutomaticReview } from "./automatic-completion-reviews.js";
@@ -573,6 +574,7 @@ export async function reconcileNativeFinalizations(
   } else {
     await dismissAutomaticCompletionReviews(db);
   }
+  await retireSupersededCompletionReviews(db, runIds);
   const rows = await db
     .select({
       runId: heartbeatRuns.id,
@@ -728,12 +730,13 @@ export async function reconcileNativeFinalizations(
         assessment.priorIssueStatus !== row.issueStatus
         || Number(assessment.priorStatusVersion) !== Number(row.issueStatusVersion)
       );
-      const retiredAutomaticReview = issueMatchesCurrentDecision && currentDecision
-        ? await decisionHasRetiredAutomaticReview(db, currentDecision) : false;
+      const retiredReview = issueMatchesCurrentDecision && currentDecision
+        ? (await decisionHasRetiredAutomaticReview(db, currentDecision)
+          || await decisionHasSupersededCompletionReview(db, currentDecision)) : false;
       let reassessment = null;
       let resultRow = null;
       let contractRow = null;
-      if (assessment && (authoritativeStatusChanged || changedEvidence || retiredAutomaticReview)) {
+      if (assessment && (authoritativeStatusChanged || changedEvidence || retiredReview)) {
         [resultRow, contractRow] = await Promise.all([
           db.select().from(nativeRunResults).where(and(
             eq(nativeRunResults.id, assessment.resultId),
@@ -767,25 +770,25 @@ export async function reconcileNativeFinalizations(
         : newEvidenceSatisfiesContract
           ? { newEvidenceSatisfiesContract: true }
           : {};
-      if (Object.keys(facts).length > 0 || retiredAutomaticReview) {
+      if (Object.keys(facts).length > 0 || retiredReview) {
         if (!assessment || !reassessment || !resultRow || !contractRow) {
           throw new Error("native_reconciliation_reassessment_missing");
         }
-        const currentIssue = retiredAutomaticReview
+        const currentIssue = retiredReview
           ? await db.select().from(issues).where(and(eq(issues.id, row.issueId), eq(issues.companyId, row.companyId))).then((entries) => entries[0])
           : null;
-        const readiness = retiredAutomaticReview ? await issueService(db).getDependencyReadiness(row.issueId, db) : null;
-        const currentRun = retiredAutomaticReview ? await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, row.runId)).then((entries) => entries[0]) : null;
+        const readiness = retiredReview ? await issueService(db).getDependencyReadiness(row.issueId, db) : null;
+        const currentRun = retiredReview ? await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, row.runId)).then((entries) => entries[0]) : null;
         // Never replay an old result over a new run or a later task contract.
-        const latestContract = retiredAutomaticReview ? await db.select({ id: completionContracts.id }).from(completionContracts)
+        const latestContract = retiredReview ? await db.select({ id: completionContracts.id }).from(completionContracts)
           .where(and(eq(completionContracts.companyId, row.companyId), eq(completionContracts.issueId, row.issueId)))
           .orderBy(desc(completionContracts.revision)).limit(1).then((entries) => entries[0]) : null;
-        if (retiredAutomaticReview && (!currentIssue || currentRun?.status !== "succeeded"
+        if (retiredReview && (!currentIssue || currentRun?.status !== "succeeded"
           || latestContract?.id !== contractRow.id
           || (currentIssue.executionRunId && currentIssue.executionRunId !== row.runId))) continue;
         // A committed decision proves the original barrier passed. If a later
         // workspace operation exists, do not ignore a pending or failed retry.
-        const reviewBarrier = retiredAutomaticReview ? await db.select({ status: workspaceOperations.status })
+        const reviewBarrier = retiredReview ? await db.select({ status: workspaceOperations.status })
           .from(workspaceOperations).where(and(eq(workspaceOperations.companyId, row.companyId),
             eq(workspaceOperations.heartbeatRunId, row.runId), eq(workspaceOperations.phase, "workspace_finalize")))
           .orderBy(desc(workspaceOperations.createdAt)).limit(1).then((entries) => entries[0]) : null;
@@ -813,7 +816,7 @@ export async function reconcileNativeFinalizations(
           assessment: reassessment,
           supersedesAssessmentId: assessment.id,
         });
-        const decision = retiredAutomaticReview && currentIssue
+        const decision = retiredReview && currentIssue
           ? resolveNativeFinalizerStatus({
               hasPendingChildCompletion,
               assessment: reassessment, terminalState: "succeeded", workspaceFinalizeStatus: "succeeded",
