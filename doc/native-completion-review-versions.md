@@ -63,3 +63,9 @@ withdrawal remains durable even if its live publication fails.
 An authoritative later issue status change retains precedence over new evidence.
 Saved-result final arbitration does not replace a detected later authoritative
 status change. The selected arbitration path also selects its matching commit guard.
+
+A named handoff consumes its durable marker only when the saved result can
+materialize the requested named review. An intervening confirmation or
+unread child that prevents replacement keeps that marker pending. Governance and child delivery are
+rechecked inside the commit, so clearing another wait can resume the same saved
+result without a replacement writer run.

@@ -2123,6 +2123,53 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     expect((await issueService(db).getById(seeded.issueId))!.status).toBe("done");
   }, 30_000);
 
+  it.each(["confirmation", "child"] as const)("named handoff retains its trigger across an intervening %s wait", async (wait) => {
+    const seeded = await seedReviewVersionHandoff();
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, seeded.issueId));
+    const blockerId = randomUUID();let clear: () => Promise<unknown>;
+    if (wait === "confirmation") {
+      const [card] = await db.insert(issueThreadInteractions).values({ id: blockerId, companyId, issueId: seeded.issueId,
+        kind: "request_confirmation", status: "pending", createdByUserId: "local-board",
+        payload: { version: 1, prompt: "Separate ordinary confirmation" } }).returning();
+      clear = async () => issueThreadInteractionService(db).withdrawInteraction((await issueService(db).getById(seeded.issueId))!, card!.id,
+        { reason: "Separate confirmation withdrawn normally" }, { userId: "local-board" });
+    } else if (wait === "child") {
+      await db.insert(agentWakeupRequests).values({ id: blockerId, companyId, agentId, source: "automation",
+        triggerDetail: "system", reason: "issue_children_completed", status: "queued",
+        requestedByActorType: "system", requestedByActorId: "native-status-committer", payload: { issueId: seeded.issueId,
+          _paperclipWakeContext: { wakeReason: "issue_children_completed", nativeChildCompletionDecisionId: randomUUID() } } });
+      clear = async () => db.update(agentWakeupRequests).set({ status: "consumed" }).where(eq(agentWakeupRequests.id, blockerId));
+    } else { throw new Error("Unsupported wait fixture"); }
+    await reconcileNativeFinalizations(db, [seeded.nextRunId]);
+    expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, seeded.nextRunId)))[0]!.decisionId).toBe(seeded.decision.id);
+    await clear();
+    await reconcileNativeFinalizations(db, [seeded.nextRunId]);
+    const pending = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId));
+    expect(pending.filter((card) => card.status === "pending")).toEqual([expect.objectContaining({ sourceRunId: seeded.nextRunId, addresseeAgentId: delegateAgentId })]);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, seeded.issueId))).toEqual(runs);
+    await reconcileNativeFinalizations(db, [seeded.nextRunId]);
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId))).toEqual(pending);
+  }, 30_000);
+
+  it("named handoff rechecks a confirmation arriving inside the commit window", async () => {
+    const seeded = await seedReviewVersionHandoff();let cardId: string | null = null;
+    const original = assessmentWriter.recordNativeWorkAssessment;
+    const assessment = vi.spyOn(assessmentWriter, "recordNativeWorkAssessment").mockImplementationOnce(async (...args) => {
+      const result = await original(...args);
+      const [card] = await db.insert(issueThreadInteractions).values({ companyId, issueId: seeded.issueId,
+        kind: "request_confirmation", status: "pending", createdByUserId: "local-board",
+        payload: { version: 1, prompt: "Concurrent confirmation" } }).returning();cardId=card!.id;return result;
+    });
+    try { await reconcileNativeFinalizations(db, [seeded.nextRunId]); } finally { assessment.mockRestore(); }
+    expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, seeded.nextRunId)))[0]!.decisionId).toBe(seeded.decision.id);
+    expect(cardId).not.toBeNull();
+    await issueThreadInteractionService(db).withdrawInteraction((await issueService(db).getById(seeded.issueId))!, cardId!,
+      { reason: "Concurrent confirmation withdrawn normally" }, { userId: "local-board" });
+    await reconcileNativeFinalizations(db, [seeded.nextRunId]);
+    const cards = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId));
+    expect(cards.filter((card) => card.status === "pending")).toEqual([expect.objectContaining({ sourceRunId: seeded.nextRunId, addresseeAgentId: delegateAgentId })]);
+  }, 30_000);
+
   it.each(["execution", "contract"])("review version handoff rechecks a concurrent %s change under the commit lock", async (change) => {
     const seeded = await seedReviewVersionHandoff();
     const original = assessmentWriter.recordNativeWorkAssessment;

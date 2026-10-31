@@ -788,9 +788,10 @@ export async function reconcileNativeFinalizations(
         assessment.priorIssueStatus !== row.issueStatus
         || Number(assessment.priorStatusVersion) !== Number(row.issueStatusVersion)
       );
-      const retiredReview = issueMatchesCurrentDecision && currentDecision
-        ? (await decisionHasRetiredAutomaticReview(db, currentDecision)
-          || await decisionHasSupersededCompletionReview(db, currentDecision)) : false;
+      const supersededCompletionReview = issueMatchesCurrentDecision && currentDecision
+        ? await decisionHasSupersededCompletionReview(db, currentDecision) : false;
+      const retiredReview = supersededCompletionReview || (issueMatchesCurrentDecision && currentDecision
+        ? await decisionHasRetiredAutomaticReview(db, currentDecision) : false);
       let reassessment = null;
       let resultRow = null;
       let contractRow = null;
@@ -874,23 +875,6 @@ export async function reconcileNativeFinalizations(
             ? record(row.contextSnapshot).nativeStatusWakeIntentId as string : null,
         };
         const hasPendingChildCompletion = await hasPendingNativeChildCompletion(db, childCompletionRecipient);
-        const reassessmentRow = await recordNativeWorkAssessment({
-          db,
-          companyId: row.companyId,
-          issueId: row.issueId,
-          runId: row.runId,
-          turnId: resultRow.turnId,
-          contractId: contractRow.id,
-          contractCanonicalSha256: contractRow.canonicalSha256,
-          resultId: resultRow.id,
-          resultCanonicalSha256: resultRow.canonicalSha256,
-          priorIssueStatus: row.issueStatus,
-          priorStatusVersion: Number(row.issueStatusVersion),
-          priorDecisionId: row.issueDecisionId,
-          policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
-          assessment: reassessment,
-          supersedesAssessmentId: assessment.id,
-        });
         let decision = needsFinalArbitration && currentIssue
           ? resolveNativeFinalizerStatus({
               hasPendingChildCompletion,
@@ -909,6 +893,28 @@ export async function reconcileNativeFinalizations(
         if (newEvidenceSatisfiesContract && !retiredReview && decision.statusAction === "done") {
           decision = { ...decision, reasonCode: "decision_superseded_by_new_evidence" };
         }
+        // Consume a named handoff only by materializing its saved request.
+        // A different waiting decision retains the durable old marker.
+        if (supersededCompletionReview && !decision.effects.some((effect) => effect.kind === "bind_reviewer"
+          && effect.ownerUserId === null && reassessment.attentionRequests.some((request) => request.kind === "review"
+            && request.ownerClass === "agent" && request.targetAgentId === effect.ownerAgentId))) continue;
+        const reassessmentRow = await recordNativeWorkAssessment({
+          db,
+          companyId: row.companyId,
+          issueId: row.issueId,
+          runId: row.runId,
+          turnId: resultRow.turnId,
+          contractId: contractRow.id,
+          contractCanonicalSha256: contractRow.canonicalSha256,
+          resultId: resultRow.id,
+          resultCanonicalSha256: resultRow.canonicalSha256,
+          priorIssueStatus: row.issueStatus,
+          priorStatusVersion: Number(row.issueStatusVersion),
+          priorDecisionId: row.issueDecisionId,
+          policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+          assessment: reassessment,
+          supersedesAssessmentId: assessment.id,
+        });
         let committed: Awaited<ReturnType<typeof commitNativeStatusDecision>>;
         try {
           const commitInput = {
@@ -921,14 +927,15 @@ export async function reconcileNativeFinalizations(
             priorStatusVersion: Number(row.issueStatusVersion),
             priorDecisionId: row.issueDecisionId,
             decision,
-            requireNoPendingChildCompletion: decision.statusAction === "done" ? childCompletionRecipient : undefined,
+            requireNoPendingChildCompletion: decision.statusAction === "done" || supersededCompletionReview
+              ? childCompletionRecipient : undefined,
             supersedesCommittedDecisionId: row.coordinatorPhase === "committed"
               ? row.decisionId ?? undefined
               : undefined,
           };
           committed = needsFinalArbitration
             ? await commitVersionBoundReconciliation({ commit: commitInput, expectedAssigneeAgentId: row.agentId,
-                contractId: contractRow.id, requireNoPendingGovernance: !retiredReview })
+                contractId: contractRow.id })
             : await commitNativeStatusDecision(commitInput);
         } catch (error) {
           if (error instanceof NativeStatusRaceError) continue;

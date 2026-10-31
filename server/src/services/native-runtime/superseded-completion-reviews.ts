@@ -168,7 +168,6 @@ export async function commitVersionBoundReconciliation(input: {
   commit: Parameters<typeof commitNativeStatusDecision>[0];
   expectedAssigneeAgentId: string;
   contractId: string;
-  requireNoPendingGovernance: boolean;
 }) {
   const expected = input.commit;
   // Decorate the committer's own transaction factory rather than nesting a
@@ -193,10 +192,10 @@ export async function commitVersionBoundReconciliation(input: {
       eq(heartbeatRuns.companyId, expected.companyId), inArray(heartbeatRuns.status, ["queued", "running"]),
       or(eq(heartbeatRuns.nativeIssueId, expected.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${expected.issueId}`),
     )).limit(1);
-    if (active.length || (input.requireNoPendingGovernance && await pendingNativeGovernance({
+    if (active.length || await pendingNativeGovernance({
       db: tx as unknown as Db, companyId: expected.companyId, issueId: expected.issueId,
       runId: expected.runId, executionState: record(issue.executionState),
-    }))) throw new NativeStatusRaceError();
+    })) throw new NativeStatusRaceError();
     if (expected.decision.statusAction === "done" && (await issueService(tx as unknown as Db)
       .getDependencyReadiness(expected.issueId, tx as unknown as Db)).unresolvedBlockerCount > 0) throw new NativeStatusRaceError();
     // The original committer callback runs under these same authority locks.
