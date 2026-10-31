@@ -1,4 +1,4 @@
-import { retireSupersededCompletionReviews, decisionHasSupersededCompletionReview } from "./superseded-completion-reviews.js";
+import { retireSupersededCompletionReviews, decisionHasSupersededCompletionReview, commitVersionBoundReconciliation } from "./superseded-completion-reviews.js";
 import { recoverLegacyUnsafeWorkspaceExports } from "./native-workspace-export-recovery.js";
 import { hasPendingNativeChildCompletion } from "./native-child-completion-delivery.js";
 import { dismissAutomaticCompletionReviews, decisionHasRetiredAutomaticReview } from "./automatic-completion-reviews.js";
@@ -764,7 +764,14 @@ export async function reconcileNativeFinalizations(
       const newEvidenceSatisfiesContract = !!changedEvidence
         && previousAssessment.allCriteriaSatisfied !== true
         && reassessment?.allCriteriaSatisfied === true
-        && reassessment.verificationPassed === true;
+        && reassessment.verificationPassed === true
+        && reassessment.objectiveSatisfied === true
+        && reassessment.reportedDisposition === "done"
+        && !reassessment.hasBlockingRemainingWork
+        && !reassessment.hasFailedVerification
+        && reassessment.attentionRequests.length === 0
+        && !await pendingNativeGovernance({ db, companyId: row.companyId, issueId: row.issueId,
+          runId: row.runId, executionState: null });
       const facts: NativeReconciliationFacts = authoritativeStatusChanged
         ? { authoritativeStatusChanged: true }
         : newEvidenceSatisfiesContract
@@ -833,7 +840,7 @@ export async function reconcileNativeFinalizations(
             });
         let committed: Awaited<ReturnType<typeof commitNativeStatusDecision>>;
         try {
-          committed = await commitNativeStatusDecision({
+          const commitInput = {
             db,
             companyId: row.companyId,
             issueId: row.issueId,
@@ -847,7 +854,11 @@ export async function reconcileNativeFinalizations(
             supersedesCommittedDecisionId: row.coordinatorPhase === "committed"
               ? row.decisionId ?? undefined
               : undefined,
-          });
+          };
+          committed = retiredReview || newEvidenceSatisfiesContract
+            ? await commitVersionBoundReconciliation({ commit: commitInput, expectedAssigneeAgentId: row.agentId,
+                contractId: contractRow.id, requireNoPendingGovernance: !retiredReview })
+            : await commitNativeStatusDecision(commitInput);
         } catch (error) {
           if (error instanceof NativeStatusRaceError) continue;
           throw error;

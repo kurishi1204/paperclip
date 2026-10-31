@@ -1,3 +1,4 @@
+import * as assessmentWriter from "../services/native-runtime/work-assessments.js";
 import { retireSupersededCompletionReviews } from "../services/native-runtime/superseded-completion-reviews.js";
 import { getNativeReviewAssignment } from "../services/native-runtime/native-review-participant.js";
 import { dismissAutomaticCompletionReviews } from "../services/native-runtime/automatic-completion-reviews.js";
@@ -2105,6 +2106,30 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId))).toEqual(cards);
   }, 30_000);
 
+  it.each(["execution", "contract"])("review version handoff rechecks a concurrent %s change under the commit lock", async (change) => {
+    const seeded = await seedReviewVersionHandoff();
+    const original = assessmentWriter.recordNativeWorkAssessment;
+    const injected = vi.spyOn(assessmentWriter, "recordNativeWorkAssessment").mockImplementationOnce(async (...args) => {
+      const value = await original(...args);
+      if (change === "execution") {
+        const successor = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: successor, companyId, agentId, status: "running",
+          runtimeMode: "native", nativeIssueId: seeded.issueId, contextSnapshot: { issueId: seeded.issueId } });
+        await db.update(issues).set({ executionRunId: successor, checkoutRunId: successor }).where(eq(issues.id, seeded.issueId));
+      } else {
+        const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.id, seeded.contractId!));
+        await db.insert(completionContracts).values({ ...contract!, id: randomUUID(), revision: 2, canonicalSha256: randomUUID() });
+      }
+      return value;
+    });
+    try {
+      await reconcileNativeFinalizations(db, [seeded.nextRunId]);
+      expect(injected).toHaveBeenCalledTimes(1);
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId))).toHaveLength(1);
+      expect((await issueService(db).getById(seeded.issueId))!.lastStatusDecisionId).toBe(seeded.decision.id);
+    } finally { injected.mockRestore(); }
+  }, 30_000);
+
   it("review version handoff survives retirement before a restart without resending the writer", async () => {
     const seeded = await seedReviewVersionHandoff();
     await retireSupersededCompletionReviews(db, [seeded.nextRunId]);
@@ -2137,7 +2162,7 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
       if (guard === "answered") await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, seeded.oldCard.id));
       if (guard === "review_started") await db.update(heartbeatRuns).set({ startedAt: new Date() }).where(eq(heartbeatRuns.id, seeded.cancelledReviewRunId));
       if (guard === "worker_running") await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, seeded.nextRunId));
-      if (guard === "human_review") await db.update(issueThreadInteractions).set({ addresseeAgentId: null, resolverPolicy: "human_only" }).where(eq(issueThreadInteractions.id, seeded.oldCard.id));
+      if (guard === "human_review") await db.update(issueThreadInteractions).set({ effectiveResolverPolicy: "human_only", effectiveResolverPolicySource: "company_cap" }).where(eq(issueThreadInteractions.id, seeded.oldCard.id));
       if (guard === "new_status") await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, seeded.issueId));
       if (guard === "workspace_failed") await db.update(workspaceOperations).set({ status: "failed" }).where(eq(workspaceOperations.heartbeatRunId, seeded.nextRunId));
       if (guard === "new_contract") {
@@ -2264,6 +2289,21 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     expect(results).toEqual([expect.objectContaining({ reconciliationAction: delivery === "queued"
       ? "native_child_completion_pending" : "decision_superseded_by_new_evidence" })]);
     expect((await issueService(db).getById(seeded.issueId))!.status).toBe(delivery === "queued" ? "in_progress" : "done");
+  }, 30_000);
+
+  it("new evidence cannot bypass a pending named independent review", async () => {
+    const seeded = await seedAutomaticReview();
+    const [result] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.id, seeded.resultId!));
+    await db.update(nativeRunResults).set({ resultJson: { ...result!.resultJson,
+      result: { ...result!.resultJson.result as object, attentionRequests: [{ kind: "review", ownerClass: "agent",
+        targetAgentId: delegateAgentId, summary: "Review current evidence independently" }] } } }).where(eq(nativeRunResults.id, seeded.resultId!));
+    const [assessment] = await db.select().from(workAssessments).where(eq(workAssessments.id, seeded.assessmentId));
+    await db.update(workAssessments).set({ assessmentJson: { ...assessment!.assessmentJson,
+      attentionRequests: [{ kind: "review", ownerClass: "agent", targetAgentId: delegateAgentId, summary: "Review current evidence independently" }] } }).where(eq(workAssessments.id, seeded.assessmentId));
+    await db.update(issueWorkProducts).set({ updatedAt: new Date(Date.now() + 1000) }).where(eq(issueWorkProducts.id, seeded.workProductId));
+    await reconcileNativeFinalizations(db, [seeded.runId]);
+    expect((await issueService(db).getById(seeded.issueId))!.status).toBe("in_review");
+    expect((await issueThreadInteractionService(db).getById(seeded.interaction.id))!.status).toBe("pending");
   }, 30_000);
 
   it("completes a new merge run after an old CI review and bounds repeated incomplete results", async () => {

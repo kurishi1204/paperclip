@@ -1,3 +1,5 @@
+import { commitNativeStatusDecision, NativeStatusRaceError } from "./status-decision-committer.js";
+import { pendingNativeGovernance } from "./native-run-finalizer.js";
 import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import {
   completionContracts, heartbeatRuns, issueThreadInteractions, issues,
@@ -84,6 +86,7 @@ export async function retireSupersededCompletionReviews(db: Db, runIds?: string[
         eq(issueThreadInteractions.companyId, scope.companyId), eq(issueThreadInteractions.issueId, scope.issueId))).for("update");
       const target = record(record(card?.payload).target);
       if (!card || card.status !== "pending" || card.kind !== "request_confirmation"
+        || card.requestedResolverPolicy !== "anyone" || card.effectiveResolverPolicy !== "anyone"
         || card.createdByAgentId || card.createdByUserId || card.addresseeAgentId !== request.targetAgentId
         || card.addresseeUserId || card.continuationPolicy !== "wake_assignee"
         || target.type !== "custom" || target.key !== "native_completion_review"
@@ -146,4 +149,41 @@ export async function decisionHasSupersededCompletionReview(db: Db, decision: ty
     sql`${issueThreadInteractions.sourceRunId} <> ${decision.runId}::uuid`,
   ));
   return !!row;
+}
+
+/** Revalidate a saved-result transition while holding the execution authority locks. */
+export async function commitVersionBoundReconciliation(input: {
+  commit: Parameters<typeof commitNativeStatusDecision>[0];
+  expectedAssigneeAgentId: string;
+  contractId: string;
+  requireNoPendingGovernance: boolean;
+}) {
+  const expected = input.commit;
+  return expected.db.transaction(async (tx) => {
+    const [coordinator] = await tx.select().from(nativeRunFinalizations)
+      .where(and(eq(nativeRunFinalizations.runId, expected.runId), eq(nativeRunFinalizations.companyId, expected.companyId)))
+      .for("update");
+    const [issue] = await tx.select().from(issues).where(and(eq(issues.id, expected.issueId),
+      eq(issues.companyId, expected.companyId))).for("update");
+    const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, expected.runId),
+      eq(heartbeatRuns.companyId, expected.companyId), eq(heartbeatRuns.nativeIssueId, expected.issueId))).for("update");
+    const [contract] = await tx.select({ id: completionContracts.id }).from(completionContracts)
+      .where(and(eq(completionContracts.companyId, expected.companyId), eq(completionContracts.issueId, expected.issueId)))
+      .orderBy(desc(completionContracts.revision)).limit(1);
+    if (!coordinator || coordinator.phase !== "committed" || coordinator.decisionId !== expected.supersedesCommittedDecisionId
+      || !issue || issue.assigneeAgentId !== input.expectedAssigneeAgentId || issue.executionRunId || issue.checkoutRunId
+      || record(issue.executionState).status === "pending" || !run || run.status !== "succeeded"
+      || run.agentId !== input.expectedAssigneeAgentId || contract?.id !== input.contractId) throw new NativeStatusRaceError();
+    const active = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, expected.companyId), inArray(heartbeatRuns.status, ["queued", "running"]),
+      or(eq(heartbeatRuns.nativeIssueId, expected.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${expected.issueId}`),
+    )).limit(1);
+    if (active.length || (input.requireNoPendingGovernance && await pendingNativeGovernance({
+      db: tx as unknown as Db, companyId: expected.companyId, issueId: expected.issueId,
+      runId: expected.runId, executionState: record(issue.executionState),
+    }))) throw new NativeStatusRaceError();
+    // A concurrent checkout cannot slip between this recheck and the commit:
+    // the outer transaction retains both coordinator and issue row locks.
+    return commitNativeStatusDecision({ ...expected, db: tx as unknown as Db });
+  });
 }

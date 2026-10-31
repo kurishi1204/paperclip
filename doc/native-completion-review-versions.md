@@ -16,6 +16,8 @@ attempt to execute the old review must have been cancelled before dispatch
 with `issue_assignee_changed`; an attempt that began execution prevents this
 automatic handoff.
 
+A persisted requested or effective restriction prevents automatic retirement, even if company policy later becomes less restrictive.
+
 Retirement records a withdrawal, never an approval. The activity record links
 the old request, current status decision, and saved replacement result. The
 old results, decisions and cancelled run stay unchanged. A durable retirement
@@ -29,10 +31,19 @@ or contract, failed workspace finalization, and reviews that have begun work
 remain governed by their existing rules. Review assignment still requires
 the issue's current status decision and projected status version to match;
 the handoff does not relax that authority check or the independent-review
-policy.
+policy. Replacement commit rechecks current writer ownership, execution inactivity
+and the latest contract while retaining the issue/coordinator locks. Changed
+work-product evidence alone cannot complete an issue with pending governance
+or an explicit attention request.
 
 The real-PostgreSQL cases in `native-status-arbiter-corpus.test.ts` exercise a
 writer result, its ordinary continuation, the obsolete queued review, normal
 reconciliation, restart after retirement, and preservation of the remaining
 authorities. Product acceptance additionally requires observing the named
 reviewer resolve the current saved document in the running service.
+
+This change does not modify the adopted human-verdict service. Its historical
+human actor path does not share the agent assignment currency check; hardening
+that separate path remains a known baseline limitation. This operational
+milestone uses only the named independent agent's version-bound verdict. It
+neither substitutes a human verdict nor claims general human-verdict hardening.
