@@ -1,3 +1,4 @@
+import { issueService } from "../issues.js";
 import { commitNativeStatusDecision, NativeStatusRaceError } from "./status-decision-committer.js";
 import { pendingNativeGovernance } from "./native-run-finalizer.js";
 import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
@@ -159,7 +160,10 @@ export async function commitVersionBoundReconciliation(input: {
   requireNoPendingGovernance: boolean;
 }) {
   const expected = input.commit;
-  return expected.db.transaction(async (tx) => {
+  // Decorate the committer's own transaction factory rather than nesting a
+  // second transaction around it. Its normal publication flush therefore
+  // still happens only after the real outermost commit.
+  const guardedTransaction: Db["transaction"] = async (callback, config) => expected.db.transaction(async (tx) => {
     const [coordinator] = await tx.select().from(nativeRunFinalizations)
       .where(and(eq(nativeRunFinalizations.runId, expected.runId), eq(nativeRunFinalizations.companyId, expected.companyId)))
       .for("update");
@@ -182,8 +186,17 @@ export async function commitVersionBoundReconciliation(input: {
       db: tx as unknown as Db, companyId: expected.companyId, issueId: expected.issueId,
       runId: expected.runId, executionState: record(issue.executionState),
     }))) throw new NativeStatusRaceError();
-    // A concurrent checkout cannot slip between this recheck and the commit:
-    // the outer transaction retains both coordinator and issue row locks.
-    return commitNativeStatusDecision({ ...expected, db: tx as unknown as Db });
+    if (expected.decision.statusAction === "done" && (await issueService(tx as unknown as Db)
+      .getDependencyReadiness(expected.issueId, tx as unknown as Db)).unresolvedBlockerCount > 0) throw new NativeStatusRaceError();
+    // The original committer callback runs under these same authority locks.
+    return callback(tx);
+  }, config);
+  const guardedDb = new Proxy(expected.db, {
+    get(target, key) {
+      if (key === "transaction") return guardedTransaction;
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
   });
+  return commitNativeStatusDecision({ ...expected, db: guardedDb });
 }

@@ -47,3 +47,10 @@ human actor path does not share the agent assignment currency check; hardening
 that separate path remains a known baseline limitation. This operational
 milestone uses only the named independent agent's version-bound verdict. It
 neither substitutes a human verdict nor claims general human-verdict hardening.
+
+The saved-result authority guard decorates the existing committer's transaction
+factory; it does not add an outer transaction or change the committer's normal
+post-commit publication boundary. Earlier coordinator phases and terminal runs
+whose status has not been projected resume through the normal finalizer. New
+evidence uses full finalizer arbitration, including durable dependencies, with
+a second dependency/readiness check under the commit authority locks.

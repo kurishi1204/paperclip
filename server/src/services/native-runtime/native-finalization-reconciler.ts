@@ -578,6 +578,7 @@ export async function reconcileNativeFinalizations(
   const rows = await db
     .select({
       runId: heartbeatRuns.id,
+      runStatus: heartbeatRuns.status,
       companyId: heartbeatRuns.companyId,
       agentId: heartbeatRuns.agentId,
       issueId: nativeRunFinalizations.issueId,
@@ -761,7 +762,11 @@ export async function reconcileNativeFinalizations(
         });
       }
       const previousAssessment = record(assessment?.assessmentJson);
-      const newEvidenceSatisfiesContract = !!changedEvidence
+      // Earlier phases and unprojected terminal runs belong to the normal
+      // finalizer below, never a committed-result re-arbitration shortcut.
+      const newEvidenceSatisfiesContract = row.coordinatorPhase === "committed"
+        && row.runStatus === "succeeded"
+        && !!changedEvidence
         && previousAssessment.allCriteriaSatisfied !== true
         && reassessment?.allCriteriaSatisfied === true
         && reassessment.verificationPassed === true
@@ -781,21 +786,22 @@ export async function reconcileNativeFinalizations(
         if (!assessment || !reassessment || !resultRow || !contractRow) {
           throw new Error("native_reconciliation_reassessment_missing");
         }
-        const currentIssue = retiredReview
+        const needsFinalArbitration = retiredReview || newEvidenceSatisfiesContract;
+        const currentIssue = needsFinalArbitration
           ? await db.select().from(issues).where(and(eq(issues.id, row.issueId), eq(issues.companyId, row.companyId))).then((entries) => entries[0])
           : null;
-        const readiness = retiredReview ? await issueService(db).getDependencyReadiness(row.issueId, db) : null;
-        const currentRun = retiredReview ? await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, row.runId)).then((entries) => entries[0]) : null;
+        const readiness = needsFinalArbitration ? await issueService(db).getDependencyReadiness(row.issueId, db) : null;
+        const currentRun = needsFinalArbitration ? await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, row.runId)).then((entries) => entries[0]) : null;
         // Never replay an old result over a new run or a later task contract.
-        const latestContract = retiredReview ? await db.select({ id: completionContracts.id }).from(completionContracts)
+        const latestContract = needsFinalArbitration ? await db.select({ id: completionContracts.id }).from(completionContracts)
           .where(and(eq(completionContracts.companyId, row.companyId), eq(completionContracts.issueId, row.issueId)))
           .orderBy(desc(completionContracts.revision)).limit(1).then((entries) => entries[0]) : null;
-        if (retiredReview && (!currentIssue || currentRun?.status !== "succeeded"
+        if (needsFinalArbitration && (!currentIssue || currentRun?.status !== "succeeded"
           || latestContract?.id !== contractRow.id
           || (currentIssue.executionRunId && currentIssue.executionRunId !== row.runId))) continue;
         // A committed decision proves the original barrier passed. If a later
         // workspace operation exists, do not ignore a pending or failed retry.
-        const reviewBarrier = retiredReview ? await db.select({ status: workspaceOperations.status })
+        const reviewBarrier = needsFinalArbitration ? await db.select({ status: workspaceOperations.status })
           .from(workspaceOperations).where(and(eq(workspaceOperations.companyId, row.companyId),
             eq(workspaceOperations.heartbeatRunId, row.runId), eq(workspaceOperations.phase, "workspace_finalize")))
           .orderBy(desc(workspaceOperations.createdAt)).limit(1).then((entries) => entries[0]) : null;
@@ -823,7 +829,7 @@ export async function reconcileNativeFinalizations(
           assessment: reassessment,
           supersedesAssessmentId: assessment.id,
         });
-        const decision = retiredReview && currentIssue
+        let decision = needsFinalArbitration && currentIssue
           ? resolveNativeFinalizerStatus({
               hasPendingChildCompletion,
               assessment: reassessment, terminalState: "succeeded", workspaceFinalizeStatus: "succeeded",
@@ -838,6 +844,9 @@ export async function reconcileNativeFinalizations(
               facts: { ...facts, hasPendingChildCompletion },
               priorIssueStatus: row.issueStatus as NativeAuthoritativeIssueStatus, agentId: row.agentId,
             });
+        if (newEvidenceSatisfiesContract && !retiredReview && decision.statusAction === "done") {
+          decision = { ...decision, reasonCode: "decision_superseded_by_new_evidence" };
+        }
         let committed: Awaited<ReturnType<typeof commitNativeStatusDecision>>;
         try {
           const commitInput = {
