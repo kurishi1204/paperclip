@@ -1,3 +1,4 @@
+import { logger } from "../../middleware/logger.js";
 import { issueService } from "../issues.js";
 import { commitNativeStatusDecision, NativeStatusRaceError } from "./status-decision-committer.js";
 import { pendingNativeGovernance } from "./native-run-finalizer.js";
@@ -41,9 +42,11 @@ export async function retireSupersededCompletionReviews(db: Db, runIds?: string[
     .innerJoin(statusDecisions, eq(statusDecisions.id, nativeRunFinalizations.decisionId))
     .where(and(eq(nativeRunFinalizations.phase, "committed"), eq(issues.status, "in_review"),
       eq(statusDecisions.reasonCode, "governed_gate_pending"),
-      ...(runIds?.length ? [inArray(nativeRunFinalizations.runId, runIds)] : [])));
+      ...(runIds?.length ? [inArray(nativeRunFinalizations.runId, runIds)] : [])))
+    .catch((err) => { logger.warn({ err }, "Completion review handoff lookup failed; normal recovery continues"); return []; });
   for (const candidate of candidates) {
     const publications: ActivityPublication[] = [];
+    try {
     await db.transaction(async (tx) => {
       // Same lock order as status commit and native reconciliation.
       const [coordinator] = await tx.select().from(nativeRunFinalizations)
@@ -135,7 +138,15 @@ export async function retireSupersededCompletionReviews(db: Db, runIds?: string[
       });
       publications.push(publication);
     });
-    for (const publication of publications) publishActivity(publication);
+    } catch (err) {
+      logger.warn({ err, runId: candidate.runId }, "Completion review handoff candidate failed; normal recovery continues");
+      continue;
+    }
+    for (const publication of publications) {
+      try { publishActivity(publication); } catch (err) {
+        logger.warn({ err, runId: candidate.runId }, "Committed review retirement publication failed; durable handoff remains recoverable");
+      }
+    }
   }
 }
 

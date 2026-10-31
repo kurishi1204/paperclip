@@ -1,3 +1,5 @@
+import * as completionReviewHandoff from "../services/native-runtime/superseded-completion-reviews.js";
+import * as workspaceFinalizer from "../services/native-runtime/native-workspace-finalizer.js";
 import * as assessmentWriter from "../services/native-runtime/work-assessments.js";
 import { retireSupersededCompletionReviews } from "../services/native-runtime/superseded-completion-reviews.js";
 import { getNativeReviewAssignment, claimNativeReviewExecutionLock } from "../services/native-runtime/native-review-participant.js";
@@ -2323,6 +2325,57 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     await reconcileNativeFinalizations(db, [seeded.runId]);
     expect((await issueService(db).getById(seeded.issueId))!.status).toBe("done");
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId)))[0]!.status).toBe("succeeded");
+  }, 30_000);
+
+  it("new evidence resumes a later failed workspace retry before reassessment", async () => {
+    const seeded = await seedAutomaticReview();
+    await db.update(issueThreadInteractions).set({ status: "cancelled", result: {} }).where(eq(issueThreadInteractions.id, seeded.interaction.id));
+    await db.insert(workspaceOperations).values({ companyId, heartbeatRunId: seeded.runId, issueId: seeded.issueId,
+      phase: "workspace_finalize", status: "failed", exitCode: 1, createdAt: new Date(Date.now() + 1000) });
+    await db.update(issueWorkProducts).set({ updatedAt: new Date(Date.now() + 2000) }).where(eq(issueWorkProducts.id, seeded.workProductId));
+    const resume = vi.spyOn(workspaceFinalizer, "resumeNativeWorkspaceFinalization");
+    try {
+      await reconcileNativeFinalizations(db, [seeded.runId]);
+      expect(resume).toHaveBeenCalledWith(expect.objectContaining({ runId: seeded.runId }));
+      expect((await issueService(db).getById(seeded.issueId))!.status).toBe("done");
+    } finally { resume.mockRestore(); }
+  }, 30_000);
+
+  it("isolates a failed handoff candidate and recovers it on a later sweep", async () => {
+    const first = await seedReviewVersionHandoff(), second = await seedReviewVersionHandoff();
+    const transaction = vi.spyOn(db, "transaction").mockRejectedValueOnce(new Error("handoff transaction unavailable"));
+    try { await retireSupersededCompletionReviews(db, [first.nextRunId, second.nextRunId]); }
+    finally { transaction.mockRestore(); }
+    const cards = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.companyId, companyId));
+    expect(cards.filter((x) => [first.oldCard.id, second.oldCard.id].includes(x.id)).map((x) => x.status).sort()).toEqual(["cancelled", "pending"]);
+    await reconcileNativeFinalizations(db, [first.nextRunId, second.nextRunId]);
+    for (const seeded of [first, second]) {
+      const rows = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, seeded.issueId));
+      expect(rows).toHaveLength(2);expect(rows.filter((x) => x.status === "pending")).toHaveLength(1);
+    }
+  }, 30_000);
+
+  it("continues unrelated recovery after committed retirement publication fails", async () => {
+    const handoff = await seedReviewVersionHandoff(), unrelated = await seedAutomaticReview();
+    const publish = vi.spyOn(activityLog, "publishActivity").mockImplementation((publication) => {
+      const details = publication.payload.details as { source?: string } | undefined;
+      if (details?.source === "native_completion_review_superseded_by_writer_result") throw new Error("retirement publication unavailable");
+    });
+    try { await reconcileNativeFinalizations(db, [handoff.nextRunId, unrelated.runId]); }
+    finally { publish.mockRestore(); }
+    expect((await issueService(db).getById(unrelated.issueId))!.status).toBe("done");
+    const cards = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, handoff.issueId));
+    expect(cards).toHaveLength(2);expect(cards.filter((x) => x.status === "pending")).toHaveLength(1);
+    await reconcileNativeFinalizations(db, [handoff.nextRunId]);
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, handoff.issueId))).toEqual(cards);
+  }, 30_000);
+
+  it("continues normal finalization when the handoff lookup fails", async () => {
+    const seeded = await seedAutomaticReview();
+    const retire = vi.spyOn(completionReviewHandoff, "retireSupersededCompletionReviews").mockRejectedValueOnce(new Error("handoff lookup unavailable"));
+    try { await reconcileNativeFinalizations(db, [seeded.runId]); }
+    finally { retire.mockRestore(); }
+    expect((await issueService(db).getById(seeded.issueId))!.status).toBe("done");
   }, 30_000);
 
   it("new evidence retains an unresolved durable dependency", async () => {

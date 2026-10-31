@@ -54,3 +54,8 @@ post-commit publication boundary. Earlier coordinator phases and terminal runs
 whose status has not been projected resume through the normal finalizer. New
 evidence uses full finalizer arbitration, including durable dependencies, with
 a second dependency/readiness check under the commit authority locks.
+
+Workspace recovery uses its existing ownership and failure policy before evidence
+reassessment. A handoff lookup, candidate transaction or retirement publication
+failure is logged and isolated so unrelated normal recovery continues; a committed
+withdrawal remains durable even if its live publication fails.

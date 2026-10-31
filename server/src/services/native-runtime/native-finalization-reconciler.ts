@@ -574,7 +574,9 @@ export async function reconcileNativeFinalizations(
   } else {
     await dismissAutomaticCompletionReviews(db);
   }
-  await retireSupersededCompletionReviews(db, runIds);
+  await retireSupersededCompletionReviews(db, runIds).catch((err) => {
+    logger.warn({ err }, "Completion review handoff lookup failed; normal recovery continues");
+  });
   const rows = await db
     .select({
       runId: heartbeatRuns.id,
@@ -642,6 +644,61 @@ export async function reconcileNativeFinalizations(
       results.push({ runId: row.runId, phase: "committed", deliveredEffectIds });
       continue;
     }
+    const resumeWorkspace = async () => {
+      const recoveryDecision = resolveNativeReconciliationStatus({
+        facts: { workspaceOperationPending: true },
+        priorIssueStatus: row.issueStatus as NativeAuthoritativeIssueStatus,
+        agentId: row.agentId,
+      });
+      if (!recoveryDecision.effects.some((effect) => effect.kind === "resume_workspace_operation")) {
+        throw new Error("native_reconciliation_workspace_resume_policy_missing");
+      }
+      const operation = await resumeNativeWorkspaceFinalization({
+        db,
+        runId: row.runId,
+        environmentRuntime: options.environmentRuntime,
+      });
+      // Busy is ownership, not another failed export or retry-budget debit.
+      if (!operation) return null;
+      const workspaceFinalizeStatus =
+        operation.status === "succeeded" ? "succeeded" : "failed";
+      if (workspaceFinalizeStatus === "failed") {
+        const unrecoverable = operation.stderrExcerpt?.includes(
+          "workspace_sync_out_unrecoverable",
+        );
+        const failure = await recordNativeFinalizationFailure({
+          db,
+          runId: row.runId,
+          error: new Error(
+            unrecoverable
+              ? "native_workspace_sync_out_unrecoverable"
+              : "native_workspace_sync_out_failed",
+          ),
+          projectRunStatus: true,
+          failureScope: "workspace",
+          permanent: unrecoverable,
+        });
+        results.push({
+          ...failure,
+          reconciliationAction: "resume_workspace_operation" as const,
+          workspaceOperationId: operation.id,
+          workspaceFinalizeStatus,
+          reconciliationDecision: recoveryDecision,
+        });
+        if (failure.phase === "terminal_failure") {
+          await options
+            .onWorkspaceSettled?.({
+              runId: row.runId,
+              companyId: row.companyId,
+              agentId: row.agentId,
+              succeeded: false,
+            })
+            .catch(() => undefined);
+        }
+        return null;
+      }
+      return { operation, recoveryDecision, workspaceFinalizeStatus: "succeeded" as const };
+    };
     if (row.assessmentId) {
       const assessment = await db.select({
         id: workAssessments.id,
@@ -805,7 +862,11 @@ export async function reconcileNativeFinalizations(
           .from(workspaceOperations).where(and(eq(workspaceOperations.companyId, row.companyId),
             eq(workspaceOperations.heartbeatRunId, row.runId), eq(workspaceOperations.phase, "workspace_finalize")))
           .orderBy(desc(workspaceOperations.createdAt)).limit(1).then((entries) => entries[0]) : null;
-        if (reviewBarrier && reviewBarrier.status !== "succeeded") continue;
+        if (reviewBarrier && reviewBarrier.status !== "succeeded") {
+          // A new evidence event may resume ordinary workspace recovery; a
+          // retired card alone does not authorize another workspace attempt.
+          if (!newEvidenceSatisfiesContract || !await resumeWorkspace()) continue;
+        }
         const childCompletionRecipient = {
           companyId: row.companyId, issueId: row.issueId, agentId: row.agentId, runId: row.runId,
           sourceIntentId: typeof record(row.contextSnapshot).nativeStatusWakeIntentId === "string"
@@ -892,58 +953,9 @@ export async function reconcileNativeFinalizations(
       .limit(1)
       .then((entries) => entries[0] ?? null);
     if (!barrier || barrier.status !== "succeeded") {
-      const recoveryDecision = resolveNativeReconciliationStatus({
-        facts: { workspaceOperationPending: true },
-        priorIssueStatus: row.issueStatus as NativeAuthoritativeIssueStatus,
-        agentId: row.agentId,
-      });
-      if (!recoveryDecision.effects.some((effect) => effect.kind === "resume_workspace_operation")) {
-        throw new Error("native_reconciliation_workspace_resume_policy_missing");
-      }
-      const operation = await resumeNativeWorkspaceFinalization({
-        db,
-        runId: row.runId,
-        environmentRuntime: options.environmentRuntime,
-      });
-      // Busy is ownership, not another failed export or retry-budget debit.
-      if (!operation) continue;
-      const workspaceFinalizeStatus =
-        operation.status === "succeeded" ? "succeeded" : "failed";
-      if (workspaceFinalizeStatus === "failed") {
-        const unrecoverable = operation.stderrExcerpt?.includes(
-          "workspace_sync_out_unrecoverable",
-        );
-        const failure = await recordNativeFinalizationFailure({
-          db,
-          runId: row.runId,
-          error: new Error(
-            unrecoverable
-              ? "native_workspace_sync_out_unrecoverable"
-              : "native_workspace_sync_out_failed",
-          ),
-          projectRunStatus: true,
-          failureScope: "workspace",
-          permanent: unrecoverable,
-        });
-        results.push({
-          ...failure,
-          reconciliationAction: "resume_workspace_operation" as const,
-          workspaceOperationId: operation.id,
-          workspaceFinalizeStatus,
-          reconciliationDecision: recoveryDecision,
-        });
-        if (failure.phase === "terminal_failure") {
-          await options
-            .onWorkspaceSettled?.({
-              runId: row.runId,
-              companyId: row.companyId,
-              agentId: row.agentId,
-              succeeded: false,
-            })
-            .catch(() => undefined);
-        }
-        continue;
-      }
+      const recovered = await resumeWorkspace();
+      if (!recovered) continue;
+      const { operation, recoveryDecision, workspaceFinalizeStatus } = recovered;
       try {
         const finalized = await finalizeNativeRun({
           db,
