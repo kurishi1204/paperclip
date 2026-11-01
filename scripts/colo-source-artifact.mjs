@@ -17,6 +17,17 @@ const git = (root, args, options = {}) => execFileSync('git', ['-C', root, ...ar
   maxBuffer: 512 * 1024 * 1024, env: gitEnvironment, ...options,
 });
 
+function sourceObjectIds(repository, commit) {
+  const tree = git(repository, ['rev-parse', `${commit}^{tree}`], { encoding: 'utf8' }).trim();
+  const entries = git(repository, ['ls-tree', '-r', '-t', commit], { encoding: 'utf8' });
+  const ids = new Set([commit, tree]);
+  for (const entry of entries.trim().split('\n')) {
+    const match = entry.match(/^[0-7]{6} (blob|tree) ([a-f0-9]{40})\t/);
+    if (match) ids.add(match[2]);
+  }
+  return [...ids].sort();
+}
+
 // A minimal object pack has this commit and its complete tree, without history.
 // Git checks object hashes. The trusted expected commit therefore binds the tree.
 function fromObjects(objects, commit, fn) {
@@ -28,6 +39,10 @@ function fromObjects(objects, commit, fn) {
     try { resolved = git(temporary, ['rev-parse', '--verify', `${commit}^{commit}`], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim(); }
     catch { throw new Error('Source object commit mismatch.'); }
     if (resolved !== commit) throw new Error('Source object commit mismatch.');
+    const actual = git(temporary, ['cat-file', '--batch-all-objects', '--batch-check=%(objectname)'], { encoding: 'utf8' }).trim().split('\n').sort();
+    if (JSON.stringify(actual) !== JSON.stringify(sourceObjectIds(temporary, commit))) {
+      throw new Error('Git object pack contains unrelated or missing objects.');
+    }
     return fn(temporary);
   } finally { rmSync(temporary, { recursive: true, force: true }); }
 }
@@ -40,13 +55,7 @@ export function packSource(root, output, commit) {
   if (resolved !== commit) throw new Error('The requested commit is not available.');
   const prefix = `paperclip-${commit}/`;
   const tree = git(root, ['rev-parse', `${commit}^{tree}`], { encoding: 'utf8' }).trim();
-  const entries = git(root, ['ls-tree', '-r', '-t', commit], { encoding: 'utf8' });
-  const objectIds = new Set([commit, tree]);
-  for (const entry of entries.trim().split('\n')) {
-    const match = entry.match(/^[0-7]{6} (blob|tree) ([a-f0-9]{40})\t/);
-    if (match) objectIds.add(match[2]); // Gitlinks are represented by their parent tree.
-  }
-  const objects = git(root, ['pack-objects', '--stdout'], { input: [...objectIds].join('\n') + '\n' });
+  const objects = git(root, ['pack-objects', '--stdout'], { input: sourceObjectIds(root, commit).join('\n') + '\n' });
   const tar = fromObjects(objects, commit, (repository) =>
     git(repository, ['archive', '--format=tar', `--prefix=${prefix}`, commit]));
   const archive = gzipSync(tar, { level: 9 });
@@ -77,7 +86,7 @@ export function packSource(root, output, commit) {
 
 // Expected manifest SHA comes from the selected successful workflow receipt.
 // This verifies bytes and the Git archive identity. It does not extract or run source.
-export function verifySource(directory, commit, expectedSHA256) {
+export function verifySource(directory, commit, expectedSHA256, installedLockPath) {
   fullCommit(commit);
   if (!/^[a-f0-9]{64}$/.test(expectedSHA256 ?? '')) throw new Error('A trusted manifest SHA-256 is required.');
   const manifestBytes = readFileSync(path.join(directory, 'manifest.json'));
@@ -102,6 +111,9 @@ export function verifySource(directory, commit, expectedSHA256) {
   if (lockfile.length !== manifest.dependencyLock.bytes || sha256(lockfile) !== manifest.dependencyLock.sha256) {
     throw new Error('Resolved dependency lock checksum mismatch.');
   }
+  if (installedLockPath && !readFileSync(installedLockPath).equals(lockfile)) {
+    throw new Error('Installed dependency lock differs from the fixed source package.');
+  }
   const tar = gunzipSync(archive, { maxOutputLength: 512 * 1024 * 1024 });
   const objects = readFileSync(path.join(directory, 'source-objects.pack'));
   if (objects.length !== manifest.gitObjects.bytes || sha256(objects) !== manifest.gitObjects.sha256) {
@@ -119,12 +131,12 @@ export function verifySource(directory, commit, expectedSHA256) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const [command, directory, commit, expectedSHA256, ...extra] = process.argv.slice(2);
-    if (!directory || extra.length || !['pack', 'verify'].includes(command) || (command === 'pack' && expectedSHA256)) {
-      throw new Error('Usage: node scripts/colo-source-artifact.mjs pack OUTPUT COMMIT | verify DIRECTORY COMMIT MANIFEST_SHA256');
+    const [command, directory, commit, expectedSHA256, installedLockPath, ...extra] = process.argv.slice(2);
+    if (!directory || extra.length || !['pack', 'verify'].includes(command) || (command === 'pack' && (expectedSHA256 || installedLockPath))) {
+      throw new Error('Usage: node scripts/colo-source-artifact.mjs pack OUTPUT COMMIT | verify DIRECTORY COMMIT MANIFEST_SHA256 [INSTALLED_LOCK_PATH]');
     }
     const result = command === 'pack' ? packSource(process.cwd(), path.resolve(directory), commit)
-      : verifySource(path.resolve(directory), commit, expectedSHA256);
+      : verifySource(path.resolve(directory), commit, expectedSHA256, installedLockPath);
     console.log(JSON.stringify(result, null, 2));
   } catch (error) {
     console.error(error.message);

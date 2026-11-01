@@ -11,7 +11,7 @@ const sourcePins = {
   'agent-runtime-images.yml': 'f5545e5026b260939a60d84a7362487123bd5196aecd09edbba8aed7c91614e8',
   'cloud-migrator-artifacts.yml': 'e3f8b842e6bccc9e037417d1c1028161aa6974cfa1994bd041e07bfe98d8e672',
   'cloud-readiness.yml': '6fa94435fcf0524e50f4d883fa08fd3d59d8f42344cdda28718f1fa212ab84c2',
-  'colo-source-artifact.yml': 'a5aafec70b9b4e4a0656a578a8a0c2a8e392ce22f2659f94b0e30a25ef6f35f4',
+  'colo-source-artifact.yml': '56451ca86d8255b3d9ec447a46eb14953bc7d9f08cff99df59fb4f62a2cb3bd4',
   'commitperclip-review.yml': 'a99c5dcfc4e22bc697b163a95a2121a4854636212c7757e148bdfb7f7cfeba37',
   'docker-runner-check.yml': 'ca484e72732dc8f6417a5cdb3968238c6f74ea455a3acaa8acd07a2c76811f00',
   'docker.yml': '27988c53e451e602a5e35fdf857aca98aac48fa120d2d94f3457467311808ca3',

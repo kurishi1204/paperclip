@@ -137,3 +137,27 @@ test('extra output files are rejected by both pack and verify', () => fixture(({
   // Even without any expected file, an existing directory cannot be reused.
   assert.throws(() => packSource(root, output, commit), /EEXIST/);
 }));
+
+test('install or build cannot substitute the frozen dependency lock', () => fixture(({ root, commit, output }) => {
+  packSource(root, output, commit);
+  const expected = digest(output);
+  const installedLock = path.join(root, 'pnpm-lock.yaml');
+  assert.equal(verifySource(output, commit, expected, installedLock).verified, true);
+  writeFileSync(installedLock, 'changed during build');
+  assert.throws(() => verifySource(output, commit, expected, installedLock), /Installed dependency lock differs/);
+}));
+
+test('unrelated Git objects are rejected even when the source tree is correct', () => fixture(({ root, git, commit, output }) => {
+  const m = packSource(root, output, commit);
+  const unrelated = execFileSync('git', ['-C', root, 'hash-object', '-w', '--stdin'], {
+    input: 'SYNTHETIC_UNRELATED_OBJECT', encoding: 'utf8',
+  }).trim();
+  const objects = execFileSync('git', ['-C', root, 'rev-list', '--objects', commit], { encoding: 'utf8' })
+    .trim().split('\n').map((line) => line.split(' ')[0]);
+  objects.push(unrelated);
+  const changed = execFileSync('git', ['-C', root, 'pack-objects', '--stdout'], { input: objects.join('\n') + '\n' });
+  writeFileSync(path.join(output, 'source-objects.pack'), changed);
+  writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({ ...m,
+    gitObjects: { ...m.gitObjects, bytes: changed.length, sha256: createHash('sha256').update(changed).digest('hex') } }));
+  assert.throws(() => verifySource(output, commit, digest(output)), /unrelated or missing objects/);
+}));

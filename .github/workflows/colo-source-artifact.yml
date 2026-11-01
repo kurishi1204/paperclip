@@ -35,17 +35,24 @@ jobs:
       # This lock is retained separately; Git source and master are not changed.
       - name: Resolve the dependency lock
         run: pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
-      - name: Install frozen dependencies
-        run: pnpm install --frozen-lockfile
-      - name: Build the fixed source
-        run: pnpm build
-      - name: Pack and read back the fixed source
+      - name: Freeze the source and resolved lock before install or build
+        id: source
         env:
           SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           node scripts/colo-source-artifact.mjs pack dist/colo-source "$SOURCE_SHA"
           MANIFEST_SHA=$(sha256sum dist/colo-source/manifest.json | cut -d ' ' -f 1)
-          node scripts/colo-source-artifact.mjs verify dist/colo-source "$SOURCE_SHA" "$MANIFEST_SHA"
+          echo "manifest_sha=$MANIFEST_SHA" >> "$GITHUB_OUTPUT"
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build the fixed source
+        run: pnpm build
+      - name: Read back the frozen source and installed lock after build
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          MANIFEST_SHA: ${{ steps.source.outputs.manifest_sha }}
+        run: |
+          node scripts/colo-source-artifact.mjs verify dist/colo-source "$SOURCE_SHA" "$MANIFEST_SHA" pnpm-lock.yaml
           {
             echo '## COLO source artifact'
             echo "Commit: $SOURCE_SHA"
