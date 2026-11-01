@@ -43,21 +43,29 @@ jobs:
           node scripts/colo-source-artifact.mjs pack dist/colo-source "$SOURCE_SHA"
           MANIFEST_SHA=$(sha256sum dist/colo-source/manifest.json | cut -d ' ' -f 1)
           echo "manifest_sha=$MANIFEST_SHA" >> "$GITHUB_OUTPUT"
+      - name: Restore the frozen source into the build directory
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          MANIFEST_SHA: ${{ steps.source.outputs.manifest_sha }}
+          SOURCE_BUILD_DIR: ${{ runner.temp }}/colo-source-build
+        run: node scripts/colo-source-artifact.mjs restore dist/colo-source "$SOURCE_SHA" "$MANIFEST_SHA" "$SOURCE_BUILD_DIR"
       - name: Install frozen dependencies
+        working-directory: ${{ runner.temp }}/colo-source-build
         run: pnpm install --frozen-lockfile
-      - name: Build the fixed source
+      - name: Build the restored fixed source
+        working-directory: ${{ runner.temp }}/colo-source-build
         run: pnpm build
       - name: Read back the frozen source and installed lock after build
         env:
           SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           MANIFEST_SHA: ${{ steps.source.outputs.manifest_sha }}
         run: |
-          node scripts/colo-source-artifact.mjs verify dist/colo-source "$SOURCE_SHA" "$MANIFEST_SHA" pnpm-lock.yaml
+          node scripts/colo-source-artifact.mjs verify dist/colo-source "$SOURCE_SHA" "$MANIFEST_SHA" "${{ runner.temp }}/colo-source-build/pnpm-lock.yaml"
           {
             echo '## COLO source artifact'
             echo "Commit: $SOURCE_SHA"
             echo "Manifest SHA-256: $MANIFEST_SHA"
-            echo 'Frozen install, source transport tests and normal build completed.'
+            echo 'Frozen install and normal build completed from the restored source package.'
             echo 'This is source only. Build native dependencies on the target platform.'
             echo 'PR artifacts are candidates. Adoption and service cutover are separate.'
           } >> "$GITHUB_STEP_SUMMARY"

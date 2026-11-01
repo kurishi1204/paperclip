@@ -1,163 +1,141 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { gzipSync, gunzipSync } from 'node:zlib';
-import { packSource, verifySource } from './colo-source-artifact.mjs';
+import { packSource, verifySource, restoreSource } from './colo-source-artifact.mjs';
 
-function digest(output) {
-  return createHash('sha256').update(readFileSync(path.join(output, 'manifest.json'))).digest('hex');
-}
-
+const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
+const digest = (output) => hash(readFileSync(path.join(output, 'manifest.json')));
 function fixture(fn) {
   const root = mkdtempSync(path.join(os.tmpdir(), 'colo-source-artifact-'));
   const git = (...args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8' }).trim();
   try {
-    git('init', '--quiet');
-    git('config', 'user.name', 'Fixture');
-    git('config', 'user.email', 'fixture@example.invalid');
+    git('init', '--quiet'); git('config', 'user.name', 'Fixture'); git('config', 'user.email', 'fixture@example.invalid');
     writeFileSync(path.join(root, 'source.txt'), 'first\n');
     writeFileSync(path.join(root, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
-    git('add', 'source.txt', 'pnpm-lock.yaml');
-    git('commit', '--quiet', '-m', 'fixture');
-    fn({ root, git, commit: git('rev-parse', 'HEAD'), output: path.join(root, 'output') });
+    git('add', 'source.txt', 'pnpm-lock.yaml'); git('commit', '--quiet', '-m', 'fixture');
+    fn({ root, git, commit: git('rev-parse', 'HEAD'), output: path.join(root, 'output'), restored: path.join(root, 'restored') });
   } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
-test('fixed Git bytes round-trip; local changes and secrets are excluded', () => fixture(({ root, git, commit, output }) => {
+test('restore uses fixed Git source and excludes local changes and secrets', () => fixture(({ root, commit, output, restored }) => {
   writeFileSync(path.join(root, '.env'), 'SYNTHETIC_SECRET=not-real\n');
   writeFileSync(path.join(root, 'source.txt'), 'uncommitted\n');
-  const manifest = packSource(root, output, commit);
-  const expected = digest(output);
-  assert.equal(verifySource(output, commit, expected).verified, true);
-  const tar = path.join(root, 'source.tar');
-  writeFileSync(tar, gunzipSync(readFileSync(path.join(output, manifest.archive))));
-  const entries = execFileSync('tar', ['-tf', tar], { encoding: 'utf8' }).trim().split('\n');
-  assert.deepEqual(entries, [`paperclip-${commit}/`, `paperclip-${commit}/pnpm-lock.yaml`, `paperclip-${commit}/source.txt`]);
-  assert.equal(execFileSync('tar', ['-xOf', tar, `paperclip-${commit}/source.txt`], { encoding: 'utf8' }), 'first\n');
+  const m = packSource(root, output, commit);
+  assert.equal(m.prebuiltRuntime, false);
+  assert.equal(restoreSource(output, commit, digest(output), restored).restored, true);
+  assert.equal(readFileSync(path.join(restored, 'source.txt'), 'utf8'), 'first\n');
+  assert.equal(existsSync(path.join(restored, '.env')), false);
+  assert.equal(execFileSync('git', ['-C', restored, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(), commit);
+  assert.equal(execFileSync('git', ['-C', restored, 'status', '--porcelain'], { encoding: 'utf8' }), '');
 }));
 
-test('archive mutation is rejected', () => fixture(({ root, commit, output }) => {
-  const m = packSource(root, output, commit);
-  const expected = digest(output);
-  writeFileSync(path.join(output, m.archive), 'corrupt');
-  assert.throws(() => verifySource(output, commit, expected), /checksum/);
+test('export-ignore and export-subst do not omit or rewrite restored source', () => fixture(({ root, git, output, restored }) => {
+  writeFileSync(path.join(root, '.gitattributes'), 'package.json export-ignore\nsource.txt export-subst\n');
+  writeFileSync(path.join(root, 'package.json'), '{"name":"fixture"}\n');
+  writeFileSync(path.join(root, 'source.txt'), '$Format:%H$\n');
+  git('add', '.gitattributes', 'package.json', 'source.txt'); git('commit', '--quiet', '-m', 'export attributes');
+  const commit = git('rev-parse', 'HEAD'); packSource(root, output, commit);
+  restoreSource(output, commit, digest(output), restored);
+  assert.equal(JSON.parse(readFileSync(path.join(restored, 'package.json'))).name, 'fixture');
+  assert.equal(readFileSync(path.join(restored, 'source.txt'), 'utf8'), '$Format:%H$\n');
 }));
 
-test('manifest cannot select an outside path', () => fixture(({ root, commit, output }) => {
+test('object mutation is rejected before restore creates output', () => fixture(({ root, commit, output, restored }) => {
+  packSource(root, output, commit); const expected = digest(output);
+  writeFileSync(path.join(output, 'source-objects.pack'), 'corrupt');
+  assert.throws(() => restoreSource(output, commit, expected, restored), /checksum/);
+  assert.equal(existsSync(restored), false);
+}));
+
+test('manifest cannot select an outside path even with an expected digest', () => fixture(({ root, commit, output }) => {
   const m = packSource(root, output, commit);
-  const expected = digest(output);
-  writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({ ...m, archive: '../outside' }));
-  assert.throws(() => verifySource(output, commit, expected), /checksum/);
+  writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({ ...m, gitObjects: { ...m.gitObjects, file: '../outside' } }));
+  assert.throws(() => verifySource(output, commit, digest(output)), /identity mismatch/);
 }));
 
 test('a coherent manifest cannot replace the trusted checksum', () => fixture(({ root, commit, output }) => {
-  const m = packSource(root, output, commit);
-  const expected = digest(output);
-  const changed = Buffer.from('changed');
-  writeFileSync(path.join(output, m.archive), changed);
-  writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({ ...m, bytes: changed.length,
-    sha256: createHash('sha256').update(changed).digest('hex') }));
-  assert.throws(() => verifySource(output, commit, expected), /checksum/);
+  const m = packSource(root, output, commit); const expected = digest(output); const changed = Buffer.from('changed');
+  writeFileSync(path.join(output, 'source-objects.pack'), changed);
+  writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({ ...m, gitObjects: { ...m.gitObjects, bytes: changed.length, sha256: hash(changed) } }));
+  assert.throws(() => verifySource(output, commit, expected), /manifest checksum/);
 }));
 
-test('a different commit is rejected even with a matching archive hash', () => fixture(({ root, git, commit, output }) => {
+test('objects for a different commit cannot be relabelled', () => fixture(({ root, git, commit, output }) => {
   const m = packSource(root, output, commit);
-  const expected = digest(output);
-  writeFileSync(path.join(root, 'source.txt'), 'second\n');
-  git('commit', '-am', 'second', '--quiet');
+  writeFileSync(path.join(root, 'source.txt'), 'second\n'); git('commit', '-am', 'second', '--quiet');
   const other = git('rev-parse', 'HEAD');
-  writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({ ...m, commit: other,
-    archive: `paperclip-source-${other}.tar.gz`, prefix: `paperclip-${other}/` }));
-  writeFileSync(path.join(output, `paperclip-source-${other}.tar.gz`), readFileSync(path.join(output, m.archive)));
-  rmSync(path.join(output, m.archive));
+  writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({ ...m, commit: other }));
   assert.throws(() => verifySource(output, other, digest(output)), /commit mismatch/);
 }));
 
-test('missing expected checksum and abbreviated commit are rejected', () => fixture(({ root, commit, output }) => {
-  const m = packSource(root, output, commit);
-  const expected = digest(output);
+test('missing trusted checksum and abbreviated commit are rejected', () => fixture(({ root, commit, output }) => {
+  packSource(root, output, commit);
   assert.throws(() => verifySource(output, commit), /trusted manifest/);
   assert.throws(() => packSource(root, output, commit.slice(0, 7)), /full commit/);
-  assert.equal(m.prebuiltRuntime, false);
 }));
 
-test('previous pack evidence is not overwritten', () => fixture(({ root, commit, output }) => {
-  const m = packSource(root, output, commit);
-  const expected = digest(output);
+test('neither a package nor an existing restore directory is overwritten', () => fixture(({ root, commit, output, restored }) => {
+  packSource(root, output, commit); const expected = digest(output);
   assert.throws(() => packSource(root, output, commit), /EEXIST/);
-  assert.equal(verifySource(output, commit, expected).verified, true);
+  restoreSource(output, commit, expected, restored);
+  assert.throws(() => restoreSource(output, commit, expected, restored), /EEXIST/);
+  assert.equal(readFileSync(path.join(restored, 'source.txt'), 'utf8'), 'first\n');
 }));
 
-test('resolved lock bytes are bound and mutation is rejected', () => fixture(({ root, commit, output }) => {
-  writeFileSync(path.join(root, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n# CI resolution\n');
-  const m = packSource(root, output, commit);
-  const expected = digest(output);
-  assert.equal(verifySource(output, commit, expected).dependencyLockSHA256, m.dependencyLock.sha256);
+test('resolved lock is restored while original Git lock remains available', () => fixture(({ root, commit, output, restored }) => {
+  const resolved = 'lockfileVersion: 9.0\n# resolved for CI\n';
+  writeFileSync(path.join(root, 'pnpm-lock.yaml'), resolved);
+  packSource(root, output, commit); restoreSource(output, commit, digest(output), restored);
+  assert.equal(readFileSync(path.join(restored, 'pnpm-lock.yaml'), 'utf8'), resolved);
+  assert.equal(execFileSync('git', ['-C', restored, 'show', 'HEAD:pnpm-lock.yaml'], { encoding: 'utf8' }), 'lockfileVersion: 9.0\n');
   writeFileSync(path.join(output, 'resolved-pnpm-lock.yaml'), 'changed');
-  assert.throws(() => verifySource(output, commit, expected), /lock checksum/);
+  assert.throws(() => verifySource(output, commit, digest(output)), /lock checksum/);
 }));
 
-test('large archives verify without piping the full tar to the header reader', () => fixture(({ root, git, output }) => {
-  writeFileSync(path.join(root, 'large.txt'), Buffer.alloc(2 * 1024 * 1024, 65));
-  git('add', 'large.txt');
-  git('commit', '--quiet', '-m', 'large archive');
-  const commit = git('rev-parse', 'HEAD');
-  packSource(root, output, commit);
-  assert.equal(verifySource(output, commit, digest(output)).verified, true);
+test('large source files survive Git-native restoration', () => fixture(({ root, git, output, restored }) => {
+  const bytes = Buffer.alloc(2 * 1024 * 1024, 65); writeFileSync(path.join(root, 'large.txt'), bytes);
+  git('add', 'large.txt'); git('commit', '--quiet', '-m', 'large source'); const commit = git('rev-parse', 'HEAD');
+  packSource(root, output, commit); restoreSource(output, commit, digest(output), restored);
+  assert.ok(readFileSync(path.join(restored, 'large.txt')).equals(bytes));
 }));
 
-
-test('changed tar contents with a coherent digest still fail the Git tree check', () => fixture(({ root, commit, output }) => {
-  const m = packSource(root, output, commit);
-  const tar = gunzipSync(readFileSync(path.join(output, m.archive)));
-  const offset = tar.indexOf(Buffer.from('first\n'));
-  assert.ok(offset > 0);
-  Buffer.from('wrong\n').copy(tar, offset);
-  const changed = gzipSync(tar);
-  writeFileSync(path.join(output, m.archive), changed);
-  writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({ ...m, bytes: changed.length,
-    sha256: createHash('sha256').update(changed).digest('hex') }));
-  assert.throws(() => verifySource(output, commit, digest(output)), /expected Git tree/);
-}));
-
-test('extra output files are rejected by both pack and verify', () => fixture(({ root, commit, output }) => {
-  const m = packSource(root, output, commit);
-  const expected = digest(output);
-  writeFileSync(path.join(output, 'extra.txt'), 'unexpected');
-  assert.throws(() => packSource(root, output, commit), /EEXIST/);
+test('extra package files are rejected', () => fixture(({ root, commit, output }) => {
+  packSource(root, output, commit); const expected = digest(output); writeFileSync(path.join(output, 'extra.txt'), 'unexpected');
   assert.throws(() => verifySource(output, commit, expected), /Unexpected source artifact files/);
-  rmSync(path.join(output, m.archive));
-  rmSync(path.join(output, 'manifest.json'));
+}));
+
+test('artifact files cannot be replaced by symlinks', () => fixture(({ root, commit, output }) => {
+  packSource(root, output, commit); const expected = digest(output);
   rmSync(path.join(output, 'resolved-pnpm-lock.yaml'));
-  rmSync(path.join(output, 'source-objects.pack'));
-  // Even without any expected file, an existing directory cannot be reused.
-  assert.throws(() => packSource(root, output, commit), /EEXIST/);
+  symlinkSync(path.join(root, 'pnpm-lock.yaml'), path.join(output, 'resolved-pnpm-lock.yaml'));
+  assert.throws(() => verifySource(output, commit, expected), /regular files/);
 }));
 
 test('install or build cannot substitute the frozen dependency lock', () => fixture(({ root, commit, output }) => {
-  packSource(root, output, commit);
-  const expected = digest(output);
-  const installedLock = path.join(root, 'pnpm-lock.yaml');
-  assert.equal(verifySource(output, commit, expected, installedLock).verified, true);
-  writeFileSync(installedLock, 'changed during build');
-  assert.throws(() => verifySource(output, commit, expected, installedLock), /Installed dependency lock differs/);
+  packSource(root, output, commit); const expected = digest(output); const lock = path.join(root, 'pnpm-lock.yaml');
+  assert.equal(verifySource(output, commit, expected, lock).verified, true);
+  writeFileSync(lock, 'changed during build');
+  assert.throws(() => verifySource(output, commit, expected, lock), /Installed dependency lock differs/);
 }));
 
-test('unrelated Git objects are rejected even when the source tree is correct', () => fixture(({ root, git, commit, output }) => {
+test('unrelated Git objects are rejected', () => fixture(({ root, git, commit, output }) => {
   const m = packSource(root, output, commit);
-  const unrelated = execFileSync('git', ['-C', root, 'hash-object', '-w', '--stdin'], {
-    input: 'SYNTHETIC_UNRELATED_OBJECT', encoding: 'utf8',
-  }).trim();
-  const objects = execFileSync('git', ['-C', root, 'rev-list', '--objects', commit], { encoding: 'utf8' })
-    .trim().split('\n').map((line) => line.split(' ')[0]);
-  objects.push(unrelated);
-  const changed = execFileSync('git', ['-C', root, 'pack-objects', '--stdout'], { input: objects.join('\n') + '\n' });
+  const extra = execFileSync('git', ['-C', root, 'hash-object', '-w', '--stdin'], { input: 'SYNTHETIC_UNRELATED_OBJECT', encoding: 'utf8' }).trim();
+  const ids = git('rev-list', '--objects', commit).split('\n').map((line) => line.split(' ')[0]); ids.push(extra);
+  const changed = execFileSync('git', ['-C', root, 'pack-objects', '--stdout'], { input: ids.join('\n') + '\n' });
   writeFileSync(path.join(output, 'source-objects.pack'), changed);
-  writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({ ...m,
-    gitObjects: { ...m.gitObjects, bytes: changed.length, sha256: createHash('sha256').update(changed).digest('hex') } }));
+  writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({ ...m, gitObjects: { ...m.gitObjects, bytes: changed.length, sha256: hash(changed) } }));
   assert.throws(() => verifySource(output, commit, digest(output)), /unrelated or missing objects/);
+}));
+
+test('restoration does not follow a committed dependency-lock symlink', () => fixture(({ root, git, output, restored }) => {
+  rmSync(path.join(root, 'pnpm-lock.yaml')); symlinkSync('source.txt', path.join(root, 'pnpm-lock.yaml'));
+  git('add', 'pnpm-lock.yaml'); git('commit', '--quiet', '-m', 'invalid lock symlink'); const commit = git('rev-parse', 'HEAD');
+  packSource(root, output, commit);
+  assert.throws(() => restoreSource(output, commit, digest(output), restored), /regular file/);
+  assert.equal(readFileSync(path.join(restored, 'source.txt'), 'utf8'), 'first\n');
 }));
