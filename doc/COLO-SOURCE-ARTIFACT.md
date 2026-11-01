@@ -1,0 +1,44 @@
+# COLO source artifact
+
+This is the source transport contract for `kurishi1204/paperclip`. The
+`COLO source artifact` workflow runs on pull requests and master pushes. It uses
+read-only repository permissions. It does not publish npm packages, Docker images
+or AWS artifacts. The upstream distribution workflows and their failures stay
+separate.
+
+A successful job runs the transport tests, the adopted CI resolution-only step,
+a frozen pnpm install and the normal build. It archives the exact source commit,
+reads it back, and uploads the source, resolved dependency lock and `manifest.json`
+for 30 days. The job summary has the full commit and manifest
+SHA-256. Save that receipt with an artifact download if longer retention is needed.
+Checksums identify bytes; they do not authenticate an operator or prove adoption.
+
+Select a successful run and its exact commit. A PR artifact is a candidate. Before
+using it for a service update, verify normal PR checks, the repository review gate,
+adoption, the selected run, and the operator's permission to update the service.
+Do not use the latest artifact name as an adoption decision.
+
+Download the artifact into a new directory. Take the expected manifest hash from
+the selected run summary. Run the verifier from trusted adopted code before
+extraction:
+
+```sh
+node scripts/colo-source-artifact.mjs verify DOWNLOAD_DIRECTORY FULL_COMMIT EXPECTED_MANIFEST_SHA256
+```
+
+The verifier checks the receipt-bound manifest, archive name, length, hash, Git
+archive commit, and resolved dependency lock bytes.
+It does not extract or execute source. The packer uses committed Git bytes, not
+working files. Local secrets, databases, node_modules and build outputs do not
+enter the source archive unless someone committed them to Git.
+
+This is not a portable prebuilt runtime. The build needs Node 24.11+, pnpm 9.15.4
+and the Rust toolchain from `packages/paperclip-runner/rust-toolchain.toml`. The
+workflow uses an Ubuntu runner with Rust available. On the target platform, use
+the declared Node, pnpm and Rust versions. Copy the verified `resolved-pnpm-lock.yaml` over
+`pnpm-lock.yaml` in the extracted source. Then run
+`pnpm install --frozen-lockfile` and the normal build. The original Git lock stays
+in the retained source archive; do not commit the resolved lock from this package.
+Retain and verify local service state, authentication, database compatibility and
+active-run continuity under the service's own update procedure. This workflow does
+not stop, restart, migrate or otherwise change a running service.

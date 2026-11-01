@@ -1,0 +1,62 @@
+name: COLO source artifact
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: colo-source-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  source-artifact:
+    if: github.repository == 'kurishi1204/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+          cache: pnpm
+      - name: Verify source transport
+        run: node --test scripts/colo-source-artifact.test.mjs
+      # Match the adopted PR CI's resolution-only lockfile policy.
+      # This lock is retained separately; Git source and master are not changed.
+      - name: Resolve the dependency lock
+        run: pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build the fixed source
+        run: pnpm build
+      - name: Pack and read back the fixed source
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          node scripts/colo-source-artifact.mjs pack dist/colo-source "$SOURCE_SHA"
+          MANIFEST_SHA=$(sha256sum dist/colo-source/manifest.json | cut -d ' ' -f 1)
+          node scripts/colo-source-artifact.mjs verify dist/colo-source "$SOURCE_SHA" "$MANIFEST_SHA"
+          {
+            echo '## COLO source artifact'
+            echo "Commit: $SOURCE_SHA"
+            echo "Manifest SHA-256: $MANIFEST_SHA"
+            echo 'Frozen install, source transport tests and normal build completed.'
+            echo 'This is source only. Build native dependencies on the target platform.'
+            echo 'PR artifacts are candidates. Adoption and service cutover are separate.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: colo-source-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist/colo-source/
+          if-no-files-found: error
+          retention-days: 30
