@@ -11,6 +11,7 @@ const sourcePins = {
   'agent-runtime-images.yml': 'f5545e5026b260939a60d84a7362487123bd5196aecd09edbba8aed7c91614e8',
   'cloud-migrator-artifacts.yml': 'e3f8b842e6bccc9e037417d1c1028161aa6974cfa1994bd041e07bfe98d8e672',
   'cloud-readiness.yml': '6fa94435fcf0524e50f4d883fa08fd3d59d8f42344cdda28718f1fa212ab84c2',
+  'colo-source-artifact.yml': '7ef4a5707faf0b913fac8d53789224a76a48716af1dc8497e4decae79853e94b',
   'commitperclip-review.yml': 'a99c5dcfc4e22bc697b163a95a2121a4854636212c7757e148bdfb7f7cfeba37',
   'docker-runner-check.yml': 'ca484e72732dc8f6417a5cdb3968238c6f74ea455a3acaa8acd07a2c76811f00',
   'docker.yml': '27988c53e451e602a5e35fdf857aca98aac48fa120d2d94f3457467311808ca3',
@@ -54,7 +55,7 @@ const guardedRoots = {
 
 const reviewedFiles = [
   'agent-runtime-images.yml', 'cloud-migrator-artifacts.yml', 'cloud-readiness.yml',
-  'commitperclip-review.yml', 'docker-runner-check.yml', 'docker.yml', 'e2e.yml',
+  'colo-source-artifact.yml', 'commitperclip-review.yml', 'docker-runner-check.yml', 'docker.yml', 'e2e.yml',
   'pr-trusted.yml', 'pr.yml', 'refresh-lockfile.yml', 'release-smoke.yml',
   'release-verify.yml', 'release.yml', 'runner-chaos-evals.yml',
   'runner-full-stack-e2e.yml', 'runner-live-evals.yml',
@@ -78,7 +79,7 @@ function jobBody(file, name) {
   return lines.slice(index + 1, next === -1 ? undefined : next);
 }
 
-test('all 20 reviewed workflow files are present, with no new workflow', () => {
+test('the complete pinned workflow inventory has no undeclared workflow', () => {
   const actual = readdirSync(workflowDir).filter((name) => /\.ya?ml$/.test(name)).sort();
   assert.deepEqual(actual, reviewedFiles.toSorted());
 });
@@ -115,4 +116,13 @@ test('every reviewed workflow retains its exact source bytes', () => {
     const actual = createHash('sha256').update(source(file)).digest('hex');
     assert.equal(actual, sourcePins[file], `${file}: unreviewed source`);
   }
+});
+
+
+test('the COLO source job is fork-only and has read-only permissions', () => {
+  const text = source('colo-source-artifact.yml').toString('utf8');
+  assert.deepEqual(jobBody('colo-source-artifact.yml', 'source-artifact')
+    .filter((line) => line.startsWith('    if: ')), ["    if: github.repository == 'kurishi1204/paperclip'"]);
+  assert.match(text, /\npermissions:\n  contents: read\n/);
+  assert.doesNotMatch(text, /secrets:|contents: write|id-token: write|pull_request_target:/);
 });
