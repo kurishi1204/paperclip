@@ -74,3 +74,10 @@ Saved-result recovery isolates each coordinator after the adopted pending-effect
 integrity checks, including replacement creation and post-commit publication. An unavailable named reviewer leaves the original
 coordinator and withdrawal marker recoverable; the failure is logged with the
 run and issue, never reported as completion. Other coordinators continue.
+
+An ordinary followup can advance the completion contract before its writer
+continuation finishes. The old review may belong to an earlier contract only
+when it is in the latest contract's explicit `supersedesContractId` ancestry,
+with each link owned by this company/issue and strictly decreasing revision.
+The new saved result must still belong to the latest current contract. No old
+result, assessment or contract is rewritten, and an unrelated revision is held.
