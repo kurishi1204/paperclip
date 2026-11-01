@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { gzipSync, gunzipSync } from 'node:zlib';
 
@@ -10,9 +11,27 @@ const fullCommit = (value) => {
   if (!/^[a-f0-9]{40}$/.test(value ?? '')) throw new Error('A full commit SHA is required.');
   return value;
 };
+const gitEnvironment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+Object.assign(gitEnvironment, { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_ATTR_NOSYSTEM: '1' });
 const git = (root, args, options = {}) => execFileSync('git', ['-C', root, ...args], {
-  maxBuffer: 512 * 1024 * 1024, ...options,
+  maxBuffer: 512 * 1024 * 1024, env: gitEnvironment, ...options,
 });
+
+// A minimal object pack has this commit and its complete tree, without history.
+// Git checks object hashes. The trusted expected commit therefore binds the tree.
+function fromObjects(objects, commit, fn) {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'colo-source-objects-'));
+  try {
+    git(temporary, ['init', '--bare', '--quiet', '--template=']);
+    git(temporary, ['index-pack', '--stdin'], { input: objects });
+    let resolved;
+    try { resolved = git(temporary, ['rev-parse', '--verify', `${commit}^{commit}`], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim(); }
+    catch { throw new Error('Source object commit mismatch.'); }
+    if (resolved !== commit) throw new Error('Source object commit mismatch.');
+    return fn(temporary);
+  } finally { rmSync(temporary, { recursive: true, force: true }); }
+}
+
 
 // Only committed Git bytes enter the archive. Build outputs and local files do not.
 export function packSource(root, output, commit) {
@@ -20,14 +39,23 @@ export function packSource(root, output, commit) {
   const resolved = git(root, ['rev-parse', '--verify', `${commit}^{commit}`], { encoding: 'utf8' }).trim();
   if (resolved !== commit) throw new Error('The requested commit is not available.');
   const prefix = `paperclip-${commit}/`;
-  const tar = git(root, ['archive', '--format=tar', `--prefix=${prefix}`, commit]);
+  const tree = git(root, ['rev-parse', `${commit}^{tree}`], { encoding: 'utf8' }).trim();
+  const entries = git(root, ['ls-tree', '-r', '-t', commit], { encoding: 'utf8' });
+  const objectIds = new Set([commit, tree]);
+  for (const entry of entries.trim().split('\n')) {
+    const match = entry.match(/^[0-7]{6} (blob|tree) ([a-f0-9]{40})\t/);
+    if (match) objectIds.add(match[2]); // Gitlinks are represented by their parent tree.
+  }
+  const objects = git(root, ['pack-objects', '--stdout'], { input: [...objectIds].join('\n') + '\n' });
+  const tar = fromObjects(objects, commit, (repository) =>
+    git(repository, ['archive', '--format=tar', `--prefix=${prefix}`, commit]));
   const archive = gzipSync(tar, { level: 9 });
   const name = `paperclip-source-${commit}.tar.gz`;
   const lockfile = readFileSync(path.join(root, 'pnpm-lock.yaml'));
   const manifest = {
     schema: 'paperclip.colo-source-artifact/v1',
     commit,
-    tree: git(root, ['rev-parse', `${commit}^{tree}`], { encoding: 'utf8' }).trim(),
+    tree,
     archive: name,
     prefix,
     bytes: archive.length,
@@ -35,11 +63,14 @@ export function packSource(root, output, commit) {
     content: 'committed-source-only',
     prebuiltRuntime: false,
     dependencyLock: { file: 'resolved-pnpm-lock.yaml', bytes: lockfile.length, sha256: sha256(lockfile) },
+    gitObjects: { file: 'source-objects.pack', bytes: objects.length, sha256: sha256(objects) },
   };
-  mkdirSync(output, { recursive: true });
+  mkdirSync(path.dirname(output), { recursive: true });
+  mkdirSync(output); // The entire output directory must be new, not only our files.
   // A fixed output is single-use. Do not overwrite evidence from an earlier pack.
   writeFileSync(path.join(output, name), archive, { flag: 'wx' });
   writeFileSync(path.join(output, 'resolved-pnpm-lock.yaml'), lockfile, { flag: 'wx' });
+  writeFileSync(path.join(output, 'source-objects.pack'), objects, { flag: 'wx' });
   writeFileSync(path.join(output, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' });
   return manifest;
 }
@@ -57,7 +88,12 @@ export function verifySource(directory, commit, expectedSHA256) {
       manifest.archive !== name || manifest.prefix !== `paperclip-${commit}/` ||
       manifest.content !== 'committed-source-only' || manifest.prebuiltRuntime !== false ||
       !/^[a-f0-9]{40}$/.test(manifest.tree ?? '') ||
-      manifest.dependencyLock?.file !== 'resolved-pnpm-lock.yaml') throw new Error('Source manifest identity mismatch.');
+      manifest.dependencyLock?.file !== 'resolved-pnpm-lock.yaml' ||
+      manifest.gitObjects?.file !== 'source-objects.pack') throw new Error('Source manifest identity mismatch.');
+  const expectedFiles = ['manifest.json', name, 'resolved-pnpm-lock.yaml', 'source-objects.pack'].sort();
+  if (JSON.stringify(readdirSync(directory).sort()) !== JSON.stringify(expectedFiles)) {
+    throw new Error('Unexpected source artifact files.');
+  }
   const archive = readFileSync(path.join(directory, name));
   if (archive.length !== manifest.bytes || sha256(archive) !== manifest.sha256) {
     throw new Error('Source archive checksum mismatch.');
@@ -67,8 +103,16 @@ export function verifySource(directory, commit, expectedSHA256) {
     throw new Error('Resolved dependency lock checksum mismatch.');
   }
   const tar = gunzipSync(archive, { maxOutputLength: 512 * 1024 * 1024 });
-  const embeddedCommit = execFileSync('git', ['get-tar-commit-id'], { input: tar.subarray(0, 1024), encoding: 'utf8' }).trim();
-  if (embeddedCommit !== commit) throw new Error('Git archive commit mismatch.');
+  const objects = readFileSync(path.join(directory, 'source-objects.pack'));
+  if (objects.length !== manifest.gitObjects.bytes || sha256(objects) !== manifest.gitObjects.sha256) {
+    throw new Error('Git source object checksum mismatch.');
+  }
+  fromObjects(objects, commit, (repository) => {
+    const tree = git(repository, ['rev-parse', `${commit}^{tree}`], { encoding: 'utf8' }).trim();
+    if (tree !== manifest.tree) throw new Error('Git source tree mismatch.');
+    const canonical = git(repository, ['archive', '--format=tar', `--prefix=${manifest.prefix}`, commit]);
+    if (!tar.equals(canonical)) throw new Error('Source archive differs from the expected Git tree.');
+  });
   return { commit, manifestSHA256: expectedSHA256, archiveSHA256: manifest.sha256,
     dependencyLockSHA256: manifest.dependencyLock.sha256, bytes: archive.length, verified: true };
 }

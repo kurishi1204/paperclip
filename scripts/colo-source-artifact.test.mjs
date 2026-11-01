@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { gunzipSync } from 'node:zlib';
+import { gzipSync, gunzipSync } from 'node:zlib';
 import { packSource, verifySource } from './colo-source-artifact.mjs';
 
 function digest(output) {
@@ -73,6 +73,7 @@ test('a different commit is rejected even with a matching archive hash', () => f
   writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({ ...m, commit: other,
     archive: `paperclip-source-${other}.tar.gz`, prefix: `paperclip-${other}/` }));
   writeFileSync(path.join(output, `paperclip-source-${other}.tar.gz`), readFileSync(path.join(output, m.archive)));
+  rmSync(path.join(output, m.archive));
   assert.throws(() => verifySource(output, other, digest(output)), /commit mismatch/);
 }));
 
@@ -107,4 +108,32 @@ test('large archives verify without piping the full tar to the header reader', (
   const commit = git('rev-parse', 'HEAD');
   packSource(root, output, commit);
   assert.equal(verifySource(output, commit, digest(output)).verified, true);
+}));
+
+
+test('changed tar contents with a coherent digest still fail the Git tree check', () => fixture(({ root, commit, output }) => {
+  const m = packSource(root, output, commit);
+  const tar = gunzipSync(readFileSync(path.join(output, m.archive)));
+  const offset = tar.indexOf(Buffer.from('first\n'));
+  assert.ok(offset > 0);
+  Buffer.from('wrong\n').copy(tar, offset);
+  const changed = gzipSync(tar);
+  writeFileSync(path.join(output, m.archive), changed);
+  writeFileSync(path.join(output, 'manifest.json'), JSON.stringify({ ...m, bytes: changed.length,
+    sha256: createHash('sha256').update(changed).digest('hex') }));
+  assert.throws(() => verifySource(output, commit, digest(output)), /expected Git tree/);
+}));
+
+test('extra output files are rejected by both pack and verify', () => fixture(({ root, commit, output }) => {
+  const m = packSource(root, output, commit);
+  const expected = digest(output);
+  writeFileSync(path.join(output, 'extra.txt'), 'unexpected');
+  assert.throws(() => packSource(root, output, commit), /EEXIST/);
+  assert.throws(() => verifySource(output, commit, expected), /Unexpected source artifact files/);
+  rmSync(path.join(output, m.archive));
+  rmSync(path.join(output, 'manifest.json'));
+  rmSync(path.join(output, 'resolved-pnpm-lock.yaml'));
+  rmSync(path.join(output, 'source-objects.pack'));
+  // Even without any expected file, an existing directory cannot be reused.
+  assert.throws(() => packSource(root, output, commit), /EEXIST/);
 }));
