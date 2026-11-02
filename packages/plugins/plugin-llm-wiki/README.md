@@ -253,3 +253,37 @@ Any additional files in that folder are installed as sibling instruction files
 for the managed agent. The settings health check reports drift from these
 defaults, and resetting the managed agent asks for confirmation before replacing
 customized instructions.
+# Verified owner-comment reads by designated employees
+
+`wiki_read_owner_raw` reads one captured comment by `companyId`, `commentId`, and
+`expectedBodySha256`. It returns the same verified raw receipt as the owner UI,
+including the capture timestamp and event ID when recorded. Missing provenance
+is `null`; the calling run is never labelled as the ingestion run. No file, raw
+receipt, comment, or wiki page is written by this tool.
+
+Employee reads are off unless the company configuration explicitly contains:
+
+```json
+{
+  "ownerCommentRawReaderAccess": {
+    "version": 1,
+    "enabled": true,
+    "agentIds": ["<approved agent UUID>", "<independent reviewer UUID>"],
+    "issueIds": ["<approved source issue UUID>"]
+  }
+}
+```
+
+Only the host-authenticated run identity can match this grant. Company mismatch,
+unlisted identities, malformed grants, out-of-grant source issues, and an
+unexpected body hash are denied. Existing capture consent, source classification,
+current comment checks, and stored-file integrity checks still apply. This
+separate read grant does not change the capture policy hash or re-ingest old raw.
+Remove an identity or disable this grant to deny its subsequent reads.
+The allowlist is the company administrator's permission policy, not a fixed
+global headcount. Saving or expanding it requires the existing instance-admin
+configuration API. Apply only the identities and source issues the owner has
+approved; the tool cannot expand that policy from its parameters.
+
+The UI data bridge remains board-only. Adding an employee read grant does not
+give employees board access, capture, publishing, or access to other companies.

@@ -28,9 +28,10 @@ const comment = {id:commentId,companyId:company,issueId,authorType:"user",author
   derivedAuthorSource:null,deletedAt:null,sourceTrust:null,metadata:null,presentation:null,
   createdAt:new Date(now),updatedAt:new Date(now),body} as IssueComment;
 
-function setup(options: {spaceSlug?: string; profile?: unknown} = {}) {
+function setup(options: {spaceSlug?: string; profile?: unknown; readerAccess?: unknown} = {}) {
   const slug=options.spaceSlug ?? "owner-notes";
-  const harness = createTestHarness({manifest,config:{ownerCommentRawCapture:{...config.ownerCommentRawCapture,spaceSlug:slug}}});
+  const harness = createTestHarness({manifest,config:{ownerCommentRawCapture:{...config.ownerCommentRawCapture,spaceSlug:slug},
+    ...(options.readerAccess === undefined ? {} : {ownerCommentRawReaderAccess:options.readerAccess})}});
   harness.seed({issues:[issue],issueComments:[comment]});
   const files = new Map<string,string>();
   let row: Record<string,unknown> | null = null;
@@ -60,7 +61,8 @@ function setup(options: {spaceSlug?: string; profile?: unknown} = {}) {
       if (sql.includes("INSERT")) rawInserts.push(params ?? []);
       if (sql.includes("INSERT") && !row) row={company_id:params?.[0],space_id:params?.[1],comment_id:params?.[2],
         issue_id:params?.[3],owner_user_id:params?.[4],body_sha256:params?.[5],comment_updated_at:params?.[6],
-        raw_path:params?.[7],policy_sha256:params?.[8],status:"pending"};
+        raw_path:params?.[7],policy_sha256:params?.[8],status:"pending",capture_created_at:now,
+        metadata:JSON.parse(String(params?.[9]))};
       if (sql.includes("UPDATE") && row) row.status="verified";
       return {rowCount:1};
     }
@@ -83,6 +85,53 @@ function setup(options: {spaceSlug?: string; profile?: unknown} = {}) {
 }
 
 describe("owner comment raw receipt through exported plugin",()=>{
+  const author = "11111111-1111-4111-8111-111111111111";
+  const reviewer = "22222222-2222-4222-8222-222222222222";
+  const outsider = "33333333-3333-4333-8333-333333333333";
+  const readerAccess = {version:1,enabled:true,agentIds:[author,reviewer],issueIds:[issueId]};
+  const readParams = {companyId:company,commentId,expectedBodySha256:bodyHash};
+  const runContext = (agentId=author) => ({companyId:company,agentId,runId:"44444444-4444-4444-8444-444444444444"});
+
+  it("lets each explicitly granted identity read and cite the same verified version without writing",async()=>{
+    const s=setup({readerAccess});await plugin.definition.setup(s.harness.ctx);await s.emit();
+    const writes=s.harness.dbExecutes.length;
+    for (const agentId of [author,reviewer]) {
+      const one=await s.harness.executeTool<{content:string;data:{source:string;receipt:{bodySha256:string;eventId:string|null;captureCreatedAt:string}}}>(
+        "wiki_read_owner_raw",readParams,runContext(agentId));
+      const cited=await s.harness.executeTool("wiki_read_owner_raw",readParams,runContext(agentId));
+      expect(one.content).toBe(body);expect(one.data.source).toBe(body);
+      expect(one.data.receipt).toMatchObject({status:"verified",bodySha256:bodyHash,captureCreatedAt:now,ingestRunId:null});
+      expect(createHash("sha256").update(one.content).digest("hex")).toBe(bodyHash);
+      expect(cited.data).toMatchObject({companyId:company,commentId,receipt:{bodySha256:bodyHash}});
+      expect(one.data.receipt.eventId).toBe(JSON.parse(String(s.rawInserts[0]?.[9])).eventId);
+    }
+    expect(s.harness.dbExecutes.length).toBe(writes);expect(s.creates()).toBe(1);
+    expect(s.files.size).toBe(1);
+  });
+  it("denies absent grants and parameter-forged identity before reading raw files",async()=>{
+    for (const readerAccess of [undefined,{version:1,enabled:true,agentIds:[reviewer],issueIds:[issueId]}]) {
+      const s=setup({readerAccess});await plugin.definition.setup(s.harness.ctx);await s.emit();
+      let reads=0;s.harness.ctx.localFolders.readText=async()=>{reads++;return body;};
+      await expect(s.harness.executeTool("wiki_read_owner_raw",{...readParams,agentId:reviewer},runContext(outsider)))
+        .rejects.toThrow("agent_reader_forbidden");expect(reads).toBe(0);
+    }
+  });
+  it("denies other companies, out-of-grant issues, stale versions, and malformed grants",async()=>{
+    const s=setup({readerAccess});await plugin.definition.setup(s.harness.ctx);await s.emit();
+    await expect(s.harness.executeTool("wiki_read_owner_raw",{...readParams,companyId:outsider},runContext()))
+      .rejects.toThrow("agent_reader_identity");
+    await expect(s.harness.executeTool("wiki_read_owner_raw",{...readParams,expectedBodySha256:"0".repeat(64)},runContext()))
+      .rejects.toThrow("reader_version");
+    const other=setup({readerAccess:{...readerAccess,issueIds:[outsider]}});
+    await plugin.definition.setup(other.harness.ctx);await other.emit();
+    let reads=0;other.harness.ctx.localFolders.readText=async()=>{reads++;return body;};
+    await expect(other.harness.executeTool("wiki_read_owner_raw",readParams,runContext()))
+      .rejects.toThrow("agent_reader_forbidden");expect(reads).toBe(0);
+    const malformed=setup({readerAccess:{...readerAccess,agentIds:[author,"not-an-agent"]}});
+    await plugin.definition.setup(malformed.harness.ctx);
+    await expect(malformed.harness.executeTool("wiki_read_owner_raw",readParams,runContext()))
+      .rejects.toThrow("agent_reader_policy");
+  });
   it("stores only a quarantined raw file and verifies duplicate delivery by readback",async()=>{
     const s=setup(); await plugin.definition.setup(s.harness.ctx);
     await s.emit(); await s.emit();

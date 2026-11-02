@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { Issue, IssueComment, PluginContext, PluginEvent } from "@paperclipai/plugin-sdk";
+import type { Issue, IssueComment, PluginContext, PluginEvent, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { DEFAULT_MAX_SOURCE_BYTES, PLUGIN_ID, WIKI_ROOT_FOLDER_KEY } from "../manifest.js";
 import { DEFAULT_WIKI_ID, containsDistillationSecret, evaluateOwnerCommentRawSpacePolicy, OwnerCommentRawSpacePolicyDenied, ownerCommentRawSpacePolicy, spaceRelativePath, type WikiSpace } from "./core.js";
 
@@ -103,12 +103,15 @@ function exactComment(...args: Parameters<typeof evaluateCommentProjection>) {
 }
 
 type Row = { company_id: string; space_id: string; comment_id: string; issue_id: string; owner_user_id: string;
-  body_sha256: string; comment_updated_at: string; raw_path: string; policy_sha256: string; status: string };
+  body_sha256: string; comment_updated_at: string; raw_path: string; policy_sha256: string; status: string;
+  capture_created_at?: string; metadata?: unknown };
 const table = (ctx: PluginContext) => `"${ctx.db.namespace}"."paperclip_owner_raw_captures"`;
 async function getRow(ctx: PluginContext, companyId: string, spaceId: string, commentId: string): Promise<Row | null> {
   const rows = await ctx.db.query<Row>(`SELECT company_id, space_id, comment_id, issue_id, owner_user_id, body_sha256,
     to_char(comment_updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS comment_updated_at,
-    raw_path, policy_sha256, status FROM ${table(ctx)}
+    raw_path, policy_sha256, status,
+    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS capture_created_at,
+    metadata FROM ${table(ctx)}
     WHERE company_id=$1 AND space_id=$2 AND comment_id=$3`, [companyId, spaceId, commentId]);
   return rows[0] ?? null;
 }
@@ -138,10 +141,14 @@ function assertStoredRow(row: Row, companyId: string, space: WikiSpace, commentI
       `.paperclip/owner-comment-raw/${space.id}/${commentId}/${row.body_sha256}.txt`)) hold("reader_row");
 }
 function rawReadResult(companyId: string, commentId: string, issueId: string, source: string, row: Row, updatedAt: string) {
+  const eventId = record(row.metadata)?.eventId;
   return { companyId, commentId, issueId, source, receipt: { status: "verified", bodySha256: row.body_sha256,
     bodyBytes: Buffer.byteLength(source,"utf8"), readbackAt: new Date().toISOString(), qa: false,
     companyAdoption: false, wikiPublished: false, commentUpdatedAt: updatedAt,
-    attribution: "host_user_attributed_no_run_markers", rawPath: row.raw_path } };
+    attribution: "host_user_attributed_no_run_markers", rawPath: row.raw_path,
+    captureCreatedAt: dateMs(row.capture_created_at) === null ? null : row.capture_created_at,
+    eventId: typeof eventId === "string" && uuid(eventId) ? eventId : null,
+    ingestRunId: null } };
 }
 async function readSpacePolicy(ctx: PluginContext, companyId: string, config: Config) {
   try { return await ownerCommentRawSpacePolicy(ctx, companyId, config.spaceSlug, config.issueIds); }
@@ -261,7 +268,8 @@ export async function captureOwnerCommentRaw(ctx: PluginContext, event: PluginEv
   }
 }
 
-export async function readOwnerCommentRaw(ctx: PluginContext, companyId: string, commentId: string, expectedSpace?: WikiSpace) {
+export async function readOwnerCommentRaw(ctx: PluginContext, companyId: string, commentId: string, expectedSpace?: WikiSpace,
+  allowedIssueIds?: readonly string[]) {
   if (!uuid(companyId) || !uuid(commentId)) hold("reader_identity");
   companyId = companyId.toLowerCase(); commentId = commentId.toLowerCase();
   const config = parseConfig(await ctx.config.get(companyId));
@@ -271,6 +279,7 @@ export async function readOwnerCommentRaw(ctx: PluginContext, companyId: string,
   const row = await getRow(ctx, companyId, space.id, commentId);
   if (!row || row.status !== "verified") hold("reader_row");
   assertStoredRow(row, companyId, space, commentId);
+  if (allowedIssueIds && !allowedIssueIds.includes(row.issue_id)) hold("agent_reader_forbidden");
   if (!config.issueIds.includes(row.issue_id) || row.owner_user_id !== config.ownerUserId
     || row.policy_sha256 !== config.policySha256) hold("reader_row");
   const issue = await ctx.issues.get(row.issue_id, companyId);
@@ -283,6 +292,29 @@ export async function readOwnerCommentRaw(ctx: PluginContext, companyId: string,
   const current = exactComment(comments, commentId, companyId, issue, config.ownerUserId, occurredAt,
     config.maxBodyBytes, { bodyHash: row.body_sha256, updatedAt: row.comment_updated_at });
   return rawReadResult(companyId, commentId, issue.id, stored, row, current.updatedAt);
+}
+
+/** Agent access is a separate, opt-in read grant. UI bridge authorization and
+ * capture consent remain unchanged. Identity comes from the host run context. */
+export async function readOwnerCommentRawForAgent(ctx: PluginContext, params: unknown, run: ToolRunContext) {
+  const input = record(params);
+  if (!input || !uuid(input.companyId) || !uuid(input.commentId)
+    || typeof input.expectedBodySha256 !== "string" || !SHA.test(input.expectedBodySha256)
+    || !run || !uuid(run.companyId) || !uuid(run.agentId) || !uuid(run.runId)
+    || input.companyId.toLowerCase() !== run.companyId.toLowerCase()) hold("agent_reader_identity");
+  const companyId = run.companyId.toLowerCase();
+  const grant = record((await ctx.config.get(companyId)).ownerCommentRawReaderAccess);
+  if (!grant || grant.version !== 1 || grant.enabled !== true) hold("agent_reader_forbidden");
+  const agentIds = grant.agentIds, issueIds = grant.issueIds;
+  if (!Array.isArray(agentIds) || agentIds.length < 1 || agentIds.length > 32 || !agentIds.every(uuid)
+    || new Set(agentIds.map(id => id.toLowerCase())).size !== agentIds.length
+    || !Array.isArray(issueIds) || issueIds.length < 1 || issueIds.length > MAX_ISSUES || !issueIds.every(uuid)
+    || new Set(issueIds.map(id => id.toLowerCase())).size !== issueIds.length) hold("agent_reader_policy");
+  if (!agentIds.some(id => id.toLowerCase() === run.agentId.toLowerCase())) hold("agent_reader_forbidden");
+  const result = await readOwnerCommentRaw(ctx, companyId, input.commentId.toLowerCase(), undefined,
+    issueIds.map(id => id.toLowerCase()));
+  if (result.receipt.bodySha256 !== input.expectedBodySha256) hold("reader_version");
+  return result;
 }
 
 /** Only verified raw is labelled as such. Known missing receipts retain the

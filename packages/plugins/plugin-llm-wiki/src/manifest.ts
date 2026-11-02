@@ -399,6 +399,21 @@ const manifest: PaperclipPluginManifestV1 = {
       }
     },
     {
+      name: "wiki_read_owner_raw",
+      displayName: "Read Verified Owner Raw",
+      description: "Read one consented owner-comment raw version. Requires a company-scoped agent/issue read grant and the expected full body SHA-256. Does not write, capture, or publish.",
+      parametersSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          companyId: { type: "string" },
+          commentId: { type: "string" },
+          expectedBodySha256: { type: "string", pattern: "^[0-9a-f]{64}$" }
+        },
+        required: ["companyId", "commentId", "expectedBodySha256"]
+      }
+    },
+    {
       name: "wiki_read_source",
       displayName: "Read Wiki Source",
       description: "Read a captured raw source from one wiki space. Operation agents should pass the issue's spaceSlug; omitting it uses the default space.",
