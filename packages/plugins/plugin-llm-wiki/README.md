@@ -287,9 +287,17 @@ The allowlist is the company administrator's permission policy, not a fixed
 global headcount. Saving or expanding it requires the existing instance-admin
 configuration API. Apply only the identities and source issues the owner has
 approved; the tool cannot expand that policy from its parameters.
-Configuration validation accepts 1–32 unique agent UUIDs and 1–25 unique source
-issue UUIDs. Larger or malformed policies are rejected, never truncated or
-partially applied. These input bounds do not select or authorize any identities.
+Each read validates the saved grant: 1–32 unique agent UUIDs and 1–25 unique source
+issue UUIDs. Larger or malformed policies deny all employee reads until corrected;
+they are never truncated or partially applied. The generic configuration API does
+not reject these values at save time. Validate a grant before applying it. These
+input bounds do not select or authorize any identities.
+
+This is an issue-level grant for the existing consented capture scope. It permits
+verified owner comments in the listed issues only while the capture policy and
+current comment checks also permit them. It is not a grant for one comment or one
+body hash. `expectedBodySha256` pins the version returned by each read; it does not
+grant access to a comment outside the authorized source issues.
 
 The HTTP host requires the authenticated agent and token-bound run to match the
 request. A runless token or a Board-supplied agent run cannot use this grant.

@@ -90,7 +90,8 @@ describe("owner comment raw receipt through exported plugin",()=>{
   const outsider = "33333333-3333-4333-8333-333333333333";
   const readerAccess = {version:1,enabled:true,agentIds:[author,reviewer],issueIds:[issueId]};
   const readParams = {companyId:company,commentId,expectedBodySha256:bodyHash};
-  const runContext = (agentId=author) => ({companyId:company,agentId,runId:"44444444-4444-4444-8444-444444444444"});
+  const runContext = (agentId=author) => ({companyId:company,agentId,
+    runId:agentId===reviewer ? "66666666-6666-4666-8666-666666666666" : "44444444-4444-4444-8444-444444444444"});
 
   it("lets each explicitly granted identity read and cite the same verified version without writing",async()=>{
     const s=setup({readerAccess});await plugin.definition.setup(s.harness.ctx);await s.emit();
