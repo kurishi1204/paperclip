@@ -253,3 +253,56 @@ Any additional files in that folder are installed as sibling instruction files
 for the managed agent. The settings health check reports drift from these
 defaults, and resetting the managed agent asks for confirmation before replacing
 customized instructions.
+# Verified owner-comment reads by designated employees
+
+`wiki_read_owner_raw` reads one captured comment by `companyId`, `commentId`, and
+`expectedBodySha256`. It returns the same verified raw receipt as the owner UI,
+including `captureRecordCreatedAt` and the event ID when recorded. The timestamp
+is when the pending capture row was created, not when file verification finished.
+The event ID is stored capture metadata; it is not independently revalidated
+against the event journal by this reader. Missing provenance
+is `null`; the calling run is never labelled as the ingestion run. No file, raw
+receipt, comment, or wiki page is written by this tool.
+
+Employee reads are off unless the company configuration explicitly contains:
+
+```json
+{
+  "ownerCommentRawReaderAccess": {
+    "version": 1,
+    "enabled": true,
+    "agentIds": ["<approved agent UUID>", "<independent reviewer UUID>"],
+    "issueIds": ["<approved source issue UUID>"]
+  }
+}
+```
+
+Only the host-authenticated run identity can match this grant. Company mismatch,
+unlisted identities, malformed grants, out-of-grant source issues, and an
+unexpected body hash are denied. Existing capture consent, source classification,
+current comment checks, and stored-file integrity checks still apply. This
+separate read grant does not change the capture policy hash or re-ingest old raw.
+Remove an identity or disable this grant to deny its subsequent reads.
+The allowlist is the company administrator's permission policy, not a fixed
+global headcount. Saving or expanding it requires the existing instance-admin
+configuration API. Apply only the identities and source issues the owner has
+approved; the tool cannot expand that policy from its parameters.
+Each read validates the saved grant: 1–32 unique agent UUIDs and 1–25 unique source
+issue UUIDs. Larger or malformed policies deny all employee reads until corrected;
+they are never truncated or partially applied. The generic configuration API does
+not reject these values at save time. Validate a grant before applying it. These
+input bounds do not select or authorize any identities.
+
+This is an issue-level grant for the existing consented capture scope. It permits
+verified owner comments in the listed issues only while the capture policy and
+current comment checks also permit them. It is not a grant for one comment or one
+body hash. `expectedBodySha256` pins the version returned by each read; it does not
+grant access to a comment outside the authorized source issues.
+
+The HTTP host requires the authenticated agent and token-bound run to match the
+request. A runless token or a Board-supplied agent run cannot use this grant.
+Board users keep the existing
+Board-only raw data reader. Other plugin tools keep their existing access rules.
+
+The UI data bridge remains board-only. Adding an employee read grant does not
+give employees board access, capture, publishing, or access to other companies.

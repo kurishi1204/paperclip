@@ -630,6 +630,68 @@ describe("plugin tool and bridge authz", () => {
     }
   });
 
+  it.each([
+    { agentId: "88888888-8888-4888-8888-888888888888", runId: runA, reasonCode: "actor_agent_mismatch" },
+    { agentId: agentA, runId: "99999999-9999-4999-8999-999999999999", reasonCode: "actor_run_mismatch" },
+  ])("rejects forged caller context without a tool gateway: $reasonCode", async ({ agentId, runId, reasonCode }) => {
+    const executeTool = vi.fn().mockResolvedValue({ content: "must not be disclosed" });
+    const { app } = await createApp(agentActor(), {}, {
+      db: createSelectQueueDb([
+        [{ companyId: companyA }],
+        [{ companyId: companyA, agentId }],
+        [{ companyId: companyA }],
+      ]),
+      toolDeps: { toolDispatcher: { listToolsForAgent: vi.fn(), getTool: vi.fn(() => ({ name: "paperclip.example:search" })), executeTool } },
+    });
+    const response = await request(app).post("/api/plugins/tools/execute").send({
+      tool: "paperclip.example:search", parameters: {},
+      runContext: { companyId: companyA, agentId, runId, projectId: projectA },
+    });
+    expect(response.status).toBe(403);
+    expect(response.body.reasonCode).toBe(reasonCode);
+    expect(executeTool).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: "board", actor: boardActor() },
+    { label: "admin board", actor: boardActor({ isInstanceAdmin: true }) },
+    { label: "agent without a run", actor: agentActor({ runId: null }) },
+    { label: "another agent", actor: agentActor({ agentId: "88888888-8888-4888-8888-888888888888" }) },
+    { label: "another run", actor: agentActor({ runId: "99999999-9999-4999-8999-999999999999" }) },
+  ])("rejects unbound employee raw reader identity: $label", async ({ actor }) => {
+    const executeTool = vi.fn().mockResolvedValue({ content: "must not be disclosed" });
+    const { app } = await createApp(actor, {}, {
+      db: createSelectQueueDb([
+        [{ companyId: companyA }], [{ companyId: companyA, agentId: agentA }], [{ companyId: companyA }],
+      ]),
+      toolDeps: { toolDispatcher: { listToolsForAgent: vi.fn(), getTool: vi.fn(() => ({ name: "paperclipai.plugin-llm-wiki:wiki_read_owner_raw" })), executeTool } },
+    });
+    const response = await request(app).post("/api/plugins/tools/execute").send({
+      tool: "paperclipai.plugin-llm-wiki:wiki_read_owner_raw", parameters: {},
+      runContext: { companyId: companyA, agentId: agentA, runId: runA, projectId: projectA },
+    });
+    expect(response.status).toBe(403);
+    expect(response.body.reasonCode).toBe("employee_reader_identity");
+    expect(executeTool).not.toHaveBeenCalled();
+  });
+
+  it("keeps the caller's own context working without a tool gateway", async () => {
+    const executeTool = vi.fn().mockResolvedValue({ content: "approved read" });
+    const { app } = await createApp(agentActor(), {}, {
+      db: createSelectQueueDb([
+        [{ companyId: companyA }], [{ companyId: companyA, agentId: agentA }], [{ companyId: companyA }],
+      ]),
+      toolDeps: { toolDispatcher: { listToolsForAgent: vi.fn(), getTool: vi.fn(() => ({ name: "paperclipai.plugin-llm-wiki:wiki_read_owner_raw" })), executeTool } },
+    });
+    const response = await request(app).post("/api/plugins/tools/execute").send({
+      tool: "paperclipai.plugin-llm-wiki:wiki_read_owner_raw", parameters: {},
+      runContext: { companyId: companyA, agentId: agentA, runId: runA, projectId: projectA },
+    });
+    expect(response.status).toBe(200);
+    expect(response.body.content).toBe("approved read");
+    expect(executeTool).toHaveBeenCalledTimes(1);
+  });
+
   it("allows tool execution when agent, run, and project all belong to runContext.companyId", async () => {
     const executeTool = vi.fn().mockResolvedValue({ content: "ok" });
     const { app } = await createApp(boardActor(), {}, {

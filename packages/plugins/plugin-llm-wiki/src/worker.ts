@@ -60,7 +60,7 @@ import {
   writeTemplate,
   writeWikiPage,
 } from "./wiki.js";
-import { captureOwnerCommentRaw, OwnerCommentRawHold, readOwnerCommentRaw } from "./wiki/owner-comment-raw.js";
+import { captureOwnerCommentRaw, OwnerCommentRawHold, readOwnerCommentRaw, readOwnerCommentRawForAgent } from "./wiki/owner-comment-raw.js";
 
 function stringField(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -219,6 +219,16 @@ const plugin = definePlugin({
         if (raw.status === "rejected") throw raw.reason;
       });
     }
+
+    ctx.tools.register("wiki_read_owner_raw", {
+      displayName: "Read Verified Owner Raw",
+      description: "Read one approved owner-comment raw version with a verified receipt.",
+      parametersSchema: ctx.manifest.tools?.find(tool => tool.name === "wiki_read_owner_raw")?.parametersSchema
+        ?? { type: "object" },
+    }, async (params, run) => {
+      const result = await readOwnerCommentRawForAgent(ctx, params, run);
+      return { content: result.source, data: result };
+    });
 
     ctx.data.register("owner-comment-raw-source", async (params) => {
       const companyId = readCompanyIdFromParams(params);

@@ -1044,6 +1044,37 @@ export function pluginRoutes(
     }
 
     assertCompanyAccess(req, runContext.companyId);
+    // Only an authenticated, token-bound employee run may use this separate grant.
+    // Board callers retain the existing Board-only raw data reader.
+    if (tool === "paperclipai.plugin-llm-wiki:wiki_read_owner_raw" && !(
+      req.actor.type === "agent"
+      && req.actor.agentId === runContext.agentId
+      && req.actor.runId
+      && req.actor.runId === runContext.runId
+    )) {
+      res.status(403).json({
+        error: "The employee raw reader requires the authenticated agent and run",
+        reasonCode: "employee_reader_identity",
+      });
+      return;
+    }
+    // Bind caller identity before either the gateway or direct dispatcher path.
+    if (req.actor.type === "agent") {
+      if (req.actor.agentId !== runContext.agentId) {
+        res.status(403).json({
+          error: "Agent cannot execute tools as another agent",
+          reasonCode: "actor_agent_mismatch",
+        });
+        return;
+      }
+      if (req.actor.runId && req.actor.runId !== runContext.runId) {
+        res.status(403).json({
+          error: "Agent cannot execute tools for another run",
+          reasonCode: "actor_run_mismatch",
+        });
+        return;
+      }
+    }
     const scopeError = await validateToolRunContextScope(runContext);
     if (scopeError) {
       res.status(403).json({ error: scopeError });

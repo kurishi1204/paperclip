@@ -712,6 +712,7 @@ describe("LLM Wiki plugin scaffold", () => {
       "wiki_write_page",
       "wiki_propose_patch",
       "wiki_list_sources",
+      "wiki_read_owner_raw",
       "wiki_read_source",
       "wiki_append_log",
       "wiki_update_index",
