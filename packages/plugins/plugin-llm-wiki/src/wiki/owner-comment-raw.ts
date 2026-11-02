@@ -146,7 +146,7 @@ function rawReadResult(companyId: string, commentId: string, issueId: string, so
     bodyBytes: Buffer.byteLength(source,"utf8"), readbackAt: new Date().toISOString(), qa: false,
     companyAdoption: false, wikiPublished: false, commentUpdatedAt: updatedAt,
     attribution: "host_user_attributed_no_run_markers", rawPath: row.raw_path,
-    captureCreatedAt: dateMs(row.capture_created_at) === null ? null : row.capture_created_at,
+    captureRecordCreatedAt: dateMs(row.capture_created_at) === null ? null : row.capture_created_at,
     eventId: typeof eventId === "string" && uuid(eventId) ? eventId : null,
     ingestRunId: null } };
 }

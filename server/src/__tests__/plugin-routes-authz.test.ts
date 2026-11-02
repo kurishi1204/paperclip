@@ -652,9 +652,15 @@ describe("plugin tool and bridge authz", () => {
     expect(executeTool).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])("rejects board use of the employee-only raw reader, admin=$0", async (isInstanceAdmin) => {
+  it.each([
+    { label: "board", actor: boardActor() },
+    { label: "admin board", actor: boardActor({ isInstanceAdmin: true }) },
+    { label: "agent without a run", actor: agentActor({ runId: null }) },
+    { label: "another agent", actor: agentActor({ agentId: "88888888-8888-4888-8888-888888888888" }) },
+    { label: "another run", actor: agentActor({ runId: "99999999-9999-4999-8999-999999999999" }) },
+  ])("rejects unbound employee raw reader identity: $label", async ({ actor }) => {
     const executeTool = vi.fn().mockResolvedValue({ content: "must not be disclosed" });
-    const { app } = await createApp(boardActor({ isInstanceAdmin }), {}, {
+    const { app } = await createApp(actor, {}, {
       db: createSelectQueueDb([
         [{ companyId: companyA }], [{ companyId: companyA, agentId: agentA }], [{ companyId: companyA }],
       ]),
@@ -665,7 +671,7 @@ describe("plugin tool and bridge authz", () => {
       runContext: { companyId: companyA, agentId: agentA, runId: runA, projectId: projectA },
     });
     expect(response.status).toBe(403);
-    expect(response.body.reasonCode).toBe("agent_actor_required");
+    expect(response.body.reasonCode).toBe("employee_reader_identity");
     expect(executeTool).not.toHaveBeenCalled();
   });
 

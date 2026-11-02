@@ -257,7 +257,10 @@ customized instructions.
 
 `wiki_read_owner_raw` reads one captured comment by `companyId`, `commentId`, and
 `expectedBodySha256`. It returns the same verified raw receipt as the owner UI,
-including the capture timestamp and event ID when recorded. Missing provenance
+including `captureRecordCreatedAt` and the event ID when recorded. The timestamp
+is when the pending capture row was created, not when file verification finished.
+The event ID is stored capture metadata; it is not independently revalidated
+against the event journal by this reader. Missing provenance
 is `null`; the calling run is never labelled as the ingestion run. No file, raw
 receipt, comment, or wiki page is written by this tool.
 
@@ -284,9 +287,13 @@ The allowlist is the company administrator's permission policy, not a fixed
 global headcount. Saving or expanding it requires the existing instance-admin
 configuration API. Apply only the identities and source issues the owner has
 approved; the tool cannot expand that policy from its parameters.
+Configuration validation accepts 1–32 unique agent UUIDs and 1–25 unique source
+issue UUIDs. Larger or malformed policies are rejected, never truncated or
+partially applied. These input bounds do not select or authorize any identities.
 
-The HTTP host accepts this tool only from an authenticated agent, even when a
-Board caller supplies an existing agent run. Board users keep the existing
+The HTTP host requires the authenticated agent and token-bound run to match the
+request. A runless token or a Board-supplied agent run cannot use this grant.
+Board users keep the existing
 Board-only raw data reader. Other plugin tools keep their existing access rules.
 
 The UI data bridge remains board-only. Adding an employee read grant does not

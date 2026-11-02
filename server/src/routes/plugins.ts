@@ -1044,12 +1044,17 @@ export function pluginRoutes(
     }
 
     assertCompanyAccess(req, runContext.companyId);
-    // This separate employee grant must not use a Board-supplied agent identity.
+    // Only an authenticated, token-bound employee run may use this separate grant.
     // Board callers retain the existing Board-only raw data reader.
-    if (tool === "paperclipai.plugin-llm-wiki:wiki_read_owner_raw" && req.actor.type !== "agent") {
+    if (tool === "paperclipai.plugin-llm-wiki:wiki_read_owner_raw" && !(
+      req.actor.type === "agent"
+      && req.actor.agentId === runContext.agentId
+      && req.actor.runId
+      && req.actor.runId === runContext.runId
+    )) {
       res.status(403).json({
-        error: "The employee raw reader requires an authenticated agent",
-        reasonCode: "agent_actor_required",
+        error: "The employee raw reader requires the authenticated agent and run",
+        reasonCode: "employee_reader_identity",
       });
       return;
     }

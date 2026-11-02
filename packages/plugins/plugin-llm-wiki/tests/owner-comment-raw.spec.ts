@@ -96,11 +96,11 @@ describe("owner comment raw receipt through exported plugin",()=>{
     const s=setup({readerAccess});await plugin.definition.setup(s.harness.ctx);await s.emit();
     const writes=s.harness.dbExecutes.length;
     for (const agentId of [author,reviewer]) {
-      const one=await s.harness.executeTool<{content:string;data:{source:string;receipt:{bodySha256:string;eventId:string|null;captureCreatedAt:string}}}>(
+      const one=await s.harness.executeTool<{content:string;data:{source:string;receipt:{bodySha256:string;eventId:string|null;captureRecordCreatedAt:string}}}>(
         "wiki_read_owner_raw",readParams,runContext(agentId));
       const cited=await s.harness.executeTool("wiki_read_owner_raw",readParams,runContext(agentId));
       expect(one.content).toBe(body);expect(one.data.source).toBe(body);
-      expect(one.data.receipt).toMatchObject({status:"verified",bodySha256:bodyHash,captureCreatedAt:now,ingestRunId:null});
+      expect(one.data.receipt).toMatchObject({status:"verified",bodySha256:bodyHash,captureRecordCreatedAt:now,ingestRunId:null});
       expect(createHash("sha256").update(one.content).digest("hex")).toBe(bodyHash);
       expect(cited.data).toMatchObject({companyId:company,commentId,receipt:{bodySha256:bodyHash}});
       expect(one.data.receipt.eventId).toBe(JSON.parse(String(s.rawInserts[0]?.[9])).eventId);
