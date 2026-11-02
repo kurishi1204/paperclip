@@ -652,16 +652,33 @@ describe("plugin tool and bridge authz", () => {
     expect(executeTool).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])("rejects board use of the employee-only raw reader, admin=$0", async (isInstanceAdmin) => {
+    const executeTool = vi.fn().mockResolvedValue({ content: "must not be disclosed" });
+    const { app } = await createApp(boardActor({ isInstanceAdmin }), {}, {
+      db: createSelectQueueDb([
+        [{ companyId: companyA }], [{ companyId: companyA, agentId: agentA }], [{ companyId: companyA }],
+      ]),
+      toolDeps: { toolDispatcher: { listToolsForAgent: vi.fn(), getTool: vi.fn(() => ({ name: "paperclipai.plugin-llm-wiki:wiki_read_owner_raw" })), executeTool } },
+    });
+    const response = await request(app).post("/api/plugins/tools/execute").send({
+      tool: "paperclipai.plugin-llm-wiki:wiki_read_owner_raw", parameters: {},
+      runContext: { companyId: companyA, agentId: agentA, runId: runA, projectId: projectA },
+    });
+    expect(response.status).toBe(403);
+    expect(response.body.reasonCode).toBe("agent_actor_required");
+    expect(executeTool).not.toHaveBeenCalled();
+  });
+
   it("keeps the caller's own context working without a tool gateway", async () => {
     const executeTool = vi.fn().mockResolvedValue({ content: "approved read" });
     const { app } = await createApp(agentActor(), {}, {
       db: createSelectQueueDb([
         [{ companyId: companyA }], [{ companyId: companyA, agentId: agentA }], [{ companyId: companyA }],
       ]),
-      toolDeps: { toolDispatcher: { listToolsForAgent: vi.fn(), getTool: vi.fn(() => ({ name: "paperclip.example:search" })), executeTool } },
+      toolDeps: { toolDispatcher: { listToolsForAgent: vi.fn(), getTool: vi.fn(() => ({ name: "paperclipai.plugin-llm-wiki:wiki_read_owner_raw" })), executeTool } },
     });
     const response = await request(app).post("/api/plugins/tools/execute").send({
-      tool: "paperclip.example:search", parameters: {},
+      tool: "paperclipai.plugin-llm-wiki:wiki_read_owner_raw", parameters: {},
       runContext: { companyId: companyA, agentId: agentA, runId: runA, projectId: projectA },
     });
     expect(response.status).toBe(200);

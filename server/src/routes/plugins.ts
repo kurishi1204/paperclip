@@ -1044,6 +1044,15 @@ export function pluginRoutes(
     }
 
     assertCompanyAccess(req, runContext.companyId);
+    // This separate employee grant must not use a Board-supplied agent identity.
+    // Board callers retain the existing Board-only raw data reader.
+    if (tool === "paperclipai.plugin-llm-wiki:wiki_read_owner_raw" && req.actor.type !== "agent") {
+      res.status(403).json({
+        error: "The employee raw reader requires an authenticated agent",
+        reasonCode: "agent_actor_required",
+      });
+      return;
+    }
     // Bind caller identity before either the gateway or direct dispatcher path.
     if (req.actor.type === "agent") {
       if (req.actor.agentId !== runContext.agentId) {

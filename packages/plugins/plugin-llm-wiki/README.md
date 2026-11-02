@@ -285,5 +285,9 @@ global headcount. Saving or expanding it requires the existing instance-admin
 configuration API. Apply only the identities and source issues the owner has
 approved; the tool cannot expand that policy from its parameters.
 
+The HTTP host accepts this tool only from an authenticated agent, even when a
+Board caller supplies an existing agent run. Board users keep the existing
+Board-only raw data reader. Other plugin tools keep their existing access rules.
+
 The UI data bridge remains board-only. Adding an employee read grant does not
 give employees board access, capture, publishing, or access to other companies.
