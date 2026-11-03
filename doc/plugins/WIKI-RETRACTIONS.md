@@ -317,7 +317,13 @@ receipt envelope with `state`, `event`, `maintenanceLog` and
 
 Wiki-root access and both Board transitions also require an exclusive physical
 root for the company. A same or nested root configured for another company is
-refused before files are read or written. Missing other roots cannot be used for
-an operation; once created they are checked again. Other ownership lookup errors
+refused before files are read or written. Uncreated roots claim their prospective physical namespace through the nearest
+existing ancestor. Host and Board configuration validate the proposed target
+before preparing or saving it; writes also check after preparation. Other ownership lookup errors
 fail closed. Instance-administrator edits outside the host remain outside this
 boundary.
+
+Root configuration takes an exclusive plugin claim lock. Normal operations share
+that lock, in addition to the company operation lock. Both public configuration
+writers use the same prospective-root contract; creating a missing parent is not
+an escape from ownership checks. Historical receipt/audit reads remain available.

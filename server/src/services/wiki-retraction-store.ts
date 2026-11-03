@@ -17,10 +17,15 @@ export function wikiRetractionLockKey(pluginId: string, companyId: string) {
   return JSON.stringify(["wiki-retraction/v1", pluginId, companyId]);
 }
 export async function withWikiRetractionLock<T>(db: Db, pluginId: string, companyId: string,
-  work: (tx: Db) => Promise<T>): Promise<T> {
+  work: (tx: Db) => Promise<T>, rootConfiguration=false): Promise<T> {
   return db.transaction(async tx => {
     const key = wikiRetractionLockKey(pluginId, companyId);
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
+    // Configuration takes the exclusive claim lock. Normal operations share
+    // it, so a new root mapping cannot race a file effect in another company.
+    const roots=JSON.stringify(["wiki-root-claims/v1",pluginId]);
+    if(rootConfiguration)await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${roots}, 0))`);
+    else await tx.execute(sql`select pg_advisory_xact_lock_shared(hashtextextended(${roots}, 0))`);
     return work(tx as unknown as Db);
   });
 }
@@ -108,10 +113,30 @@ export async function loadCurrentWikiRetractions(db:Db,pluginId:string,companyId
   return events;
 }
 
+/** Resolve the nearest existing ancestor without creating a directory.
+ * Missing descendants still claim their future physical namespace. */
+async function prospectiveWikiRoot(input:string) {
+  let ancestor=path.resolve(input);const suffix:string[]=[];
+  for(;;){
+    try{return path.join(await fs.realpath(ancestor),...suffix);}
+    catch(error){
+      if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;
+      const parent=path.dirname(ancestor);if(parent===ancestor)throw error;
+      suffix.unshift(path.basename(ancestor));ancestor=parent;
+    }
+  }
+}
+/** Used by both public configuration writers before preparation or saving. */
+export async function assertWikiConfiguredRoot(db:Db,pluginId:string,companyId:string,root:string) {
+  const events=await loadCurrentWikiRetractions(db,pluginId,companyId);
+  retractionFolderGate(events,companyId,"wiki-root").assertRoot(await prospectiveWikiRoot(root));
+  await assertWikiRootOwnership(db,pluginId,companyId,root);
+}
+
 /** Each company needs an exclusive physical Wiki root, including nested roots.
  * An instance administrator can still edit files outside this host boundary. */
 export async function assertWikiRootOwnership(db:Db,pluginId:string,companyId:string,root:string) {
-  const own=await fs.realpath(root);
+  const own=await prospectiveWikiRoot(root);
   const rows=await db.select().from(pluginCompanySettings).where(eq(pluginCompanySettings.pluginId,pluginId));
   const contains=(a:string,b:string)=>{const r=path.relative(a,b);return r===""||(!r.startsWith(".."+path.sep)&&r!==".."&&!path.isAbsolute(r));};
   for(const row of rows) {
@@ -119,11 +144,8 @@ export async function assertWikiRootOwnership(db:Db,pluginId:string,companyId:st
     const configured=getStoredLocalFolders(row.settingsJson)["wiki-root"]?.path;
     if(!configured)continue;
     let other:string;
-    try{other=await fs.realpath(configured);}catch(error){
-      if(["ENOENT","ENOTDIR"].includes((error as NodeJS.ErrnoException).code??""))continue;
-      throw new RetractionError("runtime_root_ownership_unknown");
-    }
-    if(contains(own,other)||contains(other,own))throw new RetractionError("runtime_root_shared");
+    try{other=await prospectiveWikiRoot(configured);}catch{throw new RetractionError("runtime_root_ownership_unknown");}
+    if(contains(own,other)||contains(other,own))throw conflict("wiki_retraction_runtime_root_shared",{code:"wiki_root_shared"});
   }
 }
 

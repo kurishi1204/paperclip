@@ -92,6 +92,7 @@ import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { secretService } from "../services/secrets.js";
 import { wikiRetractionRuntime } from "../services/wiki-retraction-runtime.js";
+import { assertWikiConfiguredRoot, withWikiRetractionLock } from "../services/wiki-retraction-store.js";
 import { wikiRepublicationRuntime } from "../services/wiki-republication-runtime.js";
 import { HttpError, badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 
@@ -3041,28 +3042,37 @@ export function pluginRoutes(
       return;
     }
 
-    const existing = await registry.getCompanySettings(plugin.id, companyId);
+    const configuredPath=body.path;
+    const configure=async(connection:Db)=>{
+      const scopedRegistry=pluginRegistryService(connection);
+      const existing = await scopedRegistry.getCompanySettings(plugin.id, companyId);
     const declaration = requireLocalFolderDeclaration(plugin.manifestJson.localFolders ?? [], folderKey);
     const status = await inspectPluginLocalFolder({
       folderKey,
       declaration,
       storedConfig: getStoredLocalFolders(existing?.settingsJson)[folderKey] ?? null,
       overrideConfig: {
-        path: body.path,
+        path: configuredPath,
       },
     });
 
+    if(plugin.pluginKey==="paperclipai.plugin-llm-wiki"&&folderKey==="wiki-root")
+      await assertWikiConfiguredRoot(connection,plugin.id,companyId,(status.realPath??status.path)!);
     const nextSettings = setStoredLocalFolder(existing?.settingsJson, folderKey, {
-      path: body.path,
+      path: configuredPath,
       access: status.access,
       requiredDirectories: status.requiredDirectories,
       requiredFiles: status.requiredFiles,
     });
-    await registry.upsertCompanySettings(plugin.id, companyId, {
+    await scopedRegistry.upsertCompanySettings(plugin.id, companyId, {
       enabled: existing?.enabled ?? true,
       settingsJson: nextSettings,
       lastError: status.healthy ? null : status.problems.map((item: { message: string }) => item.message).join("; "),
     });
+      return status;
+    };
+    const status=plugin.pluginKey==="paperclipai.plugin-llm-wiki"&&folderKey==="wiki-root"
+      ?await withWikiRetractionLock(db,plugin.id,companyId,configure,true):await configure(db);
     await logPluginMutationActivity(req, "plugin.local_folder.configured", plugin.id, {
       pluginId: plugin.id,
       pluginKey: plugin.pluginKey,

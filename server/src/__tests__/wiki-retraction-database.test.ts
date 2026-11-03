@@ -300,9 +300,9 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     // Actual Express route + real SQL/file runtime; only the authenticated
     // Board actor is injected here. No mocked publication runtime or store.
     const [{pluginRoutes},{errorHandler}]=await Promise.all([import("../routes/plugins.js"),import("../middleware/index.js")]);
-    const appFor=(companyId:string)=>{
+    const appFor=(companyId:string,isInstanceAdmin=false)=>{
       const app=express();app.use(express.json());
-      app.use((req,_res,next)=>{req.actor={type:"board",userId:"synthetic-owner",source:"session",isInstanceAdmin:false,companyIds:[companyId]};next();});
+      app.use((req,_res,next)=>{req.actor={type:"board",userId:"synthetic-owner",source:"session",isInstanceAdmin,companyIds:[companyId]};next();});
       app.use("/api",pluginRoutes(db,{} as never));app.use(errorHandler);return app;
     };
     const endpoint=`/api/plugins/${pluginId}/wiki-retractions/republications`;
@@ -363,14 +363,42 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     // A different company's real host must not overwrite the retained root,
     // even though that company has no withdrawal events of its own.
     const otherCompany=randomUUID();await db.insert(companies).values({id:otherCompany,name:"Synthetic other root owner",issuePrefix:"X"+otherCompany.replaceAll("-","").slice(0,12)});
-    await db.insert(pluginCompanySettings).values({companyId:otherCompany,pluginId,settingsJson:{localFolders:{"wiki-root":{path:f.dir,access:"readWrite"}}}});
     const {buildHostServices}=await import("../services/plugin-host-services.js");
     const host=buildHostServices(db,pluginId,wikiManifest.id,{forPlugin:()=>({clear:()=>{}})} as never,undefined,{manifest:wikiManifest});
     try {
+      // Both public root configuration writers reject the proposed target.
+      await expect(host.localFolders.configure({companyId:otherCompany,folderKey:"wiki-root",path:f.dir})).rejects.toThrow(/runtime_root_shared/);
+      expect(await db.select().from(pluginCompanySettings).where(eq(pluginCompanySettings.companyId,otherCompany))).toHaveLength(0);
+      const configHTTP=await request(appFor(otherCompany,true)).put(`/api/plugins/${pluginId}/companies/${otherCompany}/local-folders/wiki-root`).send({path:f.dir});
+      expect(configHTTP.status,JSON.stringify(configHTTP.body)).toBe(409);
+      expect(await db.select().from(pluginCompanySettings).where(eq(pluginCompanySettings.companyId,otherCompany))).toHaveLength(0);
+      // An old unsafe setting with an uncreated nested root cannot create
+      // directories or files through the real host write entry.
+      const missingRoot=join(f.dir,"not-created-by-other");
+      await db.insert(pluginCompanySettings).values({companyId:otherCompany,pluginId,settingsJson:{localFolders:{"wiki-root":{path:missingRoot,access:"readWrite"}}}});
+      await expect(host.localFolders.writeTextAtomic({companyId:otherCompany,folderKey:"wiki-root",relativePath:"wiki/new.md",contents:"must not create"})).rejects.toThrow(/runtime_root_shared/);
+      await expect(fs.stat(missingRoot)).rejects.toMatchObject({code:"ENOENT"});
+      // A bad existing mapping can be corrected to a distinct owned root.
+      const safeRoot=await realpath(await mkdtemp(join(tmpdir(),"wiki-other-owner-")));roots.push(safeRoot);
+      await host.localFolders.configure({companyId:otherCompany,folderKey:"wiki-root",path:safeRoot});
+      await db.update(pluginCompanySettings).set({settingsJson:{localFolders:{"wiki-root":{path:f.dir,access:"readWrite"}}}}).where(eq(pluginCompanySettings.companyId,otherCompany));
       const before=await readFile(join(f.dir,"wiki/p7.md"));
       await expect(host.localFolders.writeTextAtomic({companyId:otherCompany,folderKey:"wiki-root",relativePath:"wiki/p7.md",contents:"cross-company overwrite"})).rejects.toThrow(/runtime_root_shared/);
       expect(await readFile(join(f.dir,"wiki/p7.md"))).toEqual(before);
     }finally{host.dispose();await db.delete(pluginCompanySettings).where(eq(pluginCompanySettings.companyId,otherCompany));}
+
+    // Exclusive configuration claims prevent two companies from choosing
+    // the same new physical root concurrently. No file effect runs twice.
+    const claimants:string[]=[randomUUID(),randomUUID()],claimRoot=await realpath(await mkdtemp(join(tmpdir(),"wiki-root-claim-")));roots.push(claimRoot);
+    for(const id of claimants)await db.insert(companies).values({id,name:"Synthetic root claimant",issuePrefix:"C"+id.replaceAll("-","").slice(0,12)});
+    const claimHost=buildHostServices(db,pluginId,wikiManifest.id,{forPlugin:()=>({clear:()=>{}})} as never,undefined,{manifest:wikiManifest});
+    try {
+      const outcomes=await Promise.allSettled(claimants.map(companyId=>claimHost.localFolders.configure({companyId,folderKey:"wiki-root",path:claimRoot})));
+      expect(outcomes.filter(r=>r.status==="fulfilled")).toHaveLength(1);
+      const rejected=outcomes.find(r=>r.status==="rejected")as PromiseRejectedResult;expect(String(rejected.reason)).toMatch(/runtime_root_shared/);
+      const configured=await db.select().from(pluginCompanySettings).where(eq(pluginCompanySettings.pluginId,pluginId));
+      expect(configured.filter(r=>claimants.includes(r.companyId))).toHaveLength(1);
+    }finally{claimHost.dispose();for(const id of claimants)await db.delete(pluginCompanySettings).where(eq(pluginCompanySettings.companyId,id));}
 
     // Read a prior completed receipt after a distinct valid publication
     // appends to the same maintenance log. Its append is still complete.

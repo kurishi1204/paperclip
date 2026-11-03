@@ -156,9 +156,9 @@ test("company Wiki roots cannot share physical files through equal, nested or al
    configured=other;await assert.rejects(assertWikiRootOwnership(db as any,"plugin","c",f.dir),/runtime_root_shared/);
   }
   configured=f.dir;await assert.rejects(assertWikiRootOwnership(db as any,"plugin","c",join(f.dir,"nested")),/runtime_root_shared/);
-  // A distinct sibling stays usable; an absent nested path is checked again
-  // once it exists, before it can perform a folder operation.
-  configured=join(f.dir,"nested/not-created");await assertWikiRootOwnership(db as any,"plugin","c",f.dir);
+  // A distinct sibling stays usable. An absent nested path is already
+  // claimed before creation and remains rejected after it exists.
+  configured=join(f.dir,"nested/not-created");await assert.rejects(assertWikiRootOwnership(db as any,"plugin","c",f.dir),/runtime_root_shared/);
   await mkdir(configured);await assert.rejects(assertWikiRootOwnership(db as any,"plugin","c",f.dir),/runtime_root_shared/);
   configured=join(f.dir,"separate");await assertWikiRootOwnership(db as any,"plugin","c",join(f.dir,"nested"));
  }finally{await f.close();}

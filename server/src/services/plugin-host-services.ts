@@ -49,7 +49,7 @@ import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginStateStore } from "./plugin-state-store.js";
 import { pluginLifecycleInbox } from "./plugin-lifecycle-inbox.js";
 import { pluginDatabaseService } from "./plugin-database.js";
-import { assertWikiRootOwnership, loadCurrentWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
+import { assertWikiConfiguredRoot, assertWikiRootOwnership, loadCurrentWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
 import { assertCurrentWikiRepublication } from "./wiki-republication-runtime.js";
 import { retractionFolderGate, readRetractionFolderText, readRetractionFolderTextWithStatus, canonicalWikiRetractionPath as canonicalFolderPath } from "./wiki-retraction-gate.js";
 import { pluginManagedAgentService } from "./plugin-managed-agents.js";
@@ -822,17 +822,17 @@ export function buildHostServices(
   };
 
   const withWikiFolderFence = async <T>(companyId: string, folderKey: string,
-    work: (gate: ReturnType<typeof retractionFolderGate>, connection: Db, verifyPublication: (physicalPath:string)=>Promise<void>) => Promise<T>): Promise<T> => {
+    work: (gate: ReturnType<typeof retractionFolderGate>, connection: Db, verifyPublication: (physicalPath:string)=>Promise<void>) => Promise<T>, rootConfiguration=false): Promise<T> => {
     if (pluginKey !== "paperclipai.plugin-llm-wiki" || folderKey !== "wiki-root")
       return work(retractionFolderGate([], companyId, folderKey), db, async()=>{});
     return withWikiRetractionLock(db, pluginId, companyId, async tx => {
       const events=await loadCurrentWikiRetractions(tx, pluginId, companyId);
       const gate = retractionFolderGate(events, companyId, folderKey);
       const folder = await inspectStoredLocalFolder(companyId, folderKey, tx);
-      if(folder.realPath)await assertWikiRootOwnership(tx,pluginId,companyId,folder.realPath);
-      if(gate.active)gate.assertRoot(folder.realPath??"");
+      if(!rootConfiguration&&(folder.realPath??folder.path))await assertWikiRootOwnership(tx,pluginId,companyId,(folder.realPath??folder.path)!);
+      if(!rootConfiguration&&gate.active)gate.assertRoot(folder.realPath??"");
       return work(gate, tx, physicalPath=>assertCurrentWikiRepublication(tx,pluginId,companyId,events,physicalPath));
-    });
+    },rootConfiguration);
   };
 
 
@@ -1460,6 +1460,10 @@ export function buildHostServices(
           const declaration = getLocalFolderDeclaration(params.folderKey);
           const existing = await pluginRegistryService(connection).getCompanySettings(pluginId, companyId);
           const existingConfig = getStoredLocalFolders(existing?.settingsJson)[params.folderKey] ?? null;
+          if(pluginKey==="paperclipai.plugin-llm-wiki"&&params.folderKey==="wiki-root") {
+            const proposed=await inspectPluginLocalFolder({folderKey:params.folderKey,declaration,storedConfig:existingConfig,overrideConfig:{path:params.path}});
+            await assertWikiConfiguredRoot(connection,pluginId,companyId,(proposed.realPath??proposed.path)!);
+          }
           await preparePluginLocalFolder({
             folderKey: params.folderKey,
             declaration,
@@ -1477,6 +1481,7 @@ export function buildHostServices(
             },
           });
 
+          if(pluginKey==="paperclipai.plugin-llm-wiki"&&params.folderKey==="wiki-root")await assertWikiRootOwnership(connection,pluginId,companyId,status.realPath!);
           const nextSettings = setStoredLocalFolder(existing?.settingsJson, params.folderKey, {
             path: params.path,
             access: status.access,
@@ -1489,7 +1494,7 @@ export function buildHostServices(
             lastError: status.healthy ? null : status.problems.map((item: { message: string }) => item.message).join("; "),
           });
           return status;
-        });
+        },true);
       },
 
       async status(params) {
@@ -1552,6 +1557,7 @@ export function buildHostServices(
           });
           const status = await inspectStoredLocalFolder(companyId, params.folderKey, connection);
           assertWritableConfiguredLocalFolder(status);
+          if(pluginKey==="paperclipai.plugin-llm-wiki"&&params.folderKey==="wiki-root")await assertWikiRootOwnership(connection,pluginId,companyId,status.realPath!);
           gate.assertRoot(status.realPath!);
           if (gate.active) gate.assertWrite(await canonicalFolderPath(status.realPath!, params.relativePath));
           await writePluginLocalFolderTextAtomic(status.realPath!, params.relativePath, params.contents);
@@ -1570,6 +1576,7 @@ export function buildHostServices(
           });
           const status = await inspectStoredLocalFolder(companyId, params.folderKey, connection);
           assertWritableConfiguredLocalFolder(status);
+          if(pluginKey==="paperclipai.plugin-llm-wiki"&&params.folderKey==="wiki-root")await assertWikiRootOwnership(connection,pluginId,companyId,status.realPath!);
           gate.assertRoot(status.realPath!);
           if (gate.active) gate.assertWrite(await canonicalFolderPath(status.realPath!, params.relativePath));
           if (status.access !== "readWrite" || !status.writable) {
