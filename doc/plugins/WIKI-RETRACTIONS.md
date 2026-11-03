@@ -5,8 +5,9 @@ The event contract is `server/src/services/wiki-retraction-ledger.ts`.
 The board operation is `wiki-retraction-runtime.ts`; the common file boundary
 is in `plugin-host-services.ts`. Publication receipts remain separate.
 
-A withdrawal retains original bytes. It stops use of the target and holds entire
-dependent pages for review; their other claims are not declared false. This first
+A withdrawal retains original bytes. It stops use of the target and marks dependent citations
+for review while keeping downstream bodies readable through the structured
+reader; their other claims are not declared false. This first
 version deliberately pauses **writes in the affected Wiki tree**, including new
 pages, until a separately reviewed publication transition is available. Immutable
 raw capture and raw reading continue. Other companies and other Wiki spaces are
@@ -22,10 +23,11 @@ The publication verifier independently reconstructs invalid reference metadata;
 it never upgrades the whole page to an unconditional proof. Legacy fences stay
 strict and cannot be weakened by the new reader. Indexed discovery retains downstream rows with machine-readable citation holds and text warnings; direct withdrawals remain hidden. Writes remain frozen.
 
-The current execute/preview route still emits only `freeze-wiki`. Owner-consent
-resolution, new-publication release and production
-acceptance of the citation policy are not complete. Do not activate it by
-rewriting a ledger event or configuration.
+The local preview/execute route now emits `citation-holds`; execute requires
+the server-resolved same-version human decision and separate independent QA.
+This code is not deployed. New-publication release and production acceptance
+remain incomplete. Existing `freeze-wiki` ledger events are unchanged and remain
+strict; never activate the policy by rewriting an event or configuration.
 
 ## Operator path
 

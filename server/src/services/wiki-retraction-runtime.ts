@@ -72,7 +72,8 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
     // A target-linked document reference outside the registered graph requires
     // registration/review before preview; no guessed classification is accepted.
     assertNoUnregisteredRetractionDependants(pins.entries, rows, held);
-    // Index/log bytes remain untouched and available only in the audit view.
+    // Index/log bytes remain untouched. Citation-aware views may expose them
+    // with the same hold warning; legacy string readers remain strict.
     held.add("wiki/index.md"); held.add("wiki/log.md");
     const blocks: RetractionFence["blocks"] = [];
     for (const p of [...held].sort()) {
@@ -84,7 +85,7 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
     return { schema: "paperclip.wiki-retraction-request/v1", pluginId,
       target: { ...scope, path: targetPath, contentHash: targetPin.wikiSHA256 }, reason,
       publicationRegistrySHA256: publicationHash(publicationCanonical(pins)),
-      fence: { folderKey: "wiki-root", rootPath, pathPrefix: space.path_prefix ?? "", mode: "freeze-wiki", blocks,
+      fence: { folderKey: "wiki-root", rootPath, pathPrefix: space.path_prefix ?? "", mode: "citation-holds", blocks,
         readable: pins.entries.filter(p => !held.has(p.path)).map(p => ({ path: toPhysical(p.path), contentHash: p.wikiSHA256 })).sort((a,b)=>a.path.localeCompare(b.path)) } };
   }
   return {
