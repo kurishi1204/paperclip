@@ -1287,12 +1287,12 @@ export function pluginRoutes(
     const companyId = requirePluginConfigCompanyId(req, req.body.companyId);
     const plugin = await resolvePlugin(registry, req.params.pluginId);
     if (!plugin) throw notFound("Plugin not found");
-    const { issueId, documentKey, reviewId, operationId } = req.body;
-    if (![issueId, documentKey, reviewId, operationId].every(v => typeof v === "string" && v.length > 0 && v === v.trim()) ||
+    const { issueId, documentKey, reviewId, ownerDecisionId, operationId } = req.body;
+    if (![issueId, documentKey, reviewId, ownerDecisionId, operationId].every(v => typeof v === "string" && v.length > 0 && v === v.trim()) ||
       !/^[0-9a-f-]{36}$/.test(operationId)) throw badRequest("Fixed proposal, review and UUID operationId are required");
     const actor = getActorInfo(req);
     res.json(await wikiRetractionRuntime(db, plugin.id).execute({ companyId, issueId, documentKey,
-      reviewId, operationId, actorId: actor.actorId, runId: actor.runId }));
+      reviewId, ownerDecisionId, operationId, actorId: actor.actorId, runId: actor.runId }));
   });
   router.get("/plugins/:pluginId/wiki-retractions/audit", async (req, res) => {
     assertBoard(req);

@@ -9,7 +9,11 @@ function input() {
     entries: [{ path: "wiki/p7.md", producerAgentId: "author", wikiSHA256: h }] } as PublicationRegistry;
   const proposal = { schema: "paperclip.wiki-retraction-request/v1", pluginId: "wiki", target: {
     companyId: "c", wikiId: "default", spaceSlug: "default", path: "wiki/p7.md", contentHash: h }, reason: "Correct the assumption" };
-  return { companyId: "c", pluginId: "wiki", issueId: "issue", documentKey: "proposal", registry,
+  return { companyId: "c", pluginId: "wiki", issueId: "issue", documentKey: "proposal", registry, actorId: "owner",
+    ownerDecision: { id: "owner-decision", companyId: "c", issueId: "issue", kind: "request_confirmation", status: "accepted",
+      effectiveResolverPolicy: "human_only", addresseeUserId: "owner" as string | null, resolvedByUserId: "owner" as string | null,
+      resolvedByAgentId: null as string | null, resolvedByRunId: null as string | null, result: { outcome: "accepted" },
+      payload: { target: { type: "issue_document", issueId: "issue", documentId: "doc", key: "proposal", revisionId: "r2" } } },
     document: { id: "doc", companyId: "c", latestRevisionId: "r2", latestBody: JSON.stringify(proposal),
       createdByAgentId: "author", createdByUserId: null as string | null, updatedByAgentId: "author" },
     review: { id: "review", companyId: "c", issueId: "issue", kind: "request_confirmation", status: "accepted", result: { outcome: "accepted" },
@@ -42,4 +46,32 @@ test("company, scope, target hash, rejected verdict and review target mismatches
   ];
   for (const change of variants) { const f = input(); change(f); assert.throws(() => resolveReviewedWikiRetraction(f)); }
   assert.equal(variants.length, 7);
+});
+
+test("withdrawal resolves a separate human owner decision bound to the exact reviewed version", () => {
+  const f = input(); assert.equal(resolveReviewedWikiRetraction(f).ownerDecisionId, "owner-decision");
+  const mutations: Array<(f: ReturnType<typeof input>) => void> = [
+    f => { f.ownerDecision.resolvedByUserId = null; },
+    f => { f.ownerDecision.resolvedByAgentId = "agent"; },
+    f => { f.ownerDecision.resolvedByRunId = "agent-run"; },
+    f => { f.ownerDecision.effectiveResolverPolicy = "anyone"; },
+    f => { f.ownerDecision.status = "pending"; },
+    f => { f.ownerDecision.result.outcome = "rejected"; },
+    f => { f.ownerDecision.payload.target.revisionId = "old"; },
+    f => { f.ownerDecision.payload.target.documentId = "other"; },
+    f => { f.ownerDecision.payload.target.issueId = "other"; },
+    f => { f.ownerDecision.payload.target.key = "other"; },
+    f => { f.ownerDecision.companyId = "other"; },
+    f => { f.ownerDecision.issueId = "other"; },
+    f => { f.ownerDecision.addresseeUserId = "other"; },
+    f => { f.actorId = "other"; },
+    f => { f.ownerDecision.id = f.review.id; },
+  ];
+  for (const change of mutations) { const f = input(); change(f); assert.throws(() => resolveReviewedWikiRetraction(f), /human owner decision/); }
+  assert.equal(mutations.length, 15);
+});
+
+test("an operation UUID without a human interaction never substitutes for consent", () => {
+  const f = input();
+  assert.throws(() => resolveReviewedWikiRetraction({ ...f, ownerDecision: null }), /human owner decision/);
 });

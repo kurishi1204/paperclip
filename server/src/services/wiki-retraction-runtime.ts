@@ -91,13 +91,13 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
     preview: (scope: RetractionScope, targetPath: string, reason: string) =>
       withWikiRetractionLock(db, pluginId, scope.companyId, tx => snapshot(scope.companyId, scope, targetPath, reason, tx)),
     async execute(input: { companyId: string; issueId: string; documentKey: string; reviewId: string;
-      operationId: string; actorId: string; runId: string | null }) {
+      operationId: string; ownerDecisionId: string; actorId: string; runId: string | null }) {
       return withWikiRetractionLock(db, pluginId, input.companyId, async tx => {
         const allEvents = await loadAllWikiRetractions(tx, pluginId, input.companyId);
         retractionFolderGate(allEvents, input.companyId, "wiki-root");
         const recorded = allEvents.find(e => e.type === "executed" && e.retractionId === input.operationId);
         if (recorded) {
-          if (recorded.actorId !== input.actorId || recorded.approval.id !== input.reviewId ||
+          if (recorded.actorId !== input.actorId || recorded.approval.id !== input.reviewId || recorded.approval.ownerDecisionId !== input.ownerDecisionId ||
             recorded.approval.proposal?.issueId !== input.issueId || recorded.approval.proposal?.documentKey !== input.documentKey)
             throw conflict("operationId already belongs to another withdrawal request");
           return recorded; // Authoritative receipt, even if the proposal/config later changes.
@@ -112,7 +112,10 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
         const currentConfig = await pluginRegistryService(tx).getConfig(pluginId, input.companyId);
         const pins = parsePublicationRegistry(currentConfig?.configJson?.publicationReadback, input.companyId);
         const runs = review?.resolvedByRunId ? await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, review.resolvedByRunId)) : [];
-        const resolved = resolveReviewedWikiRetraction({ ...input, pluginId, document: doc, review, run: runs[0] ?? null, registry: pins });
+        const owners = await tx.select().from(issueThreadInteractions).where(and(eq(issueThreadInteractions.id, input.ownerDecisionId),
+          eq(issueThreadInteractions.companyId, input.companyId), eq(issueThreadInteractions.issueId, input.issueId))).for("update");
+        const resolved = resolveReviewedWikiRetraction({ ...input, pluginId, document: doc, review, run: runs[0] ?? null,
+          ownerDecision: owners[0] ?? null, registry: pins });
         const { proposal } = resolved;
         const events = allEvents.filter(e => e.wikiId === proposal.target.wikiId && e.spaceSlug === proposal.target.spaceSlug).sort((a,b)=>a.sequence-b.sequence);
         const fresh = await snapshot(input.companyId, proposal.target, proposal.target.path, proposal.reason, tx);
@@ -125,7 +128,7 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
         return executeRetraction(store, { target: proposal.target, fence: proposal.fence, retractionId: input.operationId,
           reason: proposal.reason, actorId: input.actorId, runId: input.runId, eventId: randomUUID(), at: new Date().toISOString(),
           approval: { id: resolved.reviewId, companyId: input.companyId, target: proposal.target, reason: proposal.reason,
-            reviewerId: resolved.reviewerId, reviewRunId: resolved.reviewRunId, ownerDecisionId: input.operationId,
+            reviewerId: resolved.reviewerId, reviewRunId: resolved.reviewRunId, ownerDecisionId: resolved.ownerDecisionId,
             proposal: { issueId: input.issueId, documentKey: input.documentKey, documentId: doc!.id,
               revisionId: doc!.latestRevisionId!, bodySHA256: publicationHash(doc!.latestBody), registrySHA256: proposal.publicationRegistrySHA256 } },
           readCurrent: async () => { const fresh = await snapshot(input.companyId, proposal.target, proposal.target.path, proposal.reason, tx); return { path: fresh.target.path, contentHash: fresh.target.contentHash }; },

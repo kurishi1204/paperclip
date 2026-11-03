@@ -42,16 +42,21 @@ No new employee mutation tool or general permission grant is introduced.
    must be the configured Wiki QA agent, distinct from the author/publisher, with
    a completed successful run. A review of a different document/version/company
    cannot authorize withdrawal.
-3. `POST .../execute` with `companyId`, `issueId`, `documentKey`, `reviewId`, and
-   a fixed UUID `operationId` is the explicit owner decision. Actor identity,
+3. Obtain a separate `human_only` confirmation addressed to the owner for the
+   exact proposal document/revision. The accepted interaction must be resolved
+   by that human user, with no agent/run attribution. QA remains a separate
+   completed independent review. The executor must be the consenting owner;
+   a random operation UUID is never an owner decision.
+4. `POST .../execute` with `companyId`, `issueId`, `documentKey`, `reviewId`, `ownerDecisionId`, and
+   a fixed UUID `operationId` supplies retry identity only. Actor identity,
    approval, and model-independent run identity are read from authenticated/server
    records. Agent arguments cannot supply them. The current proposal is compared
    with a fresh snapshot under the execution lock.
-4. `GET .../audit?companyId=...` is board-only and returns the receipt plus original
+5. `GET .../audit?companyId=...` is board-only and returns the receipt plus original
    files from the recorded root, with byte-hash preservation checks. These are
    historical audit bytes, not current citable Wiki content.
 
-The execution receipt stores the owner operation ID and actor, exact proposal
+The execution receipt stores the owner decision interaction ID, operation ID and actor, exact proposal
 revision/body hash, review/run identity, registry hash, affected physical paths,
 and the still-readable registered-page hashes. Repeating an already recorded
 operation reads its original receipt without another append, even if the proposal

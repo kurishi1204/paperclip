@@ -11,6 +11,10 @@ export function resolveReviewedWikiRetraction(input: {
   review: { id: string; companyId: string; issueId: string; kind: string; status: string;
     result: unknown; payload: unknown; sourceRunId: string | null; resolvedByAgentId: string | null; resolvedByRunId: string | null } | null;
   run: { id: string; companyId: string; agentId: string; status: string } | null;
+  actorId: string;
+  ownerDecision: { id: string; companyId: string; issueId: string; kind: string; status: string;
+    effectiveResolverPolicy: string; addresseeUserId: string | null; resolvedByUserId: string | null;
+    resolvedByAgentId: string | null; resolvedByRunId: string | null; payload: unknown; result: unknown } | null;
   registry: PublicationRegistry;
 }) {
   const { review, document: doc } = input;
@@ -37,5 +41,20 @@ export function resolveReviewedWikiRetraction(input: {
   if (input.run?.id !== review.resolvedByRunId || input.run.companyId !== input.companyId ||
     input.run.agentId !== review.resolvedByAgentId || input.run.status !== "succeeded")
     throw forbidden("Completed independent review run required");
-  return { proposal, reviewId: review.id, reviewerId: review.resolvedByAgentId, reviewRunId: review.resolvedByRunId };
+  // A request UUID is retry identity, never evidence of human consent. Resolve
+  // a separate human-only interaction from the database under the same lock.
+  const owner = input.ownerDecision;
+  const ownerTarget = (owner?.payload as { target?: { type?: string; issueId?: string; documentId?: string; key?: string; revisionId?: string } } | null)?.target;
+  if (!owner || owner.id === review.id || owner.companyId !== input.companyId || owner.issueId !== input.issueId ||
+    owner.kind !== "request_confirmation" || owner.status !== "accepted" ||
+    (owner.result as { outcome?: string } | null)?.outcome !== "accepted" ||
+    owner.effectiveResolverPolicy !== "human_only" || !owner.resolvedByUserId ||
+    owner.addresseeUserId !== owner.resolvedByUserId || owner.resolvedByUserId !== input.actorId ||
+    owner.resolvedByAgentId !== null || owner.resolvedByRunId !== null ||
+    ownerTarget?.type !== "issue_document" || ownerTarget.issueId !== input.issueId ||
+    ownerTarget.documentId !== doc.id || ownerTarget.key !== input.documentKey || ownerTarget.revisionId !== doc.latestRevisionId ||
+    review.resolvedByAgentId === input.actorId)
+    throw forbidden("Current same-version human owner decision and separate review required");
+  return { proposal, reviewId: review.id, reviewerId: review.resolvedByAgentId, reviewRunId: review.resolvedByRunId,
+    ownerDecisionId: owner.id };
 }

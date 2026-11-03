@@ -9020,7 +9020,7 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/wiki-retractions/execute",
   tags: ["plugins"],
   summary: "Execute an independently reviewed Wiki withdrawal",
-  description: "Board sessions only. Resolves the current saved proposal and independent review on the server. Retains original files and returns the durable operation receipt. The authenticated request supplies the actor.",
+  description: "Board sessions only. Resolves the current saved proposal, independent review and a separate same-version human-only owner decision on the server. Retains original files and returns the durable operation receipt. The authenticated request supplies the actor.",
   request: {
     params: z.object({ pluginId: z.string() }),
     body: jsonBody(z.object({
@@ -9028,6 +9028,7 @@ registry.registerPath({
       issueId: z.string().min(1),
       documentKey: z.string().min(1),
       reviewId: z.string().min(1),
+      ownerDecisionId: z.string().min(1),
       operationId: z.string().regex(/^[0-9a-f-]{36}$/),
     })),
   },
