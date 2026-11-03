@@ -16,7 +16,7 @@ import { eq } from "drizzle-orm";
 import { fileURLToPath } from "node:url";
 import { pluginDatabaseService } from "../services/plugin-database.js";
 import { wikiRetractionRuntime } from "../services/wiki-retraction-runtime.js";
-import { wikiRepublicationRuntime } from "../services/wiki-republication-runtime.js";
+import { wikiRepublicationRuntime, assertCurrentWikiRepublication } from "../services/wiki-republication-runtime.js";
 import { encodeWikiRepublicationDraft } from "../services/wiki-republication.js";
 import wikiManifest from "../../../packages/plugins/plugin-llm-wiki/src/manifest.js";
 
@@ -175,7 +175,7 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     const runtime=wikiRepublicationRuntime(db,pluginId),f=await context("wiki/revalidated.md");
     const original=await readFile(join(f.dir,"wiki/child.md"));
     const result=await runtime.execute(f.input);expect(result.type).toBe("republished");
-    expect((await runtime.receipt(f.companyId,f.input.operationId)).state).toBe("published");
+    expect(await runtime.receipt(f.companyId,f.input.operationId)).toMatchObject({state:"published",maintenanceLog:{state:"appended"}});
     expect((await runtime.execute(f.input)).id).toBe(result.id);
     const events=await loadAllWikiRetractions(db,pluginId,f.companyId),gate=retractionFolderGate(events,f.companyId,"wiki-root");
     expect(events).toHaveLength(2);expect(await readRetractionFolderText(f.dir,f.newPath,gate)).toBe(f.body);
@@ -185,6 +185,10 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     expect(config!.configJson.syntheticPreservedSetting).toBe(true);
     expect((config!.configJson.publicationReadback as PublicationRegistry).entries).toHaveLength(4);
     expect(await db.$client.unsafe(`SELECT * FROM ${ns}.wiki_page_revisions WHERE company_id=$1`,[f.companyId])).toHaveLength(1);
+    await withWikiRetractionLock(db,pluginId,f.companyId,tx=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,f.newPath));
+    await db.update(issueThreadInteractions).set({status:"rejected"}).where(eq(issueThreadInteractions.id,f.input.reviewId));
+    await expect(withWikiRetractionLock(db,pluginId,f.companyId,tx=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,f.newPath))).rejects.toThrow(/current_review/);
+    await withWikiRetractionLock(db,pluginId,f.companyId,tx=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,"raw/unrelated.md"));
 
     // Fail after the actual immutable file effect, inside the metadata transaction.
     const bad=await context("wiki/fault-after-file.md");

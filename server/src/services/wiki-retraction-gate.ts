@@ -3,7 +3,7 @@ import { realpath } from "node:fs/promises";
 import { resolvePluginLocalFolderPath, readPluginLocalFolderText } from "./plugin-local-folders.js";
 import { publicationHash } from "./wiki-publication-readback.js";
 import type { RetractionEvent, RetractionBlock } from "./wiki-retraction-ledger.js";
-import { RetractionError, validateRetractionEvents } from "./wiki-retraction-ledger.js";
+import { RetractionError, validateRetractionEvents, retainedRetractionFile } from "./wiki-retraction-ledger.js";
 
 /** The persisted physical-path fence does not depend on publication config.
  * v1 deliberately freezes writes in the affected Wiki tree. No new page or metadata
@@ -15,8 +15,9 @@ export function retractionFolderGate(events: RetractionEvent[], companyId: strin
     const key = JSON.stringify([event.wikiId, event.spaceSlug]);
     const group = groups.get(key) ?? []; group.push(event); groups.set(key, group);
   }
-  const active = [...groups.values()].flatMap(group =>
-    validateRetractionEvents(group[0]!, group.sort((a, b) => a.sequence - b.sequence)).filter(e => e.type === "executed"));
+  const validated = [...groups.values()].flatMap(group =>
+    validateRetractionEvents(group[0]!, group.sort((a,b)=>a.sequence-b.sequence)));
+  const active = validated.filter(e=>e.type==="executed");
   for (const event of active) if (!event.fence) throw new RetractionError("missing_runtime_fence");
   const relevant = active.filter(e => e.fence!.folderKey === folderKey);
   const published = [...groups.values()].flatMap(group => group.filter(e=>e.type==="republished"));
@@ -53,8 +54,7 @@ export function retractionFolderGate(events: RetractionEvent[], companyId: strin
       if (single && !(event.fence!.mode === "citation-holds" && single.state === "blocked_by_retraction"))
         throw new Error("E_SOURCE_RETRACTED " + JSON.stringify(single));
       const pin = event.fence!.blocks.find(p => p.path === filePath) ?? event.fence!.readable.find(p => p.path === filePath);
-      if (contents !== undefined && pin && publicationHash(contents) !== pin.contentHash)
-        throw new RetractionError("readable_content_changed");
+      if (contents !== undefined && pin) retainedRetractionFile(validated, filePath, pin.contentHash, contents);
     }
   }
   return {
@@ -71,7 +71,7 @@ export function retractionFolderGate(events: RetractionEvent[], companyId: strin
       if (held) throw new Error("E_SOURCE_RETRACTED " + JSON.stringify(held));
       if (contents !== undefined) for (const event of relevant) {
         const pin = event.fence!.readable.find(p => p.path === path);
-        if (pin && publicationHash(contents) !== pin.contentHash) throw new RetractionError("readable_content_changed");
+        if (pin) retainedRetractionFile(validated, path, pin.contentHash, contents);
       }
     },
     assertWrite(path?: string) {
@@ -116,11 +116,12 @@ export const canonicalWikiRetractionPath = async (rootPath: string, relativePath
 /** Metadata may precede a raw file. Only normalize that expected absence after
  * root, lexical and physical withdrawal checks; other boundary failures escape. */
 async function readRetractionText(rootPath: string, relativePath: string,
-  gate: ReturnType<typeof retractionFolderGate>, citationAware: boolean) {
+  gate: ReturnType<typeof retractionFolderGate>, citationAware: boolean, verifyPublication?: (physicalPath:string)=>Promise<void>) {
   const assertRead = citationAware ? gate.assertCitationRead : gate.assertRead;
   gate.assertRoot(rootPath); assertRead(relativePath);
   const canonical = await canonicalWikiRetractionPath(rootPath, relativePath);
   assertRead(canonical);
+  await verifyPublication?.(canonical);
   let contents: string;
   try { contents = await readPluginLocalFolderText(rootPath, relativePath); }
   catch (error) {
@@ -135,13 +136,13 @@ async function readRetractionText(rootPath: string, relativePath: string,
 }
 
 export async function readRetractionFolderText(rootPath: string, relativePath: string,
-  gate: ReturnType<typeof retractionFolderGate>): Promise<string> {
-  return (await readRetractionText(rootPath, relativePath, gate, false)).contents;
+  gate: ReturnType<typeof retractionFolderGate>, verifyPublication?: (physicalPath:string)=>Promise<void>): Promise<string> {
+  return (await readRetractionText(rootPath, relativePath, gate, false, verifyPublication)).contents;
 }
 
 export async function readRetractionFolderTextWithStatus(rootPath: string, relativePath: string,
-  gate: ReturnType<typeof retractionFolderGate>) {
-  const { contents, canonical } = await readRetractionText(rootPath, relativePath, gate, true);
+  gate: ReturnType<typeof retractionFolderGate>, verifyPublication?: (physicalPath:string)=>Promise<void>) {
+  const { contents, canonical } = await readRetractionText(rootPath, relativePath, gate, true, verifyPublication);
   // Report the identity used for the actual byte/hash check. Resolving it a
   // second time could attach a different alias's citation status to these bytes.
   return { contents, citationHolds: gate.citationHolds(canonical) };

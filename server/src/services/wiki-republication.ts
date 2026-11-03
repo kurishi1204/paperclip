@@ -52,7 +52,7 @@ export async function resolveReviewedWikiRepublication(input:{
   const previousPhysical=(parent.fence.pathPrefix?parent.fence.pathPrefix+"/":"")+draft.previousPath;
   publicationNeed(parent.fence.blocks.some(b=>b.path===previousPhysical&&b.state==="blocked_by_retraction"),"republication_not_downstream");
   const old=registry.entries.find(p=>p.path===draft.previousPath);
-  publicationNeed(old&&old.producerAgentId===doc.createdByAgentId&&(!doc.updatedByAgentId||doc.updatedByAgentId===doc.createdByAgentId)&&
+  publicationNeed(old&&old.producerAgentId===doc.createdByAgentId&&doc.updatedByAgentId===doc.createdByAgentId&&
     !doc.updatedByUserId,"republication_responsible_author");
   const original=await input.readers.document(old.issueId,old.documentKey);
   publicationNeed(original?.id===old.documentId&&original.createdByAgentId===old.producerAgentId,"republication_original_creator");
@@ -98,6 +98,30 @@ export function buildWikiRepublicationEvent(plan:Awaited<ReturnType<typeof resol
         revisionId:pin.revisionId,bodySHA256:pin.documentBodySHA256,registrySHA256:plan.registryBeforeSHA256}},
     republication:{operationId:input.operationId,retractionEventHash:parent.eventHash,previousPath:(parent.fence!.pathPrefix?parent.fence!.pathPrefix+"/":"")+draft.previousPath,
       physicalPath:(parent.fence!.pathPrefix?parent.fence!.pathPrefix+"/":"")+draft.path,rootPath:parent.fence!.rootPath,producerAgentId:pin.producerAgentId,
-      documentId:pin.documentId,revisionId:pin.revisionId,sourceRefsSHA256:pin.sourceRefsSHA256,registryBeforeSHA256:plan.registryBeforeSHA256,registryAfterSHA256:plan.registryAfterSHA256}};
+      documentId:pin.documentId,revisionId:pin.revisionId,sourceRefsSHA256:pin.sourceRefsSHA256,reviewRecordSHA256:pin.reviewRecordSHA256,registryBeforeSHA256:plan.registryBeforeSHA256,registryAfterSHA256:plan.registryAfterSHA256}};
   const event={...basis,eventHash:retractionEventHash(basis)};validateRetractionEvents(draft,[...input.events,event]);return event;
+}
+
+/** Shared host check for a republished page. Every actual byte reader uses it,
+ * including UI and discovery, rather than relying on the publication-time QA. */
+export function verifyCurrentWikiRepublication(input:{event:RetractionEvent;registry:PublicationRegistry;
+  document:RepublicationDocument|null;review:RepublicationReview|null;
+  run:{id:string;companyId:string;agentId:string;status:string}|null}) {
+  const {event,registry,document:doc,review,run}=input,p=event.republication;
+  publicationNeed(event.type==="republished"&&p,"republication_current_event");
+  const pin=registry.entries.find(x=>x.path===event.path);
+  publicationNeed(registry.companyId===event.companyId&&registry.wikiId===event.wikiId&&registry.spaceSlug===event.spaceSlug&&pin&&
+    pin.documentId===p.documentId&&pin.revisionId===p.revisionId&&pin.producerAgentId===p.producerAgentId&&
+    pin.wikiSHA256===event.contentHash&&pin.documentBodySHA256===event.contentHash&&pin.sourceRefsSHA256===p.sourceRefsSHA256&&
+    pin.reviewId===event.approval.id&&pin.reviewRecordSHA256===p.reviewRecordSHA256&&
+    (pin.qaAgentId??registry.qaAgentId)===event.approval.reviewerId,"republication_current_pin");
+  publicationNeed(doc&&doc.id===p.documentId&&doc.companyId===event.companyId&&doc.latestRevisionId===p.revisionId&&
+    doc.createdByAgentId===p.producerAgentId&&doc.updatedByAgentId===p.producerAgentId&&!doc.updatedByUserId&&
+    publicationHash(doc.latestBody)===event.contentHash,"republication_current_document");
+  publicationNeed(review&&review.id===event.approval.id&&review.companyId===event.companyId&&review.issueId===pin.issueId&&
+    review.kind==="request_confirmation"&&review.status==="accepted"&&(review.result as {outcome?:string}|null)?.outcome==="accepted"&&
+    review.resolvedByAgentId===event.approval.reviewerId&&review.resolvedByRunId===event.approval.reviewRunId&&
+    publicationHash(publicationCanonical(reviewBasis(review as unknown as JsonObject)))===p.reviewRecordSHA256&&
+    run&&run.id===event.approval.reviewRunId&&run.companyId===event.companyId&&run.agentId===event.approval.reviewerId&&run.status==="succeeded",
+    "republication_current_review");
 }

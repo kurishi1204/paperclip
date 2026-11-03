@@ -76,8 +76,7 @@ hashes match the recorded snapshot. Physical aliases are resolved before access.
 Discovery tools rebuild both their data and display text and report hidden entries.
 Removing publication pins cannot remove a persisted withdrawal.
 
-Index/log originals are retained, not overwritten. Their normal display is held;
-there is no fabricated new index or historical-job rewrite. Old Task outputs and
+The index original is retained. The log retains its exact original byte prefix and receives the entry-owned append described below. Citation-aware log reading validates that prefix and each recorded append; strict legacy reading remains held. There is no fabricated new index or historical-job rewrite. Old Task outputs and
 model contexts are historical material, not automatically repaired citations.
 
 ## Verification and activation limits
@@ -209,6 +208,45 @@ is never automatically repeated. If a DB failure follows file creation, the inte
 remains, metadata/pins/event roll back, and the unregistered file stays blocked.
 There is no automatic deletion, retry or rollback of file effects.
 
-The activity chain records entry-owned events. Appending the separate Wiki
-maintenance log, full PostgreSQL/HTTP execution, independent review of this
-increment and production acceptance remain open; do not call this milestone done.
+The activity chain records entry-owned events. Full PostgreSQL/HTTP runtime
+execution, independent review of the latest increment and production acceptance
+remain open; do not call this milestone done.
+
+## Entry-owned maintenance log
+
+New citation-policy withdrawals and republications compute an exact append for
+`wiki/log.md` before committing their authoritative DB event. The event seals the
+original prefix byte count/hash, append bytes/hash and resulting file hash. The
+append contains the event ID/type, withdrawal ID, target/hash, reason, actor,
+Run, time, previous event hash and previous log hash. The event ID links to the
+resulting hash in the authoritative receipt; the line does not hash itself.
+
+After the event commits, the host reacquires the same company/plugin lock and
+performs the append once. It verifies the canonical existing log file and exact
+prefix, opens with append/no-follow semantics and fsyncs. A complete identical
+append is read back without adding bytes. A partial or foreign suffix is unknown
+and refuses any further append. New operations refuse an unfinished previous log.
+No old receipt or original page is rewritten, and legacy freeze-policy receipts
+are not upgraded. All original prefix checks use UTF-8 bytes, including Japanese.
+
+The DB receipt and withdrawal hold remain authoritative if that derived append
+fails. Repeating the completed operation returns its receipt and **does not retry
+the append**. The audit returns preserved historical prefixes with current file
+hash/size; republication receipt readback separately reports log `appended`,
+`pending` or `unknown`. A pending/unknown log is not milestone completion. A later
+log-only repair requires receipt investigation, rather than replaying withdrawal
+or publication. The local file journey covers original-prefix preservation,
+duplicate append readback, a subsequent publication append and partial-write
+refusal. Actual DB/HTTP runtime qualification remains unreceived.
+
+
+Every host byte reader, including UI/discovery readers, now rechecks a new
+republication's current stored document, creator/last editor, exact QA record,
+completed Run and configured pin before returning bytes. The QA-record hash is
+sealed in the publication event. Revoked or changed QA cannot leave the immutable
+file looking currently accepted in the UI. These row locks last through the file
+read; an already returned historical response cannot be recalled. Unrelated raw
+paths do not perform this publication check. A missing last editor is rejected.
+New-leaf planning resolves the nearest existing physical ancestor, and checks the
+created leaf again before DB publication, so an internal parent symlink cannot
+separate the physical file from its receipt.

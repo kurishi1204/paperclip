@@ -1,20 +1,35 @@
 import { randomUUID } from "node:crypto";
-import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { activityLog, documents, heartbeatRuns, issueDocuments, issueThreadInteractions, pluginConfig, type Db } from "@paperclipai/db";
 import { conflict, notFound } from "../errors.js";
 import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { assertConfiguredLocalFolder, createPluginLocalFolderTextExclusive, getStoredLocalFolders, inspectPluginLocalFolder,
-  readPluginLocalFolderText, requireLocalFolderDeclaration, resolvePluginLocalFolderPath } from "./plugin-local-folders.js";
-import { loadAllWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
-import { retractionFolderGate, readRetractionFolderTextWithStatus } from "./wiki-retraction-gate.js";
+  readPluginLocalFolderText, requireLocalFolderDeclaration } from "./plugin-local-folders.js";
+import { loadAllWikiRetractions, withWikiRetractionLock, appendRetractionMaintenanceLog } from "./wiki-retraction-store.js";
+import { retractionFolderGate, readRetractionFolderTextWithStatus, canonicalWikiRetractionPath } from "./wiki-retraction-gate.js";
 import { parsePublicationRegistry, publicationCanonical, publicationHash, publicationNeed, type JsonObject } from "./wiki-publication-readback.js";
-import { buildWikiRepublicationEvent, parseWikiRepublicationDraft, resolveReviewedWikiRepublication } from "./wiki-republication.js";
-import type { RetractionEvent } from "./wiki-retraction-ledger.js";
+import { buildWikiRepublicationEvent, parseWikiRepublicationDraft, resolveReviewedWikiRepublication, verifyCurrentWikiRepublication } from "./wiki-republication.js";
+import { withRetractionMaintenanceLog, retainedRetractionFile, type RetractionEvent } from "./wiki-retraction-ledger.js";
 
 interface Request { companyId:string;issueId:string;documentKey:string;reviewId:string;operationId:string;actorId:string; }
 const WIKI_PLUGIN="paperclipai.plugin-llm-wiki";
+export async function assertWikiRepublicationTargetPath(root:string,physicalPath:string) {
+  publicationNeed(await canonicalWikiRetractionPath(root,physicalPath)===physicalPath,"republication_alias");
+}
+export async function assertCurrentWikiRepublication(db:Db,pluginId:string,companyId:string,events:RetractionEvent[],physicalPath:string) {
+  const matches=events.filter(e=>e.type==="republished"&&e.republication?.physicalPath===physicalPath);
+  if(!matches.length)return;
+  publicationNeed(matches.length===1,"republication_current_identity");const event=matches[0]!,p=event.republication!;
+  const configs=await db.select().from(pluginConfig).where(and(eq(pluginConfig.pluginId,pluginId),eq(pluginConfig.companyId,companyId))).for("share");
+  const registry=parsePublicationRegistry(configs[0]?.configJson.publicationReadback,companyId);
+  const pin=registry.entries.find(x=>x.path===event.path);publicationNeed(pin,"republication_current_pin");
+  const docs=await db.select({doc:documents}).from(issueDocuments).innerJoin(documents,eq(issueDocuments.documentId,documents.id))
+    .where(and(eq(issueDocuments.companyId,companyId),eq(issueDocuments.issueId,pin.issueId),eq(issueDocuments.key,pin.documentKey))).for("share",{of:documents});
+  const reviews=await db.select().from(issueThreadInteractions).where(and(eq(issueThreadInteractions.id,event.approval.id),eq(issueThreadInteractions.companyId,companyId))).for("share");
+  const runs=await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,event.approval.reviewRunId),eq(heartbeatRuns.companyId,companyId))).for("share");
+  verifyCurrentWikiRepublication({event,registry,document:docs[0]?.doc??null,review:reviews[0]??null,run:runs[0]??null});
+}
 export function wikiRepublicationRuntime(db:Db,pluginId:string) {
   async function document(tx:Db,companyId:string,issueId:string,key:string) {
     const rows=await tx.select({doc:documents}).from(issueDocuments).innerJoin(documents,eq(issueDocuments.documentId,documents.id))
@@ -63,8 +78,8 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
           publicationNeed(matches[0]!.content_hash===hash,"republication_page_changed");
           return {path:p,wikiId:draft.wikiId,spaceSlug:draft.spaceSlug,contents,hash,sourceRefs:matches[0]!.source_refs};
         }}});
-    const newPhysical=physical(draft.path),identity=await resolvePluginLocalFolderPath(root,newPhysical,{allowMissingLeaf:true});
-    publicationNeed(path.relative(root,identity.realPath).split(path.sep).join("/")===newPhysical,"republication_alias");
+    const newPhysical=physical(draft.path);
+    await assertWikiRepublicationTargetPath(root,newPhysical);
     return {resolved,events,root,newPhysical,pluginDb,space,ns,config,pageType:rows.find(r=>r.path===draft.previousPath)!.page_type,planHash:publicationHash(publicationCanonical({pin:resolved.pin,
       sourceRefs:resolved.sourceRefs,root,physicalPath:newPhysical,registryBefore:resolved.registryBeforeSHA256,registryAfter:resolved.registryAfterSHA256}))};
   }
@@ -84,12 +99,15 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
         return {planHash:p.planHash};
       });
       if(first.receipt)return first.receipt;
-      return withWikiRetractionLock(db,pluginId,input.companyId,async tx=>{
+      const receipt = await withWikiRetractionLock(db,pluginId,input.companyId,async tx=>{
         const all=await loadAllWikiRetractions(tx,pluginId,input.companyId);retractionFolderGate(all,input.companyId,"wiki-root");
         const p=await plan(tx,input,all);publicationNeed(p.planHash===first.planHash,"republication_plan_changed");
-        const event=buildWikiRepublicationEvent(p.resolved,{...input,events:p.events,eventId:randomUUID(),at:new Date().toISOString()});
+        const initialEvent=buildWikiRepublicationEvent(p.resolved,{...input,events:p.events,eventId:randomUUID(),at:new Date().toISOString()});
+        const logPath=(p.space.path_prefix?p.space.path_prefix+"/":"")+"wiki/log.md";
+        const event=withRetractionMaintenanceLog(initialEvent,p.events,await readPluginLocalFolderText(p.root,logPath));
         const created=await createPluginLocalFolderTextExclusive(p.root,p.newPhysical,p.resolved.contents);
         if(!created.created)throw conflict("Publication file already exists; it was not overwritten. Read intent/receipt without retry");
+        await assertWikiRepublicationTargetPath(p.root,p.newPhysical);
         publicationNeed(publicationHash(await readPluginLocalFolderText(p.root,p.newPhysical))===event.contentHash,"republication_file_readback");
         const pageId=randomUUID(),revisionId=randomUUID(),title=p.resolved.contents.match(/^#\s+(.+)$/m)?.[1]??p.resolved.draft.path;
         await p.pluginDb.execute(pluginId,`INSERT INTO ${p.ns}.wiki_pages
@@ -106,6 +124,10 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
           action:"wiki.page.retraction",entityType:"wiki_retraction",entityId:pluginId,details:event as unknown as JsonObject});
         return event;
       });
+      await withWikiRetractionLock(db,pluginId,input.companyId,async tx=>{
+        await appendRetractionMaintenanceLog(receipt,await loadAllWikiRetractions(tx,pluginId,input.companyId));
+      });
+      return receipt;
     },
     async receipt(companyId:string,operationId:string) {
       return withWikiRetractionLock(db,pluginId,companyId,async tx=>{
@@ -118,7 +140,17 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
         let file:{present:boolean;sha256?:string;matchesIntent?:boolean}={present:false};
         if(intent)try{const body=await readPluginLocalFolderText(intent.rootPath,intent.path);const sha256=publicationHash(body);file={present:true,sha256,matchesIntent:sha256===intent.contentHash};}
         catch(error){if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;}
-        return {state:event?"published":"prepared_or_unknown",event:event??null,file,automaticRetryAllowed:false};
+        let maintenanceLog: {state:string;sha256?:string;error?:string}={state:"not_recorded"};
+        if(event?.maintenanceLog) {
+          const log=event.maintenanceLog;
+          try {
+            const contents=await readPluginLocalFolderText(log.rootPath,log.path);
+            retainedRetractionFile(events.filter(e=>e.wikiId===event.wikiId&&e.spaceSlug===event.spaceSlug),log.path,log.prefixSHA256,contents);
+            const sha256=publicationHash(contents);
+            maintenanceLog={state:sha256===log.resultingSHA256?"appended":"pending",sha256};
+          } catch(error) {maintenanceLog={state:"unknown",error:error instanceof Error?error.message:"log read failed"};}
+        }
+        return {state:event?"published":"prepared_or_unknown",event:event??null,file,maintenanceLog,automaticRetryAllowed:false};
       });
     },
   };

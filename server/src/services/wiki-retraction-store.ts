@@ -1,3 +1,7 @@
+import { constants, promises as fs } from "node:fs";
+import path from "node:path";
+import { resolvePluginLocalFolderPath } from "./plugin-local-folders.js";
+import { RetractionError, retainedRetractionFile, validateRetractionEvents } from "./wiki-retraction-ledger.js";
 import { and, eq, sql } from "drizzle-orm";
 import { activityLog, type Db } from "@paperclipai/db";
 import type { RetractionEvent, RetractionScope, RetractionStore } from "./wiki-retraction-ledger.js";
@@ -49,4 +53,26 @@ export function wikiRetractionStore(db: Db, pluginId: string): RetractionStore {
       });
     }),
   };
+}
+
+/** Caller holds the company/plugin lock and has committed the event. An
+ * identical complete append is read back; partial/foreign bytes never retry. */
+export async function appendRetractionMaintenanceLog(event: RetractionEvent, events: RetractionEvent[]) {
+  const scoped = validateRetractionEvents(event,events.filter(e=>e.wikiId===event.wikiId&&e.spaceSlug===event.spaceSlug).sort((a,b)=>a.sequence-b.sequence));
+  if (!scoped.some(e=>e.id===event.id&&e.eventHash===event.eventHash)) throw new RetractionError("maintenance_log_uncommitted");
+  const log = event.maintenanceLog;
+  if (!log) throw new RetractionError("maintenance_log_record_missing");
+  const resolved = await resolvePluginLocalFolderPath(log.rootPath, log.path, { mustExist: true });
+  if (path.relative(log.rootPath, resolved.realPath).split(path.sep).join("/") !== log.path)
+    throw new RetractionError("maintenance_log_alias");
+  const handle = await fs.open(resolved.realPath, constants.O_RDWR | constants.O_APPEND | constants.O_NOFOLLOW);
+  try {
+    const contents = await handle.readFile("utf8");
+    retainedRetractionFile(scoped, log.path, log.prefixSHA256, contents);
+    if (Buffer.byteLength(contents) > log.prefixBytes) return { state: "appended" as const, alreadyPresent: true };
+    await handle.writeFile(log.appendText, "utf8"); await handle.sync();
+  } finally { await handle.close(); }
+  const contents = await fs.readFile(resolved.realPath, "utf8");
+  retainedRetractionFile(scoped, log.path, log.resultingSHA256, contents);
+  return { state: "appended" as const, alreadyPresent: false };
 }

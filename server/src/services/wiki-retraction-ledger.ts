@@ -39,8 +39,12 @@ export interface RetractionEvent extends RetractionTarget {
   republication?: {
     operationId: string; retractionEventHash: string; previousPath: string;
     physicalPath: string; rootPath: string; producerAgentId: string;
-    documentId: string; revisionId: string; sourceRefsSHA256: string;
+    documentId: string; revisionId: string; sourceRefsSHA256: string; reviewRecordSHA256: string;
     registryBeforeSHA256: string; registryAfterSHA256: string;
+  };
+  maintenanceLog?: {
+    path: string; rootPath: string; prefixBytes: number; prefixSHA256: string;
+    appendText: string; appendSHA256: string; resultingSHA256: string;
   };
   retractionId: string;
   reason: string;
@@ -86,6 +90,58 @@ function canonical(value: unknown): string {
 }
 export function retractionEventHash(event: Omit<RetractionEvent, "eventHash">): string {
   return createHash("sha256").update(canonical(event)).digest("hex");
+}
+function logHash(value: string | Buffer) { return createHash("sha256").update(value).digest("hex"); }
+function logLine(event: RetractionEvent, before: string) {
+  return "\n<!-- paperclip.wiki-maintenance/v1 -->\n" + JSON.stringify({
+    schema: "paperclip.wiki-maintenance/v1", eventId: event.id, eventType: event.type,
+    retractionId: event.retractionId, target: event.path, targetSHA256: event.contentHash,
+    reason: event.reason, actorId: event.actorId, runId: event.runId, at: event.at,
+    previousEventHash: event.previousHash, previousLogSHA256: before,
+  }) + "\n";
+}
+function logAnchor(event: RetractionEvent, prior: RetractionEvent[]) {
+  const parent = prior.find(e => e.type === "executed" && e.retractionId === event.retractionId);
+  const fence = event.fence ?? parent?.fence;
+  need(fence?.mode === "citation-holds", "maintenance_log_fence");
+  const path = (fence.pathPrefix ? fence.pathPrefix + "/" : "") + "wiki/log.md";
+  const original = fence.blocks.find(b => b.path === path); need(original, "maintenance_log_original");
+  const previous = prior.filter(e => e.maintenanceLog?.path === path).at(-1)?.maintenanceLog;
+  return { path, rootPath: fence.rootPath, prefixSHA256: previous?.resultingSHA256 ?? original.contentHash };
+}
+/** Compute the exact append before committing the authoritative event. No file
+ * is edited by the ledger. The host performs that append once after commit. */
+export function withRetractionMaintenanceLog(event: RetractionEvent, prior: RetractionEvent[], current: string): RetractionEvent {
+  const anchor = logAnchor(event, prior);
+  need(logHash(current) === anchor.prefixSHA256, "maintenance_log_pending_or_changed");
+  const appendText = logLine(event, anchor.prefixSHA256);
+  const { eventHash: _old, ...basis } = event;
+  const next = { ...basis, maintenanceLog: { ...anchor, prefixBytes: Buffer.byteLength(current), appendText,
+    appendSHA256: logHash(appendText), resultingSHA256: logHash(current + appendText) } };
+  const result = { ...next, eventHash: retractionEventHash(next) };
+  validateRetractionEvents(event,[...prior,result]); return result;
+}
+/** Return an exact historical prefix only when every recorded append and the
+ * latest complete/pending log state match. Unknown partial effects fail closed. */
+export function retainedRetractionFile(events: RetractionEvent[], filePath: string, expectedSHA256: string, contents: string): string {
+  const records = events.filter(e => e.maintenanceLog?.path === filePath).sort((a,b)=>a.sequence-b.sequence);
+  if (!records.length) { need(logHash(contents) === expectedSHA256, "readable_content_changed"); return contents; }
+  need(records.every(e => sameRetractionScope(e, records[0]!) && e.maintenanceLog!.rootPath === records[0]!.maintenanceLog!.rootPath), "maintenance_log_scope");
+  const bytes = Buffer.from(contents), latest = records.at(-1)!.maintenanceLog!;
+  const full = logHash(bytes);
+  need((full === latest.prefixSHA256 && bytes.length === latest.prefixBytes) ||
+    (full === latest.resultingSHA256 && bytes.length === latest.prefixBytes + Buffer.byteLength(latest.appendText)), "maintenance_log_unknown_effect");
+  let expectedLength: number | undefined;
+  for (const event of records) {
+    const log = event.maintenanceLog!, end = log.prefixBytes + Buffer.byteLength(log.appendText);
+    need(logHash(bytes.subarray(0, log.prefixBytes)) === log.prefixSHA256, "maintenance_log_original_changed");
+    if (bytes.length >= end) need(bytes.subarray(log.prefixBytes, end).equals(Buffer.from(log.appendText)), "maintenance_log_append_changed");
+    else need(event === records.at(-1) && bytes.length === log.prefixBytes, "maintenance_log_missing_append");
+    if (log.prefixSHA256 === expectedSHA256) expectedLength = log.prefixBytes;
+    if (log.resultingSHA256 === expectedSHA256) expectedLength = end;
+  }
+  need(expectedLength !== undefined && expectedLength <= bytes.length && logHash(bytes.subarray(0,expectedLength)) === expectedSHA256, "readable_content_changed");
+  return bytes.subarray(0,expectedLength).toString("utf8");
 }
 function verifyApproval(approval: RetractionApproval, target: RetractionTarget, reason: string, actorId: string, runId: string | null) {
   validTarget(approval.target);
@@ -140,7 +196,7 @@ export function validateRetractionEvents(scope: RetractionScope, events: Retract
         "republication_target");
       validTarget({ ...event, path: p.physicalPath });
       need([p.operationId, p.producerAgentId, p.documentId, p.revisionId].every(text) &&
-        [p.sourceRefsSHA256,p.registryBeforeSHA256,p.registryAfterSHA256].every(v => /^[a-f0-9]{64}$/.test(v)) &&
+        [p.sourceRefsSHA256,p.reviewRecordSHA256,p.registryBeforeSHA256,p.registryAfterSHA256].every(v => /^[a-f0-9]{64}$/.test(v)) &&
         p.producerAgentId !== event.approval.reviewerId && p.producerAgentId !== event.actorId &&
         event.approval.proposal?.documentId === p.documentId && event.approval.proposal.revisionId === p.revisionId &&
         event.approval.proposal.bodySHA256 === event.contentHash, "republication_review");
@@ -153,6 +209,12 @@ export function validateRetractionEvents(scope: RetractionScope, events: Retract
       need(original && original.retractionId === event.retractionId && original.contentHash === event.contentHash &&
         original.reason === event.reason && canonical(original.approval) === canonical(event.approval), "ledger_observation");
       need(event.actorId !== original.actorId && event.runId !== original.runId, "independent_observer_required");
+    }
+    if (event.maintenanceLog) {
+      const log = event.maintenanceLog, anchor = logAnchor(event, events.slice(0,i));
+      need(log.path === anchor.path && log.rootPath === anchor.rootPath && log.prefixSHA256 === anchor.prefixSHA256 &&
+        Number.isSafeInteger(log.prefixBytes) && log.prefixBytes >= 0 && log.appendText === logLine(event, anchor.prefixSHA256) &&
+        log.appendSHA256 === logHash(log.appendText) && /^[a-f0-9]{64}$/.test(log.resultingSHA256), "maintenance_log_record");
     }
     previousHash = eventHash; ids.add(event.id);
   }
@@ -168,6 +230,7 @@ export async function executeRetraction(store: RetractionStore, input: {
   approval: RetractionApproval;
   fence?: RetractionFence;
   readCurrent(): Promise<{ path: string; contentHash: string }>;
+  prepareEvent?(event: RetractionEvent, prior: RetractionEvent[]): Promise<RetractionEvent>;
 }): Promise<RetractionEvent> {
   const { target } = input; validTarget(target);
   need([input.retractionId, input.reason, input.actorId, input.eventId, input.at].every(text), "request_shape");
@@ -189,7 +252,8 @@ export async function executeRetraction(store: RetractionStore, input: {
       actorId: input.actorId, runId: input.runId, at: input.at, approval: structuredClone(input.approval),
       ...(input.fence ? { fence: structuredClone(input.fence) } : {}),
     };
-    const event: RetractionEvent = { ...basis, eventHash: retractionEventHash(basis) };
+    let event: RetractionEvent = { ...basis, eventHash: retractionEventHash(basis) };
+    if (input.prepareEvent) event = await input.prepareEvent(event, events);
     validateRetractionEvents(target, [...events, event]);
     await tx.append(event); // There is no separate mutable status to get ahead of audit.
     return event;

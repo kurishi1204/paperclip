@@ -7,8 +7,8 @@ import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { assertConfiguredLocalFolder, getStoredLocalFolders, inspectPluginLocalFolder, readPluginLocalFolderText,
   requireLocalFolderDeclaration, resolvePluginLocalFolderPath } from "./plugin-local-folders.js";
-import { executeRetraction, type RetractionFence, type RetractionScope, type RetractionStore, type RetractionTarget } from "./wiki-retraction-ledger.js";
-import { loadAllWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
+import { executeRetraction, withRetractionMaintenanceLog, retainedRetractionFile, RetractionError, type RetractionFence, type RetractionScope, type RetractionStore, type RetractionTarget } from "./wiki-retraction-ledger.js";
+import { loadAllWikiRetractions, withWikiRetractionLock, appendRetractionMaintenanceLog } from "./wiki-retraction-store.js";
 import { resolveReviewedWikiRetraction } from "./wiki-retraction-approval.js";
 import { retractionFolderGate } from "./wiki-retraction-gate.js";
 import { buildRetractionGraph, assertNoUnregisteredRetractionDependants } from "./wiki-retraction-readback.js";
@@ -103,7 +103,8 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
       withWikiRetractionLock(db, pluginId, scope.companyId, tx => snapshot(scope.companyId, scope, targetPath, reason, tx)),
     async execute(input: { companyId: string; issueId: string; documentKey: string; reviewId: string;
       operationId: string; ownerDecisionId: string; actorId: string; runId: string | null }) {
-      return withWikiRetractionLock(db, pluginId, input.companyId, async tx => {
+      let created = false;
+      const receipt = await withWikiRetractionLock(db, pluginId, input.companyId, async tx => {
         const allEvents = await loadAllWikiRetractions(tx, pluginId, input.companyId);
         retractionFolderGate(allEvents, input.companyId, "wiki-root");
         const recorded = allEvents.find(e => e.type === "executed" && e.retractionId === input.operationId);
@@ -136,15 +137,26 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
             companyId: input.companyId, actorType: "user", actorId: input.actorId, action: "wiki.page.retraction",
             entityType: "wiki_retraction", entityId: pluginId, details: event as unknown as JsonObject }); },
         }) };
+        created = true;
         return executeRetraction(store, { target: proposal.target, fence: proposal.fence, retractionId: input.operationId,
           reason: proposal.reason, actorId: input.actorId, runId: input.runId, eventId: randomUUID(), at: new Date().toISOString(),
           approval: { id: resolved.reviewId, companyId: input.companyId, target: proposal.target, reason: proposal.reason,
             reviewerId: resolved.reviewerId, reviewRunId: resolved.reviewRunId, ownerDecisionId: resolved.ownerDecisionId,
             proposal: { issueId: input.issueId, documentKey: input.documentKey, documentId: doc!.id,
               revisionId: doc!.latestRevisionId!, bodySHA256: publicationHash(doc!.latestBody), registrySHA256: proposal.publicationRegistrySHA256 } },
+          prepareEvent: async (event, prior) => {
+            const logPath = (proposal.fence.pathPrefix ? proposal.fence.pathPrefix + "/" : "") + "wiki/log.md";
+            return withRetractionMaintenanceLog(event, prior, await readPluginLocalFolderText(proposal.fence.rootPath,logPath));
+          },
           readCurrent: async () => { const fresh = await snapshot(input.companyId, proposal.target, proposal.target.path, proposal.reason, tx); return { path: fresh.target.path, contentHash: fresh.target.contentHash }; },
         });
       });
+      // The DB receipt is authoritative before the derived maintenance append.
+      // An unknown append never rolls back or replays the withdrawal.
+      if (created) await withWikiRetractionLock(db,pluginId,input.companyId,async tx=>{
+        await appendRetractionMaintenanceLog(receipt,await loadAllWikiRetractions(tx,pluginId,input.companyId));
+      });
+      return receipt;
     },
     async audit(companyId: string) {
       return withWikiRetractionLock(db, pluginId, companyId, async tx => {
@@ -154,7 +166,14 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
         if (!plugin || plugin.pluginKey !== WIKI_PLUGIN) throw notFound("Wiki plugin not found");
         return Promise.all(events.map(async event => ({ event, originals: await Promise.all((event.fence?.blocks ?? []).map(async block => {
           const contents = await readPluginLocalFolderText(event.fence!.rootPath, block.path);
-          return { path: block.path, contents, preserved: publicationHash(contents) === block.contentHash };
+          try {
+            const original = retainedRetractionFile(events.filter(e=>e.wikiId===event.wikiId&&e.spaceSlug===event.spaceSlug).sort((a,b)=>a.sequence-b.sequence),block.path,block.contentHash,contents);
+            return { path: block.path, contents: original, preserved: true, currentFileSHA256: publicationHash(contents),
+              currentFileBytes: Buffer.byteLength(contents), originalBytes: Buffer.byteLength(original) };
+          } catch (error) {
+            if (!(error instanceof RetractionError)) throw error;
+            return {path:block.path,contents,preserved:false,errorCode:error.code};
+          }
         })) })));
       });
     },

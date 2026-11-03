@@ -1,12 +1,14 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
-import { mkdtemp,mkdir,writeFile,readFile,rm,realpath } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdtemp,mkdir,writeFile,readFile,rm,realpath,symlink } from "node:fs/promises";
+import { join,relative } from "node:path";
 import { tmpdir } from "node:os";
-import { createPluginLocalFolderTextExclusive } from "../services/plugin-local-folders.js";
-import { executeRetraction,validateRetractionEvents,retractionEventHash,type RetractionEvent,type RetractionStore } from "../services/wiki-retraction-ledger.js";
-import { retractionFolderGate,readRetractionFolderTextWithStatus } from "../services/wiki-retraction-gate.js";
-import { encodeWikiRepublicationDraft,resolveReviewedWikiRepublication,buildWikiRepublicationEvent } from "../services/wiki-republication.js";
+import { createPluginLocalFolderTextExclusive,resolvePluginLocalFolderPath } from "../services/plugin-local-folders.js";
+import { executeRetraction,validateRetractionEvents,retractionEventHash,withRetractionMaintenanceLog,retainedRetractionFile,type RetractionEvent,type RetractionStore } from "../services/wiki-retraction-ledger.js";
+import { retractionFolderGate,readRetractionFolderTextWithStatus,readRetractionFolderText } from "../services/wiki-retraction-gate.js";
+import { assertWikiRepublicationTargetPath } from "../services/wiki-republication-runtime.js";
+import { appendRetractionMaintenanceLog } from "../services/wiki-retraction-store.js";
+import { encodeWikiRepublicationDraft,resolveReviewedWikiRepublication,buildWikiRepublicationEvent,verifyCurrentWikiRepublication } from "../services/wiki-republication.js";
 import { publicationCanonical,publicationHash,reviewBasis,verifyWikiPublication,type JsonObject,type PublicationRegistry } from "../services/wiki-publication-readback.js";
 
 async function fixture() {
@@ -22,11 +24,12 @@ async function fixture() {
   registry.entries.push({path,...ref,producerAgentId:"author",reviewId:review.id,wikiSHA256:publicationHash(body),documentBodySHA256:publicationHash(body),reviewRecordSHA256:publicationHash(publicationCanonical(reviewBasis(review))),sourceRefsSHA256:publicationHash(publicationCanonical(refs))});
   await writeFile(join(root,path),body);
  }
+ await writeFile(join(root,"wiki/log.md"),"# 運用ログ\n\n保存済みの元記録。\n");
  const store:RetractionStore={read:async()=>events,transaction:async(_s,work)=>work({events:async()=>events,append:async e=>{events.push(e);}})};
  const target={companyId:"c",wikiId:"default",spaceSlug:"default",path:"wiki/p7.md",contentHash:publicationHash(pages["wiki/p7.md"]!.body)};
  await executeRetraction(store,{target,retractionId:"withdrawal",reason:"Revalidation required",actorId:"owner",runId:null,eventId:"withdrawal-event",at:"2026-11-03T10:00:00Z",
   approval:{id:"withdrawal-review",companyId:"c",target,reason:"Revalidation required",reviewerId:"qa",reviewRunId:"withdrawal-qa",ownerDecisionId:"real-human-decision"},
-  fence:{folderKey:"wiki-root",rootPath:root,pathPrefix:"",mode:"citation-holds",blocks:[{path:target.path,contentHash:target.contentHash,state:"retracted"},{path:"wiki/child.md",contentHash:publicationHash(pages["wiki/child.md"]!.body),state:"blocked_by_retraction"}],readable:[{path:"wiki/upstream.md",contentHash:publicationHash(pages["wiki/upstream.md"]!.body)}]},
+  fence:{folderKey:"wiki-root",rootPath:root,pathPrefix:"",mode:"citation-holds",blocks:[{path:target.path,contentHash:target.contentHash,state:"retracted"},{path:"wiki/child.md",contentHash:publicationHash(pages["wiki/child.md"]!.body),state:"blocked_by_retraction"},{path:"wiki/log.md",contentHash:publicationHash(await readFile(join(root,"wiki/log.md"))),state:"blocked_by_retraction"}],readable:[{path:"wiki/upstream.md",contentHash:publicationHash(pages["wiki/upstream.md"]!.body)}]},
   readCurrent:async()=>target});
  const newBody=encodeWikiRepublicationDraft({companyId:"c",wikiId:"default",spaceSlug:"default",retractionId:"withdrawal",previousPath:"wiki/child.md",path:"wiki/child-revalidated.md",reason:"Responsible author revalidated the unrelated claim",dependencies:[{path:"wiki/upstream.md",wikiSHA256:publicationHash(pages["wiki/upstream.md"]!.body)}]},"# Revised conclusion\n\nUse only the current independent source.\n");
  const doc={id:"new-doc",companyId:"c",issueId:"new-issue",latestRevisionId:"new-revision",latestBody:newBody,body:newBody,createdByAgentId:"author",updatedByAgentId:"author",updatedByUserId:null};docs["new-issue"]=doc;
@@ -99,5 +102,73 @@ test("replacement bytes cannot change under a committed publication receipt",asy
   f.events.push(buildWikiRepublicationEvent(plan,{...f.input,operationId:"op",eventId:"pub",at:"2026-11-03T10:01:00Z"}));
   await writeFile(join(f.root,plan.draft.path),"tampered");
   await assert.rejects(readRetractionFolderTextWithStatus(f.root,plan.draft.path,retractionFolderGate(f.events,"c","wiki-root")),/readable_content_changed/);
+ }finally{await f.cleanup();}
+});
+
+test("entry-owned maintenance appends preserve exact original bytes and are idempotent after commit",async()=>{
+ const f=await fixture();try{
+  const file=join(f.root,"wiki/log.md"),original=await readFile(file);
+  const withdrawal=withRetractionMaintenanceLog(f.events[0]!,[],original.toString("utf8"));f.events[0]=withdrawal;
+  // The authoritative hold already exists even before the derived log append.
+  await assert.rejects(readRetractionFolderTextWithStatus(f.root,"wiki/p7.md",retractionFolderGate(f.events,"c","wiki-root")),/E_SOURCE_RETRACTED/);
+  assert.equal((await readRetractionFolderTextWithStatus(f.root,"wiki/log.md",retractionFolderGate(f.events,"c","wiki-root"))).contents,original.toString("utf8"));
+  assert.equal((await appendRetractionMaintenanceLog(withdrawal,f.events)).alreadyPresent,false);
+  const once=await readFile(file);assert.deepEqual(once.subarray(0,original.length),original);
+  assert.equal((await appendRetractionMaintenanceLog(withdrawal,f.events)).alreadyPresent,true);
+  assert.deepEqual(await readFile(file),once);
+  const plan=await resolveReviewedWikiRepublication(f.input);
+  const initial=buildWikiRepublicationEvent(plan,{...f.input,operationId:"op",eventId:"pub",at:"2026-11-03T10:01:00Z"});
+  const publication=withRetractionMaintenanceLog(initial,f.events,once.toString("utf8"));f.events.push(publication);
+  await appendRetractionMaintenanceLog(publication,f.events);
+  const twice=await readFile(file,"utf8");assert.equal(twice.split("<!-- paperclip.wiki-maintenance/v1 -->").length-1,2);
+  assert.equal(retainedRetractionFile(f.events,"wiki/log.md",withdrawal.fence!.blocks.at(-1)!.contentHash,twice),original.toString("utf8"));
+  assert.equal((await readRetractionFolderTextWithStatus(f.root,"wiki/log.md",retractionFolderGate(f.events,"c","wiki-root"))).contents,twice);
+ }finally{await f.cleanup();}
+});
+test("a partial maintenance append is observed as unknown and is never automatically repeated",async()=>{
+ const f=await fixture();try{
+  const file=join(f.root,"wiki/log.md"),original=await readFile(file,"utf8");
+  const event=withRetractionMaintenanceLog(f.events[0]!,[],original);f.events[0]=event;
+  const partial=original+event.maintenanceLog!.appendText.slice(0,12);await writeFile(file,partial);
+  await assert.rejects(appendRetractionMaintenanceLog(event,f.events),/maintenance_log_unknown_effect/);
+  assert.equal(await readFile(file,"utf8"),partial);
+  await assert.rejects(readRetractionFolderTextWithStatus(f.root,"wiki/log.md",retractionFolderGate(f.events,"c","wiki-root")),/maintenance_log_unknown_effect/);
+  const forged=structuredClone(event);forged.maintenanceLog!.appendText+="forged";
+  const {eventHash:_h,...basis}=forged;forged.eventHash=retractionEventHash(basis);
+  assert.throws(()=>validateRetractionEvents(forged,[forged]),/maintenance_log_record/);
+ }finally{await f.cleanup();}
+});
+
+test("unknown last editor never counts as the responsible author's revision",async()=>{
+ const f=await fixture();try{
+  await assert.rejects(resolveReviewedWikiRepublication({...f.input,document:{...f.doc,updatedByAgentId:null}}),/responsible_author/);
+ }finally{await f.cleanup();}
+});
+test("new leaf alias planning compares the real existing ancestor before any file effect",async()=>{
+ const f=await fixture();try{
+  await mkdir(join(f.root,"other"));await symlink("../other",join(f.root,"wiki/alias"));
+  const requested="wiki/alias/revalidated.md";
+  const old=await resolvePluginLocalFolderPath(f.root,requested,{allowMissingLeaf:true});
+  // The prior runtime's equality accepted this alias for a missing leaf.
+  assert.equal(relative(f.root,old.realPath),requested);
+  await assert.rejects(assertWikiRepublicationTargetPath(f.root,requested),/republication_alias/);
+  await assertWikiRepublicationTargetPath(f.root,"wiki/new-parent/revalidated.md");
+  await assert.rejects(readFile(join(f.root,"other/revalidated.md")),{code:"ENOENT"});
+ }finally{await f.cleanup();}
+});
+test("both structured UI reads and ordinary reads reject a publication after its current QA is invalidated",async()=>{
+ const f=await fixture();try{
+  const plan=await resolveReviewedWikiRepublication(f.input);await createPluginLocalFolderTextExclusive(f.root,plan.draft.path,plan.contents);
+  const event=buildWikiRepublicationEvent(plan,{...f.input,operationId:"op",eventId:"pub",at:"2026-11-03T10:01:00Z"});f.events.push(event);
+  const current={event,registry:plan.nextRegistry,document:f.doc,review:f.review,run:f.input.run};
+  const verify=async(p:string)=>{if(p===event.republication!.physicalPath)verifyCurrentWikiRepublication(current);};
+  const gate=retractionFolderGate(f.events,"c","wiki-root");
+  assert.equal((await readRetractionFolderTextWithStatus(f.root,plan.draft.path,gate,verify)).contents,plan.contents);
+  f.review.status="rejected";
+  // Reproduce the prior UI boundary: immutable bytes alone still look usable.
+  assert.equal((await readRetractionFolderTextWithStatus(f.root,plan.draft.path,gate)).contents,plan.contents);
+  await assert.rejects(readRetractionFolderTextWithStatus(f.root,plan.draft.path,gate,verify),/current_review/);
+  await assert.rejects(readRetractionFolderText(f.root,plan.draft.path,gate,verify),/current_review/);
+  assert.equal(await readRetractionFolderText(f.root,"wiki/upstream.md",gate,verify),f.pages["wiki/upstream.md"]!.body);
  }finally{await f.cleanup();}
 });

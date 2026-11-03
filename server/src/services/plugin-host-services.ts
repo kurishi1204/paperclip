@@ -50,6 +50,7 @@ import { pluginStateStore } from "./plugin-state-store.js";
 import { pluginLifecycleInbox } from "./plugin-lifecycle-inbox.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { loadAllWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
+import { assertCurrentWikiRepublication } from "./wiki-republication-runtime.js";
 import { retractionFolderGate, readRetractionFolderText, readRetractionFolderTextWithStatus, canonicalWikiRetractionPath as canonicalFolderPath } from "./wiki-retraction-gate.js";
 import { pluginManagedAgentService } from "./plugin-managed-agents.js";
 import { pluginManagedRoutineService } from "./plugin-managed-routines.js";
@@ -821,16 +822,17 @@ export function buildHostServices(
   };
 
   const withWikiFolderFence = async <T>(companyId: string, folderKey: string,
-    work: (gate: ReturnType<typeof retractionFolderGate>, connection: Db) => Promise<T>): Promise<T> => {
+    work: (gate: ReturnType<typeof retractionFolderGate>, connection: Db, verifyPublication: (physicalPath:string)=>Promise<void>) => Promise<T>): Promise<T> => {
     if (pluginKey !== "paperclipai.plugin-llm-wiki" || folderKey !== "wiki-root")
-      return work(retractionFolderGate([], companyId, folderKey), db);
+      return work(retractionFolderGate([], companyId, folderKey), db, async()=>{});
     return withWikiRetractionLock(db, pluginId, companyId, async tx => {
-      const gate = retractionFolderGate(await loadAllWikiRetractions(tx, pluginId, companyId), companyId, folderKey);
+      const events=await loadAllWikiRetractions(tx, pluginId, companyId);
+      const gate = retractionFolderGate(events, companyId, folderKey);
       if (gate.active) {
         const folder = await inspectStoredLocalFolder(companyId, folderKey, tx);
         gate.assertRoot(folder.realPath ?? "");
       }
-      return work(gate, tx);
+      return work(gate, tx, physicalPath=>assertCurrentWikiRepublication(tx,pluginId,companyId,events,physicalPath));
     });
   };
 
@@ -1500,7 +1502,7 @@ export function buildHostServices(
       },
 
       async list(params) {
-        return withWikiFolderFence(params.companyId, params.folderKey, async (gate, connection) => {
+        return withWikiFolderFence(params.companyId, params.folderKey, async (gate, connection, verifyPublication) => {
           const status = await inspectStoredLocalFolder(params.companyId, params.folderKey, connection);
           assertConfiguredLocalFolder(status);
           gate.assertRoot(status.realPath!);
@@ -1513,6 +1515,7 @@ export function buildHostServices(
           for (const entry of listing.entries) {
             if (entry.kind === "directory") { entries.push(entry); continue; }
             const canonical=await canonicalFolderPath(status.realPath!, entry.path);
+            await verifyPublication(canonical);
             const holds=[gate.block(entry.path),gate.block(canonical)].filter(Boolean);
             if (holds.every(hold => hold!.state === "blocked_by_retraction" && hold!.readPolicy === "citation-holds"))
               entries.push({...entry,...(holds.length ? {citationHolds:gate.citationHolds(canonical)} : {})});
@@ -1523,18 +1526,18 @@ export function buildHostServices(
       },
 
       async readText(params) {
-        return withWikiFolderFence(params.companyId, params.folderKey, async (gate, connection) => {
+        return withWikiFolderFence(params.companyId, params.folderKey, async (gate, connection, verifyPublication) => {
           const status = await inspectStoredLocalFolder(params.companyId, params.folderKey, connection);
           assertConfiguredLocalFolder(status);
-          return readRetractionFolderText(status.realPath!, params.relativePath, gate);
+          return readRetractionFolderText(status.realPath!, params.relativePath, gate, verifyPublication);
         });
       },
 
       async readTextWithStatus(params) {
-        return withWikiFolderFence(params.companyId, params.folderKey, async (gate, connection) => {
+        return withWikiFolderFence(params.companyId, params.folderKey, async (gate, connection, verifyPublication) => {
           const status = await inspectStoredLocalFolder(params.companyId, params.folderKey, connection);
           assertConfiguredLocalFolder(status);
-          return readRetractionFolderTextWithStatus(status.realPath!, params.relativePath, gate);
+          return readRetractionFolderTextWithStatus(status.realPath!, params.relativePath, gate, verifyPublication);
         });
       },
 
