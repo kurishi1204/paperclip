@@ -127,6 +127,7 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     const pluginDb=pluginDatabaseService(db);
     await pluginDb.applyMigrations(pluginId,wikiManifest,fileURLToPath(new URL("../../../packages/plugins/plugin-llm-wiki/",import.meta.url)));
     const ns=await pluginDb.getRuntimeNamespace(pluginId);
+    const {buildHostServices}=await import("../services/plugin-host-services.js");
     async function context(newPath:string,withdraw?:(input:Parameters<ReturnType<typeof wikiRetractionRuntime>["execute"]>[0],dir:string)=>Promise<{retractionId:string}>) {
       const companyId=randomUUID(),author=randomUUID(),qa=randomUUID(),spaceId=randomUUID();
       await db.insert(companies).values({id:companyId,name:"Synthetic reviewed republication",issuePrefix:"R"+companyId.replaceAll("-","").slice(0,12)});
@@ -176,7 +177,7 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
         reviewId:proposal.reviewId,ownerDecisionId,operationId:randomUUID(),actorId:"synthetic-owner",runId:null};
       const withdrawal=await (withdraw?withdraw(withdrawalInput,dir):wikiRetractionRuntime(db,pluginId).execute(withdrawalInput));
       const body=encodeWikiRepublicationDraft({companyId,wikiId:"default",spaceSlug:"default",retractionId:withdrawal.retractionId,previousPath:"wiki/child.md",path:newPath,
-        reason:"Responsible author checked current evidence",dependencies:[{path:"wiki/upstream.md",wikiSHA256:registry.entries[2]!.wikiSHA256}]},"# Revalidated conclusion\n\nUse current independent evidence.\n");
+        reason:"Responsible author checked current evidence",dependencies:[{path:"wiki/upstream.md",wikiSHA256:registry.entries[2]!.wikiSHA256}]},"# Revalidated conclusion\n\nUse current independent [evidence](wiki/upstream.md#scope).\n");
       const draft=await reviewedDocument("revalidated",body);
       const another=async(path:string,dependency?:{path:string;wikiSHA256:string})=>{
         const anotherBody=encodeWikiRepublicationDraft({companyId,wikiId:"default",spaceSlug:"default",retractionId:withdrawal.retractionId,previousPath:"wiki/child.md",path,
@@ -191,6 +192,21 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     const result=await runtime.execute(f.input);expect(result.type).toBe("republished");
     expect(await runtime.receipt(f.companyId,f.input.operationId)).toMatchObject({state:"published",maintenanceLog:{state:"appended"}});
     expect((await runtime.execute(f.input)).id).toBe(result.id);
+    // Actual indexed lookup through the registered Wiki tool. Publication and
+    // ordinary registration use the SAME parser, including fragment handling.
+    const backlinkHost=buildHostServices(db,pluginId,wikiManifest.id,{forPlugin:()=>({clear:()=>{}})} as never,undefined,{manifest:wikiManifest});
+    try {
+      const handlers=new Map<string,(params:unknown)=>Promise<any>>();
+      await registerWikiTools({manifest:wikiManifest,tools:{register:(name:string,_schema:unknown,handler:(params:unknown)=>Promise<any>)=>handlers.set(name,handler)},
+        db:{namespace:ns,query:(statement:string,params?:unknown[])=>pluginDb.query(pluginId,statement,params),execute:(statement:string,params?:unknown[])=>pluginDb.execute(pluginId,statement,params)},
+        localFolders:{status:(companyId:string,folderKey:string)=>backlinkHost.localFolders.status({companyId,folderKey}),
+          readText:(companyId:string,folderKey:string,relativePath:string)=>backlinkHost.localFolders.readText({companyId,folderKey,relativePath}),
+          readTextWithStatus:(companyId:string,folderKey:string,relativePath:string)=>backlinkHost.localFolders.readTextWithStatus({companyId,folderKey,relativePath})}} as unknown as PluginContext);
+      const lookup=await handlers.get("wiki_list_backlinks")!({companyId:f.companyId,wikiId:"default",spaceSlug:"default",path:"wiki/upstream.md"});
+      expect(lookup.data.backlinks.some((row:{path:string})=>row.path===f.newPath)).toBe(true);
+      const persisted=await db.$client.unsafe(`SELECT backlinks FROM ${ns}.wiki_pages WHERE company_id=$1 AND path=$2`,[f.companyId,f.newPath]);
+      expect(persisted[0]!.backlinks).toContain("wiki/upstream.md");
+    }finally{backlinkHost.dispose();}
     const events=await loadAllWikiRetractions(db,pluginId,f.companyId),gate=retractionFolderGate(events,f.companyId,"wiki-root");
     expect(events).toHaveLength(2);expect(await readRetractionFolderText(f.dir,f.newPath,gate)).toBe(f.body);
     expect(await readFile(join(f.dir,"wiki/child.md"))).toEqual(original);
@@ -363,7 +379,6 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     // A different company's real host must not overwrite the retained root,
     // even though that company has no withdrawal events of its own.
     const otherCompany=randomUUID();await db.insert(companies).values({id:otherCompany,name:"Synthetic other root owner",issuePrefix:"X"+otherCompany.replaceAll("-","").slice(0,12)});
-    const {buildHostServices}=await import("../services/plugin-host-services.js");
     const host=buildHostServices(db,pluginId,wikiManifest.id,{forPlugin:()=>({clear:()=>{}})} as never,undefined,{manifest:wikiManifest});
     const foreignProbes:string[]=[],allProbes:string[]=[],write=fs.writeFile;
     const writes=vi.spyOn(fs,"writeFile").mockImplementation(async(path,data,options)=>{

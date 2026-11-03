@@ -334,3 +334,9 @@ access/configuration, Board list/status/validate/configuration, and withdrawal o
 publication setup) therefore pass one guarded inspector. It checks the selected
 prospective path under the claim lock before inspection. Refused foreign roots
 receive no probe writes. Tests count attempted probe writes, not just final files.
+
+
+Immutable republication uses the same `extractWikiLinks` function as ordinary
+page registration. Its `wiki_pages.backlinks` index participates in normal
+`wiki_list_backlinks` discovery. This navigation index does not replace the
+independent document-version/source-reference publication proof.

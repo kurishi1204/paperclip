@@ -1709,7 +1709,7 @@ function inferPageType(path: string): string | null {
   return match?.[1] ?? (path === "index.md" || path === "wiki/index.md" ? "index" : path === "log.md" || path === "wiki/log.md" ? "log" : null);
 }
 
-function extractWikiLinks(contents: string): string[] {
+export function extractWikiLinks(contents: string): string[] {
   const links = new Set<string>();
   const markdownLinkPattern = /\[[^\]]+\]\(([^)]+)\)/g;
   for (const match of contents.matchAll(markdownLinkPattern)) {

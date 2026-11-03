@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { extractWikiLinks } from "../../../packages/plugins/plugin-llm-wiki/src/wiki/core.js";
 import { and, eq } from "drizzle-orm";
 import { activityLog, documents, heartbeatRuns, issueDocuments, issueThreadInteractions, pluginConfig, type Db } from "@paperclipai/db";
 import { conflict, notFound } from "../errors.js";
@@ -178,8 +179,9 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
         const pageId=randomUUID(),revisionId=randomUUID(),title=p.resolved.contents.match(/^#\s+(.+)$/m)?.[1]??p.resolved.draft.path;
         await p.pluginDb.execute(pluginId,`INSERT INTO ${p.ns}.wiki_pages
           (id,company_id,wiki_id,space_id,path,title,page_type,frontmatter,source_refs,backlinks,content_hash,current_revision_id)
-          VALUES($1,$2,$3,$4,$5,$6,$7,'{}'::jsonb,$8::jsonb,'[]'::jsonb,$9,$10)`,
-          [pageId,input.companyId,p.resolved.draft.wikiId,p.space.id,p.resolved.draft.path,title,p.pageType,JSON.stringify(p.resolved.sourceRefs),event.contentHash,revisionId]);
+          VALUES($1,$2,$3,$4,$5,$6,$7,'{}'::jsonb,$8::jsonb,$9::jsonb,$10,$11)`,
+          [pageId,input.companyId,p.resolved.draft.wikiId,p.space.id,p.resolved.draft.path,title,p.pageType,JSON.stringify(p.resolved.sourceRefs),
+            JSON.stringify(extractWikiLinks(p.resolved.contents)),event.contentHash,revisionId]);
         await p.pluginDb.execute(pluginId,`INSERT INTO ${p.ns}.wiki_page_revisions
           (id,company_id,wiki_id,space_id,page_id,path,content_hash,summary,metadata)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)`,[revisionId,input.companyId,p.resolved.draft.wikiId,p.space.id,pageId,
