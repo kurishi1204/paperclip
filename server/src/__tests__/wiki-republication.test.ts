@@ -243,3 +243,30 @@ test("publication link indexing ignores machine lineage metadata and permits an 
   assert.deepEqual((plan as typeof plan&{backlinks:string[]}).backlinks,[draft.path]);
  }finally{await f.cleanup();}
 });
+
+for(const [name,body,reason]of [
+ ["undeclared","See [[upstream|independent evidence]].",/undeclared_body_reference/],
+ ["withdrawn","See [[p7#claim|old premise]].",/E_SOURCE_RETRACTED/],
+]as const)test("rendered Wiki shorthand rejects "+name+" dependencies",async()=>{
+ const f=await fixture();try{
+  const draft=JSON.parse(f.doc.latestBody.split("\n")[1]!);draft.dependencies=[];
+  const latestBody=encodeWikiRepublicationDraft(draft,body);
+  await assert.rejects(resolveReviewedWikiRepublication({...f.input,document:{...f.doc,latestBody}}),reason);
+ }finally{await f.cleanup();}
+});
+test("external URLs and code examples are not Wiki dependencies",async()=>{
+ const f=await fixture();try{
+  const draft=JSON.parse(f.doc.latestBody.split("\n")[1]!);draft.dependencies=[];
+  const latestBody=encodeWikiRepublicationDraft(draft,"[site](https://example.test/wiki/p7.md)\n\nhttps://example.test/wiki/upstream.md\n\n`[[p7]]`\n\n```md\n[example](wiki/p7.md)\n```\n");
+  const plan=await resolveReviewedWikiRepublication({...f.input,document:{...f.doc,latestBody}});
+  assert.deepEqual(plan.backlinks,[]);
+ }finally{await f.cleanup();}
+});
+test("Markdown reference-style links and Wiki shorthand share one canonical dependency",async()=>{
+ const f=await fixture();try{
+  const draft=JSON.parse(f.doc.latestBody.split("\n")[1]!);
+  const latestBody=encodeWikiRepublicationDraft(draft,"[current][evidence] and [[upstream#scope|source]].\n\n[evidence]: upstream.md#scope\n");
+  const plan=await resolveReviewedWikiRepublication({...f.input,document:{...f.doc,latestBody}});
+  assert.deepEqual(plan.backlinks,["wiki/upstream.md"]);assert.equal(plan.sourceRefs.length,2);
+ }finally{await f.cleanup();}
+});

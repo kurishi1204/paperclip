@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { normalizeWikiLinkPagePath, extractWikiLinks } from "@paperclipai/plugin-sdk";
 
 import type { ComponentProps, ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -724,4 +725,24 @@ describe("MarkdownBody", () => {
     expect(html).toContain('href="/issues/ACME-1"');
   });
 
+});
+
+describe("shared Wiki publication link interpretation",()=>{
+ it("renders the same canonical targets that publication indexes",()=>{
+  const content="[[p7#claim|Original]] and [current](upstream.md#scope) and [record][source].\n\n[source]: upstream.md#scope\n";
+  const html=renderMarkdown(content,[],{enableWikiLinks:true,resolveWikiLinkHref:(target)=>{
+   const parsed=normalizeWikiLinkPagePath(target);return parsed?"/wiki/page/"+parsed.path+(parsed.fragment?"#"+parsed.fragment:""):null;
+  }});
+  expect(html).toContain('href="/wiki/page/wiki/p7.md#claim"');
+  expect(html.match(/href="\/wiki\/page\/wiki\/upstream.md#scope"/g)).toHaveLength(2);
+  expect(extractWikiLinks(content)).toEqual(["wiki/p7.md","wiki/upstream.md"]);
+ });
+ it("keeps external URLs and rendered code outside the Wiki reference graph",()=>{
+  const content="[site](https://example.test/wiki/p7.md)\n\nhttps://example.test/wiki/upstream.md\n\n`[[p7]]`";
+  const html=renderMarkdown(content,[],{enableWikiLinks:true,resolveWikiLinkHref:(target)=>{
+   const parsed=normalizeWikiLinkPagePath(target);return parsed?"/wiki/page/"+parsed.path:null;
+  }});
+  expect(html).toContain('href="https://example.test/wiki/p7.md"');expect(html).toMatch(/<code\b[^>]*>\[\[p7\]\]<\/code>/);
+  expect(html).not.toContain('data-paperclip-wiki-link="true"');expect(extractWikiLinks(content)).toEqual([]);
+ });
 });

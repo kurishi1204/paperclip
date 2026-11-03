@@ -159,3 +159,6 @@ export type {
   PluginCommentContextMenuItemProps,
   PluginSettingsPageProps,
 } from "./types.js";
+
+// Shared Markdown link interpretation used by the Wiki plugin and host.
+export { normalizeWikiLinkPagePath, transformWikiLinks } from "../wiki-links.js";

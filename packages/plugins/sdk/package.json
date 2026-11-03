@@ -1,7 +1,7 @@
 {
   "name": "@paperclipai/plugin-sdk",
   "version": "1.0.0",
-  "description": "Stable public API for Paperclip plugins — worker-side context and UI bridge hooks",
+  "description": "Stable public API for Paperclip plugins \u2014 worker-side context and UI bridge hooks",
   "license": "MIT",
   "homepage": "https://github.com/paperclipai/paperclip",
   "bugs": {
@@ -109,7 +109,10 @@
   },
   "dependencies": {
     "@paperclipai/shared": "workspace:*",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "remark-parse": "^11.0.0",
+    "remark-gfm": "^4.0.1",
+    "unified": "^11.0.5"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

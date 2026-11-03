@@ -340,3 +340,19 @@ Immutable republication uses the same `extractWikiLinks` function as ordinary
 page registration. The function is exported through the SDK package; the server does not import optional-plugin source files. Its `wiki_pages.backlinks` index participates in normal
 `wiki_list_backlinks` discovery. This navigation index does not replace the
 independent document-version/source-reference publication proof. Only the rendered body is indexed, not the machine lineage header. Recognized Wiki links in that body must have an exact declared dependency pin (an explicit self link is allowed); a withdrawn or held target is refused before publication.
+
+
+Wiki display and publication now share a Markdown AST walk and target normalizer
+from the SDK. The parser uses the same CommonMark/GFM grammar as the renderer.
+Wiki shorthand, local Markdown page links and reference-style definitions resolve
+to canonical page paths before dependency checks and backlink indexing. The Wiki
+renderer uses this same walk when Wiki links are enabled; ordinary non-Wiki routes
+and external URLs remain ordinary links. Code examples, HTML and external URL
+labels are not reinterpreted as Wiki citations. Existing plain Wiki-path prose
+references remain indexed, outside those excluded AST nodes.
+
+This replaces scanning Markdown bytes for link-like substrings. The same actual
+React Markdown renderer and publication resolver have paired synthetic cases;
+the real PostgreSQL publication fixture includes a shorthand and reference-style
+link to one declared source, alongside an external URL, and checks one canonical
+backlink through the registered discovery tool.

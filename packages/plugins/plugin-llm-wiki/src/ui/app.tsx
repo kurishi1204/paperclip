@@ -1,3 +1,4 @@
+import { normalizeWikiLinkPagePath } from "@paperclipai/plugin-sdk/ui";
 import {
   AssigneePicker,
   FileTree,
@@ -1504,44 +1505,6 @@ function writeRouteSidebarExpandedPaths(storageKey: string, paths: ReadonlySet<s
   } catch {
     // Ignore storage failures; the tree still works for the current render.
   }
-}
-
-const ROOT_WIKI_LINK_PAGES = new Set(["WIKI.md", "AGENTS.md", "IDEA.md", "index.md", "log.md"]);
-
-function splitWikiLinkTarget(target: string): { path: string; fragment: string | null } | null {
-  const trimmed = target.trim();
-  if (!trimmed || /^[a-z][a-z\d+.-]*:/i.test(trimmed) || trimmed.startsWith("//")) return null;
-
-  const hashIndex = trimmed.indexOf("#");
-  const rawPath = (hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed)
-    .trim()
-    .replace(/^\/+/, "");
-  if (
-    !rawPath ||
-    rawPath.includes("\\") ||
-    rawPath.split("/").some((segment) => !segment || segment === "." || segment === "..")
-  ) {
-    return null;
-  }
-
-  const fragment = hashIndex >= 0 ? trimmed.slice(hashIndex + 1).trim() || null : null;
-  return { path: rawPath, fragment };
-}
-
-function withMarkdownExtension(path: string): string {
-  return path.toLowerCase().endsWith(".md") ? path : `${path}.md`;
-}
-
-function normalizeWikiLinkPagePath(target: string): { path: string; fragment: string | null } | null {
-  const parsed = splitWikiLinkTarget(target);
-  if (!parsed) return null;
-
-  let path = withMarkdownExtension(parsed.path);
-  if (!path.startsWith("wiki/") && !path.startsWith("raw/") && !ROOT_WIKI_LINK_PAGES.has(path)) {
-    path = `wiki/${path}`;
-  }
-
-  return { path, fragment: parsed.fragment };
 }
 
 function buildWikiLinkHref(target: string, resolveHref: (to: string) => string): string | null {

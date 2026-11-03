@@ -177,7 +177,7 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
         reviewId:proposal.reviewId,ownerDecisionId,operationId:randomUUID(),actorId:"synthetic-owner",runId:null};
       const withdrawal=await (withdraw?withdraw(withdrawalInput,dir):wikiRetractionRuntime(db,pluginId).execute(withdrawalInput));
       const body=encodeWikiRepublicationDraft({companyId,wikiId:"default",spaceSlug:"default",retractionId:withdrawal.retractionId,previousPath:"wiki/child.md",path:newPath,
-        reason:"Responsible author checked current evidence",dependencies:[{path:"wiki/upstream.md",wikiSHA256:registry.entries[2]!.wikiSHA256}]},"# Revalidated conclusion\n\nUse current independent [evidence](wiki/upstream.md#scope).\n");
+        reason:"Responsible author checked current evidence",dependencies:[{path:"wiki/upstream.md",wikiSHA256:registry.entries[2]!.wikiSHA256}]},"# Revalidated conclusion\n\nUse [current][evidence] and [[upstream#scope|independent source]].\n\n[evidence]: upstream.md#scope\n\n[external](https://example.test/wiki/unrelated.md)\n");
       const draft=await reviewedDocument("revalidated",body);
       const another=async(path:string,dependency?:{path:string;wikiSHA256:string})=>{
         const anotherBody=encodeWikiRepublicationDraft({companyId,wikiId:"default",spaceSlug:"default",retractionId:withdrawal.retractionId,previousPath:"wiki/child.md",path,
