@@ -274,3 +274,23 @@ review readers supply that Run; it is excluded from the historical review hash
 and is never accepted from worker arguments. Current space root-folder ownership
 and active status are read under a shared row lock. Unregistered retained files
 keep their separate byte/hold contract and receive no registered proof.
+
+## Namespace and completion identity
+
+While a withdrawal exists, every Wiki-root folder operation checks the recorded
+space against the current `path_prefix`, `root_folder_key` and active status under
+the same lock. Changing a space configuration cannot relocate a withdrawal.
+An invalid binding blocks folder operations until the operator restores it; raw
+capture continues normally when the binding is valid.
+
+New withdrawal fences record the physical paths that were registered. Deleting a
+publication pin cannot downgrade an original page to an unregistered retained
+file. A historical fence without that classification fails closed when the
+current pin is absent. Original unregistered index/log files retain their own
+byte and citation-hold contract.
+
+The republication POST returns the same read-back receipt shape as GET. HTTP 200
+requires matching publication bytes and an appended maintenance record. A
+committed event with a pending/unknown append returns HTTP 409 with its receipt,
+not a claim of operation completion. Repeated POSTs never resume the append;
+use GET to inspect the existing operation.

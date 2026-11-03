@@ -1302,7 +1302,13 @@ export function pluginRoutes(
     const {issueId,documentKey,reviewId,operationId}=req.body;
     if(![issueId,documentKey,reviewId,operationId].every(v=>typeof v==="string"&&v.length>0&&v===v.trim())||
       !/^[0-9a-f-]{36}$/.test(operationId))throw badRequest("Fixed draft, review and UUID operationId are required");
-    res.json(await wikiRepublicationRuntime(db,plugin.id).execute({companyId,issueId,documentKey,reviewId,operationId,actorId:getActorInfo(req).actorId}));
+    const runtime=wikiRepublicationRuntime(db,plugin.id);
+    await runtime.execute({companyId,issueId,documentKey,reviewId,operationId,actorId:getActorInfo(req).actorId});
+    const receipt=await runtime.receipt(companyId,operationId);
+    // A committed publication is distinct from a completed file/log operation.
+    // Repeated POSTs only read back: pending/unknown effects never auto-replay.
+    const complete=receipt.state==="published"&&receipt.file.matchesIntent===true&&receipt.maintenanceLog.state==="appended";
+    res.status(complete?200:409).json(receipt);
   });
   router.get("/plugins/:pluginId/wiki-retractions/republications/:operationId",async(req,res)=>{
     assertBoard(req);const companyId=requirePluginConfigCompanyId(req,req.query.companyId);

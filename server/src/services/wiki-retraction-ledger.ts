@@ -25,6 +25,8 @@ export interface RetractionFence {
   rootPath: string;
   pathPrefix: string;
   mode: "freeze-wiki" | "citation-holds";
+  /** Physical paths registered at withdrawal; absent on historical events. */
+  registeredPaths?: string[];
   readable: Array<{ path: string; contentHash: string }>;
   blocks: Array<{ path: string; contentHash: string; state: "retracted" | "blocked_by_retraction" }>;
 }
@@ -173,6 +175,10 @@ export function validateRetractionEvents(scope: RetractionScope, events: Retract
       for (const item of event.fence.readable) {
         validTarget({ ...event, ...item });
         need(!paths.has(item.path), "fence_readable"); paths.add(item.path);
+      }
+      if(event.fence.registeredPaths!==undefined) {
+        need(Array.isArray(event.fence.registeredPaths)&&new Set(event.fence.registeredPaths).size===event.fence.registeredPaths.length&&
+          event.fence.registeredPaths.every(p=>typeof p==="string"&&paths.has(p)),"fence_registered_paths");
       }
     }
     const { eventHash, ...basis } = event;

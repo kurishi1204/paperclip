@@ -11849,7 +11849,7 @@ registerCurrentRoute({
 // Immutable replacement publication after a withdrawal. Board authorization
 // and server-loaded author/QA records remain mandatory.
 registry.registerPath({method:"post",path:"/api/plugins/{pluginId}/wiki-retractions/republications",tags:["plugins"],
-  summary:"Publish an independently revalidated new Wiki version",request:{params:z.object({pluginId:z.string()}),body:jsonBody(z.object({
+  summary:"Publish a reviewed Wiki version; return its receipt (409 while file or log completion is unresolved)",request:{params:z.object({pluginId:z.string()}),body:jsonBody(z.object({
     companyId:z.string(),issueId:z.string().min(1),documentKey:z.string().min(1),reviewId:z.string().min(1),operationId:z.string().regex(/^[0-9a-f-]{36}$/)}))},
   responses:{200:r.ok(),400:r.badRequest,401:r.unauthorized,403:r.forbidden,404:r.notFound,409:r.conflict}});
 registry.registerPath({method:"get",path:"/api/plugins/{pluginId}/wiki-retractions/republications/{operationId}",tags:["plugins"],

@@ -221,6 +221,22 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
       await expect(withWikiRetractionLock(db,pluginId,f.companyId,tx=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,f.newPath))).rejects.toThrow(/current_space/);
       await db.$client.unsafe(`UPDATE ${ns}.wiki_spaces SET ${field}=$2 WHERE company_id=$1`,[f.companyId,goodValue]);
     }
+    // The common read boundary refuses rebasing even when the new physical
+    // path does not match any old event. Original bytes remain untouched.
+    await mkdir(join(f.dir,"alternate/wiki"),{recursive:true});
+    await writeFile(join(f.dir,"alternate/wiki/p7.md"),await readFile(join(f.dir,"wiki/p7.md")));
+    await db.$client.unsafe(`UPDATE ${ns}.wiki_spaces SET path_prefix='alternate' WHERE company_id=$1`,[f.companyId]);
+    await expect(withWikiRetractionLock(db,pluginId,f.companyId,tx=>readRetractionFolderTextWithStatus(f.dir,"alternate/wiki/p7.md",gate,
+      path=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,path)))).rejects.toThrow(/current_space_binding/);
+    await db.$client.unsafe(`UPDATE ${ns}.wiki_spaces SET path_prefix=NULL WHERE company_id=$1`,[f.companyId]);
+    // Removing an original pin cannot downgrade current proof to raw reading.
+    const currentPins=config!.configJson.publicationReadback as PublicationRegistry;
+    await db.update(pluginConfig).set({configJson:{...config!.configJson,publicationReadback:{...currentPins,entries:currentPins.entries.filter(p=>p.path!==oldChild.path)}}}).where(eq(pluginConfig.id,config!.id));
+    await expect(readHeld()).rejects.toThrow(/current_pin/);
+    await db.update(pluginConfig).set({configJson:config!.configJson}).where(eq(pluginConfig.id,config!.id));
+    // A retained log was never a registered page. Its recorded classification
+    // allows the guarded byte/append contract without fabricating page QA.
+    await withWikiRetractionLock(db,pluginId,f.companyId,tx=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,"wiki/log.md"));
     const currentPage=await db.$client.unsafe(`SELECT source_refs FROM ${ns}.wiki_pages WHERE company_id=$1 AND path=$2`,[f.companyId,f.newPath]);
     const p7=f.registry.entries[0]!;
     const withdrawnRef={kind:"document",issueId:p7.issueId,documentId:p7.documentId,documentKey:p7.documentKey,revisionId:p7.revisionId};

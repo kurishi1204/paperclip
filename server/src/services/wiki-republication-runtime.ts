@@ -17,9 +17,28 @@ const WIKI_PLUGIN="paperclipai.plugin-llm-wiki";
 export async function assertWikiRepublicationTargetPath(root:string,physicalPath:string) {
   publicationNeed(await canonicalWikiRetractionPath(root,physicalPath)===physicalPath,"republication_alias");
 }
+/** A physical fence cannot be rebased by changing the current namespace.
+ * The host calls this under its advisory lock before any folder effect. */
+export async function assertWikiRetractionSpaceBindings(db:Db,pluginId:string,companyId:string,events:RetractionEvent[]) {
+  const active=events.filter(e=>e.type==="executed"&&e.fence);
+  if(!active.length)return;
+  const pluginDb=pluginDatabaseService(db),ns=await pluginDb.getRuntimeNamespace(pluginId);
+  const scopes=new Map(active.map(e=>[JSON.stringify([e.wikiId,e.spaceSlug]),e]));
+  for(const event of scopes.values()) {
+    const rows=await pluginDb.query<{path_prefix:string|null;root_folder_key:string;status:string}>(pluginId,
+      `SELECT path_prefix,root_folder_key,status FROM ${ns}.wiki_spaces WHERE company_id=$1 AND wiki_id=$2 AND slug=$3 FOR SHARE`,
+      [companyId,event.wikiId,event.spaceSlug]);
+    publicationNeed(rows.length===1&&rows[0]!.root_folder_key==="wiki-root"&&rows[0]!.status==="active"&&
+      active.filter(e=>e.wikiId===event.wikiId&&e.spaceSlug===event.spaceSlug)
+        .every(e=>(rows[0]!.path_prefix??"")===e.fence!.pathPrefix),"republication_current_space_binding");
+  }
+}
 /** Current proof for registered originals and new versions. The existing
  * export name is retained for the host/route contract. */
 export async function assertCurrentWikiRepublication(db:Db,pluginId:string,companyId:string,events:RetractionEvent[],physicalPath:string) {
+  // Validate current namespace identity before physical-path classification;
+  // a new prefix must not make every recorded target look unrelated.
+  await assertWikiRetractionSpaceBindings(db,pluginId,companyId,events);
   const matches=events.filter(e=>e.type==="republished"&&e.republication?.physicalPath===physicalPath);
   const original=events.find(e=>e.type==="executed"&&e.fence&&
     [...e.fence.blocks,...e.fence.readable].some(p=>p.path===physicalPath));
@@ -34,9 +53,13 @@ export async function assertCurrentWikiRepublication(db:Db,pluginId:string,compa
     registry.wikiId===event.wikiId&&registry.spaceSlug===event.spaceSlug,"republication_current_space");
   const physical=(p:string)=>spaces[0]!.path_prefix?spaces[0]!.path_prefix+"/"+p:p;
   const target=registry.entries.find(p=>physical(p.path)===physicalPath);
-  // Unregistered retained files (for example the maintenance log) keep their
-  // own byte/hold contract; they never receive a registered publication proof.
-  if(!target){publicationNeed(!matches.length,"republication_current_pin");return;}
+  // Classification is persisted with the withdrawal, never inferred from
+  // today's editable registry. Missing historical classification is unknown.
+  if(!target){
+    publicationNeed(!matches.length&&original?.fence?.registeredPaths!==undefined&&
+      !original.fence.registeredPaths.includes(physicalPath),"republication_current_pin");
+    return;
+  }
   if(matches.length)publicationNeed(physical(event.path)===physicalPath,"republication_current_physical_path");
   const gate=retractionFolderGate(events,companyId,"wiki-root"),root=event.republication?.rootPath??original!.fence!.rootPath;gate.assertRoot(root);
   const loadDocument=async(issueId:string,key:string)=>{
@@ -89,6 +112,7 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
     return event;
   }
   async function plan(tx:Db,input:Request,all:RetractionEvent[]) {
+    await assertWikiRetractionSpaceBindings(tx,pluginId,input.companyId,all);
     const registryService=pluginRegistryService(tx),plugin=await registryService.getById(pluginId);
     if(!plugin||plugin.pluginKey!==WIKI_PLUGIN)throw notFound("Wiki plugin not found");
     const configs=await tx.select().from(pluginConfig).where(and(eq(pluginConfig.pluginId,pluginId),eq(pluginConfig.companyId,input.companyId))).for("update");

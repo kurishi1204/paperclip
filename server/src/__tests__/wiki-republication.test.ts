@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { createPluginLocalFolderTextExclusive,resolvePluginLocalFolderPath } from "../services/plugin-local-folders.js";
 import { executeRetraction,validateRetractionEvents,retractionEventHash,withRetractionMaintenanceLog,retainedRetractionFile,type RetractionEvent,type RetractionStore } from "../services/wiki-retraction-ledger.js";
 import { retractionFolderGate,readRetractionFolderTextWithStatus,readRetractionFolderText } from "../services/wiki-retraction-gate.js";
-import { assertWikiRepublicationTargetPath, wikiRepublicationRuntime } from "../services/wiki-republication-runtime.js";
+import { assertCurrentWikiRepublication, assertWikiRepublicationTargetPath, wikiRepublicationRuntime } from "../services/wiki-republication-runtime.js";
 import { appendRetractionMaintenanceLog } from "../services/wiki-retraction-store.js";
 import { encodeWikiRepublicationDraft,resolveReviewedWikiRepublication,buildWikiRepublicationEvent,verifyCurrentWikiRepublication } from "../services/wiki-republication.js";
 import { publicationCanonical,publicationHash,reviewBasis,verifyWikiPublication,type JsonObject,type PublicationRegistry } from "../services/wiki-publication-readback.js";
@@ -201,5 +201,27 @@ test("both structured UI reads and ordinary reads reject a publication after its
   await assert.rejects(readRetractionFolderTextWithStatus(f.root,plan.draft.path,gate,verify),/current_review/);
   await assert.rejects(readRetractionFolderText(f.root,plan.draft.path,gate,verify),/current_review/);
   assert.equal(await readRetractionFolderText(f.root,"wiki/upstream.md",gate,verify),f.pages["wiki/upstream.md"]!.body);
+ }finally{await f.cleanup();}
+});
+
+test("changed space prefix cannot rebase a durable withdrawal onto another physical tree",async()=>{
+ const f=await fixture();try{
+  const row={status:"active",namespaceName:"plugin_synthetic",manifestJson:{database:{}},configJson:{publicationReadback:f.registry}};
+  const tx={select:()=>({from:()=>({where:()=>({limit:async()=>[row],for:async()=>[row]})})}),
+   execute:async()=>[{id:"space",path_prefix:"alternate",root_folder_key:"wiki-root",status:"active"}]};
+  // The previous implementation returned before consulting any current space.
+  await assert.rejects(assertCurrentWikiRepublication(tx as any,"plugin","c",f.events,"alternate/wiki/p7.md"),/current_space_binding/);
+ }finally{await f.cleanup();}
+});
+test("removing an original held publication pin does not remove its current-QA requirement",async()=>{
+ const f=await fixture();try{
+  // The immutable event records which original paths were registered. This
+  // fixture also covers a legacy event without that optional classification:
+  // an unknown retained-body identity must not silently skip current QA.
+  const pins={...f.registry,entries:f.registry.entries.filter(p=>p.path!=="wiki/child.md")};
+  const row={status:"active",namespaceName:"plugin_synthetic",manifestJson:{database:{}},configJson:{publicationReadback:pins}};
+  const tx={select:()=>({from:()=>({where:()=>({limit:async()=>[row],for:async()=>[row]})})}),
+   execute:async()=>[{id:"space",path_prefix:"",root_folder_key:"wiki-root",status:"active"}]};
+  await assert.rejects(assertCurrentWikiRepublication(tx as any,"plugin","c",f.events,"wiki/child.md"),/current_pin/);
  }finally{await f.cleanup();}
 });

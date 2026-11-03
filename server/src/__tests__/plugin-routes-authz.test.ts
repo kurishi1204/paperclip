@@ -1237,13 +1237,23 @@ describe("reviewed Wiki republication HTTP boundary",()=>{
   });
   it("uses the authenticated Board actor and reads the scoped receipt without rerunning publication",async()=>{
     const {app}=await createApp(boardActor());mockRepublication.execute.mockResolvedValue({type:"republished"});
-    mockRepublication.receipt.mockResolvedValue({state:"published",automaticRetryAllowed:false});
+    mockRepublication.receipt.mockResolvedValue({state:"published",file:{present:true,matchesIntent:true},maintenanceLog:{state:"appended"},automaticRetryAllowed:false});
     const result=await request(app).post(endpoint).send({...body,actorId:"forged",runId:"forged"});
     expect(result.status,JSON.stringify(result.body)).toBe(200);
     expect(mockRepublication.execute).toHaveBeenCalledExactlyOnceWith({...body,actorId:"user-1"});
     const receipt=await request(app).get(endpoint+"/"+operationId).query({companyId:companyA});
     expect(receipt.status).toBe(200);expect(receipt.body.automaticRetryAllowed).toBe(false);
-    expect(mockRepublication.receipt).toHaveBeenCalledExactlyOnceWith(companyA,operationId);
+    expect(mockRepublication.receipt).toHaveBeenCalledWith(companyA,operationId);
+    expect(mockRepublication.receipt).toHaveBeenCalledTimes(2);
+    expect(mockRepublication.execute).toHaveBeenCalledTimes(1);
+  });
+  it.each(["pending","unknown"])("does not return POST success for a %s maintenance append",async(state)=>{
+    const {app}=await createApp(boardActor());
+    mockRepublication.execute.mockResolvedValue({type:"republished"});
+    mockRepublication.receipt.mockResolvedValue({state:"published",file:{present:true,matchesIntent:true},maintenanceLog:{state},automaticRetryAllowed:false});
+    const result=await request(app).post(endpoint).send(body);
+    expect(result.status).toBe(409);expect(result.body.maintenanceLog.state).toBe(state);
+    expect(result.body.state).toBe("published");expect(result.body.automaticRetryAllowed).toBe(false);
     expect(mockRepublication.execute).toHaveBeenCalledTimes(1);
   });
   it("refuses a noncanonical operation identity without any publication effect",async()=>{

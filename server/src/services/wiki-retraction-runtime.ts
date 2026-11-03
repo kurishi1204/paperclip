@@ -96,6 +96,7 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
       target: { ...scope, path: targetPath, contentHash: targetPin.wikiSHA256 }, reason,
       publicationRegistrySHA256: publicationHash(publicationCanonical(pins)),
       fence: { folderKey: "wiki-root", rootPath, pathPrefix: space.path_prefix ?? "", mode: "citation-holds", blocks,
+        registeredPaths: pins.entries.map(p=>toPhysical(p.path)).sort(),
         readable: pins.entries.filter(p => !held.has(p.path)).map(p => ({ path: toPhysical(p.path), contentHash: p.wikiSHA256 })).sort((a,b)=>a.path.localeCompare(b.path)) } };
   }
   return {

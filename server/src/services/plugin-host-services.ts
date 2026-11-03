@@ -50,7 +50,7 @@ import { pluginStateStore } from "./plugin-state-store.js";
 import { pluginLifecycleInbox } from "./plugin-lifecycle-inbox.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { loadAllWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
-import { assertCurrentWikiRepublication } from "./wiki-republication-runtime.js";
+import { assertCurrentWikiRepublication, assertWikiRetractionSpaceBindings } from "./wiki-republication-runtime.js";
 import { retractionFolderGate, readRetractionFolderText, readRetractionFolderTextWithStatus, canonicalWikiRetractionPath as canonicalFolderPath } from "./wiki-retraction-gate.js";
 import { pluginManagedAgentService } from "./plugin-managed-agents.js";
 import { pluginManagedRoutineService } from "./plugin-managed-routines.js";
@@ -829,6 +829,7 @@ export function buildHostServices(
       const events=await loadAllWikiRetractions(tx, pluginId, companyId);
       const gate = retractionFolderGate(events, companyId, folderKey);
       if (gate.active) {
+        await assertWikiRetractionSpaceBindings(tx,pluginId,companyId,events);
         const folder = await inspectStoredLocalFolder(companyId, folderKey, tx);
         gate.assertRoot(folder.realPath ?? "");
       }
