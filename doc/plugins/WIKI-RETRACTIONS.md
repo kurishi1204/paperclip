@@ -114,3 +114,12 @@ walk's `truncated` bit is preserved through the host; the UI consumer reports
 `E_WIKI_LOCAL_SCAN_INCOMPLETE` rather than presenting a partial or empty list as
 complete. SQL collection uses batches even when the caller requests one result;
 the caller's visible count and the existing scan bound are still respected.
+
+All indexed discovery consumers, including the UI's readable-page and
+readable-source variants, now share one visibility/error policy. During an
+active withdrawal only an explicit withdrawal tombstone removes a row; other
+boundary errors fail the request. Inactive ordinary metadata may still precede
+a materialized raw file, and inactive readable-only lists still omit unreadable
+files. The active root-change failure is exercised through the actual gate and
+UI consumers, with a fixed SDK status fixture; it is not an authenticated HTTP
+acceptance claim.

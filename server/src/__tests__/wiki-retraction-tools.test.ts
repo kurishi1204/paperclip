@@ -16,7 +16,7 @@ test("actual registered Wiki tools and UI page read stop withdrawn bodies and di
     await mkdir(join(dir,"wiki"));
     const bodies: Record<string,string> = { "wiki/p7.md": "Withdrawn original", "wiki/child.md": "Derived original", "wiki/upstream.md": "Usable upstream" };
     for (const [p,b] of Object.entries(bodies)) await writeFile(join(dir,p),b);
-    let events: RetractionEvent[] = [];
+    let events: RetractionEvent[] = [];let activeRoot=dir;
     const handlers = new Map<string, (input: unknown) => Promise<any>>();
     const allRows = Object.keys(bodies).map(p => ({ kind: "page", path: p, title: p === "wiki/upstream.md" ? "Usable" : "WITHDRAWN SNIPPET", page_type: "source", match_text: "source" }));
     const sourceRows: Array<Record<string, unknown>> = [];
@@ -35,11 +35,15 @@ test("actual registered Wiki tools and UI page read stop withdrawn bodies and di
       } },
       localFolders: {
         status: async () => ({ wikiRetractions: { state: events.length ? "active" : "inactive" } }),
-        readText: async (_c: string, _k: string, p: string) => { const gate = retractionFolderGate(events,"c","wiki-root"); gate.assertRoot(dir); gate.assertRead(p); const physical=await canonicalWikiRetractionPath(dir,p);gate.assertRead(physical);const b=await readFile(join(dir,p),"utf8");gate.assertRead(physical,b);return b; },
+        readText: async (_c: string, _k: string, p: string) => { const gate = retractionFolderGate(events,"c","wiki-root"); gate.assertRoot(activeRoot); gate.assertRead(p); const physical=await canonicalWikiRetractionPath(dir,p);gate.assertRead(physical);const b=await readFile(join(dir,p),"utf8");gate.assertRead(physical,b);return b; },
         writeTextAtomic: async (_c: string, _k: string, p: string,b: string) => { retractionFolderGate(events,"c","wiki-root").assertWrite(p); await writeFile(join(dir,p),b); },
       },
     } as unknown as PluginContext;
     await registerWikiTools(ctx);
+    sourceRows.push({raw_path:"raw/not-materialized.md",title:"Captured metadata",source_type:"manual",url:null,status:"captured",created_at:"2026-11-03"});
+    assert.deepEqual((await listSources(ctx,{companyId:"c",limit:1})).sources.map(row=>row.rawPath),["raw/not-materialized.md"]);
+    sourceRows.length=0;
+
     const args={companyId:"c",wikiId:"default",spaceSlug:"default",path:"wiki/p7.md",query:"fact"};
     assert.equal((await handlers.get("wiki_read_page")!(args)).content,bodies["wiki/p7.md"]);
     const target={companyId:"c",wikiId:"default",spaceSlug:"default",path:"wiki/p7.md",contentHash:publicationHash(bodies["wiki/p7.md"]!)};
@@ -84,6 +88,11 @@ test("actual registered Wiki tools and UI page read stop withdrawn bodies and di
     (ctx.localFolders as unknown as {list:()=>Promise<unknown>}).list=async()=>({...rawWindow,entries:[]});
     await expect.soft(listPages(ctx,{...args,pageType:"source",includeRaw:true,limit:1})).rejects.toThrow(/E_WIKI_LOCAL_SCAN_INCOMPLETE/);
 
+
+    activeRoot=join(dir,"changed-root");await mkdir(activeRoot);
+    await expect.soft(listPages(ctx,{...args,pageType:"source",includeRaw:false,limit:1})).rejects.toThrow(/runtime_root_changed/);
+    await expect.soft(listSources(ctx,{...args,onlyReadable:true,limit:1})).rejects.toThrow(/runtime_root_changed/);
+    activeRoot=dir;
     // Exhaustion must be reported, never disguised as an empty complete search.
     for(let i=0;i<2001;i++)allRows.push({kind:"page",path:`wiki/000-cap-${String(i).padStart(4,"0")}.md`,title:"WITHDRAWN SNIPPET",page_type:"source",match_text:"source"});
     queryWindowCalls=0;

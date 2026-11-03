@@ -1739,23 +1739,6 @@ async function readCurrentWithHash(
   }
 }
 
-async function filterReadableRows<T>(
-  ctx: PluginContext,
-  companyId: string,
-  space: Pick<WikiSpace, "pathPrefix">,
-  rows: T[],
-  pathForRow: (row: T) => string,
-): Promise<T[]> {
-  const checks: Array<T | null> = await Promise.all(rows.map(async (row): Promise<T | null> => {
-    try {
-      await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, pathForRow(row)));
-      return row;
-    } catch {
-      return null;
-    }
-  }));
-  return checks.filter((row): row is T => row != null);
-}
 
 async function listLocalFiles(ctx: PluginContext, input: { companyId: string; space: Pick<WikiSpace, "pathPrefix">; relativePath: "wiki" | "raw" }): Promise<PluginLocalFolderEntry[]> {
   const relativePath = spaceRelativePath(input.space, input.relativePath);
@@ -4137,22 +4120,32 @@ export async function fileQueryAnswerAsPage(ctx: PluginContext, input: FileQuery
 
 /** The host supplies withdrawal state through the common file boundary.
  * Rebuild discovery text as well as data; never retain withdrawn snippets. */
-async function filterRetractionRows<T>(ctx: PluginContext, companyId: string, space: WikiSpace,
-  rows: T[], pathFor: (row: T) => string) {
+async function filterWikiRows<T>(ctx: PluginContext, companyId: string, space: Pick<WikiSpace, "pathPrefix">,
+  rows: T[], pathFor: (row: T) => string, onlyReadable = false) {
   const status = await ctx.localFolders.status(companyId, WIKI_ROOT_FOLDER_KEY);
-  if (status.wikiRetractions?.state !== "active") return { rows,
+  const held = status.wikiRetractions?.state === "active";
+  if (!held && !onlyReadable) return { rows,
     retractionReadback: { state: "inactive", hiddenCount: 0, tombstones: [] as unknown[] } };
-  const active: T[] = []; const tombstones: unknown[] = [];
-  for (const row of rows) {
-    try { await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, pathFor(row))); active.push(row); }
-    catch (error) {
+  // Every discovery consumer uses this policy. During a hold, only a known
+  // withdrawal may hide a row. Root/permission/transport errors remain errors.
+  const checked = await Promise.all(rows.map(async row => {
+    try {
+      await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, pathFor(row)));
+      return { row, tombstone: null as unknown };
+    } catch (error) {
+      if (!held) return { row: null, tombstone: null as unknown };
       const message = error instanceof Error ? error.message : String(error);
       const marker = message.indexOf("E_SOURCE_RETRACTED ");
       if (marker < 0) throw error;
-      tombstones.push(JSON.parse(message.slice(marker + "E_SOURCE_RETRACTED ".length)));
+      return { row: null, tombstone: JSON.parse(message.slice(marker + "E_SOURCE_RETRACTED ".length)) as unknown };
     }
+  }));
+  const active: T[] = []; const tombstones: unknown[] = [];
+  for (const result of checked) {
+    if (result.row !== null) active.push(result.row);
+    if (result.tombstone !== null) tombstones.push(result.tombstone);
   }
-  return { rows: active, retractionReadback: { state: "checked", hiddenCount: tombstones.length, tombstones } };
+  return { rows: active, retractionReadback: { state: held ? "checked" : "inactive", hiddenCount: tombstones.length, tombstones } };
 }
 
 /** Apply visibility before the caller's result limit. Hidden rows consume scan
@@ -4208,7 +4201,7 @@ export async function registerWikiTools(ctx: PluginContext) {
        ORDER BY kind, path
        LIMIT $4 OFFSET $6`,
       [companyId, wikiId, `%${query}%`, take, space.id, offset],
-    ), rows => filterRetractionRows(ctx, companyId, space, rows, row => row.path));
+    ), rows => filterWikiRows(ctx, companyId, space, rows, row => row.path));
     return {
       content: checked.rows.length ? checked.rows.map((row) => `${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No wiki matches found.",
       data: { companyId, wikiId, spaceSlug: space.slug, query, results: checked.rows, retractionReadback: checked.retractionReadback },
@@ -4300,7 +4293,7 @@ export async function registerWikiTools(ctx: PluginContext) {
         ORDER BY created_at DESC, raw_path
         LIMIT $3 OFFSET $5`,
       [companyId, wikiId, take, space.id, offset],
-    ), rows => filterRetractionRows(ctx, companyId, space, rows, row => row.raw_path));
+    ), rows => filterWikiRows(ctx, companyId, space, rows, row => row.raw_path));
     return {
       content: checked.rows.length ? checked.rows.map((row) => `${row.raw_path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No sources captured yet.",
       data: { companyId, wikiId, spaceSlug: space.slug, sources: checked.rows, retractionReadback: checked.retractionReadback },
@@ -4386,7 +4379,7 @@ export async function registerWikiTools(ctx: PluginContext) {
         ORDER BY path
         LIMIT $5 OFFSET $6`,
       [companyId, wikiId, path, space.id, take, offset],
-    ), rows => filterRetractionRows(ctx, companyId, space, rows, row => row.path));
+    ), rows => filterWikiRows(ctx, companyId, space, rows, row => row.path));
     return {
       content: checked.rows.length ? checked.rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No backlinks indexed.",
       data: { companyId, wikiId, spaceSlug: space.slug, path, backlinks: checked.rows, retractionReadback: checked.retractionReadback },
@@ -4406,7 +4399,7 @@ export async function registerWikiTools(ctx: PluginContext) {
     const checked = await collectVisibleRows<{ path: string; title: string | null; page_type: string | null }>(limit, (take, offset) => ctx.db.query<{ path: string; title: string | null; page_type: string | null }>(
       `SELECT path, title, page_type FROM ${tableName(ctx.db.namespace, "wiki_pages")} WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 ORDER BY path LIMIT $4 OFFSET $5`,
       [companyId, wikiId, space.id, take, offset],
-    ), rows => filterRetractionRows(ctx, companyId, space, rows, row => row.path));
+    ), rows => filterWikiRows(ctx, companyId, space, rows, row => row.path));
     return {
       content: checked.rows.length ? checked.rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No pages indexed yet.",
       data: { companyId, wikiId, spaceSlug: space.slug, pages: checked.rows, retractionReadback: checked.retractionReadback },
@@ -4506,7 +4499,7 @@ export async function listPages(ctx: PluginContext, input: {
       ORDER BY path
       LIMIT $${limitIndex} OFFSET $${limitIndex + 1}`,
     [...params.slice(0, -1), take, offset],
-  ), async rows => ({ rows: await filterReadableRows(ctx, input.companyId, space, rows, row => row.path) }));
+  ), rows => filterWikiRows(ctx, input.companyId, space, rows, row => row.path, true));
   const readablePageRows = pageResult.rows;
   const pages: WikiPageRow[] = readablePageRows.map((row) => ({
     path: row.path,
@@ -4548,9 +4541,7 @@ export async function listSources(ctx: PluginContext, input: {
       ORDER BY created_at DESC, raw_path
       LIMIT $3 OFFSET $5`,
     [input.companyId, wikiId, take, space.id, offset],
-  ), rows => input.onlyReadable
-    ? filterReadableRows(ctx, input.companyId, space, rows, row => row.raw_path).then(rows => ({ rows }))
-    : filterRetractionRows(ctx, input.companyId, space, rows, row => row.raw_path));
+  ), rows => filterWikiRows(ctx, input.companyId, space, rows, row => row.raw_path, input.onlyReadable));
   const sourceRows = sourceResult.rows;
   return {
     sources: sourceRows.map((row) => ({
