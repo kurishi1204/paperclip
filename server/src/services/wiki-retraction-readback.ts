@@ -51,3 +51,20 @@ export function filterRetractedWikiResults<T extends { content?: unknown; data?:
   return { ...result, content, data: { ...data, [field]: rows,
     retractionReadback: { state: "checked", hiddenCount: hidden.length, tombstones: hidden } } };
 }
+
+/** Unregistered pages require follow-up only when they cite the affected
+ * document versions. An unrelated registered source must not block withdrawal. */
+export function assertNoUnregisteredRetractionDependants(
+  pins: Array<Pick<PublicationRegistry["entries"][number], "path" | "issueId" | "documentId" | "documentKey" | "revisionId">>,
+  rows: Array<{ path: string; source_refs: unknown }>, held: ReadonlySet<string>,
+) {
+  const docKeys = new Set(pins.filter(pin => held.has(pin.path))
+    .map(pin => JSON.stringify([pin.issueId, pin.documentId, pin.documentKey, pin.revisionId])));
+  for (const row of rows.filter(row => !pins.some(pin => pin.path === row.path))) {
+    publicationNeed(Array.isArray(row.source_refs), "retraction_reference_shape");
+    for (const ref of row.source_refs as JsonObject[]) if (ref.kind === "document") {
+      const key = JSON.stringify([ref.issueId, ref.documentId, ref.documentKey, ref.revisionId]);
+      publicationNeed(!docKeys.has(key), "retraction_unregistered_dependant");
+    }
+  }
+}

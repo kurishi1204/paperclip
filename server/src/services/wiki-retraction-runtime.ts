@@ -11,7 +11,7 @@ import { executeRetraction, type RetractionFence, type RetractionScope, type Ret
 import { loadAllWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
 import { resolveReviewedWikiRetraction } from "./wiki-retraction-approval.js";
 import { retractionFolderGate } from "./wiki-retraction-gate.js";
-import { buildRetractionGraph } from "./wiki-retraction-readback.js";
+import { buildRetractionGraph, assertNoUnregisteredRetractionDependants } from "./wiki-retraction-readback.js";
 import { parsePublicationRegistry, publicationCanonical, publicationHash, publicationNeed, type JsonObject } from "./wiki-publication-readback.js";
 
 export interface WikiRetractionProposal {
@@ -71,14 +71,7 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
     // Existing unregistered pages cannot silently escape dependency analysis.
     // A target-linked document reference outside the registered graph requires
     // registration/review before preview; no guessed classification is accepted.
-    const docKeys = new Set(pins.entries.map(p => JSON.stringify([p.issueId,p.documentId,p.documentKey,p.revisionId])));
-    for (const row of rows.filter(r => !pins.entries.some(p => p.path === r.path))) {
-      publicationNeed(Array.isArray(row.source_refs), "retraction_reference_shape");
-      for (const ref of row.source_refs as JsonObject[]) if (ref.kind === "document") {
-        const key = JSON.stringify([ref.issueId,ref.documentId,ref.documentKey,ref.revisionId]);
-        publicationNeed(!docKeys.has(key), "retraction_unregistered_dependant");
-      }
-    }
+    assertNoUnregisteredRetractionDependants(pins.entries, rows, held);
     // Index/log bytes remain untouched and available only in the audit view.
     held.add("wiki/index.md"); held.add("wiki/log.md");
     const blocks: RetractionFence["blocks"] = [];

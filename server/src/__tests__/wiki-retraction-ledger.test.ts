@@ -7,7 +7,7 @@ import { executeRetraction, readRetractions, retractionBlock, validateRetraction
   type RetractionEvent, type RetractionScope, type RetractionStore } from "../services/wiki-retraction-ledger.js";
 import { applyWikiPublicationReadback, publicationCanonical, publicationHash,
   type JsonObject, type PublicationRegistry } from "../services/wiki-publication-readback.js";
-import { buildRetractionGraph, filterRetractedWikiResults } from "../services/wiki-retraction-readback.js";
+import { buildRetractionGraph, filterRetractedWikiResults, assertNoUnregisteredRetractionDependants } from "../services/wiki-retraction-readback.js";
 
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), "wiki-retraction-"));
@@ -169,4 +169,16 @@ test("search, page listing and backlinks omit both withdrawn and dependent snipp
     (pages.direct!.sourceRefs as unknown[]).pop();
     await assert.rejects(buildRetractionGraph(registry, async p => pages[p]!), /retraction_references_changed/);
   } finally { await f.close(); }
+});
+
+test("unregistered references block only affected document versions, including indirect holds", () => {
+  const a = { path: "wiki/a.md", issueId: "a", documentId: "doc-a", documentKey: "body", revisionId: "a-v1" };
+  const b = { path: "wiki/b.md", issueId: "b", documentId: "doc-b", documentKey: "body", revisionId: "b-v1" };
+  const ref = (pin: typeof a) => ({ kind: "document", issueId: pin.issueId, documentId: pin.documentId,
+    documentKey: pin.documentKey, revisionId: pin.revisionId });
+  const c = (pin: typeof a) => [{ path: "wiki/unregistered-c.md", source_refs: [ref(pin)] }];
+  assert.doesNotThrow(() => assertNoUnregisteredRetractionDependants([a,b], c(b), new Set([a.path])));
+  assert.throws(() => assertNoUnregisteredRetractionDependants([a,b], c(a), new Set([a.path])), /unregistered_dependant/);
+  assert.throws(() => assertNoUnregisteredRetractionDependants([a,b], c(b), new Set([a.path,b.path])), /unregistered_dependant/);
+  assert.throws(() => assertNoUnregisteredRetractionDependants([a,b], [{path:"wiki/c.md",source_refs:null}], new Set([a.path])), /reference_shape/);
 });
