@@ -5,7 +5,7 @@ import { publicationNeed } from "./wiki-publication-readback.js";
 import { retractionFolderGate } from "./wiki-retraction-gate.js";
 import { constants, promises as fs } from "node:fs";
 import path from "node:path";
-import { getStoredLocalFolders, readPluginLocalFolderText, resolvePluginLocalFolderPath } from "./plugin-local-folders.js";
+import { getStoredLocalFolders, inspectPluginLocalFolder, readPluginLocalFolderText, resolvePluginLocalFolderPath } from "./plugin-local-folders.js";
 import { RetractionError, retainedRetractionFile, validateRetractionEvents } from "./wiki-retraction-ledger.js";
 import { and, eq, sql } from "drizzle-orm";
 import { activityLog, pluginCompanySettings, type Db } from "@paperclipai/db";
@@ -116,6 +116,7 @@ export async function loadCurrentWikiRetractions(db:Db,pluginId:string,companyId
 /** Resolve the nearest existing ancestor without creating a directory.
  * Missing descendants still claim their future physical namespace. */
 async function prospectiveWikiRoot(input:string) {
+  publicationNeed(typeof input==="string"&&path.isAbsolute(input),"root_absolute");
   let ancestor=path.resolve(input);const suffix:string[]=[];
   for(;;){
     try{return path.join(await fs.realpath(ancestor),...suffix);}
@@ -171,4 +172,14 @@ export async function readWikiMaintenanceState(event:RetractionEvent,events:Retr
     const sha256=createHash("sha256").update(contents).digest("hex"),appendEnd=log.prefixBytes+Buffer.byteLength(log.appendText);
     return {state:Buffer.byteLength(contents)>=appendEnd?"appended":"pending",sha256};
   }catch(error){return {state:"unknown",error:error instanceof Error?error.message:"log read failed"};}
+}
+
+/** Inspection can write a capability probe. Own the prospective target under
+ * the same claim lock BEFORE calling the inspector, even for status/validate. */
+export async function inspectWikiLocalFolder(db:Db,pluginId:string,companyId:string,input:Parameters<typeof inspectPluginLocalFolder>[0]) {
+  return withWikiRetractionLock(db,pluginId,companyId,async tx=>{
+    const root=input.overrideConfig?.path??input.storedConfig?.path;
+    if(root)await assertWikiConfiguredRoot(tx,pluginId,companyId,root);
+    return inspectPluginLocalFolder(input);
+  });
 }

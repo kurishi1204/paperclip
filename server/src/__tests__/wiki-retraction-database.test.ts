@@ -365,6 +365,12 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     const otherCompany=randomUUID();await db.insert(companies).values({id:otherCompany,name:"Synthetic other root owner",issuePrefix:"X"+otherCompany.replaceAll("-","").slice(0,12)});
     const {buildHostServices}=await import("../services/plugin-host-services.js");
     const host=buildHostServices(db,pluginId,wikiManifest.id,{forPlugin:()=>({clear:()=>{}})} as never,undefined,{manifest:wikiManifest});
+    const foreignProbes:string[]=[],allProbes:string[]=[],write=fs.writeFile;
+    const writes=vi.spyOn(fs,"writeFile").mockImplementation(async(path,data,options)=>{
+      if(String(path).includes("/.paperclip-local-folder-probe-"))allProbes.push(String(path));
+      if(String(path).startsWith(join(f.dir,".paperclip-local-folder-probe-")))foreignProbes.push(String(path));
+      return write(path,data,options);
+    });
     try {
       // Both public root configuration writers reject the proposed target.
       await expect(host.localFolders.configure({companyId:otherCompany,folderKey:"wiki-root",path:f.dir})).rejects.toThrow(/runtime_root_shared/);
@@ -381,11 +387,19 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
       // A bad existing mapping can be corrected to a distinct owned root.
       const safeRoot=await realpath(await mkdtemp(join(tmpdir(),"wiki-other-owner-")));roots.push(safeRoot);
       await host.localFolders.configure({companyId:otherCompany,folderKey:"wiki-root",path:safeRoot});
+      expect(allProbes.some(p=>p.startsWith(safeRoot+"/"))).toBe(true);
       await db.update(pluginCompanySettings).set({settingsJson:{localFolders:{"wiki-root":{path:f.dir,access:"readWrite"}}}}).where(eq(pluginCompanySettings.companyId,otherCompany));
       const before=await readFile(join(f.dir,"wiki/p7.md"));
       await expect(host.localFolders.writeTextAtomic({companyId:otherCompany,folderKey:"wiki-root",relativePath:"wiki/p7.md",contents:"cross-company overwrite"})).rejects.toThrow(/runtime_root_shared/);
       expect(await readFile(join(f.dir,"wiki/p7.md"))).toEqual(before);
-    }finally{host.dispose();await db.delete(pluginCompanySettings).where(eq(pluginCompanySettings.companyId,otherCompany));}
+      for(const suffix of ["","/wiki-root/status"]){
+        const statusHTTP=await request(appFor(otherCompany,true)).get(`/api/plugins/${pluginId}/companies/${otherCompany}/local-folders`+suffix);
+        expect(statusHTTP.status,JSON.stringify(statusHTTP.body)).toBe(409);
+      }
+      const validateHTTP=await request(appFor(otherCompany,true)).post(`/api/plugins/${pluginId}/companies/${otherCompany}/local-folders/wiki-root/validate`).send({path:f.dir});
+      expect(validateHTTP.status,JSON.stringify(validateHTTP.body)).toBe(409);
+      expect(foreignProbes).toEqual([]);
+    }finally{writes.mockRestore();host.dispose();await db.delete(pluginCompanySettings).where(eq(pluginCompanySettings.companyId,otherCompany));}
 
     // Exclusive configuration claims prevent two companies from choosing
     // the same new physical root concurrently. No file effect runs twice.

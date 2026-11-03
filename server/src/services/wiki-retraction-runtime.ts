@@ -8,7 +8,7 @@ import { pluginDatabaseService } from "./plugin-database.js";
 import { assertConfiguredLocalFolder, getStoredLocalFolders, inspectPluginLocalFolder, readPluginLocalFolderText,
   requireLocalFolderDeclaration, resolvePluginLocalFolderPath } from "./plugin-local-folders.js";
 import { executeRetraction, withRetractionMaintenanceLog, retainedRetractionFile, RetractionError, type RetractionFence, type RetractionScope, type RetractionStore, type RetractionTarget } from "./wiki-retraction-ledger.js";
-import { loadAllWikiRetractions, loadCurrentWikiRetractions, withWikiRetractionLock, assertWikiRootOwnership, appendCommittedWikiMaintenance, readWikiMaintenanceState } from "./wiki-retraction-store.js";
+import { loadAllWikiRetractions, loadCurrentWikiRetractions, withWikiRetractionLock, inspectWikiLocalFolder, assertWikiRootOwnership, appendCommittedWikiMaintenance, readWikiMaintenanceState } from "./wiki-retraction-store.js";
 import { resolveReviewedWikiRetraction } from "./wiki-retraction-approval.js";
 import { retractionFolderGate } from "./wiki-retraction-gate.js";
 import { buildRetractionGraph, assertNoUnregisteredRetractionDependants } from "./wiki-retraction-readback.js";
@@ -31,7 +31,7 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
     const plugin = await registry.getById(pluginId);
     if (!plugin || plugin.pluginKey !== WIKI_PLUGIN) throw notFound("Wiki plugin not found");
     const settings = await registry.getCompanySettings(pluginId, companyId);
-    const folder = await inspectPluginLocalFolder({ folderKey: "wiki-root",
+    const folder = await inspectWikiLocalFolder(connection,pluginId,companyId,{ folderKey: "wiki-root",
       declaration: requireLocalFolderDeclaration(plugin.manifestJson.localFolders, "wiki-root"),
       storedConfig: getStoredLocalFolders(settings?.settingsJson)["wiki-root"] ?? null });
     assertConfiguredLocalFolder(folder);

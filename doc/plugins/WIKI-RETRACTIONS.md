@@ -327,3 +327,10 @@ Root configuration takes an exclusive plugin claim lock. Normal operations share
 that lock, in addition to the company operation lock. Both public configuration
 writers use the same prospective-root contract; creating a missing parent is not
 an escape from ownership checks. Historical receipt/audit reads remain available.
+
+
+Folder inspection itself can create a write probe. All Wiki inspectors (host
+access/configuration, Board list/status/validate/configuration, and withdrawal or
+publication setup) therefore pass one guarded inspector. It checks the selected
+prospective path under the claim lock before inspection. Refused foreign roots
+receive no probe writes. Tests count attempted probe writes, not just final files.

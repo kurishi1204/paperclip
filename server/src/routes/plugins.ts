@@ -92,7 +92,7 @@ import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { secretService } from "../services/secrets.js";
 import { wikiRetractionRuntime } from "../services/wiki-retraction-runtime.js";
-import { assertWikiConfiguredRoot, withWikiRetractionLock } from "../services/wiki-retraction-store.js";
+import { inspectWikiLocalFolder, assertWikiConfiguredRoot, withWikiRetractionLock } from "../services/wiki-retraction-store.js";
 import { wikiRepublicationRuntime } from "../services/wiki-republication-runtime.js";
 import { HttpError, badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 
@@ -542,6 +542,11 @@ async function sendWikiOperationReceipt(res:Response,operationId:string,kind:"re
   const complete=!completionIssue&&receipt.maintenanceLog.state==="appended"&&
     (kind==="retraction"?receipt.state==="withdrawn":receipt.state==="published"&&receipt.file?.matchesIntent===true);
   res.status(complete?200:409).json({...receipt,...(completionIssue?{completionIssue}:{})});
+}
+
+function inspectScopedLocalFolder(connection:Db,plugin:{id:string;pluginKey:string},companyId:string,input:Parameters<typeof inspectPluginLocalFolder>[0]) {
+  return plugin.pluginKey==="paperclipai.plugin-llm-wiki"&&input.folderKey==="wiki-root"
+    ?inspectWikiLocalFolder(connection,plugin.id,companyId,input):inspectPluginLocalFolder(input);
 }
 
 export function pluginRoutes(
@@ -2949,7 +2954,7 @@ export function pluginRoutes(
     const folderKeys = declarations.map((declaration) => declaration.folderKey);
 
     const statuses = await Promise.all(folderKeys.map((folderKey) =>
-      inspectPluginLocalFolder({
+      inspectScopedLocalFolder(db,plugin,companyId,{
         folderKey,
         declaration: findLocalFolderDeclaration(declarations, folderKey),
         storedConfig: storedFolders[folderKey] ?? null,
@@ -2978,7 +2983,7 @@ export function pluginRoutes(
     const storedFolders = getStoredLocalFolders(settings?.settingsJson);
     const declarations = plugin.manifestJson.localFolders ?? [];
     const declaration = requireLocalFolderDeclaration(declarations, folderKey);
-    const status = await inspectPluginLocalFolder({
+    const status = await inspectScopedLocalFolder(db,plugin,companyId,{
       folderKey,
       declaration,
       storedConfig: storedFolders[folderKey] ?? null,
@@ -3009,7 +3014,7 @@ export function pluginRoutes(
     }
 
     const declaration = requireLocalFolderDeclaration(plugin.manifestJson.localFolders ?? [], folderKey);
-    const status = await inspectPluginLocalFolder({
+    const status = await inspectScopedLocalFolder(db,plugin,companyId,{
       folderKey,
       declaration,
       overrideConfig: {
@@ -3047,7 +3052,7 @@ export function pluginRoutes(
       const scopedRegistry=pluginRegistryService(connection);
       const existing = await scopedRegistry.getCompanySettings(plugin.id, companyId);
     const declaration = requireLocalFolderDeclaration(plugin.manifestJson.localFolders ?? [], folderKey);
-    const status = await inspectPluginLocalFolder({
+    const status = await inspectScopedLocalFolder(connection,plugin,companyId,{
       folderKey,
       declaration,
       storedConfig: getStoredLocalFolders(existing?.settingsJson)[folderKey] ?? null,

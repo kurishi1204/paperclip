@@ -49,7 +49,7 @@ import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginStateStore } from "./plugin-state-store.js";
 import { pluginLifecycleInbox } from "./plugin-lifecycle-inbox.js";
 import { pluginDatabaseService } from "./plugin-database.js";
-import { assertWikiConfiguredRoot, assertWikiRootOwnership, loadCurrentWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
+import { inspectWikiLocalFolder, assertWikiConfiguredRoot, assertWikiRootOwnership, loadCurrentWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
 import { assertCurrentWikiRepublication } from "./wiki-republication-runtime.js";
 import { retractionFolderGate, readRetractionFolderText, readRetractionFolderTextWithStatus, canonicalWikiRetractionPath as canonicalFolderPath } from "./wiki-retraction-gate.js";
 import { pluginManagedAgentService } from "./plugin-managed-agents.js";
@@ -723,7 +723,7 @@ export function buildHostServices(
     instructionTemplateVariables: async (companyId) => {
       const variables: Record<string, string | null | undefined> = {};
       for (const declaration of options.manifest?.localFolders ?? []) {
-        const status = await inspectPluginLocalFolder({
+        const status = await inspectScopedLocalFolder(db,companyId,{
           folderKey: declaration.folderKey,
           declaration,
           storedConfig: await getStoredLocalFolderConfig(companyId, declaration.folderKey),
@@ -836,8 +836,12 @@ export function buildHostServices(
   };
 
 
+  const inspectScopedLocalFolder=(connection:Db,companyId:string,input:Parameters<typeof inspectPluginLocalFolder>[0])=>
+    pluginKey==="paperclipai.plugin-llm-wiki"&&input.folderKey==="wiki-root"
+      ?inspectWikiLocalFolder(connection,pluginId,companyId,input):inspectPluginLocalFolder(input);
+
   const inspectStoredLocalFolder = async (companyId: string, folderKey: string, connection: Db = db) =>
-    inspectPluginLocalFolder({
+    inspectScopedLocalFolder(connection,companyId,{
       folderKey,
       declaration: getLocalFolderDeclaration(folderKey),
       storedConfig: await getStoredLocalFolderConfig(companyId, folderKey, connection),
@@ -1461,7 +1465,7 @@ export function buildHostServices(
           const existing = await pluginRegistryService(connection).getCompanySettings(pluginId, companyId);
           const existingConfig = getStoredLocalFolders(existing?.settingsJson)[params.folderKey] ?? null;
           if(pluginKey==="paperclipai.plugin-llm-wiki"&&params.folderKey==="wiki-root") {
-            const proposed=await inspectPluginLocalFolder({folderKey:params.folderKey,declaration,storedConfig:existingConfig,overrideConfig:{path:params.path}});
+            const proposed=await inspectScopedLocalFolder(connection,companyId,{folderKey:params.folderKey,declaration,storedConfig:existingConfig,overrideConfig:{path:params.path}});
             await assertWikiConfiguredRoot(connection,pluginId,companyId,(proposed.realPath??proposed.path)!);
           }
           await preparePluginLocalFolder({
@@ -1472,7 +1476,7 @@ export function buildHostServices(
               path: params.path,
             },
           });
-          const status = await inspectPluginLocalFolder({
+          const status = await inspectScopedLocalFolder(connection,companyId,{
             folderKey: params.folderKey,
             declaration,
             storedConfig: existingConfig,

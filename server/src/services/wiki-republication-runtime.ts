@@ -6,7 +6,7 @@ import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { assertConfiguredLocalFolder, createPluginLocalFolderTextExclusive, getStoredLocalFolders, inspectPluginLocalFolder,
   readPluginLocalFolderText, requireLocalFolderDeclaration } from "./plugin-local-folders.js";
-import { loadAllWikiRetractions, withWikiRetractionLock, appendCommittedWikiMaintenance, readWikiMaintenanceState, assertWikiRootOwnership, assertWikiRetractionSpaceBindings } from "./wiki-retraction-store.js";
+import { loadAllWikiRetractions, withWikiRetractionLock, appendCommittedWikiMaintenance, readWikiMaintenanceState, inspectWikiLocalFolder, assertWikiRootOwnership, assertWikiRetractionSpaceBindings } from "./wiki-retraction-store.js";
 import { retractionFolderGate, readRetractionFolderTextWithStatus, canonicalWikiRetractionPath } from "./wiki-retraction-gate.js";
 import { parsePublicationRegistry, publicationCanonical, publicationHash, publicationNeed, verifyWikiPublication, type JsonObject } from "./wiki-publication-readback.js";
 import { buildWikiRepublicationEvent, parseWikiRepublicationDraft, resolveReviewedWikiRepublication, verifyCurrentWikiRepublication } from "./wiki-republication.js";
@@ -105,7 +105,7 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
     const draftDoc=await document(tx,input.companyId,input.issueId,input.documentKey);publicationNeed(draftDoc,"republication_document");
     const draft=parseWikiRepublicationDraft(draftDoc.latestBody);
     const settings=await registryService.getCompanySettings(pluginId,input.companyId);
-    const folder=await inspectPluginLocalFolder({folderKey:"wiki-root",declaration:requireLocalFolderDeclaration(plugin.manifestJson.localFolders,"wiki-root"),
+    const folder=await inspectWikiLocalFolder(tx,pluginId,input.companyId,{folderKey:"wiki-root",declaration:requireLocalFolderDeclaration(plugin.manifestJson.localFolders,"wiki-root"),
       storedConfig:getStoredLocalFolders(settings?.settingsJson)["wiki-root"]??null});
     assertConfiguredLocalFolder(folder);publicationNeed(folder.writable,"republication_folder_write_access");const root=folder.realPath!;
     await assertWikiRootOwnership(tx,pluginId,input.companyId,root);
