@@ -469,6 +469,8 @@ export interface PluginLocalFolderProblem {
 }
 
 export interface PluginLocalFolderStatus {
+  /** Host-owned Wiki hold state; absent on hosts/folders without this feature. */
+  wikiRetractions?: { state: "inactive" | "active" };
   folderKey: string;
   configured: boolean;
   path: string | null;
@@ -501,6 +503,8 @@ export interface PluginLocalFolderListOptions {
 }
 
 export interface PluginLocalFolderEntry {
+  /** Host-owned warning for retained physical Wiki files, including unindexed log files. */
+  citationHolds?: PluginWikiCitationHold[];
   path: string;
   name: string;
   kind: "file" | "directory";
@@ -515,6 +519,17 @@ export interface PluginLocalFolderListing {
   truncated: boolean;
 }
 
+export interface PluginWikiCitationHold {
+  state: "blocked_by_retraction"; path: string; retractedPath: string;
+  retractionId: string; reason: string; eventHash: string;
+  readPolicy: "citation-holds";
+}
+export interface PluginLocalFolderTextRead {
+  contents: string;
+  /** Host-generated. The bytes remain unchanged; only these citations are held. */
+  citationHolds: PluginWikiCitationHold[];
+}
+
 export interface PluginLocalFoldersClient {
   /** Manifest-declared local folders for this plugin. */
   declarations(): import("@paperclipai/shared").PluginLocalFolderDeclaration[];
@@ -524,8 +539,14 @@ export interface PluginLocalFoldersClient {
   status(companyId: string, folderKey: string): Promise<PluginLocalFolderStatus>;
   /** List entries below a configured folder after containment checks. */
   list(companyId: string, folderKey: string, options?: PluginLocalFolderListOptions): Promise<PluginLocalFolderListing>;
-  /** Read a UTF-8 text file below a configured folder after containment checks. */
+  /** Read a UTF-8 text file below a configured folder after containment checks.
+   * During an active Wiki withdrawal, the host may return the exact error
+   * message E_WIKI_SOURCE_NOT_MATERIALIZED only after root and physical-path
+   * checks succeed. This represents absent file bytes, not a boundary failure. */
   readText(companyId: string, folderKey: string, relativePath: string): Promise<string>;
+  /** Citation-aware Wiki reader. A missing method uses the stricter string path.
+   * Directly withdrawn sources still fail with E_SOURCE_RETRACTED. */
+  readTextWithStatus?(companyId: string, folderKey: string, relativePath: string): Promise<PluginLocalFolderTextRead>;
   /** Write a UTF-8 text file below a configured folder using atomic rename. */
   writeTextAtomic(
     companyId: string,

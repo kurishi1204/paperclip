@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { normalizeWikiLinkPagePath, extractWikiLinks, buildWikiReferenceHref } from "@paperclipai/shared";
 
 import type { ComponentProps, ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -724,4 +725,51 @@ describe("MarkdownBody", () => {
     expect(html).toContain('href="/issues/ACME-1"');
   });
 
+});
+
+describe("shared Wiki publication link interpretation",()=>{
+ it("renders the same canonical targets that publication indexes",()=>{
+  const content="[[p7#claim|Original]] and [current](upstream.md#scope) and [record][source].\n\n[source]: upstream.md#scope\n";
+  const html=renderMarkdown(content,[],{enableWikiLinks:true,resolveWikiLinkHref:(target)=>{
+   const parsed=normalizeWikiLinkPagePath(target);return parsed?"/wiki/page/"+parsed.path+(parsed.fragment?"#"+parsed.fragment:""):null;
+  }});
+  expect(html).toContain('href="/wiki/page/wiki/p7.md#claim"');
+  expect(html.match(/href="\/wiki\/page\/wiki\/upstream.md#scope"/g)).toHaveLength(2);
+  expect(extractWikiLinks(content)).toEqual(["wiki/p7.md","wiki/upstream.md"]);
+ });
+ it("keeps external URLs and rendered code outside the Wiki reference graph",()=>{
+  const content="[site](https://example.test/wiki/p7.md)\n\nhttps://example.test/wiki/upstream.md\n\n`[[p7]]`";
+  const html=renderMarkdown(content,[],{enableWikiLinks:true,resolveWikiLinkHref:(target)=>{
+   const parsed=normalizeWikiLinkPagePath(target);return parsed?"/wiki/page/"+parsed.path:null;
+  }});
+  expect(html).toContain('href="https://example.test/wiki/p7.md"');expect(html).toMatch(/<code\b[^>]*>\[\[p7\]\]<\/code>/);
+  expect(html).not.toContain('data-paperclip-wiki-link="true"');expect(extractWikiLinks(content)).toEqual([]);
+ });
+});
+
+describe("Wiki link page and space context",()=>{
+ it("opens the same non-default space and canonical relative source that publication verifies",()=>{
+  const body="[source](../upstream.md#scope) and [[../upstream.md#scope|source]] and [extensionless](../upstream#scope)";
+  const context={currentPagePath:"wiki/group/revalidated.md",spaceSlug:"team two"};
+  const html=renderMarkdown(body,[],{enableWikiLinks:true,resolveWikiLinkHref:(target)=>buildWikiReferenceHref(target,path=>"/plugin"+path,context)});
+  expect(html.match(/href="\/plugin\/wiki\/spaces\/team%20two\/page\/wiki\/upstream.md#scope"/g)).toHaveLength(3);
+  expect(extractWikiLinks(body,context.currentPagePath)).toEqual(["wiki/upstream.md"]);
+ });
+ it("preserves app URLs and unresolved Markdown links rather than silently losing anchors",()=>{
+  const body="[Settings](/wiki/settings) and [source](../outside.md)";
+  const html=renderMarkdown(body,[],{enableWikiLinks:true,resolveWikiLinkHref:(target)=>buildWikiReferenceHref(target,path=>path,{currentPagePath:"wiki/revalidated.md",spaceSlug:"team"})});
+  expect(html).toContain('href="/wiki/settings"');expect(html).toContain('href="../outside.md"');
+  expect(()=>extractWikiLinks(body,"wiki/revalidated.md",{strictInvalidReferences:true})).toThrow(/E_INVALID_WIKI_REFERENCE/);
+  expect(extractWikiLinks(body,"wiki/revalidated.md")).toEqual([]);
+ });
+});
+
+describe("Wiki URI components share one source identity",()=>{
+ for(const target of ["upstream.md?view=1#scope","./upstream.md?view=1#scope","./upstream?view=1#scope"])
+ it("preserves navigation query without adding it to the verified source: "+target,()=>{
+  const body="[source]("+target+")",context={currentPagePath:"wiki/revalidated.md",spaceSlug:"team"};
+  const html=renderMarkdown(body,[],{enableWikiLinks:true,resolveWikiLinkHref:(t)=>buildWikiReferenceHref(t,path=>path,context)});
+  expect(html).toContain('href="/wiki/spaces/team/page/wiki/upstream.md?view=1#scope"');
+  expect(extractWikiLinks(body,context.currentPagePath,{strictInvalidReferences:true})).toEqual(["wiki/upstream.md"]);
+ });
 });

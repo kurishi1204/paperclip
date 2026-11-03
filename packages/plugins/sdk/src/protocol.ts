@@ -1553,6 +1553,10 @@ export interface WorkerToHostMethods {
     params: { companyId: string; folderKey: string; relativePath: string },
     result: string,
   ];
+  "localFolders.readTextWithStatus": [
+    params: { companyId: string; folderKey: string; relativePath: string },
+    result: import("./types.js").PluginLocalFolderTextRead,
+  ];
   "localFolders.writeTextAtomic": [
     params: {
       companyId: string;

@@ -1,6 +1,13 @@
 import express from "express";
+import { conflict } from "../errors.js";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const mockRetraction=vi.hoisted(()=>({execute:vi.fn(),receipt:vi.fn()}));
+vi.mock("../services/wiki-retraction-runtime.js",()=>({wikiRetractionRuntime:()=>mockRetraction}));
+
+const mockRepublication = vi.hoisted(() => ({ execute:vi.fn(),receipt:vi.fn() }));
+vi.mock("../services/wiki-republication-runtime.js",()=>({wikiRepublicationRuntime:()=>mockRepublication}));
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -156,7 +163,7 @@ describe("plugin install and upgrade authz", () => {
 
     expect(res.status).toBe(200);
     const packageNames = res.body.map((plugin: { packageName: string }) => plugin.packageName);
-    const byPackageName = new Map(
+    const byPackageName = new Map<string, { packageName: string; experimental: boolean; hasBuiltEntrypoints: boolean }>(
       res.body.map((plugin: { packageName: string; experimental: boolean; hasBuiltEntrypoints: boolean }) => [plugin.packageName, plugin]),
     );
     expect(packageNames).toContain("@paperclipai/plugin-workspace-diff");
@@ -1216,4 +1223,90 @@ describe("operator-hidden plugin management floor", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
   }, 20_000);
+});
+
+
+describe("reviewed Wiki republication HTTP boundary",()=>{
+  const endpoint=`/api/plugins/${pluginId}/wiki-retractions/republications`;
+  const operationId="88888888-8888-4888-8888-888888888888";
+  const body={companyId:companyA,issueId:projectA,documentKey:"revalidated",reviewId:runA,operationId};
+  beforeEach(()=>{vi.clearAllMocks();readyPlugin();});
+  it("refuses agent and other-company actors before invoking the runtime",async()=>{
+    for(const actor of [agentActor(),boardActor({companyIds:[companyB]})]){
+      const {app}=await createApp(actor);
+      expect((await request(app).post(endpoint).send(body)).status).toBe(403);
+      expect((await request(app).get(endpoint+"/"+operationId).query({companyId:companyA})).status).toBe(403);
+    }
+    expect(mockRepublication.execute).not.toHaveBeenCalled();expect(mockRepublication.receipt).not.toHaveBeenCalled();
+  });
+  it("uses the authenticated Board actor and reads the scoped receipt without rerunning publication",async()=>{
+    const {app}=await createApp(boardActor());mockRepublication.execute.mockResolvedValue({type:"republished"});
+    mockRepublication.receipt.mockResolvedValue({state:"published",file:{present:true,matchesIntent:true},maintenanceLog:{state:"appended"},automaticRetryAllowed:false});
+    const result=await request(app).post(endpoint).send({...body,actorId:"forged",runId:"forged"});
+    expect(result.status,JSON.stringify(result.body)).toBe(200);
+    expect(mockRepublication.execute).toHaveBeenCalledExactlyOnceWith({...body,actorId:"user-1"});
+    const receipt=await request(app).get(endpoint+"/"+operationId).query({companyId:companyA});
+    expect(receipt.status).toBe(200);expect(receipt.body.automaticRetryAllowed).toBe(false);
+    expect(mockRepublication.receipt).toHaveBeenCalledWith(companyA,operationId);
+    expect(mockRepublication.receipt).toHaveBeenCalledTimes(2);
+    expect(mockRepublication.execute).toHaveBeenCalledTimes(1);
+  });
+  it.each(["pending","unknown"])("does not return POST success for a %s maintenance append",async(state)=>{
+    const {app}=await createApp(boardActor());
+    mockRepublication.execute.mockResolvedValue({type:"republished"});
+    mockRepublication.receipt.mockResolvedValue({state:"published",file:{present:true,matchesIntent:true},maintenanceLog:{state},automaticRetryAllowed:false});
+    const result=await request(app).post(endpoint).send(body);
+    expect(result.status).toBe(409);expect(result.body.maintenanceLog.state).toBe(state);
+    expect(result.body.state).toBe("published");expect(result.body.automaticRetryAllowed).toBe(false);
+    expect(mockRepublication.execute).toHaveBeenCalledTimes(1);
+  });
+  it("returns committed evidence on the first POST when the derived append fails",async()=>{
+    const {app}=await createApp(boardActor());
+    mockRepublication.execute.mockRejectedValue(conflict("Publication committed; append unresolved",{
+      code:"wiki_republication_post_commit_unresolved",operationId,automaticRetryAllowed:false,
+    }));
+    mockRepublication.receipt.mockResolvedValue({state:"published",file:{present:true,matchesIntent:true},maintenanceLog:{state:"pending"},automaticRetryAllowed:false});
+    const result=await request(app).post(endpoint).send(body);
+    expect(result.status).toBe(409);expect(result.body.state).toBe("published");
+    expect(result.body.maintenanceLog.state).toBe("pending");
+    expect(result.body.completionIssue).toBe("wiki_republication_post_commit_unresolved");
+    expect(mockRepublication.execute).toHaveBeenCalledTimes(1);
+    expect(mockRepublication.receipt).toHaveBeenCalledExactlyOnceWith(companyA,operationId);
+  });
+  it("refuses a noncanonical operation identity without any publication effect",async()=>{
+    const {app}=await createApp(boardActor());
+    expect((await request(app).post(endpoint).send({...body,operationId:"not-a-uuid"})).status).toBe(400);
+    expect(mockRepublication.execute).not.toHaveBeenCalled();
+  });
+});
+
+describe("shared Wiki withdrawal receipt boundary",()=>{
+ const endpoint=`/api/plugins/${pluginId}/wiki-retractions/execute`,operationId="99999999-9999-4999-8999-999999999999";
+ const body={companyId:companyA,issueId:projectA,documentKey:"proposal",reviewId:runA,ownerDecisionId:"77777777-7777-4777-8777-777777777777",operationId};
+ beforeEach(()=>{vi.clearAllMocks();readyPlugin();});
+ it("returns completed withdrawal evidence and reads it without replay",async()=>{
+  const {app}=await createApp(boardActor());mockRetraction.execute.mockResolvedValue({type:"executed"});
+  mockRetraction.receipt.mockResolvedValue({state:"withdrawn",maintenanceLog:{state:"appended"},automaticRetryAllowed:false});
+  const result=await request(app).post(endpoint).send(body);expect(result.status).toBe(200);expect(result.body.state).toBe("withdrawn");
+  const read=await request(app).get(`/api/plugins/${pluginId}/wiki-retractions/operations/${operationId}`).query({companyId:companyA});
+  expect(read.status).toBe(200);expect(mockRetraction.execute).toHaveBeenCalledTimes(1);
+ });
+ it.each(["pending","unknown"])("keeps a %s withdrawal append visibly incomplete",async(state)=>{
+  const {app}=await createApp(boardActor());mockRetraction.execute.mockResolvedValue({type:"executed"});
+  mockRetraction.receipt.mockResolvedValue({state:"withdrawn",maintenanceLog:{state},automaticRetryAllowed:false});
+  const result=await request(app).post(endpoint).send(body);expect(result.status).toBe(409);expect(result.body.maintenanceLog.state).toBe(state);
+ });
+ it("returns committed withdrawal evidence on the first append failure",async()=>{
+  const {app}=await createApp(boardActor());mockRetraction.execute.mockRejectedValue(conflict("Committed append unresolved",{code:"wiki_retraction_post_commit_unresolved",operationId}));
+  mockRetraction.receipt.mockResolvedValue({state:"withdrawn",maintenanceLog:{state:"pending"},automaticRetryAllowed:false});
+  const result=await request(app).post(endpoint).send(body);expect(result.status).toBe(409);
+  expect(result.body).toMatchObject({state:"withdrawn",completionIssue:"wiki_retraction_post_commit_unresolved",automaticRetryAllowed:false});
+ });
+ it("rejects agents and other-company actors before execution or receipt lookup",async()=>{
+  for(const actor of [agentActor(),boardActor({companyIds:[companyB]})]){
+   const {app}=await createApp(actor);expect((await request(app).post(endpoint).send(body)).status).toBe(403);
+   expect((await request(app).get(`/api/plugins/${pluginId}/wiki-retractions/operations/${operationId}`).query({companyId:companyA})).status).toBe(403);
+  }
+  expect(mockRetraction.execute).not.toHaveBeenCalled();expect(mockRetraction.receipt).not.toHaveBeenCalled();
+ });
 });

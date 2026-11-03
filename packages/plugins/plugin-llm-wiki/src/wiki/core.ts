@@ -1,5 +1,7 @@
+import { extractWikiLinks } from "@paperclipai/plugin-sdk";
+export { extractWikiLinks } from "@paperclipai/plugin-sdk";
 import { createHash, randomUUID } from "node:crypto";
-import type { Agent, AgentSessionEvent, Issue, IssueComment, PluginContext, PluginEvent, PluginLocalFolderEntry, Project, ToolResult } from "@paperclipai/plugin-sdk";
+import type { Agent, AgentSessionEvent, Issue, IssueComment, PluginContext, PluginEvent, PluginLocalFolderEntry, PluginWikiCitationHold, Project, ToolResult } from "@paperclipai/plugin-sdk";
 import type { IssueDocument, PluginIssueOriginKind, PluginManagedRoutineResolution, PluginManagedSkillResolution } from "@paperclipai/plugin-sdk/types";
 import {
   DEFAULT_MAX_SOURCE_BYTES,
@@ -1709,21 +1711,6 @@ function inferPageType(path: string): string | null {
   return match?.[1] ?? (path === "index.md" || path === "wiki/index.md" ? "index" : path === "log.md" || path === "wiki/log.md" ? "log" : null);
 }
 
-function extractWikiLinks(contents: string): string[] {
-  const links = new Set<string>();
-  const markdownLinkPattern = /\[[^\]]+\]\(([^)]+)\)/g;
-  for (const match of contents.matchAll(markdownLinkPattern)) {
-    const target = match[1]?.split("#")[0]?.trim();
-    if (target && (target.startsWith("wiki/") || target === "index.md" || target === "log.md" || target === "AGENTS.md" || target === "IDEA.md")) {
-      links.add(target);
-    }
-  }
-  const wikiTokenPattern = /\bwiki\/[A-Za-z0-9._/-]+\.md\b/g;
-  for (const match of contents.matchAll(wikiTokenPattern)) {
-    links.add(match[0]);
-  }
-  return [...links].sort();
-}
 
 async function readCurrentWithHash(
   ctx: PluginContext,
@@ -1739,38 +1726,26 @@ async function readCurrentWithHash(
   }
 }
 
-async function filterReadableRows<T>(
-  ctx: PluginContext,
-  companyId: string,
-  space: Pick<WikiSpace, "pathPrefix">,
-  rows: T[],
-  pathForRow: (row: T) => string,
-): Promise<T[]> {
-  const checks: Array<T | null> = await Promise.all(rows.map(async (row): Promise<T | null> => {
-    try {
-      await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, pathForRow(row)));
-      return row;
-    } catch {
-      return null;
-    }
-  }));
-  return checks.filter((row): row is T => row != null);
-}
 
 async function listLocalFiles(ctx: PluginContext, input: { companyId: string; space: Pick<WikiSpace, "pathPrefix">; relativePath: "wiki" | "raw" }): Promise<PluginLocalFolderEntry[]> {
+  const relativePath = spaceRelativePath(input.space, input.relativePath);
+  let listing: Awaited<ReturnType<PluginContext["localFolders"]["list"]>>;
   try {
-    const relativePath = spaceRelativePath(input.space, input.relativePath);
-    const listing = await ctx.localFolders.list(input.companyId, WIKI_ROOT_FOLDER_KEY, {
-      relativePath,
-      recursive: true,
-      maxEntries: LOCAL_BROWSE_FILE_LIMIT,
+    listing = await ctx.localFolders.list(input.companyId, WIKI_ROOT_FOLDER_KEY, {
+      relativePath, recursive: true, maxEntries: LOCAL_BROWSE_FILE_LIMIT,
     });
-    return listing.entries
-      .filter((entry) => entry.kind === "file")
-      .map((entry) => ({ ...entry, path: logicalPathFromSpacePath(input.space, entry.path) }));
-  } catch {
+  } catch (error) {
+    // Initial, unconfigured folders historically have no local rows. During an
+    // active withdrawal, a failed boundary check must remain a visible failure.
+    const status = await ctx.localFolders.status(input.companyId, WIKI_ROOT_FOLDER_KEY);
+    if (status.wikiRetractions?.state === "active") throw error;
     return [];
   }
+  // The host retains the walker's pre-filter truncation bit. Never convert
+  // a partial physical inventory into an apparently complete empty UI result.
+  if (listing.truncated) throw new Error(`E_WIKI_LOCAL_SCAN_INCOMPLETE: ${relativePath}; maximum=${LOCAL_BROWSE_FILE_LIMIT}; refine the folder`);
+  return listing.entries.filter(entry => entry.kind === "file")
+    .map(entry => ({ ...entry, path: logicalPathFromSpacePath(input.space, entry.path) }));
 }
 
 function mergeLocalPageRows(pages: WikiPageRow[], entries: PluginLocalFolderEntry[]): WikiPageRow[] {
@@ -1779,6 +1754,7 @@ function mergeLocalPageRows(pages: WikiPageRow[], entries: PluginLocalFolderEntr
     if (!entry.path.endsWith(".md") || byPath.has(entry.path)) continue;
     byPath.set(entry.path, {
       path: entry.path,
+      ...(entry.citationHolds?.length ? {citationHolds:entry.citationHolds} : {}),
       title: null,
       pageType: inferPageType(entry.path),
       backlinkCount: 0,
@@ -1849,7 +1825,7 @@ async function upsertPageMetadata(ctx: PluginContext, input: {
   const hash = contentHash(input.contents);
   const title = inferTitle(input.path, input.contents);
   const pageType = inferPageType(input.path);
-  const backlinks = extractWikiLinks(input.contents);
+  const backlinks = extractWikiLinks(input.contents,input.path);
   const sourceRefs = Array.isArray(input.sourceRefs) ? input.sourceRefs : [];
 
   await ctx.db.execute(
@@ -4130,6 +4106,74 @@ export async function fileQueryAnswerAsPage(ctx: PluginContext, input: FileQuery
   };
 }
 
+/** The host supplies withdrawal state through the common file boundary.
+ * Rebuild discovery text as well as data; never retain withdrawn snippets. */
+async function filterWikiRows<T>(ctx: PluginContext, companyId: string, space: Pick<WikiSpace, "pathPrefix">,
+  rows: T[], pathFor: (row: T) => string, onlyReadable = false) {
+  const status = await ctx.localFolders.status(companyId, WIKI_ROOT_FOLDER_KEY);
+  const held = status.wikiRetractions?.state === "active";
+  if (!held && !onlyReadable) return { rows,
+    retractionReadback: { state: "inactive", hiddenCount: 0, tombstones: [] as unknown[] } };
+  // Every discovery consumer uses this policy. During a hold, only a known
+  // withdrawal may hide a row. Root/permission/transport errors remain errors.
+  const checked = await Promise.all(rows.map(async row => {
+    try {
+      const read=await readWikiTextWithStatus(ctx, companyId, spaceRelativePath(space, pathFor(row)));
+      return { row: read.citationHolds.length ? Object.assign({},row,{citationHolds:read.citationHolds}) : row,
+        tombstone: null as unknown };
+    } catch (error) {
+      if (!held) return { row: null, tombstone: null as unknown };
+      const message = error instanceof Error ? error.message : String(error);
+      // A host-defined absence is safe metadata, after the host has checked
+      // root and physical aliases. It is not a readable body or a generic error.
+      if (message === "E_WIKI_SOURCE_NOT_MATERIALIZED") return { row: onlyReadable ? null : row, tombstone: null as unknown };
+      const marker = message.indexOf("E_SOURCE_RETRACTED ");
+      if (marker < 0) throw error;
+      return { row: null, tombstone: JSON.parse(message.slice(marker + "E_SOURCE_RETRACTED ".length)) as unknown };
+    }
+  }));
+  const active: T[] = []; const tombstones: unknown[] = [];
+  for (const result of checked) {
+    if (result.row !== null) active.push(result.row);
+    if (result.tombstone !== null) tombstones.push(result.tombstone);
+  }
+  return { rows: active, retractionReadback: { state: held ? "checked" : "inactive", hiddenCount: tombstones.length, tombstones } };
+}
+
+/** Apply visibility before the caller's result limit. Hidden rows consume scan
+ * work, never the visible result budget. Report incomplete scans explicitly. */
+async function collectVisibleRows<T>(limit: number,
+  load: (take: number, offset: number) => Promise<T[]>,
+  check: (rows: T[]) => Promise<{ rows: T[]; retractionReadback?: { state: string; hiddenCount: number; tombstones: unknown[] } }>,
+) {
+  const rows: T[] = []; let scanned = 0;
+  // Validate the boundary even when SQL has no rows. No-match is not proof
+  // that a withdrawal is inactive or that a moved root is healthy.
+  const initial = await check([]);
+  if (initial.rows.length) throw new Error("E_WIKI_PAGE_WINDOW_INVALID");
+  const retractionReadback = { state: initial.retractionReadback?.state ?? "not_checked", hiddenCount: 0, tombstones: [] as unknown[] };
+  while (rows.length < limit) {
+    if (scanned >= LOCAL_BROWSE_FILE_LIMIT) {
+      if (!(await load(1, scanned)).length) break;
+      throw new Error(`E_WIKI_RETRACTION_SCAN_INCOMPLETE: scanned=${scanned}, visible=${rows.length}, requested=${limit}; refine the query`);
+    }
+    const take = Math.min(Math.max(limit - rows.length, 50), LOCAL_BROWSE_FILE_LIMIT - scanned);
+    const batch = await load(take, scanned);
+    if (!batch.length) break;
+    if (batch.length > take) throw new Error("E_WIKI_PAGE_WINDOW_INVALID");
+    const checked = await check(batch);
+    rows.push(...checked.rows.slice(0, limit - rows.length));
+    if (checked.retractionReadback) {
+      if (checked.retractionReadback.state === "checked") retractionReadback.state = "checked";
+      retractionReadback.hiddenCount += checked.retractionReadback.hiddenCount;
+      retractionReadback.tombstones.push(...checked.retractionReadback.tombstones);
+    }
+    scanned += batch.length;
+    if (batch.length < take) break;
+  }
+  return { rows, retractionReadback };
+}
+
 export async function registerWikiTools(ctx: PluginContext) {
   ctx.tools.register("wiki_search", {
     displayName: "Search Wiki",
@@ -4142,7 +4186,7 @@ export async function registerWikiTools(ctx: PluginContext) {
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
     const query = requireString(input.query, "query");
     const limit = normalizeLimit(input.limit, 20, 50);
-    const rows = await ctx.db.query<{ kind: string; path: string; title: string | null; match_text: string | null }>(
+    const checked = await collectVisibleRows<{ kind: string; path: string; title: string | null; match_text: string | null }>(limit, (take, offset) => ctx.db.query<{ kind: string; path: string; title: string | null; match_text: string | null }>(
       `SELECT 'page' AS kind, path, title, page_type AS match_text
          FROM ${tableName(ctx.db.namespace, "wiki_pages")}
         WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3))
@@ -4151,12 +4195,12 @@ export async function registerWikiTools(ctx: PluginContext) {
          FROM ${tableName(ctx.db.namespace, "wiki_sources")}
         WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(raw_path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3) OR lower(coalesce(url, '')) LIKE lower($3))
        ORDER BY kind, path
-       LIMIT $4`,
-      [companyId, wikiId, `%${query}%`, limit, space.id],
-    );
+       LIMIT $4 OFFSET $6`,
+      [companyId, wikiId, `%${query}%`, take, space.id, offset],
+    ), rows => filterWikiRows(ctx, companyId, space, rows, row => row.path));
     return {
-      content: rows.length ? rows.map((row) => `${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No wiki matches found.",
-      data: { companyId, wikiId, spaceSlug: space.slug, query, results: rows },
+      content: checked.rows.length ? checked.rows.map((row) => `${citationRowLabel(row)}${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No wiki matches found.",
+      data: { companyId, wikiId, spaceSlug: space.slug, query, results: checked.rows, retractionReadback: checked.retractionReadback },
     };
   });
 
@@ -4170,8 +4214,18 @@ export async function registerWikiTools(ctx: PluginContext) {
     const wikiId = normalizeWikiId(input.wikiId);
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
     const path = assertPagePath(requireString(input.path, "path"));
-    const contents = await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, path));
-    return { content: contents, data: { companyId, wikiId, spaceSlug: space.slug, path, hash: contentHash(contents) } };
+    try {
+      const read = await readWikiTextWithStatus(ctx, companyId, spaceRelativePath(space, path));
+      return { content: citationWarning(read.citationHolds) + read.contents,
+        data: { companyId, wikiId, spaceSlug: space.slug, path, hash: contentHash(read.contents),
+          ...(read.citationHolds.length ? { contents: read.contents, citationHolds: read.citationHolds } : {}) } };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const marker = message.indexOf("E_SOURCE_RETRACTED ");
+      if (marker < 0) throw error;
+      const tombstone = JSON.parse(message.slice(marker + "E_SOURCE_RETRACTED ".length));
+      return { content: JSON.stringify(tombstone), data: { companyId, wikiId, spaceSlug: space.slug, path, publicationReadback: tombstone } };
+    }
   });
 
   ctx.tools.register("wiki_write_page", {
@@ -4230,17 +4284,17 @@ export async function registerWikiTools(ctx: PluginContext) {
     const wikiId = normalizeWikiId(input.wikiId);
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
     const limit = normalizeLimit(input.limit, 50, 200);
-    const rows = await ctx.db.query<{ raw_path: string; title: string | null; source_type: string; url: string | null; content_hash: string }>(
+    const checked = await collectVisibleRows<{ raw_path: string; title: string | null; source_type: string; url: string | null; content_hash: string }>(limit, (take, offset) => ctx.db.query<{ raw_path: string; title: string | null; source_type: string; url: string | null; content_hash: string }>(
       `SELECT raw_path, title, source_type, url, content_hash
          FROM ${tableName(ctx.db.namespace, "wiki_sources")}
         WHERE company_id = $1 AND wiki_id = $2 AND space_id = $4
-        ORDER BY created_at DESC
-        LIMIT $3`,
-      [companyId, wikiId, limit, space.id],
-    );
+        ORDER BY created_at DESC, raw_path
+        LIMIT $3 OFFSET $5`,
+      [companyId, wikiId, take, space.id, offset],
+    ), rows => filterWikiRows(ctx, companyId, space, rows, row => row.raw_path));
     return {
-      content: rows.length ? rows.map((row) => `${row.raw_path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No sources captured yet.",
-      data: { companyId, wikiId, spaceSlug: space.slug, sources: rows },
+      content: checked.rows.length ? checked.rows.map((row) => `${citationRowLabel(row)}${row.raw_path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No sources captured yet.",
+      data: { companyId, wikiId, spaceSlug: space.slug, sources: checked.rows, retractionReadback: checked.retractionReadback },
     };
   });
 
@@ -4315,17 +4369,18 @@ export async function registerWikiTools(ctx: PluginContext) {
     const wikiId = normalizeWikiId(input.wikiId);
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
     const path = assertPagePath(requireString(input.path, "path"));
-    const rows = await ctx.db.query<{ path: string; title: string | null }>(
+    const limit = 200;
+    const checked = await collectVisibleRows<{ path: string; title: string | null }>(limit, (take, offset) => ctx.db.query<{ path: string; title: string | null }>(
       `SELECT path, title
          FROM ${tableName(ctx.db.namespace, "wiki_pages")}
         WHERE company_id = $1 AND wiki_id = $2 AND space_id = $4 AND backlinks ? $3
         ORDER BY path
-        LIMIT 200`,
-      [companyId, wikiId, path, space.id],
-    );
+        LIMIT $5 OFFSET $6`,
+      [companyId, wikiId, path, space.id, take, offset],
+    ), rows => filterWikiRows(ctx, companyId, space, rows, row => row.path));
     return {
-      content: rows.length ? rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No backlinks indexed.",
-      data: { companyId, wikiId, spaceSlug: space.slug, path, backlinks: rows },
+      content: checked.rows.length ? checked.rows.map((row) => `${citationRowLabel(row)}${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No backlinks indexed.",
+      data: { companyId, wikiId, spaceSlug: space.slug, path, backlinks: checked.rows, retractionReadback: checked.retractionReadback },
     };
   });
 
@@ -4338,13 +4393,14 @@ export async function registerWikiTools(ctx: PluginContext) {
     const companyId = requireString(input.companyId, "companyId");
     const wikiId = normalizeWikiId(input.wikiId);
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
-    const rows = await ctx.db.query<{ path: string; title: string | null; page_type: string | null }>(
-      `SELECT path, title, page_type FROM ${tableName(ctx.db.namespace, "wiki_pages")} WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 ORDER BY path LIMIT 200`,
-      [companyId, wikiId, space.id],
-    );
+    const limit = 200;
+    const checked = await collectVisibleRows<{ path: string; title: string | null; page_type: string | null }>(limit, (take, offset) => ctx.db.query<{ path: string; title: string | null; page_type: string | null }>(
+      `SELECT path, title, page_type FROM ${tableName(ctx.db.namespace, "wiki_pages")} WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 ORDER BY path LIMIT $4 OFFSET $5`,
+      [companyId, wikiId, space.id, take, offset],
+    ), rows => filterWikiRows(ctx, companyId, space, rows, row => row.path));
     return {
-      content: rows.length ? rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No pages indexed yet.",
-      data: { companyId, wikiId, spaceSlug: space.slug, pages: rows },
+      content: checked.rows.length ? checked.rows.map((row) => `${citationRowLabel(row)}${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No pages indexed yet.",
+      data: { companyId, wikiId, spaceSlug: space.slug, pages: checked.rows, retractionReadback: checked.retractionReadback },
     };
   });
 }
@@ -4361,6 +4417,7 @@ function isTemplateFile(value: string): value is WikiTemplateFile {
 }
 
 export type WikiPageRow = {
+  citationHolds?: PluginLocalFolderEntry["citationHolds"];
   path: string;
   title: string | null;
   pageType: string | null;
@@ -4418,7 +4475,15 @@ export async function listPages(ctx: PluginContext, input: {
   }
   params.push(limit);
   const limitIndex = params.length;
-  const pageRows = await ctx.db.query<{
+  const pageResult = await collectVisibleRows<{
+    path: string;
+    title: string | null;
+    page_type: string | null;
+    backlinks: unknown;
+    source_refs: unknown;
+    content_hash: string | null;
+    updated_at: string;
+  }>(limit, (take, offset) => ctx.db.query<{
     path: string;
     title: string | null;
     page_type: string | null;
@@ -4431,16 +4496,17 @@ export async function listPages(ctx: PluginContext, input: {
        FROM ${tableName(ctx.db.namespace, "wiki_pages")}
       WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3${pageFilter}
       ORDER BY path
-      LIMIT $${limitIndex}`,
-    params,
-  );
-  const readablePageRows = await filterReadableRows(ctx, input.companyId, space, pageRows, (row) => row.path);
+      LIMIT $${limitIndex} OFFSET $${limitIndex + 1}`,
+    [...params.slice(0, -1), take, offset],
+  ), rows => filterWikiRows(ctx, input.companyId, space, rows, row => row.path, true));
+  const readablePageRows = pageResult.rows;
   const pages: WikiPageRow[] = readablePageRows.map((row) => ({
     path: row.path,
     title: row.title,
     pageType: row.page_type,
     backlinkCount: Array.isArray(row.backlinks) ? row.backlinks.length : 0,
     sourceCount: Array.isArray(row.source_refs) ? row.source_refs.length : 0,
+    ...citationRowMetadata(row),
     contentHash: row.content_hash,
     updatedAt: row.updated_at,
   }));
@@ -4455,7 +4521,7 @@ export async function listPages(ctx: PluginContext, input: {
     sources = (await listSources(ctx, { companyId: input.companyId, wikiId, spaceSlug: space.slug, limit, onlyReadable: true })).sources;
     sources = mergeLocalSourceRows(sources, await listLocalFiles(ctx, { companyId: input.companyId, space, relativePath: "raw" }));
   }
-  return { pages: pagesWithLocalFiles, sources };
+  return { pages: pagesWithLocalFiles.slice(0, limit), sources: sources.slice(0, limit) };
 }
 
 export async function listSources(ctx: PluginContext, input: {
@@ -4468,17 +4534,15 @@ export async function listSources(ctx: PluginContext, input: {
   const wikiId = normalizeWikiId(input.wikiId);
   const space = await resolveSpace(ctx, { companyId: input.companyId, wikiId, spaceSlug: input.spaceSlug });
   const limit = normalizeLimit(input.limit, 500, LOCAL_BROWSE_FILE_LIMIT);
-  const rows = await ctx.db.query<{ raw_path: string; title: string | null; source_type: string; url: string | null; status: string; created_at: string }>(
+  const sourceResult = await collectVisibleRows<{ raw_path: string; title: string | null; source_type: string; url: string | null; status: string; created_at: string }>(limit, (take, offset) => ctx.db.query<{ raw_path: string; title: string | null; source_type: string; url: string | null; status: string; created_at: string }>(
     `SELECT raw_path, title, source_type, url, status, created_at::text AS created_at
        FROM ${tableName(ctx.db.namespace, "wiki_sources")}
       WHERE company_id = $1 AND wiki_id = $2 AND space_id = $4
-      ORDER BY created_at DESC
-      LIMIT $3`,
-    [input.companyId, wikiId, limit, space.id],
-  );
-  const sourceRows = input.onlyReadable
-    ? await filterReadableRows(ctx, input.companyId, space, rows, (row) => row.raw_path)
-    : rows;
+      ORDER BY created_at DESC, raw_path
+      LIMIT $3 OFFSET $5`,
+    [input.companyId, wikiId, take, space.id, offset],
+  ), rows => filterWikiRows(ctx, input.companyId, space, rows, row => row.raw_path, input.onlyReadable));
+  const sourceRows = sourceResult.rows;
   return {
     sources: sourceRows.map((row) => ({
       rawPath: row.raw_path,
@@ -4491,11 +4555,35 @@ export async function listSources(ctx: PluginContext, input: {
   };
 }
 
+async function readWikiTextWithStatus(ctx: PluginContext, companyId: string, path: string) {
+  if (ctx.localFolders.readTextWithStatus)
+    return ctx.localFolders.readTextWithStatus(companyId, WIKI_ROOT_FOLDER_KEY, path);
+  return { contents: await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, path), citationHolds: [] };
+}
+function citationRowMetadata(row: unknown): {citationHolds?:PluginWikiCitationHold[]} {
+  const holds=(row as {citationHolds?:unknown})?.citationHolds;
+  if (holds === undefined) return {};
+  if (!Array.isArray(holds) || holds.some(value => {
+    if (!value || typeof value !== "object") return true;
+    const h=value as Record<string,unknown>;
+    return h.state!=="blocked_by_retraction" || h.readPolicy!=="citation-holds" ||
+      ["path","retractedPath","retractionId","reason","eventHash"].some(k=>typeof h[k]!=="string" || !h[k]);
+  })) throw new Error("E_WIKI_INVALID_CITATION_HOLD");
+  return holds.length ? {citationHolds:holds as PluginWikiCitationHold[]} : {};
+}
+function citationRowLabel(row: unknown) {
+  return citationRowMetadata(row).citationHolds?.length ? "[引用利用保留] " : "";
+}
+function citationWarning(holds: unknown[]) {
+  return holds.length ? "[E_WIKI_CITATION_HOLD " + JSON.stringify(holds) + "]\n利用保留、誤り認定ではない。該当引用を根拠に使わず、無関係な内容のみ再利用してください。\n\n" : "";
+}
+
 export async function readWikiPage(ctx: PluginContext, input: { companyId: string; wikiId?: string | null; spaceSlug?: string | null; path: string }) {
   const wikiId = normalizeWikiId(input.wikiId);
   const space = await resolveSpace(ctx, { companyId: input.companyId, wikiId, spaceSlug: input.spaceSlug });
   const path = assertWikiPath(input.path);
-  const contents = await ctx.localFolders.readText(input.companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, path));
+  const read = await readWikiTextWithStatus(ctx, input.companyId, spaceRelativePath(space, path));
+  const { contents, citationHolds } = read;
   const meta = await ctx.db.query<{ title: string | null; page_type: string | null; backlinks: unknown; source_refs: unknown; updated_at: string }>(
     `SELECT title, page_type, backlinks, source_refs, updated_at::text AS updated_at
        FROM ${tableName(ctx.db.namespace, "wiki_pages")}
@@ -4509,6 +4597,8 @@ export async function readWikiPage(ctx: PluginContext, input: { companyId: strin
     spaceSlug: space.slug,
     path,
     contents,
+    citationHolds,
+    warnings: citationHolds.length ? ["利用保留、誤り認定ではない。失効した引用以外の内容は再利用できます。"] : [],
     title: row?.title ?? inferTitle(path, contents),
     pageType: row?.page_type ?? inferPageType(path),
     backlinks: Array.isArray(row?.backlinks) ? row?.backlinks : [],

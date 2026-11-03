@@ -22,7 +22,8 @@
  * @see PLUGIN_SPEC.md §13.10 — `executeTool`
  */
 
-import type { Db } from "@paperclipai/db";
+import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
 import type {
   PaperclipPluginManifestV1,
   PluginRecord,
@@ -41,6 +42,9 @@ import { pluginRegistryService } from "./plugin-registry.js";
 import { logger } from "../middleware/logger.js";
 import { documentService } from "./documents.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { loadAllWikiRetractions } from "./wiki-retraction-store.js";
+import { retractionFolderGate } from "./wiki-retraction-gate.js";
+import { pluginDatabaseService } from "./plugin-database.js";
 import { applyWikiPublicationReadback, publicationNeed } from "./wiki-publication-readback.js";
 
 // ---------------------------------------------------------------------------
@@ -437,11 +441,24 @@ export function createPluginToolDispatcher(
         );
         if (settings?.configJson && Object.prototype.hasOwnProperty.call(settings.configJson, "publicationReadback")) {
           const resolvedPage = result.result.data as Record<string, unknown>;
+          const persisted = await loadAllWikiRetractions(db, registered.pluginDbId, runContext.companyId);
+          const gate = retractionFolderGate(persisted, runContext.companyId, "wiki-root");
+          let spaces: Array<{ path_prefix: string | null }> = [];
+          if (gate.active) {
+            const pluginDb = pluginDatabaseService(db);
+            const namespace = await pluginDb.getRuntimeNamespace(registered.pluginDbId);
+            spaces = await pluginDb.query<{ path_prefix: string | null }>(registered.pluginDbId,
+              `SELECT path_prefix FROM ${namespace}.wiki_spaces WHERE company_id = $1 AND wiki_id = $2 AND slug = $3`,
+              [runContext.companyId, resolvedPage.wikiId, resolvedPage.spaceSlug]);
+            publicationNeed(spaces.length === 1, "retraction_space");
+          }
+          const physical = (p: string) => spaces[0]?.path_prefix ? `${spaces[0].path_prefix}/${p}` : p;
           const documents = documentService(db);
           const interactions = issueThreadInteractionService(db);
           result.result = await applyWikiPublicationReadback(
             settings.configJson.publicationReadback, runContext.companyId,
             parameters, result.result, {
+              retraction: async (path) => gate.block(physical(path)),
               page: async (path) => await workerManager.call(
                 registered.pluginDbId, "getData", {
                   key: "page-content", companyId: runContext.companyId,
@@ -455,9 +472,13 @@ export function createPluginToolDispatcher(
               document: async (issueId, key) => await documents.getIssueDocumentByKey(
                 issueId, key,
               ) as Record<string, unknown> | null,
-              review: async (issueId, id) => (
-                (await interactions.listForIssue(issueId)).find(r => r.id === id) ?? null
-              ) as unknown as Record<string, unknown> | null,
+              review: async (issueId, id) => {
+                const review=(await interactions.listForIssue(issueId)).find(r=>r.id===id);
+                if(!review)return null;
+                const rows=review.resolvedByRunId?await db.select().from(heartbeatRuns).where(and(
+                  eq(heartbeatRuns.id,review.resolvedByRunId),eq(heartbeatRuns.companyId,runContext.companyId))):[];
+                return {...review,resolvedRun:rows[0]??null} as unknown as Record<string,unknown>;
+              },
             },
           );
         }

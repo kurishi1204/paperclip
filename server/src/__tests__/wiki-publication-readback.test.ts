@@ -3,23 +3,23 @@ import assert from "node:assert/strict";
 import { applyWikiPublicationReadback, verifyWikiPublication, publicationCanonical, publicationHash, type JsonObject, type PublicationRegistry } from "../services/wiki-publication-readback.js";
 
 function fixture() {
-  const documents: Record<string, JsonObject> = {}; const reviews: Record<string, JsonObject> = {}; const pages: Record<string, JsonObject> = {};
+  const runs: Record<string, JsonObject> = {}; const documents: Record<string, JsonObject> = {}; const reviews: Record<string, JsonObject> = {}; const pages: Record<string, JsonObject> = {};
   const registry: PublicationRegistry = { schema: "colo.shared-wiki-publication-readback/v1", companyId: "company", wikiId: "default", spaceSlug: "default", qaAgentId: "qa", entries: [] };
   for (const name of ["source", "synthesis"]) {
     const body = `審査された本文 ${name}`; const contents = `収録メモ\n${body}`;
     const ref = { kind: "document", issueId: name, documentId: `doc-${name}`, documentKey: name, revisionId: `rev-${name}` };
-    documents[name] = { id: ref.documentId, companyId: "company", issueId: name, latestRevisionId: ref.revisionId, body };
-    const review: JsonObject = { id: `qa-${name}`, companyId: "company", issueId: name, status: "accepted", sourceRunId: "producer-run", resolvedByAgentId: "qa", resolvedByRunId: "qa-run", resolvedAt: "2026-10-30T14:00:23.540Z", payload: { target: { key: "native_completion_review" } }, result: { outcome: "accepted" } };
-    reviews[name] = review; pages[name] = { path: name, wikiId: "default", spaceSlug: "default", contents, hash: publicationHash(contents), sourceRefs: [ref] };
+    documents[name] = { id: ref.documentId, companyId: "company", issueId: name, latestRevisionId: ref.revisionId, body, createdByAgentId:"producer",updatedByAgentId:"producer",updatedByUserId:null };
+    const review: JsonObject = { id: `qa-${name}`, companyId: "company", issueId: name, status: "accepted", sourceRunId: "producer-run", resolvedByAgentId: "qa", resolvedByRunId: "qa-run-"+name, resolvedAt: "2026-10-30T14:00:23.540Z", payload: { target: { key: "native_completion_review" } }, result: { outcome: "accepted" } };
+    runs[review.resolvedByRunId as string]={id:review.resolvedByRunId,companyId:"company",agentId:"qa",status:"succeeded"}; reviews[name] = review; pages[name] = { path: name, wikiId: "default", spaceSlug: "default", contents, hash: publicationHash(contents), sourceRefs: [ref] };
     registry.entries.push({ path: name, issueId: name, documentId: ref.documentId, documentKey: name, revisionId: ref.revisionId, producerAgentId: "producer", reviewId: review.id as string, wikiSHA256: publicationHash(contents), documentBodySHA256: publicationHash(body), reviewRecordSHA256: publicationHash(publicationCanonical(review)), sourceRefsSHA256: "" });
   }
   (pages.synthesis!.sourceRefs as unknown[]).push(structuredClone((pages.source!.sourceRefs as unknown[])[0]));
   for (const pin of registry.entries) pin.sourceRefsSHA256 = publicationHash(publicationCanonical(pages[pin.path]!.sourceRefs));
   let reads = 0;
-  const readers = { page: async (path: string) => { reads++; return pages[path]!; }, document: async (id: string) => documents[id]!, review: async (id: string) => reviews[id]! };
+  const readers = { page: async (path: string) => { reads++; return pages[path]!; }, document: async (id: string) => documents[id]!, review: async (id: string) => ({...reviews[id]!,resolvedRun:runs[reviews[id]!.resolvedByRunId as string]??null}) };
   const result = { content: pages.synthesis!.contents as string, data: { companyId: "company", wikiId: "default", spaceSlug: "default", path: "synthesis", hash: pages.synthesis!.hash } };
   const run = (args: unknown = { companyId: "company", path: "synthesis" }, configuration: unknown = registry) => applyWikiPublicationReadback(configuration, "company", args, result, readers);
-  return { registry, documents, reviews, pages, result, run, reads: () => reads };
+  return { registry, documents, reviews, runs, pages, result, run, reads: () => reads };
 }
 
 test("employee tool receives the same body and a current parent citation", async () => {
@@ -38,7 +38,7 @@ test("source document company mismatch is rejected", async () => { const f = fix
 test("caller parameters cannot change company", async () => { const f = fixture(); await assert.rejects(f.run({ companyId: "other", path: "synthesis" }), /request_scope/); assert.equal(f.reads(), 0); });
 test("unregistered pages explicitly retain unverified status", async () => { const f = fixture(); f.result.data.path = "not-registered"; const out = await f.run({ companyId: "company", path: "not-registered" }); assert.match(out.content, /unverified source material/); assert.equal(((out.data as JsonObject).publicationReadback as JsonObject).state, "unregistered"); assert.equal(f.reads(), 0); });
 test("malformed configured registry is not silently disabled", async () => { const f = fixture(); f.registry.entries[0]!.wikiSHA256 = "invalid"; await assert.rejects(f.run(), /registry_hash/); });
-test("self-reviewed publication cannot pass", async () => { const f = fixture(); f.registry.entries[0]!.producerAgentId = "qa"; await assert.rejects(f.run(), /review_not_independent/); });
+test("self-reviewed publication cannot pass", async () => { const f = fixture(); f.registry.entries[0]!.producerAgentId = "qa"; f.documents.source!.createdByAgentId="qa";f.documents.source!.updatedByAgentId="qa"; await assert.rejects(f.run(), /review_not_independent/); });
 test("database Date receipts hash like their API JSON representation", async () => { const f = fixture(); f.reviews.source!.resolvedAt = new Date(f.reviews.source!.resolvedAt as string); await f.run(); });
 
 test("tool metadata cannot point at another page under a verified body", async () => { const f = fixture(); f.result.data.path = "other"; await assert.rejects(f.run(), /tool_metadata_changed/); });
@@ -61,7 +61,7 @@ test("a shared ancestor is checked once in a single dependency read", async () =
     const ref = { kind: "document", issueId: name, documentId: "doc-" + name, documentKey: name, revisionId: "rev-" + name };
     const body = "Body for " + name;
     const review: JsonObject = { id: "qa-" + name, companyId: "company", issueId: name, status: "accepted", sourceRunId: "writer-run", resolvedByAgentId: "qa", resolvedByRunId: "qa-run", resolvedAt: null, payload: {}, result: { outcome: "accepted" } };
-    documents[name] = { id: ref.documentId, companyId: "company", issueId: name, latestRevisionId: ref.revisionId, body };
+    documents[name] = { id: ref.documentId, companyId: "company", issueId: name, latestRevisionId: ref.revisionId, body,createdByAgentId:"writer",updatedByAgentId:"writer",updatedByUserId:null };
     reviews[review.id as string] = review;
     pages[name] = { path: name, wikiId: "default", spaceSlug: "default", contents: body, hash: publicationHash(body), sourceRefs: [ref, ...parents.map(p => (pages[p]!.sourceRefs as unknown[])[0])] };
     registry.entries.push({ path: name, ...ref, producerAgentId: "writer", reviewId: review.id as string, wikiSHA256: pages[name]!.hash as string, documentBodySHA256: publicationHash(body), reviewRecordSHA256: publicationHash(publicationCanonical(review)), sourceRefsSHA256: publicationHash(publicationCanonical(pages[name]!.sourceRefs)) });
@@ -77,7 +77,7 @@ test("a shared ancestor is checked once in a single dependency read", async () =
   const readers = {
     page: async (path: string) => { pageReads.push(path); return pages[path]!; },
     document: async (id: string) => { documentReads.push(id); return documents[id]!; },
-    review: async (_id: string, id: string) => { reviewReads.push(id); return reviews[id]!; },
+    review: async (_id: string, id: string) => { reviewReads.push(id); return {...reviews[id]!,resolvedRun:{id:reviews[id]!.resolvedByRunId,companyId:"company",agentId:"qa",status:"succeeded"}}; },
   };
   await verifyWikiPublication(registry, "root", readers);
   for (const reads of [pageReads, documentReads, reviewReads]) {
@@ -148,12 +148,12 @@ test("missing resolved metadata cannot silently opt out of verification", async 
 test("each publication keeps its own named reviewer across recursive dependencies", async () => {
   const f = fixture();
   f.registry.entries[1]!.qaAgentId = "new-qa";
-  f.reviews.synthesis!.resolvedByAgentId = "new-qa";
+  f.reviews.synthesis!.resolvedByAgentId = "new-qa"; f.runs[f.reviews.synthesis!.resolvedByRunId as string]!.agentId="new-qa";
   f.registry.entries[1]!.reviewRecordSHA256 = publicationHash(publicationCanonical(f.reviews.synthesis));
   await f.run();
   assert.equal(f.registry.qaAgentId, "qa");
   assert.equal(f.reviews.source!.resolvedByAgentId, "qa");
-  f.reviews.source!.resolvedByAgentId = "new-qa";
+  f.reviews.source!.resolvedByAgentId = "new-qa"; f.runs[f.reviews.source!.resolvedByRunId as string]!.agentId="new-qa";
   await assert.rejects(f.run(), /review_not_independent/);
 });
 
@@ -179,9 +179,52 @@ for (const value of [null, undefined, "", " ", " qa ", 42, [], {}]) {
 test("a new reviewer's revoked receipt still blocks the dependent page", async () => {
   const f = fixture();
   f.registry.entries[0]!.qaAgentId = "new-qa";
-  f.reviews.source!.resolvedByAgentId = "new-qa";
+  f.reviews.source!.resolvedByAgentId = "new-qa"; f.runs[f.reviews.source!.resolvedByRunId as string]!.agentId="new-qa";
   f.registry.entries[0]!.reviewRecordSHA256 = publicationHash(publicationCanonical(f.reviews.source));
   await f.run();
   f.reviews.source!.status = "rejected";
   await assert.rejects(f.run(), /review_not_accepted/);
+});
+
+function citationReaders(f: ReturnType<typeof fixture>, legacy=false) {
+ return {page:async(p:string)=>f.pages[p]!,document:async(id:string)=>f.documents[id]!,review:async(id:string)=>({...f.reviews[id]!,resolvedRun:f.runs[f.reviews[id]!.resolvedByRunId as string]??null}),
+  retraction:async(p:string)=>({state:p==="source"?"retracted" as const:"blocked_by_retraction" as const,path:p,retractedPath:"source",retractionId:"withdrawal",reason:"Needs revalidation",eventHash:"e".repeat(64),...(legacy?{}:{readPolicy:"citation-holds" as const})})};
+}
+test("citation policy keeps exact downstream body and reconstructs held reference proof",async()=>{
+ const f=fixture();const body=f.pages.synthesis!.contents;
+ const input={...f.result,content:"worker warning is replaced",data:{...f.result.data,contents:body,citationHolds:[{invented:true}]}};
+ const out=await applyWikiPublicationReadback(f.registry,"company",{companyId:"company",path:"synthesis"},input,citationReaders(f));
+ const proof=(out.data as JsonObject).publicationReadback as JsonObject;
+ assert.equal(proof.state,"verified_with_citation_holds");
+ assert.deepEqual((proof.invalidatedCitations as JsonObject[]).map(h=>[h.path,h.documentId,h.revisionId]),[["source","doc-source","rev-source"]]);
+ assert.ok(out.content.endsWith(body as string));assert.match(out.content,/利用保留、誤り認定ではない/);
+ assert.equal(out.content.includes("invented"),false);
+ assert.equal(f.pages.synthesis!.contents,body);
+});
+test("direct source stays a tombstone; legacy downstream stays blocked",async()=>{
+ const f=fixture();
+ const direct=await applyWikiPublicationReadback(f.registry,"company",{companyId:"company",path:"source"},{content:"untrusted body",data:{companyId:"company",wikiId:"default",spaceSlug:"default",path:"source"}},citationReaders(f));
+ assert.equal(direct.content.includes(f.pages.source!.contents as string),false);
+ assert.equal(((direct.data as JsonObject).publicationReadback as JsonObject).state,"retracted");
+ const legacy=await applyWikiPublicationReadback(f.registry,"company",{companyId:"company",path:"synthesis"},f.result,citationReaders(f,true));
+ assert.equal(legacy.content.includes(f.pages.synthesis!.contents as string),false);
+});
+test("citation policy still rejects changed downstream text, invalid QA and worker substitution",async()=>{
+ for(const mutation of ["page","qa","worker"]){const f=fixture();const input={...f.result,data:{...f.result.data,contents:f.pages.synthesis!.contents}};
+  if(mutation==="page")f.pages.synthesis!.contents="modified";
+  if(mutation==="qa")f.reviews.synthesis!.status="pending";
+  if(mutation==="worker")input.data.contents="substituted";
+  await assert.rejects(applyWikiPublicationReadback(f.registry,"company",{companyId:"company",path:"synthesis"},input,citationReaders(f)));
+ }
+});
+
+for(const field of ["createdByAgentId","updatedByAgentId"] as const){
+ test("a registered original cannot change "+field+" under its old publication proof",async()=>{
+  const f=fixture();f.documents.source![field]="qa";
+  await assert.rejects(f.run(),/document_author_changed/);
+ });
+}
+test("an accepted original's failed QA Run blocks its dependent result",async()=>{
+ const f=fixture();f.runs[f.reviews.source!.resolvedByRunId as string]!.status="failed";
+ await assert.rejects(f.run(),/review_run_not_completed/);
 });

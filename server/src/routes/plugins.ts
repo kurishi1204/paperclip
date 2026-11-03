@@ -91,7 +91,10 @@ import {
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { secretService } from "../services/secrets.js";
-import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { wikiRetractionRuntime } from "../services/wiki-retraction-runtime.js";
+import { inspectWikiLocalFolder, assertWikiConfiguredRoot, withWikiRetractionLock } from "../services/wiki-retraction-store.js";
+import { wikiRepublicationRuntime } from "../services/wiki-republication-runtime.js";
+import { HttpError, badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 
 /**
  * Floor: when the hosting operator hides the Plugins settings surface
@@ -525,6 +528,27 @@ interface PluginToolExecuteRequest {
  * @param bridgeDeps - Optional bridge proxy dependencies for getData/performAction
  * @returns Express router with plugin routes mounted
  */
+type WikiOperationReceipt={state:string;file?:{matchesIntent?:boolean};maintenanceLog:{state:string}};
+async function sendWikiOperationReceipt(res:Response,operationId:string,kind:"retraction"|"republication",
+  execute:()=>Promise<unknown>,read:()=>Promise<WikiOperationReceipt>) {
+  let completionIssue:string|undefined;
+  try{await execute();}catch(error){
+    const detail=error instanceof HttpError?error.details as {code?:string;operationId?:string}|undefined:undefined;
+    if(error instanceof HttpError&&error.status===409&&detail?.code===`wiki_${kind}_post_commit_unresolved`&&detail.operationId===operationId)
+      completionIssue=detail.code;
+    else throw error;
+  }
+  const receipt=await read();
+  const complete=!completionIssue&&receipt.maintenanceLog.state==="appended"&&
+    (kind==="retraction"?receipt.state==="withdrawn":receipt.state==="published"&&receipt.file?.matchesIntent===true);
+  res.status(complete?200:409).json({...receipt,...(completionIssue?{completionIssue}:{})});
+}
+
+function inspectScopedLocalFolder(connection:Db,plugin:{id:string;pluginKey:string},companyId:string,input:Parameters<typeof inspectPluginLocalFolder>[0]) {
+  return plugin.pluginKey==="paperclipai.plugin-llm-wiki"&&input.folderKey==="wiki-root"
+    ?inspectWikiLocalFolder(connection,plugin.id,companyId,input):inspectPluginLocalFolder(input);
+}
+
 export function pluginRoutes(
   db: Db,
   loader: ReturnType<typeof pluginLoader>,
@@ -1267,6 +1291,62 @@ export function pluginRoutes(
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).json({ error: message });
     }
+  });
+
+  // Withdrawal is an explicit board operation. Ordinary plugin/agent calls
+  // cannot manufacture an approval, change the actor, or read audit originals.
+  router.post("/plugins/:pluginId/wiki-retractions/preview", async (req, res) => {
+    assertBoard(req);
+    const companyId = requirePluginConfigCompanyId(req, req.body.companyId);
+    const plugin = await resolvePlugin(registry, req.params.pluginId);
+    if (!plugin) throw notFound("Plugin not found");
+    const { wikiId, spaceSlug, path: pagePath, reason } = req.body;
+    if (![wikiId, spaceSlug, pagePath, reason].every(v => typeof v === "string" && v.length > 0 && v === v.trim()))
+      throw badRequest("Canonical wikiId, spaceSlug, path and reason are required");
+    res.json(await wikiRetractionRuntime(db, plugin.id).preview({ companyId, wikiId, spaceSlug }, pagePath, reason));
+  });
+  router.post("/plugins/:pluginId/wiki-retractions/execute", async (req, res) => {
+    assertBoard(req);
+    const companyId = requirePluginConfigCompanyId(req, req.body.companyId);
+    const plugin = await resolvePlugin(registry, req.params.pluginId);
+    if (!plugin) throw notFound("Plugin not found");
+    const { issueId, documentKey, reviewId, ownerDecisionId, operationId } = req.body;
+    if (![issueId, documentKey, reviewId, ownerDecisionId, operationId].every(v => typeof v === "string" && v.length > 0 && v === v.trim()) ||
+      !/^[0-9a-f-]{36}$/.test(operationId)) throw badRequest("Fixed proposal, review and UUID operationId are required");
+    const actor = getActorInfo(req);
+    const runtime=wikiRetractionRuntime(db,plugin.id);
+    await sendWikiOperationReceipt(res,operationId,"retraction",
+      ()=>runtime.execute({companyId,issueId,documentKey,reviewId,ownerDecisionId,operationId,actorId:actor.actorId,runId:actor.runId}),
+      ()=>runtime.receipt(companyId,operationId));
+  });
+  router.post("/plugins/:pluginId/wiki-retractions/republications", async (req,res)=>{
+    assertBoard(req);
+    const companyId=requirePluginConfigCompanyId(req,req.body.companyId);
+    const plugin=await resolvePlugin(registry,req.params.pluginId);if(!plugin)throw notFound("Plugin not found");
+    const {issueId,documentKey,reviewId,operationId}=req.body;
+    if(![issueId,documentKey,reviewId,operationId].every(v=>typeof v==="string"&&v.length>0&&v===v.trim())||
+      !/^[0-9a-f-]{36}$/.test(operationId))throw badRequest("Fixed draft, review and UUID operationId are required");
+    const runtime=wikiRepublicationRuntime(db,plugin.id);
+    await sendWikiOperationReceipt(res,operationId,"republication",
+      ()=>runtime.execute({companyId,issueId,documentKey,reviewId,operationId,actorId:getActorInfo(req).actorId}),
+      ()=>runtime.receipt(companyId,operationId));
+  });
+  router.get("/plugins/:pluginId/wiki-retractions/republications/:operationId",async(req,res)=>{
+    assertBoard(req);const companyId=requirePluginConfigCompanyId(req,req.query.companyId);
+    const plugin=await resolvePlugin(registry,req.params.pluginId);if(!plugin)throw notFound("Plugin not found");
+    res.json(await wikiRepublicationRuntime(db,plugin.id).receipt(companyId,req.params.operationId));
+  });
+  router.get("/plugins/:pluginId/wiki-retractions/operations/:operationId",async(req,res)=>{
+    assertBoard(req);const companyId=requirePluginConfigCompanyId(req,req.query.companyId);
+    const plugin=await resolvePlugin(registry,req.params.pluginId);if(!plugin)throw notFound("Plugin not found");
+    res.json(await wikiRetractionRuntime(db,plugin.id).receipt(companyId,req.params.operationId));
+  });
+  router.get("/plugins/:pluginId/wiki-retractions/audit", async (req, res) => {
+    assertBoard(req);
+    const companyId = requirePluginConfigCompanyId(req, req.query.companyId);
+    const plugin = await resolvePlugin(registry, req.params.pluginId);
+    if (!plugin) throw notFound("Plugin not found");
+    res.json(await wikiRetractionRuntime(db, plugin.id).audit(companyId));
   });
 
   // ===========================================================================
@@ -2874,7 +2954,7 @@ export function pluginRoutes(
     const folderKeys = declarations.map((declaration) => declaration.folderKey);
 
     const statuses = await Promise.all(folderKeys.map((folderKey) =>
-      inspectPluginLocalFolder({
+      inspectScopedLocalFolder(db,plugin,companyId,{
         folderKey,
         declaration: findLocalFolderDeclaration(declarations, folderKey),
         storedConfig: storedFolders[folderKey] ?? null,
@@ -2903,7 +2983,7 @@ export function pluginRoutes(
     const storedFolders = getStoredLocalFolders(settings?.settingsJson);
     const declarations = plugin.manifestJson.localFolders ?? [];
     const declaration = requireLocalFolderDeclaration(declarations, folderKey);
-    const status = await inspectPluginLocalFolder({
+    const status = await inspectScopedLocalFolder(db,plugin,companyId,{
       folderKey,
       declaration,
       storedConfig: storedFolders[folderKey] ?? null,
@@ -2934,7 +3014,7 @@ export function pluginRoutes(
     }
 
     const declaration = requireLocalFolderDeclaration(plugin.manifestJson.localFolders ?? [], folderKey);
-    const status = await inspectPluginLocalFolder({
+    const status = await inspectScopedLocalFolder(db,plugin,companyId,{
       folderKey,
       declaration,
       overrideConfig: {
@@ -2967,28 +3047,37 @@ export function pluginRoutes(
       return;
     }
 
-    const existing = await registry.getCompanySettings(plugin.id, companyId);
+    const configuredPath=body.path;
+    const configure=async(connection:Db)=>{
+      const scopedRegistry=pluginRegistryService(connection);
+      const existing = await scopedRegistry.getCompanySettings(plugin.id, companyId);
     const declaration = requireLocalFolderDeclaration(plugin.manifestJson.localFolders ?? [], folderKey);
-    const status = await inspectPluginLocalFolder({
+    const status = await inspectScopedLocalFolder(connection,plugin,companyId,{
       folderKey,
       declaration,
       storedConfig: getStoredLocalFolders(existing?.settingsJson)[folderKey] ?? null,
       overrideConfig: {
-        path: body.path,
+        path: configuredPath,
       },
     });
 
+    if(plugin.pluginKey==="paperclipai.plugin-llm-wiki"&&folderKey==="wiki-root")
+      await assertWikiConfiguredRoot(connection,plugin.id,companyId,(status.realPath??status.path)!);
     const nextSettings = setStoredLocalFolder(existing?.settingsJson, folderKey, {
-      path: body.path,
+      path: configuredPath,
       access: status.access,
       requiredDirectories: status.requiredDirectories,
       requiredFiles: status.requiredFiles,
     });
-    await registry.upsertCompanySettings(plugin.id, companyId, {
+    await scopedRegistry.upsertCompanySettings(plugin.id, companyId, {
       enabled: existing?.enabled ?? true,
       settingsJson: nextSettings,
       lastError: status.healthy ? null : status.problems.map((item: { message: string }) => item.message).join("; "),
     });
+      return status;
+    };
+    const status=plugin.pluginKey==="paperclipai.plugin-llm-wiki"&&folderKey==="wiki-root"
+      ?await withWikiRetractionLock(db,plugin.id,companyId,configure,true):await configure(db);
     await logPluginMutationActivity(req, "plugin.local_folder.configured", plugin.id, {
       pluginId: plugin.id,
       pluginKey: plugin.pluginKey,

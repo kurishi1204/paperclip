@@ -1,3 +1,4 @@
+import { buildWikiSpacePrefix, buildWikiPageHref, buildWikiReferenceHref } from "@paperclipai/plugin-sdk/ui";
 import {
   AssigneePicker,
   FileTree,
@@ -298,6 +299,7 @@ type WikiSpaceWithFolderStatus = WikiSpace & {
 const DEFAULT_SPACE_SLUG = "default";
 
 type WikiPageRow = {
+  citationHolds?: PageContentData["citationHolds"];
   path: string;
   title: string | null;
   pageType: string | null;
@@ -329,6 +331,7 @@ type PageContentData = {
   pageType: string | null;
   backlinks: string[];
   sourceRefs: Array<Record<string, unknown> | string>;
+  citationHolds?: Array<{ retractedPath: string; retractionId: string; eventHash: string }>;
   updatedAt: string | null;
   hash: string;
 };
@@ -1426,11 +1429,7 @@ function readSettingsSpaceSlugFromLocation(pathname: string): string | null {
   return typeof slug === "string" && slug.length > 0 ? slug : null;
 }
 
-function buildSpacePrefix(spaceSlug: string): string {
-  return spaceSlug && spaceSlug !== DEFAULT_SPACE_SLUG
-    ? `/wiki/spaces/${encodeURIComponent(spaceSlug)}`
-    : `/wiki`;
-}
+function buildSpacePrefix(spaceSlug:string):string {return buildWikiSpacePrefix(spaceSlug);}
 
 function buildSectionHref(section: SectionKey, spaceSlug: string = DEFAULT_SPACE_SLUG): string {
   const prefix = buildSpacePrefix(spaceSlug);
@@ -1460,11 +1459,7 @@ function readSelectedTreePathFromLocation(pathname: string, search: string): str
   return readSelectedTreePathFromSearch(search);
 }
 
-function buildPageHref(treePath: string, spaceSlug: string = DEFAULT_SPACE_SLUG): string {
-  const prefix = buildSpacePrefix(spaceSlug);
-  const encodedPath = routeSegmentsFromTreePath(treePath).map((segment) => encodeURIComponent(segment)).join("/");
-  return encodedPath ? `${prefix}/page/${encodedPath}` : prefix;
-}
+function buildPageHref(treePath:string,spaceSlug:string=DEFAULT_SPACE_SLUG):string {return buildWikiPageHref(treePath,spaceSlug);}
 
 function wikiSidebarNavigationState(treePath: string): Record<typeof WIKI_SIDEBAR_NAV_STATE_KEY, string> {
   return { [WIKI_SIDEBAR_NAV_STATE_KEY]: treePath };
@@ -1502,52 +1497,6 @@ function writeRouteSidebarExpandedPaths(storageKey: string, paths: ReadonlySet<s
   } catch {
     // Ignore storage failures; the tree still works for the current render.
   }
-}
-
-const ROOT_WIKI_LINK_PAGES = new Set(["WIKI.md", "AGENTS.md", "IDEA.md", "index.md", "log.md"]);
-
-function splitWikiLinkTarget(target: string): { path: string; fragment: string | null } | null {
-  const trimmed = target.trim();
-  if (!trimmed || /^[a-z][a-z\d+.-]*:/i.test(trimmed) || trimmed.startsWith("//")) return null;
-
-  const hashIndex = trimmed.indexOf("#");
-  const rawPath = (hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed)
-    .trim()
-    .replace(/^\/+/, "");
-  if (
-    !rawPath ||
-    rawPath.includes("\\") ||
-    rawPath.split("/").some((segment) => !segment || segment === "." || segment === "..")
-  ) {
-    return null;
-  }
-
-  const fragment = hashIndex >= 0 ? trimmed.slice(hashIndex + 1).trim() || null : null;
-  return { path: rawPath, fragment };
-}
-
-function withMarkdownExtension(path: string): string {
-  return path.toLowerCase().endsWith(".md") ? path : `${path}.md`;
-}
-
-function normalizeWikiLinkPagePath(target: string): { path: string; fragment: string | null } | null {
-  const parsed = splitWikiLinkTarget(target);
-  if (!parsed) return null;
-
-  let path = withMarkdownExtension(parsed.path);
-  if (!path.startsWith("wiki/") && !path.startsWith("raw/") && !ROOT_WIKI_LINK_PAGES.has(path)) {
-    path = `wiki/${path}`;
-  }
-
-  return { path, fragment: parsed.fragment };
-}
-
-function buildWikiLinkHref(target: string, resolveHref: (to: string) => string): string | null {
-  const normalized = normalizeWikiLinkPagePath(target);
-  if (!normalized) return null;
-
-  const href = resolveHref(buildPageHref(normalized.path));
-  return normalized.fragment ? `${href}#${encodeURIComponent(normalized.fragment)}` : href;
 }
 
 function routeSegmentsFromTreePath(treePath: string): string[] {
@@ -3119,7 +3068,7 @@ function treeDisplayName(path: string, title: string | null): string {
   return (BASELINE_FILES as readonly string[]).includes(path) ? basename(path) : pageDisplayName(path, title);
 }
 
-function buildBrowseTree(
+export function buildBrowseTree(
   pages: WikiPageRow[],
   sources: WikiSourceRow[],
 ): FileTreeNode[] {
@@ -3148,7 +3097,7 @@ function buildBrowseTree(
     seenPaths.add(page.path);
     const parentDir = dirname(page.path);
     const file: FileTreeNode = {
-      name: treeDisplayName(page.path, page.title),
+      name: (page.citationHolds?.length ? "[引用利用保留] " : "") + treeDisplayName(page.path, page.title),
       path: page.path,
       kind: "file",
       children: [],
@@ -3304,8 +3253,8 @@ function PageDetail({ context, path, spaceSlug }: { context: { companyId: string
 
   const editable = path ? isEditableWikiPagePath(path) : false;
   const resolveWikiLinkHref = useCallback(
-    (target: string) => buildWikiLinkHref(target, hostNavigation.resolveHref),
-    [hostNavigation.resolveHref],
+    (target: string) => path?buildWikiReferenceHref(target,hostNavigation.resolveHref,{currentPagePath:path,spaceSlug:spaceSlug??DEFAULT_SPACE_SLUG}):null,
+    [hostNavigation.resolveHref,path,spaceSlug],
   );
   const handleTocClick = useCallback((event: React.MouseEvent<HTMLAnchorElement>, id: string) => {
     const root = markdownBodyRef.current;
@@ -3364,6 +3313,13 @@ function PageDetail({ context, path, spaceSlug }: { context: { companyId: string
 
   return (
     <article style={{ padding: isMobile ? "16px" : "24px 28px", display: "grid", gap: isMobile ? 12 : 14, minWidth: 0 }}>
+      {content.data.citationHolds?.length ? <Callout tone="warn">
+        <strong>引用の利用保留（本文の誤り認定ではありません）</strong>
+        <p>以下の出典に依存する引用は使わず、無関係な内容のみ再利用してください。</p>
+        <ul>{content.data.citationHolds.map(hold => <li key={hold.retractionId}>
+          <Mono>{hold.retractedPath}</Mono> — <Mono>{hold.retractionId}</Mono>
+        </li>)}</ul>
+      </Callout> : null}
       <header style={{ display: "grid", gap: 8, minWidth: 0 }}>
         <div style={{ display: "flex", alignItems: "flex-start", gap: 12, flexWrap: "wrap", minWidth: 0 }}>
           <div style={{ flex: "1 1 260px", minWidth: 0 }}>

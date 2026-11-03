@@ -46,7 +46,10 @@
   },
   "dependencies": {
     "zod": "^4.4.3",
-    "three": "0.185.1"
+    "three": "0.185.1",
+    "remark-parse": "^11.0.0",
+    "remark-gfm": "^4.0.1",
+    "unified": "^11.0.5"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

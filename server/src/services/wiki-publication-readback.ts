@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { RetractionBlock } from "./wiki-retraction-ledger.js";
 
 export type JsonObject = Record<string, unknown>;
 export interface PublicationPin {
@@ -17,6 +18,18 @@ export interface PublicationReaders {
   page(path: string): Promise<JsonObject>;
   document(issueId: string, key: string): Promise<JsonObject | null>;
   review(issueId: string, id: string): Promise<JsonObject | null>;
+  /** Host-owned durable state, never supplied by agent arguments or the worker. */
+  retraction?(path: string): Promise<RetractionBlock | null>;
+}
+export class PublicationRetractionError extends Error {
+  constructor(readonly block: RetractionBlock) { super(`wiki_publication_${block.state}`); }
+}
+function retractedToolResult<T>(registry: PublicationRegistry, path: string, source: RetractionBlock): T {
+  const block: RetractionBlock = { ...source, path,
+    state: source.retractedPath === path ? "retracted" : "blocked_by_retraction" };
+  // Only this explicitly constructed tombstone crosses the tool boundary.
+  return { content: JSON.stringify(block), data: { companyId: registry.companyId,
+    wikiId: registry.wikiId, spaceSlug: registry.spaceSlug, path, publicationReadback: block } } as T;
 }
 export function publicationNeed(ok: unknown, reason: string): asserts ok {
   if (!ok) throw new Error(`wiki_publication_${reason}`);
@@ -72,21 +85,30 @@ export function parsePublicationRegistry(value: unknown, companyId: string): Pub
   publicationNeed(new Set(versions).size === versions.length, "registry_document_ambiguous");
   return record as unknown as PublicationRegistry;
 }
-function reviewBasis(review: JsonObject) {
+export function reviewBasis(review: JsonObject) {
   return Object.fromEntries(["id", "companyId", "issueId", "status", "sourceRunId", "resolvedByAgentId", "resolvedByRunId", "resolvedAt", "payload", "result"].map(k => [k, review[k] ?? null]));
 }
 export interface PublicationCitation {
   path: string; wikiSHA256: string; documentId: string; revisionId: string;
   documentBodySHA256: string; bodyByteStart: number; bodyByteEndExclusive: number; reviewId: string;
 }
+export interface PublicationCitationHold {
+  path: string; documentId: string; revisionId: string; wikiSHA256: string;
+  retractedPath: string; retractionId: string; eventHash: string; reason: string;
+  state: "citation_use_held";
+}
 export interface PublicationProof {
-  state: "verified";
+  state: "verified" | "verified_with_citation_holds";
   citation: PublicationCitation;
   dependencies: PublicationCitation[];
+  invalidatedCitations?: PublicationCitationHold[];
 }
 export async function verifyWikiPublication(registry: PublicationRegistry, path: string, readers: PublicationReaders, initialSeen = new Set<string>()): Promise<PublicationProof> {
   const verified = new Map<string, PublicationProof>();
   async function visit(path: string, seen: Set<string>): Promise<PublicationProof> {
+    const block = await readers.retraction?.(path);
+    if (block && !(block.state === "blocked_by_retraction" && block.readPolicy === "citation-holds"))
+      throw new PublicationRetractionError(block);
     publicationNeed(!seen.has(path), "dependency_cycle");
     const cached = verified.get(path);
     if (cached) return cached;
@@ -99,6 +121,9 @@ export async function verifyWikiPublication(registry: PublicationRegistry, path:
     publicationNeed(Array.isArray(page.sourceRefs) && publicationHash(publicationCanonical(page.sourceRefs)) === pin.sourceRefsSHA256, "references_changed");
     const document = await readers.document(pin.issueId, pin.documentKey);
     publicationNeed(document && document.companyId === registry.companyId && document.issueId === pin.issueId && document.id === pin.documentId && document.latestRevisionId === pin.revisionId && typeof document.body === "string" && publicationHash(document.body) === pin.documentBodySHA256, "document_changed");
+    publicationNeed(document.createdByAgentId===pin.producerAgentId &&
+      document.updatedByAgentId===pin.producerAgentId && !document.updatedByUserId,
+      "document_author_changed");
     const bytes = Buffer.from(page.contents); const body = Buffer.from(document.body as string); const start = bytes.indexOf(body);
     publicationNeed(body.length > 0 && start >= 0 && bytes.indexOf(body, start + 1) === -1, "body_not_unique_exact_copy");
     const review = await readers.review(pin.issueId, pin.reviewId);
@@ -109,19 +134,43 @@ export async function verifyWikiPublication(registry: PublicationRegistry, path:
     const qaAgentId = Object.hasOwn(pin, "qaAgentId") ? pin.qaAgentId : registry.qaAgentId;
     publicationNeed(typeof qaAgentId === "string" && qaAgentId.trim().length > 0 && qaAgentId === qaAgentId.trim(), "registry_pin_reviewer");
     publicationNeed(review.resolvedByAgentId === qaAgentId && review.resolvedByAgentId !== pin.producerAgentId && review.resolvedByRunId && review.resolvedByRunId !== review.sourceRunId, "review_not_independent");
+    const resolvedRun=review.resolvedRun as JsonObject|null|undefined;
+    publicationNeed(resolvedRun&&resolvedRun.id===review.resolvedByRunId&&
+      resolvedRun.companyId===registry.companyId&&resolvedRun.agentId===qaAgentId&&
+      resolvedRun.status==="succeeded","review_run_not_completed");
     publicationNeed(publicationHash(publicationCanonical(reviewBasis(review))) === pin.reviewRecordSHA256, "review_changed");
     const refs = page.sourceRefs.map(object); const own = refs.filter(r => r.kind === "document" && r.documentId === pin.documentId);
     publicationNeed(own.length === 1 && ["issueId", "documentId", "documentKey", "revisionId"].every(k => own[0]![k] === pin[k as keyof PublicationPin]), "own_reference_changed");
     const dependencies: PublicationCitation[] = [];
+    const invalidated: PublicationCitationHold[] = [];
     for (const ref of refs) {
       publicationNeed(ref.kind === "document", "unregistered_source_kind");
       if (ref.documentId === pin.documentId) continue;
       const parents = registry.entries.filter(p => ["issueId", "documentId", "documentKey", "revisionId"].every(k => p[k as keyof PublicationPin] === ref[k]));
       publicationNeed(parents.length === 1, "unregistered_dependency");
-      const parent = await visit(parents[0]!.path, nextSeen); dependencies.push(parent.citation);
+      try {
+        const parent = await visit(parents[0]!.path, nextSeen);
+        dependencies.push(parent.citation);
+        invalidated.push(...(parent.invalidatedCitations ?? []));
+      } catch (error) {
+        // Only a host-recorded citation policy permits a partial proof.
+        // A v1 fence, transport error, changed body or bad QA still fails.
+        if (!(error instanceof PublicationRetractionError) || block?.readPolicy !== "citation-holds" ||
+          block.state !== "blocked_by_retraction" || error.block.readPolicy !== "citation-holds") throw error;
+        const pin=parents[0]!;
+        invalidated.push({ path: pin.path, documentId: pin.documentId, revisionId: pin.revisionId,
+          wikiSHA256: pin.wikiSHA256, retractedPath: error.block.retractedPath,
+          retractionId: error.block.retractionId, eventHash: error.block.eventHash,
+          reason: error.block.reason, state: "citation_use_held" });
+      }
     }
     publicationNeed(new Set(dependencies.map(p => p.path)).size === dependencies.length, "duplicate_dependency");
-    const proof: PublicationProof = { state: "verified", citation: { path, wikiSHA256: pin.wikiSHA256, documentId: pin.documentId, revisionId: pin.revisionId, documentBodySHA256: pin.documentBodySHA256, bodyByteStart: start, bodyByteEndExclusive: start + body.length, reviewId: pin.reviewId }, dependencies };
+    const holds = [...new Map(invalidated.map(h => [JSON.stringify([h.path,h.retractionId,h.eventHash]),h])).values()];
+    // A recorded downstream hold must resolve to an invalid reference. Never
+    // silently present an unexplained hold as fully verified.
+    publicationNeed(!block || holds.length > 0, "citation_hold_unresolved");
+    const proof: PublicationProof = { state: holds.length ? "verified_with_citation_holds" : "verified",
+      ...(holds.length ? { invalidatedCitations: holds } : {}), citation: { path, wikiSHA256: pin.wikiSHA256, documentId: pin.documentId, revisionId: pin.revisionId, documentBodySHA256: pin.documentBodySHA256, bodyByteStart: start, bodyByteEndExclusive: start + body.length, reviewId: pin.reviewId }, dependencies };
     // Only successful proofs are reused, only within this tool call. A later
     // employee read always checks current documents and QA records again.
     verified.set(path, proof);
@@ -146,15 +195,34 @@ export async function applyWikiPublicationReadback<T extends { content?: unknown
     registry.entries.some(p => p.path === data.path);
   // A canonical registered request must not be redirected by worker metadata.
   publicationNeed(!requestedRegistered || (resolvedRegistered && data.path === args.path), "tool_metadata_changed");
+  if (data.wikiId === registry.wikiId && data.spaceSlug === registry.spaceSlug) {
+    const direct = await readers.retraction?.(data.path);
+    if (direct && !(direct.state === "blocked_by_retraction" && direct.readPolicy === "citation-holds"))
+      return retractedToolResult<T>(registry, data.path, direct);
+  }
   if (!resolvedRegistered) {
     return { ...result, content: "[Current publication receipt not registered for this Wiki page; treat it as unverified source material.]\n\n" + result.content, data: { ...data, publicationReadback: { state: "unregistered" } } };
   }
   const resolvedPath = data.path;
   let root: JsonObject | undefined;
-  const proof = await verifyWikiPublication(registry, resolvedPath, { ...readers, page: async path => { const value = await readers.page(path); if (path === resolvedPath) root = value; return value; } });
-  publicationNeed(result.content === root?.contents, "tool_body_changed");
+  let proof: PublicationProof;
+  try {
+    proof = await verifyWikiPublication(registry, resolvedPath, { ...readers, page: async path => { const value = await readers.page(path); if (path === resolvedPath) root = value; return value; } });
+  } catch (error) {
+    if (!(error instanceof PublicationRetractionError)) throw error;
+    return retractedToolResult<T>(registry, resolvedPath, error.block);
+  }
+  publicationNeed(proof.state === "verified_with_citation_holds"
+    ? data.contents === root?.contents : result.content === root?.contents, "tool_body_changed");
   publicationNeed(data.companyId === companyId && data.wikiId === registry.wikiId &&
     data.spaceSlug === registry.spaceSlug && data.path === resolvedPath &&
     data.hash === proof.citation.wikiSHA256, "tool_metadata_changed");
+  if (proof.state === "verified_with_citation_holds") {
+    const warning="[E_WIKI_CITATION_HOLD " + JSON.stringify(proof.invalidatedCitations) + "]\n利用保留、誤り認定ではない。該当引用を根拠に使わず、無関係な内容のみ再利用してください。\n\n";
+    // Re-render from the exact pinned bytes and host proof, discarding any
+    // worker-supplied warning, extra prose or invented hold metadata.
+    return { ...result, content: warning + root!.contents,
+      data: { ...data, contents: root!.contents, citationHolds: proof.invalidatedCitations, publicationReadback: proof } };
+  }
   return { ...result, data: { ...data, publicationReadback: proof } };
 }

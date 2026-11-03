@@ -510,6 +510,10 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           return callHost("localFolders.readText", { companyId, folderKey, relativePath });
         },
 
+        async readTextWithStatus(companyId: string, folderKey: string, relativePath: string) {
+          return callHost("localFolders.readTextWithStatus", { companyId, folderKey, relativePath });
+        },
+
         async writeTextAtomic(companyId: string, folderKey: string, relativePath: string, contents: string) {
           return callHost("localFolders.writeTextAtomic", {
             companyId,
