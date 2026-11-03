@@ -4150,6 +4150,36 @@ async function filterRetractionRows<T>(ctx: PluginContext, companyId: string, sp
   return { rows: active, retractionReadback: { state: "checked", hiddenCount: tombstones.length, tombstones } };
 }
 
+/** Apply visibility before the caller's result limit. Hidden rows consume scan
+ * work, never the visible result budget. Report incomplete scans explicitly. */
+async function collectVisibleRows<T>(limit: number,
+  load: (take: number, offset: number) => Promise<T[]>,
+  check: (rows: T[]) => Promise<{ rows: T[]; retractionReadback?: { state: string; hiddenCount: number; tombstones: unknown[] } }>,
+) {
+  const rows: T[] = []; let scanned = 0;
+  const retractionReadback = { state: "inactive", hiddenCount: 0, tombstones: [] as unknown[] };
+  while (rows.length < limit) {
+    if (scanned >= LOCAL_BROWSE_FILE_LIMIT) {
+      if (!(await load(1, scanned)).length) break;
+      throw new Error(`E_WIKI_RETRACTION_SCAN_INCOMPLETE: scanned=${scanned}, visible=${rows.length}, requested=${limit}; refine the query`);
+    }
+    const take = Math.min(limit - rows.length, LOCAL_BROWSE_FILE_LIMIT - scanned);
+    const batch = await load(take, scanned);
+    if (!batch.length) break;
+    if (batch.length > take) throw new Error("E_WIKI_PAGE_WINDOW_INVALID");
+    const checked = await check(batch);
+    rows.push(...checked.rows);
+    if (checked.retractionReadback) {
+      if (checked.retractionReadback.state === "checked") retractionReadback.state = "checked";
+      retractionReadback.hiddenCount += checked.retractionReadback.hiddenCount;
+      retractionReadback.tombstones.push(...checked.retractionReadback.tombstones);
+    }
+    scanned += batch.length;
+    if (batch.length < take) break;
+  }
+  return { rows, retractionReadback };
+}
+
 export async function registerWikiTools(ctx: PluginContext) {
   ctx.tools.register("wiki_search", {
     displayName: "Search Wiki",
@@ -4162,7 +4192,7 @@ export async function registerWikiTools(ctx: PluginContext) {
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
     const query = requireString(input.query, "query");
     const limit = normalizeLimit(input.limit, 20, 50);
-    const rows = await ctx.db.query<{ kind: string; path: string; title: string | null; match_text: string | null }>(
+    const checked = await collectVisibleRows<{ kind: string; path: string; title: string | null; match_text: string | null }>(limit, (take, offset) => ctx.db.query<{ kind: string; path: string; title: string | null; match_text: string | null }>(
       `SELECT 'page' AS kind, path, title, page_type AS match_text
          FROM ${tableName(ctx.db.namespace, "wiki_pages")}
         WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3))
@@ -4171,10 +4201,9 @@ export async function registerWikiTools(ctx: PluginContext) {
          FROM ${tableName(ctx.db.namespace, "wiki_sources")}
         WHERE company_id = $1 AND wiki_id = $2 AND space_id = $5 AND (lower(raw_path) LIKE lower($3) OR lower(coalesce(title, '')) LIKE lower($3) OR lower(coalesce(url, '')) LIKE lower($3))
        ORDER BY kind, path
-       LIMIT $4`,
-      [companyId, wikiId, `%${query}%`, limit, space.id],
-    );
-    const checked = await filterRetractionRows(ctx, companyId, space, rows, row => row.path);
+       LIMIT $4 OFFSET $6`,
+      [companyId, wikiId, `%${query}%`, take, space.id, offset],
+    ), rows => filterRetractionRows(ctx, companyId, space, rows, row => row.path));
     return {
       content: checked.rows.length ? checked.rows.map((row) => `${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No wiki matches found.",
       data: { companyId, wikiId, spaceSlug: space.slug, query, results: checked.rows, retractionReadback: checked.retractionReadback },
@@ -4259,15 +4288,14 @@ export async function registerWikiTools(ctx: PluginContext) {
     const wikiId = normalizeWikiId(input.wikiId);
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
     const limit = normalizeLimit(input.limit, 50, 200);
-    const rows = await ctx.db.query<{ raw_path: string; title: string | null; source_type: string; url: string | null; content_hash: string }>(
+    const checked = await collectVisibleRows<{ raw_path: string; title: string | null; source_type: string; url: string | null; content_hash: string }>(limit, (take, offset) => ctx.db.query<{ raw_path: string; title: string | null; source_type: string; url: string | null; content_hash: string }>(
       `SELECT raw_path, title, source_type, url, content_hash
          FROM ${tableName(ctx.db.namespace, "wiki_sources")}
         WHERE company_id = $1 AND wiki_id = $2 AND space_id = $4
-        ORDER BY created_at DESC
-        LIMIT $3`,
-      [companyId, wikiId, limit, space.id],
-    );
-    const checked = await filterRetractionRows(ctx, companyId, space, rows, row => row.raw_path);
+        ORDER BY created_at DESC, raw_path
+        LIMIT $3 OFFSET $5`,
+      [companyId, wikiId, take, space.id, offset],
+    ), rows => filterRetractionRows(ctx, companyId, space, rows, row => row.raw_path));
     return {
       content: checked.rows.length ? checked.rows.map((row) => `${row.raw_path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No sources captured yet.",
       data: { companyId, wikiId, spaceSlug: space.slug, sources: checked.rows, retractionReadback: checked.retractionReadback },
@@ -4345,15 +4373,15 @@ export async function registerWikiTools(ctx: PluginContext) {
     const wikiId = normalizeWikiId(input.wikiId);
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
     const path = assertPagePath(requireString(input.path, "path"));
-    const rows = await ctx.db.query<{ path: string; title: string | null }>(
+    const limit = 200;
+    const checked = await collectVisibleRows<{ path: string; title: string | null }>(limit, (take, offset) => ctx.db.query<{ path: string; title: string | null }>(
       `SELECT path, title
          FROM ${tableName(ctx.db.namespace, "wiki_pages")}
         WHERE company_id = $1 AND wiki_id = $2 AND space_id = $4 AND backlinks ? $3
         ORDER BY path
-        LIMIT 200`,
-      [companyId, wikiId, path, space.id],
-    );
-    const checked = await filterRetractionRows(ctx, companyId, space, rows, row => row.path);
+        LIMIT $5 OFFSET $6`,
+      [companyId, wikiId, path, space.id, take, offset],
+    ), rows => filterRetractionRows(ctx, companyId, space, rows, row => row.path));
     return {
       content: checked.rows.length ? checked.rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No backlinks indexed.",
       data: { companyId, wikiId, spaceSlug: space.slug, path, backlinks: checked.rows, retractionReadback: checked.retractionReadback },
@@ -4369,11 +4397,11 @@ export async function registerWikiTools(ctx: PluginContext) {
     const companyId = requireString(input.companyId, "companyId");
     const wikiId = normalizeWikiId(input.wikiId);
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
-    const rows = await ctx.db.query<{ path: string; title: string | null; page_type: string | null }>(
-      `SELECT path, title, page_type FROM ${tableName(ctx.db.namespace, "wiki_pages")} WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 ORDER BY path LIMIT 200`,
-      [companyId, wikiId, space.id],
-    );
-    const checked = await filterRetractionRows(ctx, companyId, space, rows, row => row.path);
+    const limit = 200;
+    const checked = await collectVisibleRows<{ path: string; title: string | null; page_type: string | null }>(limit, (take, offset) => ctx.db.query<{ path: string; title: string | null; page_type: string | null }>(
+      `SELECT path, title, page_type FROM ${tableName(ctx.db.namespace, "wiki_pages")} WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 ORDER BY path LIMIT $4 OFFSET $5`,
+      [companyId, wikiId, space.id, take, offset],
+    ), rows => filterRetractionRows(ctx, companyId, space, rows, row => row.path));
     return {
       content: checked.rows.length ? checked.rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No pages indexed yet.",
       data: { companyId, wikiId, spaceSlug: space.slug, pages: checked.rows, retractionReadback: checked.retractionReadback },
@@ -4450,7 +4478,15 @@ export async function listPages(ctx: PluginContext, input: {
   }
   params.push(limit);
   const limitIndex = params.length;
-  const pageRows = await ctx.db.query<{
+  const pageResult = await collectVisibleRows<{
+    path: string;
+    title: string | null;
+    page_type: string | null;
+    backlinks: unknown;
+    source_refs: unknown;
+    content_hash: string | null;
+    updated_at: string;
+  }>(limit, (take, offset) => ctx.db.query<{
     path: string;
     title: string | null;
     page_type: string | null;
@@ -4463,10 +4499,10 @@ export async function listPages(ctx: PluginContext, input: {
        FROM ${tableName(ctx.db.namespace, "wiki_pages")}
       WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3${pageFilter}
       ORDER BY path
-      LIMIT $${limitIndex}`,
-    params,
-  );
-  const readablePageRows = await filterReadableRows(ctx, input.companyId, space, pageRows, (row) => row.path);
+      LIMIT $${limitIndex} OFFSET $${limitIndex + 1}`,
+    [...params.slice(0, -1), take, offset],
+  ), async rows => ({ rows: await filterReadableRows(ctx, input.companyId, space, rows, row => row.path) }));
+  const readablePageRows = pageResult.rows;
   const pages: WikiPageRow[] = readablePageRows.map((row) => ({
     path: row.path,
     title: row.title,
@@ -4487,7 +4523,7 @@ export async function listPages(ctx: PluginContext, input: {
     sources = (await listSources(ctx, { companyId: input.companyId, wikiId, spaceSlug: space.slug, limit, onlyReadable: true })).sources;
     sources = mergeLocalSourceRows(sources, await listLocalFiles(ctx, { companyId: input.companyId, space, relativePath: "raw" }));
   }
-  return { pages: pagesWithLocalFiles, sources };
+  return { pages: pagesWithLocalFiles.slice(0, limit), sources: sources.slice(0, limit) };
 }
 
 export async function listSources(ctx: PluginContext, input: {
@@ -4500,17 +4536,16 @@ export async function listSources(ctx: PluginContext, input: {
   const wikiId = normalizeWikiId(input.wikiId);
   const space = await resolveSpace(ctx, { companyId: input.companyId, wikiId, spaceSlug: input.spaceSlug });
   const limit = normalizeLimit(input.limit, 500, LOCAL_BROWSE_FILE_LIMIT);
-  const rows = await ctx.db.query<{ raw_path: string; title: string | null; source_type: string; url: string | null; status: string; created_at: string }>(
+  const sourceResult = await collectVisibleRows<{ raw_path: string; title: string | null; source_type: string; url: string | null; status: string; created_at: string }>(limit, (take, offset) => ctx.db.query<{ raw_path: string; title: string | null; source_type: string; url: string | null; status: string; created_at: string }>(
     `SELECT raw_path, title, source_type, url, status, created_at::text AS created_at
        FROM ${tableName(ctx.db.namespace, "wiki_sources")}
       WHERE company_id = $1 AND wiki_id = $2 AND space_id = $4
-      ORDER BY created_at DESC
-      LIMIT $3`,
-    [input.companyId, wikiId, limit, space.id],
-  );
-  const sourceRows = input.onlyReadable
-    ? await filterReadableRows(ctx, input.companyId, space, rows, (row) => row.raw_path)
-    : rows;
+      ORDER BY created_at DESC, raw_path
+      LIMIT $3 OFFSET $5`,
+    [input.companyId, wikiId, take, space.id, offset],
+  ), async rows => ({ rows: input.onlyReadable
+    ? await filterReadableRows(ctx, input.companyId, space, rows, row => row.raw_path) : rows }));
+  const sourceRows = sourceResult.rows;
   return {
     sources: sourceRows.map((row) => ({
       rawPath: row.raw_path,

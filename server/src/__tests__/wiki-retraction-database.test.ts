@@ -8,6 +8,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { executeRetraction } from "../services/wiki-retraction-ledger.js";
 import { loadAllWikiRetractions, wikiRetractionStore, withWikiRetractionLock } from "../services/wiki-retraction-store.js";
 import { retractionFolderGate } from "../services/wiki-retraction-gate.js";
+import { registerWikiTools, listPages } from "../../../packages/plugins/plugin-llm-wiki/src/wiki/core.js";
+import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { publicationHash } from "../services/wiki-publication-readback.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -35,7 +37,7 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
       approval: { id: "synthetic-review", companyId, target, reason: "Incorrect synthetic claim", reviewerId: "synthetic-qa", reviewRunId: "synthetic-qa-run", ownerDecisionId: "synthetic-decision" },
       fence: { folderKey: "wiki-root" as const, rootPath: dir, pathPrefix: "", mode: "freeze-wiki" as const, readable: [], blocks: [{ path: target.path, contentHash: target.contentHash, state: "retracted" as const }] },
       readCurrent: async () => ({ path: target.path, contentHash: publicationHash(await readFile(file)) }) };
-    return { companyId, pluginId, file, body, target, input, store: wikiRetractionStore(db,pluginId) };
+    return { companyId, pluginId, dir, file, body, target, input, store: wikiRetractionStore(db,pluginId) };
   }
   it("concurrent execution appends exactly one receipt that a new store reads back", async () => {
     const f = await fixture();
@@ -67,4 +69,44 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     expect(await readFile(f.file,"utf8")).toBe(f.body);
     expect(await loadAllWikiRetractions(db,f.pluginId,f.companyId)).toHaveLength(1);
   });
+  it("registered discovery and UI keep usable pages beyond held SQL windows", async () => {
+    const f = await fixture(); const namespace = "withdrawal_window_" + randomUUID().replaceAll("-", "");
+    const available = "wiki/z-upstream.md"; const usable = "A usable unrelated fact";
+    await writeFile(join(f.dir, available), usable);
+    await db.$client.unsafe(`CREATE SCHEMA ${namespace}`);
+    try {
+      await db.$client.unsafe(`CREATE TABLE ${namespace}.wiki_pages (
+        company_id text, wiki_id text, space_id text, path text, title text, page_type text,
+        backlinks jsonb, source_refs jsonb, content_hash text, updated_at timestamptz DEFAULT now(),
+        UNIQUE(company_id,wiki_id,space_id,path))`);
+      await db.$client.unsafe(`CREATE TABLE ${namespace}.wiki_sources (
+        company_id text, wiki_id text, space_id text, raw_path text, title text, source_type text,
+        url text, status text, content_hash text, created_at timestamptz DEFAULT now())`);
+      await db.$client.unsafe(`INSERT INTO ${namespace}.wiki_pages
+        SELECT $1,'default','space','wiki/a'||lpad(n::text,3,'0')||'.md','Held','source',
+          '["wiki/parent.md"]'::jsonb,'[]'::jsonb,'synthetic',now() FROM generate_series(0,199) AS n`, [f.companyId]);
+      await db.$client.unsafe(`INSERT INTO ${namespace}.wiki_pages VALUES
+        ($1,'default','space',$2,'Held original','source','["wiki/parent.md"]'::jsonb,'[]'::jsonb,$3,now()),
+        ($1,'default','space',$4,'Usable unrelated fact','source','["wiki/parent.md"]'::jsonb,'[]'::jsonb,$5,now())`,
+        [f.companyId,f.target.path,f.target.contentHash,available,publicationHash(usable)]);
+      await executeRetraction(f.store,{...f.input,fence:{...f.input.fence,
+        readable:[{path:available,contentHash:publicationHash(usable)}]}});
+      const handlers=new Map<string,(input:unknown)=>Promise<any>>();
+      const ctx={manifest:{},tools:{register:(name:string,_meta:unknown,handler:(input:unknown)=>Promise<any>)=>handlers.set(name,handler)},
+        db:{namespace,execute:async(q:string)=>{if(!q.includes("wiki_spaces"))throw new Error("unexpected read-journey mutation");return{rowCount:0};},
+          query:async(q:string,args:unknown[]=[])=>q.includes("wiki_spaces")?[{id:"space",company_id:f.companyId,wiki_id:"default",slug:"default",display_name:"default",space_type:"local_folder",folder_mode:"managed_subfolder",root_folder_key:"wiki-root",path_prefix:null,access_scope:"shared",settings:{},status:"active"}]:[...await db.$client.unsafe(q,args as never[])]},
+        localFolders:{status:async()=>({wikiRetractions:{state:"active"}}),readText:async(_c:string,_k:string,path:string)=>{
+          const gate=retractionFolderGate(await loadAllWikiRetractions(db,f.pluginId,f.companyId),f.companyId,"wiki-root");
+          gate.assertRoot(f.dir);gate.assertRead(path);const body=await readFile(join(f.dir,path),"utf8");gate.assertRead(path,body);return body;
+        }}} as unknown as PluginContext;
+      await registerWikiTools(ctx);
+      const args={companyId:f.companyId,wikiId:"default",spaceSlug:"default",query:"wiki",path:"wiki/parent.md",limit:1};
+      expect((await handlers.get("wiki_search")!(args)).data.results.map((r:{path:string})=>r.path)).toEqual([available]);
+      expect((await handlers.get("wiki_list_pages")!(args)).data.pages.map((r:{path:string})=>r.path)).toEqual([available]);
+      expect((await handlers.get("wiki_list_backlinks")!(args)).data.backlinks.map((r:{path:string})=>r.path)).toEqual([available]);
+      expect((await listPages(ctx,{...args,pageType:"source",limit:1})).pages.map(r=>r.path)).toEqual([available]);
+      expect(await readFile(f.file,"utf8")).toBe(f.body);
+    } finally { await db.$client.unsafe(`DROP SCHEMA ${namespace} CASCADE`); }
+  }, 30_000);
+
 });

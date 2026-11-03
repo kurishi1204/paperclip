@@ -94,3 +94,15 @@ New file leaves resolve their nearest existing parent before the write-hold chec
 An existing raw-directory alias into the Wiki tree cannot create a new Wiki page.
 Raw capture under the unchanged root remains available. While a withdrawal is
 active, raw writes do not run folder preparation that could recreate held metadata.
+
+## Discovery result windows
+
+Search, page/backlink/source tools and UI page/source lists share one visible-row
+collector. A held row does not consume the caller's result limit. The collector
+continues through stable ordered SQL windows until it fills the visible window
+or reaches the end. The hidden count describes scanned windows, not a global total.
+If the existing local-browse scan budget is exhausted with more candidates left,
+the operation fails with `E_WIKI_RETRACTION_SCAN_INCOMPLETE` and observed counts;
+it does not report a false empty complete result. Raw-source ordering includes a
+path tie-breaker. This does not claim a transactional snapshot across concurrent
+metadata changes or define the still-unaccepted in-flight response contract.
