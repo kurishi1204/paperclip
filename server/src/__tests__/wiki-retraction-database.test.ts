@@ -164,13 +164,23 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
       await expect(wikiRetractionRuntime(db,pluginId).preview(target,target.path,"Synthetic revalidation")).rejects.toThrow(/published_source_identity/);
       await db.update(documents).set({createdByAgentId:author}).where(eq(documents.id,registry.entries[0]!.documentId));
       expect(preview.fence.mode).toBe("citation-holds");
-      const withdrawal=await executeRetraction(wikiRetractionStore(db,pluginId),{target,retractionId:randomUUID(),reason:"Synthetic revalidation",actorId:"synthetic-owner",runId:null,eventId:randomUUID(),at:new Date().toISOString(),
-        approval:{id:randomUUID(),companyId,target,reason:"Synthetic revalidation",reviewerId:qa,reviewRunId:randomUUID(),ownerDecisionId:randomUUID()},
-        fence:preview.fence,readCurrent:async()=>target});
+      const proposal=await reviewedDocument("withdrawal-proposal",JSON.stringify(preview)),ownerDecisionId=randomUUID();
+      await db.insert(issueThreadInteractions).values({id:ownerDecisionId,companyId,issueId:proposal.issueId,kind:"request_confirmation",status:"accepted",
+        effectiveResolverPolicy:"human_only",addresseeUserId:"synthetic-owner",resolvedByUserId:"synthetic-owner",
+        payload:{version:1,prompt:"Withdraw this exact synthetic proposal",target:{type:"issue_document",issueId:proposal.issueId,documentId:proposal.documentId,key:proposal.documentKey,revisionId:proposal.revisionId}},
+        result:{version:1,outcome:"accepted"}});
+      const withdrawal=await wikiRetractionRuntime(db,pluginId).execute({companyId,issueId:proposal.issueId,documentKey:proposal.documentKey,
+        reviewId:proposal.reviewId,ownerDecisionId,operationId:randomUUID(),actorId:"synthetic-owner",runId:null});
       const body=encodeWikiRepublicationDraft({companyId,wikiId:"default",spaceSlug:"default",retractionId:withdrawal.retractionId,previousPath:"wiki/child.md",path:newPath,
         reason:"Responsible author checked current evidence",dependencies:[{path:"wiki/upstream.md",wikiSHA256:registry.entries[2]!.wikiSHA256}]},"# Revalidated conclusion\n\nUse current independent evidence.\n");
       const draft=await reviewedDocument("revalidated",body);
-      return {companyId,dir,body,newPath,registry,input:{companyId,issueId:draft.issueId,documentKey:draft.documentKey,reviewId:draft.reviewId,operationId:randomUUID(),actorId:"synthetic-owner"}};
+      const another=async(path:string)=>{
+        const anotherBody=encodeWikiRepublicationDraft({companyId,wikiId:"default",spaceSlug:"default",retractionId:withdrawal.retractionId,previousPath:"wiki/child.md",path,
+          reason:"Another responsible revalidation",dependencies:[{path:"wiki/upstream.md",wikiSHA256:registry.entries[2]!.wikiSHA256}]},"# Another independently reviewed conclusion\n");
+        const d=await reviewedDocument("next-revalidated",anotherBody);
+        return {companyId,issueId:d.issueId,documentKey:d.documentKey,reviewId:d.reviewId,operationId:randomUUID(),actorId:"synthetic-owner"};
+      };
+      return {companyId,dir,body,newPath,registry,another,input:{companyId,issueId:draft.issueId,documentKey:draft.documentKey,reviewId:draft.reviewId,operationId:randomUUID(),actorId:"synthetic-owner"}};
     }
     const runtime=wikiRepublicationRuntime(db,pluginId),f=await context("wiki/revalidated.md");
     const original=await readFile(join(f.dir,"wiki/child.md"));
@@ -189,6 +199,16 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     await db.update(issueThreadInteractions).set({status:"rejected"}).where(eq(issueThreadInteractions.id,f.input.reviewId));
     await expect(withWikiRetractionLock(db,pluginId,f.companyId,tx=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,f.newPath))).rejects.toThrow(/current_review/);
     await withWikiRetractionLock(db,pluginId,f.companyId,tx=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,"raw/unrelated.md"));
+    const next=await f.another("wiki/next-revalidated.md"),logFile=join(f.dir,"wiki/log.md"),completeLog=await readFile(logFile);
+    const lastLog=result.maintenanceLog!;
+    await writeFile(logFile,completeLog.subarray(0,lastLog.prefixBytes));
+    await expect(runtime.execute(next)).rejects.toThrow(/readable_content_changed/);
+    expect(await db.select().from(activityLog).where(eq(activityLog.id,next.operationId))).toHaveLength(0);
+    // An already completed POST never attempts a missing log append again.
+    expect((await runtime.execute(f.input)).id).toBe(result.id);
+    expect(await readFile(logFile)).toEqual(completeLog.subarray(0,lastLog.prefixBytes));
+    expect((await runtime.receipt(f.companyId,f.input.operationId)).maintenanceLog.state).toBe("pending");
+    await writeFile(logFile,completeLog);
 
     // Fail after the actual immutable file effect, inside the metadata transaction.
     const bad=await context("wiki/fault-after-file.md");

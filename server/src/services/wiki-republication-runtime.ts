@@ -78,10 +78,20 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
           publicationNeed(matches[0]!.content_hash===hash,"republication_page_changed");
           return {path:p,wikiId:draft.wikiId,spaceSlug:draft.spaceSlug,contents,hash,sourceRefs:matches[0]!.source_refs};
         }}});
+    // A missing/pending log is known before we reserve an operation identity.
+    // Do not strand an intent merely because the previous derived append is
+    // still waiting for the same host lock.
+    const logPath=physical("wiki/log.md"),logContents=await readPluginLocalFolderText(root,logPath);
+    const previousLog=events.filter(e=>e.maintenanceLog?.path===logPath).at(-1)?.maintenanceLog;
+    if(previousLog)retainedRetractionFile(events,logPath,previousLog.resultingSHA256,logContents);
+    else {
+      const logPin=resolved.parent.fence!.blocks.find(b=>b.path===logPath);
+      publicationNeed(logPin&&publicationHash(logContents)===logPin.contentHash,"republication_log_changed");
+    }
     const newPhysical=physical(draft.path);
     await assertWikiRepublicationTargetPath(root,newPhysical);
     return {resolved,events,root,newPhysical,pluginDb,space,ns,config,pageType:rows.find(r=>r.path===draft.previousPath)!.page_type,planHash:publicationHash(publicationCanonical({pin:resolved.pin,
-      sourceRefs:resolved.sourceRefs,root,physicalPath:newPhysical,registryBefore:resolved.registryBeforeSHA256,registryAfter:resolved.registryAfterSHA256}))};
+      sourceRefs:resolved.sourceRefs,root,physicalPath:newPhysical,logSHA256:publicationHash(logContents),registryBefore:resolved.registryBeforeSHA256,registryAfter:resolved.registryAfterSHA256}))};
   }
   return {
     async execute(input:Request) {
