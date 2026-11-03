@@ -1515,10 +1515,11 @@ export function buildHostServices(
           for (const entry of listing.entries) {
             if (entry.kind === "directory") { entries.push(entry); continue; }
             const canonical=await canonicalFolderPath(status.realPath!, entry.path);
-            await verifyPublication(canonical);
             const holds=[gate.block(entry.path),gate.block(canonical)].filter(Boolean);
-            if (holds.every(hold => hold!.state === "blocked_by_retraction" && hold!.readPolicy === "citation-holds"))
+            if (holds.every(hold => hold!.state === "blocked_by_retraction" && hold!.readPolicy === "citation-holds")) {
+              await verifyPublication(canonical);
               entries.push({...entry,...(holds.length ? {citationHolds:gate.citationHolds(canonical)} : {})});
+            }
           }
           return { ...listing, entries, folderKey: params.folderKey,
             retractionReadback: { state: gate.active ? "checked" : "inactive", hiddenCount: listing.entries.length - entries.length } };

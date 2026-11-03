@@ -150,3 +150,30 @@ test("registered Wiki tool and page UI receive the same unchanged downstream bod
   assert.equal(await readFile(join(dir,"wiki/child.md"),"utf8"),bodies["wiki/child.md"]);
  }finally{await rm(dir,{recursive:true});}
 });
+
+test("an unindexed held physical log retains its warning through page merge and the actual UI tree label",async()=>{
+ const dir=await realpath(await mkdtemp(join(tmpdir(),"wiki-physical-hold-ui-")));try{
+  await mkdir(join(dir,"wiki"));const bodies={"wiki/p7.md":"Withdrawn","wiki/log.md":"Original log retained","wiki/upstream.md":"Independent fact"};
+  for(const [p,b] of Object.entries(bodies))await writeFile(join(dir,p),b);
+  const events:RetractionEvent[]=[],store:RetractionStore={read:async()=>events,transaction:async(_s,fn)=>fn({events:async()=>events,append:async e=>{events.push(e);}})};
+  const target={companyId:"c",wikiId:"default",spaceSlug:"default",path:"wiki/p7.md",contentHash:publicationHash(bodies["wiki/p7.md"])};
+  await executeRetraction(store,{target,retractionId:"w",reason:"Citation recheck",actorId:"owner",runId:null,eventId:"e",at:"2026-11-03T10:00:00Z",
+   approval:{id:"review",companyId:"c",target,reason:"Citation recheck",reviewerId:"qa",reviewRunId:"qr",ownerDecisionId:"real-human"},
+   fence:{folderKey:"wiki-root",rootPath:dir,pathPrefix:"",mode:"citation-holds",blocks:[{path:target.path,contentHash:target.contentHash,state:"retracted"},
+    {path:"wiki/log.md",contentHash:publicationHash(bodies["wiki/log.md"]),state:"blocked_by_retraction"}],readable:[{path:"wiki/upstream.md",contentHash:publicationHash(bodies["wiki/upstream.md"])}]},readCurrent:async()=>target});
+  const gate=retractionFolderGate(events,"c","wiki-root");
+  const ctx={manifest:{},db:{namespace:"synthetic",execute:async()=>({rowCount:0}),query:async()=>[]},localFolders:{
+   status:async()=>({ready:true,wikiRetractions:{state:"active"}}),
+   readText:async(_c:string,_f:string,p:string)=>readRetractionFolderText(dir,p,gate),
+   readTextWithStatus:async(_c:string,_f:string,p:string)=>readRetractionFolderTextWithStatus(dir,p,gate),
+   list:async()=>{const listing=await listPluginLocalFolderEntries(dir,{relativePath:"wiki",recursive:true,maxEntries:100});return {...listing,entries:listing.entries.filter(e=>gate.block(e.path)?.state!=="retracted").map(e=>({...e,citationHolds:gate.citationHolds(e.path)}))};},
+  }} as unknown as PluginContext;
+  const pages=await listPages(ctx,{companyId:"c"});const log=pages.pages.find(p=>p.path==="wiki/log.md")!;
+  assert.equal(log.citationHolds?.length,1);
+  const {buildBrowseTree}=await import("../../../packages/plugins/plugin-llm-wiki/src/ui/app.js");
+  const tree=buildBrowseTree(pages.pages,pages.sources);
+  const all=(nodes:typeof tree):typeof tree=>nodes.flatMap(n=>[n,...all(n.children)]);
+  assert.match(all(tree).find(n=>n.path==="wiki/log.md")!.name,/引用利用保留/);
+  assert.doesNotMatch(all(tree).find(n=>n.path==="wiki/upstream.md")!.name,/引用利用保留/);
+ }finally{await rm(dir,{recursive:true});}
+});

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { Agent, AgentSessionEvent, Issue, IssueComment, PluginContext, PluginEvent, PluginLocalFolderEntry, Project, ToolResult } from "@paperclipai/plugin-sdk";
+import type { Agent, AgentSessionEvent, Issue, IssueComment, PluginContext, PluginEvent, PluginLocalFolderEntry, PluginWikiCitationHold, Project, ToolResult } from "@paperclipai/plugin-sdk";
 import type { IssueDocument, PluginIssueOriginKind, PluginManagedRoutineResolution, PluginManagedSkillResolution } from "@paperclipai/plugin-sdk/types";
 import {
   DEFAULT_MAX_SOURCE_BYTES,
@@ -1767,6 +1767,7 @@ function mergeLocalPageRows(pages: WikiPageRow[], entries: PluginLocalFolderEntr
     if (!entry.path.endsWith(".md") || byPath.has(entry.path)) continue;
     byPath.set(entry.path, {
       path: entry.path,
+      ...(entry.citationHolds?.length ? {citationHolds:entry.citationHolds} : {}),
       title: null,
       pageType: inferPageType(entry.path),
       backlinkCount: 0,
@@ -4429,6 +4430,7 @@ function isTemplateFile(value: string): value is WikiTemplateFile {
 }
 
 export type WikiPageRow = {
+  citationHolds?: PluginLocalFolderEntry["citationHolds"];
   path: string;
   title: string | null;
   pageType: string | null;
@@ -4571,9 +4573,16 @@ async function readWikiTextWithStatus(ctx: PluginContext, companyId: string, pat
     return ctx.localFolders.readTextWithStatus(companyId, WIKI_ROOT_FOLDER_KEY, path);
   return { contents: await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, path), citationHolds: [] };
 }
-function citationRowMetadata(row: unknown) {
-  const holds=(row as {citationHolds?:unknown[]})?.citationHolds;
-  return holds?.length ? {citationHolds:holds} : {};
+function citationRowMetadata(row: unknown): {citationHolds?:PluginWikiCitationHold[]} {
+  const holds=(row as {citationHolds?:unknown})?.citationHolds;
+  if (holds === undefined) return {};
+  if (!Array.isArray(holds) || holds.some(value => {
+    if (!value || typeof value !== "object") return true;
+    const h=value as Record<string,unknown>;
+    return h.state!=="blocked_by_retraction" || h.readPolicy!=="citation-holds" ||
+      ["path","retractedPath","retractionId","reason","eventHash"].some(k=>typeof h[k]!=="string" || !h[k]);
+  })) throw new Error("E_WIKI_INVALID_CITATION_HOLD");
+  return holds.length ? {citationHolds:holds as PluginWikiCitationHold[]} : {};
 }
 function citationRowLabel(row: unknown) {
   return citationRowMetadata(row).citationHolds?.length ? "[引用利用保留] " : "";

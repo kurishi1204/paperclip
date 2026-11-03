@@ -8,7 +8,7 @@ import { assertConfiguredLocalFolder, createPluginLocalFolderTextExclusive, getS
   readPluginLocalFolderText, requireLocalFolderDeclaration } from "./plugin-local-folders.js";
 import { loadAllWikiRetractions, withWikiRetractionLock, appendRetractionMaintenanceLog } from "./wiki-retraction-store.js";
 import { retractionFolderGate, readRetractionFolderTextWithStatus, canonicalWikiRetractionPath } from "./wiki-retraction-gate.js";
-import { parsePublicationRegistry, publicationCanonical, publicationHash, publicationNeed, type JsonObject } from "./wiki-publication-readback.js";
+import { parsePublicationRegistry, publicationCanonical, publicationHash, publicationNeed, verifyWikiPublication, type JsonObject } from "./wiki-publication-readback.js";
 import { buildWikiRepublicationEvent, parseWikiRepublicationDraft, resolveReviewedWikiRepublication, verifyCurrentWikiRepublication } from "./wiki-republication.js";
 import { withRetractionMaintenanceLog, retainedRetractionFile, type RetractionEvent } from "./wiki-retraction-ledger.js";
 
@@ -20,15 +20,48 @@ export async function assertWikiRepublicationTargetPath(root:string,physicalPath
 export async function assertCurrentWikiRepublication(db:Db,pluginId:string,companyId:string,events:RetractionEvent[],physicalPath:string) {
   const matches=events.filter(e=>e.type==="republished"&&e.republication?.physicalPath===physicalPath);
   if(!matches.length)return;
-  publicationNeed(matches.length===1,"republication_current_identity");const event=matches[0]!,p=event.republication!;
+  publicationNeed(matches.length===1,"republication_current_identity");const event=matches[0]!;
   const configs=await db.select().from(pluginConfig).where(and(eq(pluginConfig.pluginId,pluginId),eq(pluginConfig.companyId,companyId))).for("share");
   const registry=parsePublicationRegistry(configs[0]?.configJson.publicationReadback,companyId);
-  const pin=registry.entries.find(x=>x.path===event.path);publicationNeed(pin,"republication_current_pin");
-  const docs=await db.select({doc:documents}).from(issueDocuments).innerJoin(documents,eq(issueDocuments.documentId,documents.id))
-    .where(and(eq(issueDocuments.companyId,companyId),eq(issueDocuments.issueId,pin.issueId),eq(issueDocuments.key,pin.documentKey))).for("share",{of:documents});
-  const reviews=await db.select().from(issueThreadInteractions).where(and(eq(issueThreadInteractions.id,event.approval.id),eq(issueThreadInteractions.companyId,companyId))).for("share");
-  const runs=await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,event.approval.reviewRunId),eq(heartbeatRuns.companyId,companyId))).for("share");
-  verifyCurrentWikiRepublication({event,registry,document:docs[0]?.doc??null,review:reviews[0]??null,run:runs[0]??null});
+  const pluginDb=pluginDatabaseService(db),ns=await pluginDb.getRuntimeNamespace(pluginId);
+  const spaces=await pluginDb.query<{id:string;path_prefix:string|null}>(pluginId,
+    `SELECT id,path_prefix FROM ${ns}.wiki_spaces WHERE company_id=$1 AND wiki_id=$2 AND slug=$3`,[companyId,registry.wikiId,registry.spaceSlug]);
+  publicationNeed(spaces.length===1&&registry.wikiId===event.wikiId&&registry.spaceSlug===event.spaceSlug,"republication_current_space");
+  const physical=(p:string)=>spaces[0]!.path_prefix?spaces[0]!.path_prefix+"/"+p:p;
+  publicationNeed(physical(event.path)===physicalPath,"republication_current_physical_path");
+  const gate=retractionFolderGate(events,companyId,"wiki-root"),root=event.republication!.rootPath;gate.assertRoot(root);
+  const loadDocument=async(issueId:string,key:string)=>{
+    const rows=await db.select({doc:documents}).from(issueDocuments).innerJoin(documents,eq(issueDocuments.documentId,documents.id))
+      .where(and(eq(issueDocuments.companyId,companyId),eq(issueDocuments.issueId,issueId),eq(issueDocuments.key,key))).for("share",{of:documents});
+    return rows[0]?{...rows[0].doc,body:rows[0].doc.latestBody,issueId}:null;
+  };
+  const loadRun=async(id:string)=>{
+    const rows=await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,id),eq(heartbeatRuns.companyId,companyId))).for("share");return rows[0]??null;
+  };
+  const loadReview=async(issueId:string,id:string)=>{
+    const rows=await db.select().from(issueThreadInteractions).where(and(eq(issueThreadInteractions.id,id),eq(issueThreadInteractions.companyId,companyId),eq(issueThreadInteractions.issueId,issueId))).for("share");
+    const review=rows[0]??null,run=review?.resolvedByRunId?await loadRun(review.resolvedByRunId):null;
+    publicationNeed(run&&run.status==="succeeded"&&run.agentId===review?.resolvedByAgentId,"republication_dependency_review_run");return review;
+  };
+  // UI and planning use the same recursive publication proof as the tool.
+  // Actual namespace rows, current document/review/run and guarded file bytes
+  // participate; a parallel partial UI proof is not maintained here.
+  await verifyWikiPublication(registry,event.path,{
+    retraction:async p=>gate.block(physical(p)),document:loadDocument,review:loadReview,
+    page:async p=>{
+      const rows=await pluginDb.query<{source_refs:unknown;content_hash:string}>(pluginId,
+        `SELECT source_refs,content_hash FROM ${ns}.wiki_pages WHERE company_id=$1 AND wiki_id=$2 AND space_id=$3 AND path=$4 FOR SHARE`,[companyId,registry.wikiId,spaces[0]!.id,p]);
+      publicationNeed(rows.length===1,"republication_current_page");
+      const {contents}=await readRetractionFolderTextWithStatus(root,physical(p),gate);
+      const current=events.find(e=>e.type==="republished"&&e.republication?.physicalPath===physical(p));
+      if(current){
+        const pin=registry.entries.find(x=>x.path===p);publicationNeed(pin,"republication_current_pin");
+        verifyCurrentWikiRepublication({event:current,registry,document:await loadDocument(pin.issueId,pin.documentKey),
+          review:await loadReview(pin.issueId,current.approval.id),run:await loadRun(current.approval.reviewRunId)});
+      }
+      return {path:p,wikiId:registry.wikiId,spaceSlug:registry.spaceSlug,contents,hash:rows[0]!.content_hash,sourceRefs:rows[0]!.source_refs};
+    },
+  });
 }
 export function wikiRepublicationRuntime(db:Db,pluginId:string) {
   async function document(tx:Db,companyId:string,issueId:string,key:string) {
@@ -65,14 +98,19 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
     publicationNeed(spaces.length===1&&spaces[0]!.root_folder_key==="wiki-root"&&spaces[0]!.status==="active","republication_space");
     const space=spaces[0]!,physical=(p:string)=>space.path_prefix?space.path_prefix+"/"+p:p;
     const rows=await pluginDb.query<{path:string;source_refs:unknown;content_hash:string;page_type:string|null}>(pluginId,
-      `SELECT path,source_refs,content_hash,page_type FROM ${ns}.wiki_pages WHERE company_id=$1 AND wiki_id=$2 AND space_id=$3`,[input.companyId,draft.wikiId,space.id]);
+      `SELECT path,source_refs,content_hash,page_type FROM ${ns}.wiki_pages WHERE company_id=$1 AND wiki_id=$2 AND space_id=$3 FOR SHARE`,[input.companyId,draft.wikiId,space.id]);
     publicationNeed(!rows.some(r=>r.path===draft.path),"republication_path_already_indexed");
     const qa=await review(tx,input.companyId,input.issueId,input.reviewId);
     const runs=qa?.resolvedByRunId?await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,qa.resolvedByRunId),eq(heartbeatRuns.companyId,input.companyId))).for("update"):[];
     const events=all.filter(e=>e.wikiId===draft.wikiId&&e.spaceSlug===draft.spaceSlug).sort((a,b)=>a.sequence-b.sequence);
     const resolved=await resolveReviewedWikiRepublication({...input,document:draftDoc,review:qa,run:runs[0]??null,registry:pins,events,
-      readers:{document:(issueId,key)=>document(tx,input.companyId,issueId,key),review:(issueId,id)=>review(tx,input.companyId,issueId,id),
+      readers:{document:(issueId,key)=>document(tx,input.companyId,issueId,key),review:async(issueId,id)=>{
+        const current=await review(tx,input.companyId,issueId,id);
+        const currentRuns=current?.resolvedByRunId?await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,current.resolvedByRunId),eq(heartbeatRuns.companyId,input.companyId))).for("share"):[];
+        publicationNeed(currentRuns[0]?.status==="succeeded"&&currentRuns[0]?.agentId===current?.resolvedByAgentId,"republication_dependency_review_run");return current;
+      },
         retraction:async p=>gate.block(physical(p)),page:async p=>{
+          await assertCurrentWikiRepublication(tx,pluginId,input.companyId,all,physical(p));
           const matches=rows.filter(r=>r.path===p);publicationNeed(matches.length===1,"republication_page_metadata");
           const {contents}=await readRetractionFolderTextWithStatus(root,physical(p),gate);const hash=publicationHash(contents);
           publicationNeed(matches[0]!.content_hash===hash,"republication_page_changed");

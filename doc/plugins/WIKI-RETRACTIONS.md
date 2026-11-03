@@ -250,3 +250,14 @@ paths do not perform this publication check. A missing last editor is rejected.
 New-leaf planning resolves the nearest existing physical ancestor, and checks the
 created leaf again before DB publication, so an internal parent symlink cannot
 separate the physical file from its receipt.
+
+
+Current UI checks and republication planning now use the same recursive
+publication verifier as tool reads, including actual namespace `source_refs`
+and each referenced review's current completed Run. New-publication-specific
+creator/last-editor and sealed-review checks remain part of that one reader
+graph. A second, partial UI proof is not used. Physical-only page rows retain
+host citation holds through the merge, and the browse tree marks those rows
+`[引用利用保留]` as well as the detail view. The corresponding DB counterexamples
+remain unexecuted locally; the physical merge and actual tree-label function are
+exercised with isolated files.

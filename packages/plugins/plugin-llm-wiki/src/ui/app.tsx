@@ -298,6 +298,7 @@ type WikiSpaceWithFolderStatus = WikiSpace & {
 const DEFAULT_SPACE_SLUG = "default";
 
 type WikiPageRow = {
+  citationHolds?: PageContentData["citationHolds"];
   path: string;
   title: string | null;
   pageType: string | null;
@@ -3120,7 +3121,7 @@ function treeDisplayName(path: string, title: string | null): string {
   return (BASELINE_FILES as readonly string[]).includes(path) ? basename(path) : pageDisplayName(path, title);
 }
 
-function buildBrowseTree(
+export function buildBrowseTree(
   pages: WikiPageRow[],
   sources: WikiSourceRow[],
 ): FileTreeNode[] {
@@ -3149,7 +3150,7 @@ function buildBrowseTree(
     seenPaths.add(page.path);
     const parentDir = dirname(page.path);
     const file: FileTreeNode = {
-      name: treeDisplayName(page.path, page.title),
+      name: (page.citationHolds?.length ? "[引用利用保留] " : "") + treeDisplayName(page.path, page.title),
       path: page.path,
       kind: "file",
       children: [],

@@ -174,9 +174,9 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
       const body=encodeWikiRepublicationDraft({companyId,wikiId:"default",spaceSlug:"default",retractionId:withdrawal.retractionId,previousPath:"wiki/child.md",path:newPath,
         reason:"Responsible author checked current evidence",dependencies:[{path:"wiki/upstream.md",wikiSHA256:registry.entries[2]!.wikiSHA256}]},"# Revalidated conclusion\n\nUse current independent evidence.\n");
       const draft=await reviewedDocument("revalidated",body);
-      const another=async(path:string)=>{
+      const another=async(path:string,dependency?:{path:string;wikiSHA256:string})=>{
         const anotherBody=encodeWikiRepublicationDraft({companyId,wikiId:"default",spaceSlug:"default",retractionId:withdrawal.retractionId,previousPath:"wiki/child.md",path,
-          reason:"Another responsible revalidation",dependencies:[{path:"wiki/upstream.md",wikiSHA256:registry.entries[2]!.wikiSHA256}]},"# Another independently reviewed conclusion\n");
+          reason:"Another responsible revalidation",dependencies:[dependency??{path:"wiki/upstream.md",wikiSHA256:registry.entries[2]!.wikiSHA256}]},"# Another independently reviewed conclusion\n");
         const d=await reviewedDocument("next-revalidated",anotherBody);
         return {companyId,issueId:d.issueId,documentKey:d.documentKey,reviewId:d.reviewId,operationId:randomUUID(),actorId:"synthetic-owner"};
       };
@@ -196,6 +196,17 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     expect((config!.configJson.publicationReadback as PublicationRegistry).entries).toHaveLength(4);
     expect(await db.$client.unsafe(`SELECT * FROM ${ns}.wiki_page_revisions WHERE company_id=$1`,[f.companyId])).toHaveLength(1);
     await withWikiRetractionLock(db,pluginId,f.companyId,tx=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,f.newPath));
+    const currentPage=await db.$client.unsafe(`SELECT source_refs FROM ${ns}.wiki_pages WHERE company_id=$1 AND path=$2`,[f.companyId,f.newPath]);
+    const p7=f.registry.entries[0]!;
+    const withdrawnRef={kind:"document",issueId:p7.issueId,documentId:p7.documentId,documentKey:p7.documentKey,revisionId:p7.revisionId};
+    await db.$client.unsafe(`UPDATE ${ns}.wiki_pages SET source_refs=$3::jsonb WHERE company_id=$1 AND path=$2`,[f.companyId,f.newPath,JSON.stringify([withdrawnRef])]);
+    await expect(withWikiRetractionLock(db,pluginId,f.companyId,tx=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,f.newPath))).rejects.toThrow(/references_changed/);
+    await db.$client.unsafe(`UPDATE ${ns}.wiki_pages SET source_refs=$3::jsonb WHERE company_id=$1 AND path=$2`,[f.companyId,f.newPath,JSON.stringify(currentPage[0]!.source_refs)]);
+    const dependent=await f.another("wiki/dependent.md",{path:f.newPath,wikiSHA256:publicationHash(f.body)});
+    await db.update(heartbeatRuns).set({status:"failed"}).where(eq(heartbeatRuns.id,result.approval.reviewRunId));
+    await expect(runtime.execute(dependent)).rejects.toThrow(/dependency_review_run/);
+    expect(await db.select().from(activityLog).where(eq(activityLog.id,dependent.operationId))).toHaveLength(0);
+    await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,result.approval.reviewRunId));
     await db.update(issueThreadInteractions).set({status:"rejected"}).where(eq(issueThreadInteractions.id,f.input.reviewId));
     await expect(withWikiRetractionLock(db,pluginId,f.companyId,tx=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,f.newPath))).rejects.toThrow(/current_review/);
     await withWikiRetractionLock(db,pluginId,f.companyId,tx=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,"raw/unrelated.md"));

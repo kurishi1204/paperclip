@@ -503,6 +503,8 @@ export interface PluginLocalFolderListOptions {
 }
 
 export interface PluginLocalFolderEntry {
+  /** Host-owned warning for retained physical Wiki files, including unindexed log files. */
+  citationHolds?: PluginWikiCitationHold[];
   path: string;
   name: string;
   kind: "file" | "directory";
