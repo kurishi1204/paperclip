@@ -35,7 +35,13 @@ export interface RetractionEvent extends RetractionTarget {
   sequence: number;
   previousHash: string | null;
   eventHash: string;
-  type: "executed" | "observed";
+  type: "executed" | "observed" | "republished";
+  republication?: {
+    operationId: string; retractionEventHash: string; previousPath: string;
+    physicalPath: string; rootPath: string; producerAgentId: string;
+    documentId: string; revisionId: string; sourceRefsSHA256: string;
+    registryBeforeSHA256: string; registryAfterSHA256: string;
+  };
   retractionId: string;
   reason: string;
   actorId: string;
@@ -115,11 +121,33 @@ export function validateRetractionEvents(scope: RetractionScope, events: Retract
     }
     const { eventHash, ...basis } = event;
     need(eventHash === retractionEventHash(basis), "ledger_integrity");
-    need(event.type === "executed" || event.type === "observed", "ledger_type");
+    need(["executed", "observed", "republished"].includes(event.type), "ledger_type");
+    need((event.type === "republished") === Boolean(event.republication), "republication_event_shape");
     if (event.type === "executed") {
       verifyApproval(event.approval, event, event.reason, event.actorId, event.runId);
       need(!executed.has(event.path) && ![...executed.values()].some(e => e.retractionId === event.retractionId), "ledger_duplicate_retraction");
       executed.set(event.path, event);
+    } else if (event.type === "republished") {
+      verifyApproval(event.approval, event, event.reason, event.actorId, event.runId);
+      const p = event.republication;
+      const original = [...executed.values()].find(e => e.retractionId === event.retractionId);
+      need(p && original?.fence?.mode === "citation-holds" && !event.fence &&
+        original.eventHash === p.retractionEventHash && original.fence.rootPath === p.rootPath &&
+        original.approval.ownerDecisionId === event.approval.ownerDecisionId, "republication_parent");
+      const prior = original.fence.blocks.find(b => b.path === p.previousPath);
+      need(prior?.state === "blocked_by_retraction" && p.previousPath !== p.physicalPath &&
+        p.physicalPath === (original.fence.pathPrefix ? original.fence.pathPrefix + "/" : "") + event.path,
+        "republication_target");
+      validTarget({ ...event, path: p.physicalPath });
+      need([p.operationId, p.producerAgentId, p.documentId, p.revisionId].every(text) &&
+        [p.sourceRefsSHA256,p.registryBeforeSHA256,p.registryAfterSHA256].every(v => /^[a-f0-9]{64}$/.test(v)) &&
+        p.producerAgentId !== event.approval.reviewerId && p.producerAgentId !== event.actorId &&
+        event.approval.proposal?.documentId === p.documentId && event.approval.proposal.revisionId === p.revisionId &&
+        event.approval.proposal.bodySHA256 === event.contentHash, "republication_review");
+      need(!events.slice(0,i).some(e => e.republication?.operationId === p.operationId ||
+        e.republication?.physicalPath === p.physicalPath || e.fence?.blocks.some(b => b.path === p.physicalPath) ||
+        e.fence?.readable.some(b => b.path === p.physicalPath)), "republication_new_version_required");
+      need(![...executed.values()].some(e => e.fence?.mode !== "citation-holds"), "republication_legacy_hold");
     } else {
       const original = executed.get(event.path);
       need(original && original.retractionId === event.retractionId && original.contentHash === event.contentHash &&

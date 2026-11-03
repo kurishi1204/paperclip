@@ -1,0 +1,125 @@
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+import { and, eq } from "drizzle-orm";
+import { activityLog, documents, heartbeatRuns, issueDocuments, issueThreadInteractions, pluginConfig, type Db } from "@paperclipai/db";
+import { conflict, notFound } from "../errors.js";
+import { pluginRegistryService } from "./plugin-registry.js";
+import { pluginDatabaseService } from "./plugin-database.js";
+import { assertConfiguredLocalFolder, createPluginLocalFolderTextExclusive, getStoredLocalFolders, inspectPluginLocalFolder,
+  readPluginLocalFolderText, requireLocalFolderDeclaration, resolvePluginLocalFolderPath } from "./plugin-local-folders.js";
+import { loadAllWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
+import { retractionFolderGate, readRetractionFolderTextWithStatus } from "./wiki-retraction-gate.js";
+import { parsePublicationRegistry, publicationCanonical, publicationHash, publicationNeed, type JsonObject } from "./wiki-publication-readback.js";
+import { buildWikiRepublicationEvent, parseWikiRepublicationDraft, resolveReviewedWikiRepublication } from "./wiki-republication.js";
+import type { RetractionEvent } from "./wiki-retraction-ledger.js";
+
+interface Request { companyId:string;issueId:string;documentKey:string;reviewId:string;operationId:string;actorId:string; }
+const WIKI_PLUGIN="paperclipai.plugin-llm-wiki";
+export function wikiRepublicationRuntime(db:Db,pluginId:string) {
+  async function document(tx:Db,companyId:string,issueId:string,key:string) {
+    const rows=await tx.select({doc:documents}).from(issueDocuments).innerJoin(documents,eq(issueDocuments.documentId,documents.id))
+      .where(and(eq(issueDocuments.companyId,companyId),eq(issueDocuments.issueId,issueId),eq(issueDocuments.key,key))).for("update",{of:documents});
+    const row=rows[0]?.doc;return row?{...row,body:row.latestBody,issueId}:null;
+  }
+  async function review(tx:Db,companyId:string,issueId:string,id:string) {
+    const rows=await tx.select().from(issueThreadInteractions).where(and(eq(issueThreadInteractions.id,id),
+      eq(issueThreadInteractions.companyId,companyId),eq(issueThreadInteractions.issueId,issueId))).for("update");return rows[0]??null;
+  }
+  function committed(events:RetractionEvent[],input:Request) {
+    const event=events.find(e=>e.type==="republished"&&e.republication?.operationId===input.operationId);
+    if(event&&(event.actorId!==input.actorId||event.approval.id!==input.reviewId||event.approval.proposal?.issueId!==input.issueId||
+      event.approval.proposal.documentKey!==input.documentKey))throw conflict("operationId belongs to another publication");
+    return event;
+  }
+  async function plan(tx:Db,input:Request,all:RetractionEvent[]) {
+    const registryService=pluginRegistryService(tx),plugin=await registryService.getById(pluginId);
+    if(!plugin||plugin.pluginKey!==WIKI_PLUGIN)throw notFound("Wiki plugin not found");
+    const configs=await tx.select().from(pluginConfig).where(and(eq(pluginConfig.pluginId,pluginId),eq(pluginConfig.companyId,input.companyId))).for("update");
+    const config=configs[0];publicationNeed(config,"republication_config");
+    const pins=parsePublicationRegistry(config.configJson.publicationReadback,input.companyId);
+    const draftDoc=await document(tx,input.companyId,input.issueId,input.documentKey);publicationNeed(draftDoc,"republication_document");
+    const draft=parseWikiRepublicationDraft(draftDoc.latestBody);
+    const settings=await registryService.getCompanySettings(pluginId,input.companyId);
+    const folder=await inspectPluginLocalFolder({folderKey:"wiki-root",declaration:requireLocalFolderDeclaration(plugin.manifestJson.localFolders,"wiki-root"),
+      storedConfig:getStoredLocalFolders(settings?.settingsJson)["wiki-root"]??null});
+    assertConfiguredLocalFolder(folder);publicationNeed(folder.writable,"republication_folder_write_access");const root=folder.realPath!;
+    const gate=retractionFolderGate(all,input.companyId,"wiki-root");gate.assertRoot(root);
+    const pluginDb=pluginDatabaseService(tx),ns=await pluginDb.getRuntimeNamespace(pluginId);
+    const spaces=await pluginDb.query<{id:string;path_prefix:string|null;root_folder_key:string;status:string}>(pluginId,
+      `SELECT id,path_prefix,root_folder_key,status FROM ${ns}.wiki_spaces WHERE company_id=$1 AND wiki_id=$2 AND slug=$3`,[input.companyId,draft.wikiId,draft.spaceSlug]);
+    publicationNeed(spaces.length===1&&spaces[0]!.root_folder_key==="wiki-root"&&spaces[0]!.status==="active","republication_space");
+    const space=spaces[0]!,physical=(p:string)=>space.path_prefix?space.path_prefix+"/"+p:p;
+    const rows=await pluginDb.query<{path:string;source_refs:unknown;content_hash:string;page_type:string|null}>(pluginId,
+      `SELECT path,source_refs,content_hash,page_type FROM ${ns}.wiki_pages WHERE company_id=$1 AND wiki_id=$2 AND space_id=$3`,[input.companyId,draft.wikiId,space.id]);
+    publicationNeed(!rows.some(r=>r.path===draft.path),"republication_path_already_indexed");
+    const qa=await review(tx,input.companyId,input.issueId,input.reviewId);
+    const runs=qa?.resolvedByRunId?await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,qa.resolvedByRunId),eq(heartbeatRuns.companyId,input.companyId))).for("update"):[];
+    const events=all.filter(e=>e.wikiId===draft.wikiId&&e.spaceSlug===draft.spaceSlug).sort((a,b)=>a.sequence-b.sequence);
+    const resolved=await resolveReviewedWikiRepublication({...input,document:draftDoc,review:qa,run:runs[0]??null,registry:pins,events,
+      readers:{document:(issueId,key)=>document(tx,input.companyId,issueId,key),review:(issueId,id)=>review(tx,input.companyId,issueId,id),
+        retraction:async p=>gate.block(physical(p)),page:async p=>{
+          const matches=rows.filter(r=>r.path===p);publicationNeed(matches.length===1,"republication_page_metadata");
+          const {contents}=await readRetractionFolderTextWithStatus(root,physical(p),gate);const hash=publicationHash(contents);
+          publicationNeed(matches[0]!.content_hash===hash,"republication_page_changed");
+          return {path:p,wikiId:draft.wikiId,spaceSlug:draft.spaceSlug,contents,hash,sourceRefs:matches[0]!.source_refs};
+        }}});
+    const newPhysical=physical(draft.path),identity=await resolvePluginLocalFolderPath(root,newPhysical,{allowMissingLeaf:true});
+    publicationNeed(path.relative(root,identity.realPath).split(path.sep).join("/")===newPhysical,"republication_alias");
+    return {resolved,events,root,newPhysical,pluginDb,space,ns,config,pageType:rows.find(r=>r.path===draft.previousPath)!.page_type,planHash:publicationHash(publicationCanonical({pin:resolved.pin,
+      sourceRefs:resolved.sourceRefs,root,physicalPath:newPhysical,registryBefore:resolved.registryBeforeSHA256,registryAfter:resolved.registryAfterSHA256}))};
+  }
+  return {
+    async execute(input:Request) {
+      // Commit an intent before the first filesystem effect. A pending intent
+      // is never automatically resumed: ambiguous effects require readback.
+      const first=await withWikiRetractionLock(db,pluginId,input.companyId,async tx=>{
+        const all=await loadAllWikiRetractions(tx,pluginId,input.companyId);retractionFolderGate(all,input.companyId,"wiki-root");
+        const receipt=committed(all,input);if(receipt)return {receipt};
+        const prior=await tx.select({id:activityLog.id}).from(activityLog).where(eq(activityLog.id,input.operationId));
+        if(prior.length)throw conflict("Publication is prepared or outcome is unknown; read its receipt, do not resend");
+        const p=await plan(tx,input,all);
+        await tx.insert(activityLog).values({id:input.operationId,companyId:input.companyId,actorType:"user",actorId:input.actorId,
+          action:"wiki.page.republication_prepared",entityType:"wiki_republication",entityId:pluginId,
+          details:{schema:"paperclip.wiki-republication-intent/v1",...input,pluginId,planHash:p.planHash,path:p.newPhysical,rootPath:p.root,contentHash:p.resolved.pin.wikiSHA256}});
+        return {planHash:p.planHash};
+      });
+      if(first.receipt)return first.receipt;
+      return withWikiRetractionLock(db,pluginId,input.companyId,async tx=>{
+        const all=await loadAllWikiRetractions(tx,pluginId,input.companyId);retractionFolderGate(all,input.companyId,"wiki-root");
+        const p=await plan(tx,input,all);publicationNeed(p.planHash===first.planHash,"republication_plan_changed");
+        const event=buildWikiRepublicationEvent(p.resolved,{...input,events:p.events,eventId:randomUUID(),at:new Date().toISOString()});
+        const created=await createPluginLocalFolderTextExclusive(p.root,p.newPhysical,p.resolved.contents);
+        if(!created.created)throw conflict("Publication file already exists; it was not overwritten. Read intent/receipt without retry");
+        publicationNeed(publicationHash(await readPluginLocalFolderText(p.root,p.newPhysical))===event.contentHash,"republication_file_readback");
+        const pageId=randomUUID(),revisionId=randomUUID(),title=p.resolved.contents.match(/^#\s+(.+)$/m)?.[1]??p.resolved.draft.path;
+        await p.pluginDb.execute(pluginId,`INSERT INTO ${p.ns}.wiki_pages
+          (id,company_id,wiki_id,space_id,path,title,page_type,frontmatter,source_refs,backlinks,content_hash,current_revision_id)
+          VALUES($1,$2,$3,$4,$5,$6,$7,'{}'::jsonb,$8::jsonb,'[]'::jsonb,$9,$10)`,
+          [pageId,input.companyId,p.resolved.draft.wikiId,p.space.id,p.resolved.draft.path,title,p.pageType,JSON.stringify(p.resolved.sourceRefs),event.contentHash,revisionId]);
+        await p.pluginDb.execute(pluginId,`INSERT INTO ${p.ns}.wiki_page_revisions
+          (id,company_id,wiki_id,space_id,page_id,path,content_hash,summary,metadata)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)`,[revisionId,input.companyId,p.resolved.draft.wikiId,p.space.id,pageId,
+          p.resolved.draft.path,event.contentHash,p.resolved.draft.reason,JSON.stringify({operationId:input.operationId,replaces:p.resolved.draft.previousPath})]);
+        await tx.update(pluginConfig).set({configJson:{...p.config.configJson,publicationReadback:p.resolved.nextRegistry},updatedAt:new Date()})
+          .where(and(eq(pluginConfig.id,p.config.id),eq(pluginConfig.companyId,input.companyId)));
+        await tx.insert(activityLog).values({id:event.id,companyId:input.companyId,actorType:"user",actorId:input.actorId,
+          action:"wiki.page.retraction",entityType:"wiki_retraction",entityId:pluginId,details:event as unknown as JsonObject});
+        return event;
+      });
+    },
+    async receipt(companyId:string,operationId:string) {
+      return withWikiRetractionLock(db,pluginId,companyId,async tx=>{
+        const events=await loadAllWikiRetractions(tx,pluginId,companyId);retractionFolderGate(events,companyId,"wiki-root");
+        const event=events.find(e=>e.type==="republished"&&e.republication?.operationId===operationId);
+        const intents=await tx.select().from(activityLog).where(and(eq(activityLog.id,operationId),eq(activityLog.companyId,companyId),
+          eq(activityLog.entityId,pluginId),eq(activityLog.action,"wiki.page.republication_prepared")));
+        const intent=intents[0]?.details as {rootPath:string;path:string;contentHash:string}|undefined;
+        if(!intent&&!event)throw notFound("Publication operation not found");
+        let file:{present:boolean;sha256?:string;matchesIntent?:boolean}={present:false};
+        if(intent)try{const body=await readPluginLocalFolderText(intent.rootPath,intent.path);const sha256=publicationHash(body);file={present:true,sha256,matchesIntent:sha256===intent.contentHash};}
+        catch(error){if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;}
+        return {state:event?"published":"prepared_or_unknown",event:event??null,file,automaticRetryAllowed:false};
+      });
+    },
+  };
+}

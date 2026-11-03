@@ -2,6 +2,9 @@ import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+const mockRepublication = vi.hoisted(() => ({ execute:vi.fn(),receipt:vi.fn() }));
+vi.mock("../services/wiki-republication-runtime.js",()=>({wikiRepublicationRuntime:()=>mockRepublication}));
+
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
   getByKey: vi.fn(),
@@ -1216,4 +1219,36 @@ describe("operator-hidden plugin management floor", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
   }, 20_000);
+});
+
+
+describe("reviewed Wiki republication HTTP boundary",()=>{
+  const endpoint=`/api/plugins/${pluginId}/wiki-retractions/republications`;
+  const operationId="88888888-8888-4888-8888-888888888888";
+  const body={companyId:companyA,issueId:projectA,documentKey:"revalidated",reviewId:runA,operationId};
+  beforeEach(()=>{vi.clearAllMocks();readyPlugin();});
+  it("refuses agent and other-company actors before invoking the runtime",async()=>{
+    for(const actor of [agentActor(),boardActor({companyIds:[companyB]})]){
+      const {app}=await createApp(actor);
+      expect((await request(app).post(endpoint).send(body)).status).toBe(403);
+      expect((await request(app).get(endpoint+"/"+operationId).query({companyId:companyA})).status).toBe(403);
+    }
+    expect(mockRepublication.execute).not.toHaveBeenCalled();expect(mockRepublication.receipt).not.toHaveBeenCalled();
+  });
+  it("uses the authenticated Board actor and reads the scoped receipt without rerunning publication",async()=>{
+    const {app}=await createApp(boardActor());mockRepublication.execute.mockResolvedValue({type:"republished"});
+    mockRepublication.receipt.mockResolvedValue({state:"published",automaticRetryAllowed:false});
+    const result=await request(app).post(endpoint).send({...body,actorId:"forged",runId:"forged"});
+    expect(result.status,JSON.stringify(result.body)).toBe(200);
+    expect(mockRepublication.execute).toHaveBeenCalledExactlyOnceWith({...body,actorId:"user-1"});
+    const receipt=await request(app).get(endpoint+"/"+operationId).query({companyId:companyA});
+    expect(receipt.status).toBe(200);expect(receipt.body.automaticRetryAllowed).toBe(false);
+    expect(mockRepublication.receipt).toHaveBeenCalledExactlyOnceWith(companyA,operationId);
+    expect(mockRepublication.execute).toHaveBeenCalledTimes(1);
+  });
+  it("refuses a noncanonical operation identity without any publication effect",async()=>{
+    const {app}=await createApp(boardActor());
+    expect((await request(app).post(endpoint).send({...body,operationId:"not-a-uuid"})).status).toBe(400);
+    expect(mockRepublication.execute).not.toHaveBeenCalled();
+  });
 });

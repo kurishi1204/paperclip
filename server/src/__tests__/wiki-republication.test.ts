@@ -1,0 +1,103 @@
+import { test } from "vitest";
+import assert from "node:assert/strict";
+import { mkdtemp,mkdir,writeFile,readFile,rm,realpath } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { createPluginLocalFolderTextExclusive } from "../services/plugin-local-folders.js";
+import { executeRetraction,validateRetractionEvents,retractionEventHash,type RetractionEvent,type RetractionStore } from "../services/wiki-retraction-ledger.js";
+import { retractionFolderGate,readRetractionFolderTextWithStatus } from "../services/wiki-retraction-gate.js";
+import { encodeWikiRepublicationDraft,resolveReviewedWikiRepublication,buildWikiRepublicationEvent } from "../services/wiki-republication.js";
+import { publicationCanonical,publicationHash,reviewBasis,verifyWikiPublication,type JsonObject,type PublicationRegistry } from "../services/wiki-publication-readback.js";
+
+async function fixture() {
+ const root=await realpath(await mkdtemp(join(tmpdir(),"wiki-republication-")));await mkdir(join(root,"wiki"));
+ const events:RetractionEvent[]=[],pages:Record<string,{body:string;refs:JsonObject[]}>= {},docs:Record<string,any>={},reviews:Record<string,any>={};
+ const registry:PublicationRegistry={schema:"colo.shared-wiki-publication-readback/v1",companyId:"c",wikiId:"default",spaceSlug:"default",qaAgentId:"qa",entries:[]};
+ for(const name of ["p7","child","upstream"]){
+  const path=`wiki/${name}.md`,body=`# ${name}\n\n${name==="child"?"Original mixed claim and independent fact":name==="p7"?"Withdrawn assumption":"Revalidated independent source"}\n`;
+  const ref={kind:"document",issueId:name,documentId:"doc-"+name,documentKey:name,revisionId:"rev-"+name};
+  const review={id:"qa-"+name,companyId:"c",issueId:name,status:"accepted",sourceRunId:"author-run",resolvedByAgentId:"qa",resolvedByRunId:"qa-run-"+name,resolvedAt:null,payload:{},result:{outcome:"accepted"}};
+  const refs=[ref,...(name==="child"?[{kind:"document",issueId:"p7",documentId:"doc-p7",documentKey:"p7",revisionId:"rev-p7"}]:[])];
+  pages[path]={body,refs};docs[name]={id:ref.documentId,companyId:"c",issueId:name,latestRevisionId:ref.revisionId,body,createdByAgentId:"author"};reviews[review.id]=review;
+  registry.entries.push({path,...ref,producerAgentId:"author",reviewId:review.id,wikiSHA256:publicationHash(body),documentBodySHA256:publicationHash(body),reviewRecordSHA256:publicationHash(publicationCanonical(reviewBasis(review))),sourceRefsSHA256:publicationHash(publicationCanonical(refs))});
+  await writeFile(join(root,path),body);
+ }
+ const store:RetractionStore={read:async()=>events,transaction:async(_s,work)=>work({events:async()=>events,append:async e=>{events.push(e);}})};
+ const target={companyId:"c",wikiId:"default",spaceSlug:"default",path:"wiki/p7.md",contentHash:publicationHash(pages["wiki/p7.md"]!.body)};
+ await executeRetraction(store,{target,retractionId:"withdrawal",reason:"Revalidation required",actorId:"owner",runId:null,eventId:"withdrawal-event",at:"2026-11-03T10:00:00Z",
+  approval:{id:"withdrawal-review",companyId:"c",target,reason:"Revalidation required",reviewerId:"qa",reviewRunId:"withdrawal-qa",ownerDecisionId:"real-human-decision"},
+  fence:{folderKey:"wiki-root",rootPath:root,pathPrefix:"",mode:"citation-holds",blocks:[{path:target.path,contentHash:target.contentHash,state:"retracted"},{path:"wiki/child.md",contentHash:publicationHash(pages["wiki/child.md"]!.body),state:"blocked_by_retraction"}],readable:[{path:"wiki/upstream.md",contentHash:publicationHash(pages["wiki/upstream.md"]!.body)}]},
+  readCurrent:async()=>target});
+ const newBody=encodeWikiRepublicationDraft({companyId:"c",wikiId:"default",spaceSlug:"default",retractionId:"withdrawal",previousPath:"wiki/child.md",path:"wiki/child-revalidated.md",reason:"Responsible author revalidated the unrelated claim",dependencies:[{path:"wiki/upstream.md",wikiSHA256:publicationHash(pages["wiki/upstream.md"]!.body)}]},"# Revised conclusion\n\nUse only the current independent source.\n");
+ const doc={id:"new-doc",companyId:"c",issueId:"new-issue",latestRevisionId:"new-revision",latestBody:newBody,body:newBody,createdByAgentId:"author",updatedByAgentId:"author",updatedByUserId:null};docs["new-issue"]=doc;
+ const review={id:"new-qa",companyId:"c",issueId:"new-issue",kind:"request_confirmation",status:"accepted",sourceRunId:"new-author-run",resolvedByAgentId:"qa",resolvedByRunId:"new-qa-run",resolvedAt:null,result:{outcome:"accepted"},payload:{target:{type:"issue_document",issueId:"new-issue",documentId:"new-doc",key:"revalidated",revisionId:"new-revision"}}};reviews[review.id]=review;
+ const readers={page:async(p:string)=>{const {contents}=await readRetractionFolderTextWithStatus(root,p,retractionFolderGate(events,"c","wiki-root"));return {path:p,wikiId:"default",spaceSlug:"default",contents,hash:publicationHash(contents),sourceRefs:pages[p]!.refs};},document:async(issue:string)=>docs[issue]??null,review:async(_issue:string,id:string)=>reviews[id]??null,retraction:async(p:string)=>retractionFolderGate(events,"c","wiki-root").block(p)};
+ const input={companyId:"c",issueId:"new-issue",documentKey:"revalidated",actorId:"owner",document:doc,review,run:{id:"new-qa-run",companyId:"c",agentId:"qa",status:"succeeded"},registry,events,readers};
+ return {root,events,pages,docs,reviews,registry,doc,review,input,readers,cleanup:()=>rm(root,{recursive:true})};
+}
+test("responsible author -> exact-version QA -> new immutable publication makes only the new version usable",async()=>{
+ const f=await fixture();try{
+  const oldBytes=await readFile(join(f.root,"wiki/child.md"));
+  assert.equal((await verifyWikiPublication(f.registry,"wiki/child.md",f.readers)).state,"verified_with_citation_holds");
+  const plan=await resolveReviewedWikiRepublication(f.input);
+  assert.throws(()=>retractionFolderGate(f.events,"c","wiki-root").assertCitationRead(plan.draft.path),/E_SOURCE_RETRACTED/);
+  const saved=await createPluginLocalFolderTextExclusive(f.root,plan.draft.path,plan.contents);assert.equal(saved.created,true);
+  // Before the publication commit the new leaf stays unusable.
+  await assert.rejects(readRetractionFolderTextWithStatus(f.root,plan.draft.path,retractionFolderGate(f.events,"c","wiki-root")),/E_SOURCE_RETRACTED/);
+  const event=buildWikiRepublicationEvent(plan,{...f.input,operationId:"publish-op",eventId:"published",at:"2026-11-03T10:01:00Z"});f.events.push(event);
+  f.pages[plan.draft.path]={body:plan.contents,refs:plan.sourceRefs};
+  const bytes=await readRetractionFolderTextWithStatus(f.root,plan.draft.path,retractionFolderGate(f.events,"c","wiki-root"));
+  assert.equal(bytes.contents,plan.contents);assert.deepEqual(bytes.citationHolds,[]);
+  const proof=await verifyWikiPublication(plan.nextRegistry,plan.draft.path,f.readers);assert.equal(proof.state,"verified");assert.equal(proof.dependencies.length,1);
+  assert.equal((await readRetractionFolderTextWithStatus(f.root,"wiki/child.md",retractionFolderGate(f.events,"c","wiki-root"))).citationHolds.length,1);
+  await assert.rejects(readRetractionFolderTextWithStatus(f.root,"wiki/p7.md",retractionFolderGate(f.events,"c","wiki-root")),/E_SOURCE_RETRACTED/);
+  assert.deepEqual(await readFile(join(f.root,"wiki/child.md")),oldBytes);
+  assert.equal((await createPluginLocalFolderTextExclusive(f.root,plan.draft.path,"overwrite")).created,false);
+  assert.equal(await readFile(join(f.root,plan.draft.path),"utf8"),plan.contents);
+  assert.throws(()=>retractionFolderGate(f.events,"c","wiki-root").assertWrite(plan.draft.path),/WRITE_HOLD/);
+ }finally{await f.cleanup();}
+});
+test("self QA, stale QA, different author, owner edits and forged original creator cannot release a hold",async()=>{
+ const f=await fixture();try{
+  const cases=[
+   ()=>({...f.input,review:{...f.review,resolvedByAgentId:"author"}}),
+   ()=>({...f.input,review:{...f.review,payload:{target:{...f.review.payload.target,revisionId:"old"}}}}),
+   ()=>({...f.input,document:{...f.doc,createdByAgentId:"other"}}),
+   ()=>({...f.input,document:{...f.doc,updatedByUserId:"owner"}}),
+   ()=>({...f.input,run:{...f.input.run,status:"running"}}),
+  ];for(const change of cases)await assert.rejects(resolveReviewedWikiRepublication(change()));
+  f.docs.child.createdByAgentId="forged";await assert.rejects(resolveReviewedWikiRepublication(f.input),/original_creator/);
+ }finally{await f.cleanup();}
+});
+test("a replacement that still cites withdrawn or held material remains blocked",async()=>{
+ const f=await fixture();try{
+  for(const path of ["wiki/p7.md","wiki/child.md"]){
+   const text=encodeWikiRepublicationDraft({companyId:"c",wikiId:"default",spaceSlug:"default",retractionId:"withdrawal",previousPath:"wiki/child.md",path:"wiki/new.md",reason:"Recheck",dependencies:[{path,wikiSHA256:publicationHash(f.pages[path]!.body)}]},"# Candidate\n");
+   await assert.rejects(resolveReviewedWikiRepublication({...f.input,document:{...f.doc,latestBody:text}}),/retracted|dependency_held/);
+  }
+ }finally{await f.cleanup();}
+});
+test("uncommitted orphan files never release a hold and existing names are never overwritten",async()=>{
+ const f=await fixture();try{
+  const plan=await resolveReviewedWikiRepublication(f.input);await createPluginLocalFolderTextExclusive(f.root,plan.draft.path,plan.contents);
+  await assert.rejects(readRetractionFolderTextWithStatus(f.root,plan.draft.path,retractionFolderGate(f.events,"c","wiki-root")),/E_SOURCE_RETRACTED/);
+  assert.equal((await createPluginLocalFolderTextExclusive(f.root,plan.draft.path,"changed")).created,false);
+  assert.equal(f.events.length,1);assert.equal(await readFile(join(f.root,plan.draft.path),"utf8"),plan.contents);
+ }finally{await f.cleanup();}
+});
+test("published receipt tampering and direct-source resurrection fail closed",async()=>{
+ const f=await fixture();try{
+  const plan=await resolveReviewedWikiRepublication(f.input);const e=buildWikiRepublicationEvent(plan,{...f.input,operationId:"op",eventId:"pub",at:"2026-11-03T10:01:00Z"});
+  for(const mutate of [(x:RetractionEvent)=>{x.republication!.physicalPath="wiki/p7.md";},(x:RetractionEvent)=>{x.republication!.producerAgentId="qa";},(x:RetractionEvent)=>{x.approval.ownerDecisionId="fake-operation-uuid";}]){
+   const v=structuredClone(e);mutate(v);const {eventHash:_hash,...basis}=v;v.eventHash=retractionEventHash(basis);assert.throws(()=>validateRetractionEvents(v,[...f.events,v]));
+  }
+ }finally{await f.cleanup();}
+});
+test("replacement bytes cannot change under a committed publication receipt",async()=>{
+ const f=await fixture();try{
+  const plan=await resolveReviewedWikiRepublication(f.input);await createPluginLocalFolderTextExclusive(f.root,plan.draft.path,plan.contents);
+  f.events.push(buildWikiRepublicationEvent(plan,{...f.input,operationId:"op",eventId:"pub",at:"2026-11-03T10:01:00Z"}));
+  await writeFile(join(f.root,plan.draft.path),"tampered");
+  await assert.rejects(readRetractionFolderTextWithStatus(f.root,plan.draft.path,retractionFolderGate(f.events,"c","wiki-root")),/readable_content_changed/);
+ }finally{await f.cleanup();}
+});

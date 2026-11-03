@@ -9,7 +9,7 @@ A withdrawal retains original bytes. It stops use of the target and marks depend
 for review while keeping downstream bodies readable through the structured
 reader; their other claims are not declared false. This first
 version deliberately pauses **writes in the affected Wiki tree**, including new
-pages, until a separately reviewed publication transition is available. Immutable
+pages, for ordinary plugin mutations. The separate Board publication transition below can add a reviewed immutable version. Immutable
 raw capture and raw reading continue. Other companies and other Wiki spaces are
 outside that path fence.
 
@@ -25,8 +25,7 @@ strict and cannot be weakened by the new reader. Indexed discovery retains downs
 
 The local preview/execute route now emits `citation-holds`; execute requires
 the server-resolved same-version human decision and separate independent QA.
-This code is not deployed. New-publication release and production acceptance
-remain incomplete. Existing `freeze-wiki` ledger events are unchanged and remain
+This code is not deployed. A reviewed immutable republication entry is connected locally; its real PostgreSQL/HTTP acceptance and production acceptance remain incomplete. Existing `freeze-wiki` ledger events are unchanged and remain
 strict; never activate the policy by rewriting an event or configuration.
 
 ## Operator path
@@ -160,3 +159,56 @@ absence outcome, so space names cannot bypass the file fence. Other plugins and
 inactive Wiki reads retain their previous errors. The actual host helper, file
 paths, aliases and both metadata/readable consumers are exercised together;
 space resolution and SQL selection remain fixtures in the local journey.
+
+
+## Reviewed immutable republication
+
+The responsible author saves a **new issue document** containing the revised
+Markdown. Its first bytes are this hidden metadata comment; independent QA reviews
+the entire document, including the target and dependency hashes:
+
+```markdown
+<!-- paperclip.wiki-republication/v1
+{"companyId":"company UUID","wikiId":"default","spaceSlug":"default","retractionId":"recorded withdrawal UUID","previousPath":"wiki/synthesis/held.md","path":"wiki/synthesis/revalidated.md","reason":"What was rechecked","dependencies":[{"path":"wiki/sources/current.md","wikiSHA256":"current 64-character SHA-256"}]}
+-->
+
+# Revised conclusion
+
+Explain the responsible author's revalidation and the remaining usable claims.
+```
+
+The new document must be created and maintained by the original registered
+author. The host checks the original document's stored creator as well as the
+publication pin. QA must be the configured reviewer, distinct from the author and
+executor, with an accepted interaction bound to this exact document revision and
+a completed successful QA Run. Every declared dependency must pass current
+publication verification without citation holds. Semantic completeness of the
+dependency list is part of that human/employee review, not a Markdown parser claim.
+
+An authenticated Board caller posts `companyId`, `issueId`, `documentKey`,
+`reviewId`, and a fresh UUID `operationId` to
+`POST /api/plugins/:pluginId/wiki-retractions/republications`. The runtime reloads
+and locks the records, commits a durable intent, then revalidates under the same
+company/plugin lock. It creates the new file without overwriting any existing
+leaf, records page/revision metadata, appends a publication pin while preserving
+all old pins, and commits a `republished` event in the existing hash chain. The
+whole reviewed Markdown is copied exactly, retaining the normal publication proof.
+
+The withdrawal's human decision ID in the new event is **withdrawal lineage**,
+not consent to the revised body. New publication authority comes from the
+authenticated Board operation and its separately resolved exact-version QA.
+The original withdrawal, original file, downstream citation holds and other
+ordinary write restrictions remain unchanged. Only the newly committed path is
+readable as a new verified version. A direct withdrawn source cannot use this entry.
+The new version can itself be withdrawn by a later normal withdrawal.
+
+`GET /api/plugins/:pluginId/wiki-retractions/republications/:operationId?companyId=...`
+returns the durable intent/receipt and observed file hash without returning the
+body. A completed identical POST reads its receipt. A prepared/unknown operation
+is never automatically repeated. If a DB failure follows file creation, the intent
+remains, metadata/pins/event roll back, and the unregistered file stays blocked.
+There is no automatic deletion, retry or rollback of file effects.
+
+The activity chain records entry-owned events. Appending the separate Wiki
+maintenance log, full PostgreSQL/HTTP execution, independent review of this
+increment and production acceptance remain open; do not call this milestone done.

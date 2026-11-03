@@ -85,7 +85,7 @@ export function parsePublicationRegistry(value: unknown, companyId: string): Pub
   publicationNeed(new Set(versions).size === versions.length, "registry_document_ambiguous");
   return record as unknown as PublicationRegistry;
 }
-function reviewBasis(review: JsonObject) {
+export function reviewBasis(review: JsonObject) {
   return Object.fromEntries(["id", "companyId", "issueId", "status", "sourceRunId", "resolvedByAgentId", "resolvedByRunId", "resolvedAt", "payload", "result"].map(k => [k, review[k] ?? null]));
 }
 export interface PublicationCitation {

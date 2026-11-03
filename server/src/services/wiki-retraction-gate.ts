@@ -19,8 +19,20 @@ export function retractionFolderGate(events: RetractionEvent[], companyId: strin
     validateRetractionEvents(group[0]!, group.sort((a, b) => a.sequence - b.sequence)).filter(e => e.type === "executed"));
   for (const event of active) if (!event.fence) throw new RetractionError("missing_runtime_fence");
   const relevant = active.filter(e => e.fence!.folderKey === folderKey);
+  const published = [...groups.values()].flatMap(group => group.filter(e=>e.type==="republished"));
+  function publicationFor(filePath:string) {return published.find(e=>e.republication!.physicalPath===filePath);}
+  function newlyPublished(event:RetractionEvent,filePath:string) {
+    const p=publicationFor(filePath);
+    return Boolean(p&&p.sequence>event.sequence&&p.wikiId===event.wikiId&&p.spaceSlug===event.spaceSlug&&
+      p.republication!.rootPath===event.fence!.rootPath&&event.fence!.mode==="citation-holds"&&
+      !event.fence!.blocks.some(b=>b.path===filePath)&&!event.fence!.readable.some(b=>b.path===filePath));
+  }
+  function assertPublicationHash(filePath:string,contents?:string) {
+    const p=publicationFor(filePath);
+    if(p&&contents!==undefined&&publicationHash(contents)!==p.contentHash)throw new RetractionError("readable_content_changed");
+  }
   function block(path: string): RetractionBlock | null {
-    const blocks = relevant.map(event => retractionFolderGateSingle(event, path)).filter((b): b is RetractionBlock => b !== null);
+    const blocks = relevant.map(event => newlyPublished(event,path)?null:retractionFolderGateSingle(event, path)).filter((b): b is RetractionBlock => b !== null);
     return blocks.find(b => b.state === "retracted" || b.readPolicy !== "citation-holds") ?? blocks[0] ?? null;
   }
   function citationHolds(filePath: string) {
@@ -33,10 +45,11 @@ export function retractionFolderGate(events: RetractionEvent[], companyId: strin
     });
   }
   function assertCitationRead(filePath: string, contents?: string) {
+    assertPublicationHash(filePath,contents);
     for (const event of relevant) {
       // Evaluate every fence. A legacy hold or direct withdrawal must not be
       // hidden by the first, citation-only fence affecting the same page.
-      const single = retractionFolderGateSingle(event, filePath);
+      const single = newlyPublished(event,filePath)?null:retractionFolderGateSingle(event, filePath);
       if (single && !(event.fence!.mode === "citation-holds" && single.state === "blocked_by_retraction"))
         throw new Error("E_SOURCE_RETRACTED " + JSON.stringify(single));
       const pin = event.fence!.blocks.find(p => p.path === filePath) ?? event.fence!.readable.find(p => p.path === filePath);
@@ -53,6 +66,7 @@ export function retractionFolderGate(events: RetractionEvent[], companyId: strin
         throw new RetractionError("runtime_root_changed");
     },
     assertRead(path: string, contents?: string) {
+      assertPublicationHash(path,contents);
       const held = block(path);
       if (held) throw new Error("E_SOURCE_RETRACTED " + JSON.stringify(held));
       if (contents !== undefined) for (const event of relevant) {
