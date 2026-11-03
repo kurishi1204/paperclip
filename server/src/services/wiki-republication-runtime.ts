@@ -195,7 +195,11 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
             const contents=await readPluginLocalFolderText(log.rootPath,log.path);
             retainedRetractionFile(events.filter(e=>e.wikiId===event.wikiId&&e.spaceSlug===event.spaceSlug),log.path,log.prefixSHA256,contents);
             const sha256=publicationHash(contents);
-            maintenanceLog={state:sha256===log.resultingSHA256?"appended":"pending",sha256};
+            // The complete log may contain later valid appends. The verifier
+            // above has checked every recorded prefix and exact append; use
+            // this event's byte range rather than the latest file hash.
+            const appendEnd=log.prefixBytes+Buffer.byteLength(log.appendText);
+            maintenanceLog={state:Buffer.byteLength(contents)>=appendEnd?"appended":"pending",sha256};
           } catch(error) {maintenanceLog={state:"unknown",error:error instanceof Error?error.message:"log read failed"};}
         }
         return {state:event?"published":"prepared_or_unknown",event:event??null,file,maintenanceLog,automaticRetryAllowed:false};

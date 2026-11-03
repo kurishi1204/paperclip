@@ -240,6 +240,12 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
       await db.$client.unsafe(`DROP TRIGGER reject_synthetic_republication ON ${ns}.wiki_pages`);
       await db.$client.unsafe(`DROP FUNCTION ${ns}.reject_synthetic_republication()`);
     }
+    // Read a prior completed receipt after a distinct valid publication
+    // appends to the same maintenance log. Its append is still complete.
+    const history=await context("wiki/history-first.md");
+    const first=await runtime.execute(history.input);
+    await runtime.execute(await history.another("wiki/history-next.md"));
+    expect((await runtime.receipt(history.companyId,first.republication!.operationId)).maintenanceLog.state).toBe("appended");
   }, 60_000);
 
 });

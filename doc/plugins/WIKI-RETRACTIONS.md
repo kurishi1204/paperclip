@@ -261,3 +261,5 @@ host citation holds through the merge, and the browse tree marks those rows
 `[引用利用保留]` as well as the detail view. The corresponding DB counterexamples
 remain unexecuted locally; the physical merge and actual tree-label function are
 exercised with isolated files.
+
+A publication receipt checks its own verified maintenance-log byte range. Later valid appends do not turn an earlier completed append into pending. Partial or foreign suffixes remain unknown and are never automatically retried.

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { createPluginLocalFolderTextExclusive,resolvePluginLocalFolderPath } from "../services/plugin-local-folders.js";
 import { executeRetraction,validateRetractionEvents,retractionEventHash,withRetractionMaintenanceLog,retainedRetractionFile,type RetractionEvent,type RetractionStore } from "../services/wiki-retraction-ledger.js";
 import { retractionFolderGate,readRetractionFolderTextWithStatus,readRetractionFolderText } from "../services/wiki-retraction-gate.js";
-import { assertWikiRepublicationTargetPath } from "../services/wiki-republication-runtime.js";
+import { assertWikiRepublicationTargetPath, wikiRepublicationRuntime } from "../services/wiki-republication-runtime.js";
 import { appendRetractionMaintenanceLog } from "../services/wiki-retraction-store.js";
 import { encodeWikiRepublicationDraft,resolveReviewedWikiRepublication,buildWikiRepublicationEvent,verifyCurrentWikiRepublication } from "../services/wiki-republication.js";
 import { publicationCanonical,publicationHash,reviewBasis,verifyWikiPublication,type JsonObject,type PublicationRegistry } from "../services/wiki-publication-readback.js";
@@ -123,6 +123,37 @@ test("entry-owned maintenance appends preserve exact original bytes and are idem
   const twice=await readFile(file,"utf8");assert.equal(twice.split("<!-- paperclip.wiki-maintenance/v1 -->").length-1,2);
   assert.equal(retainedRetractionFile(f.events,"wiki/log.md",withdrawal.fence!.blocks.at(-1)!.contentHash,twice),original.toString("utf8"));
   assert.equal((await readRetractionFolderTextWithStatus(f.root,"wiki/log.md",retractionFolderGate(f.events,"c","wiki-root"))).contents,twice);
+ }finally{await f.cleanup();}
+});
+test("an earlier publication receipt stays appended after later maintenance events",async()=>{
+ const f=await fixture();try{
+  const file=join(f.root,"wiki/log.md"),original=await readFile(file,"utf8");
+  const withdrawal=withRetractionMaintenanceLog(f.events[0]!,[],original);f.events[0]=withdrawal;
+  await appendRetractionMaintenanceLog(withdrawal,f.events);
+  const plan=await resolveReviewedWikiRepublication(f.input);
+  const initial=buildWikiRepublicationEvent(plan,{...f.input,operationId:"history-op",eventId:"history-pub",at:"2026-11-03T10:01:00Z"});
+  const publication=withRetractionMaintenanceLog(initial,f.events,await readFile(file,"utf8"));f.events.push(publication);
+  await appendRetractionMaintenanceLog(publication,f.events);
+  const tx={execute:async()=>[],transaction:async(work:(connection:unknown)=>Promise<unknown>)=>work(tx),
+   select:(projection?:unknown)=>({from:()=>({where:async()=>projection?f.events.map(details=>({details})):
+    [{details:{rootPath:f.root,path:plan.draft.path,contentHash:publication.contentHash}}]})})};
+  // Exercise the actual receipt service over real files. Only SQL selection
+  // and transaction transport are synthetic; this is not a DB qualification.
+  const runtime=wikiRepublicationRuntime(tx as unknown as Parameters<typeof wikiRepublicationRuntime>[0],"synthetic-plugin");
+  assert.equal((await runtime.receipt("c","history-op")).maintenanceLog.state,"appended");
+  const {eventHash:_hash,maintenanceLog:_log,...basis}=withdrawal;
+  const observationBasis={...basis,id:"later-observation",type:"observed" as const,sequence:3,previousHash:publication.eventHash,
+   actorId:"independent-observer",runId:"observer-run",at:"2026-11-03T10:02:00Z"};
+  const observation=withRetractionMaintenanceLog({...observationBasis,eventHash:retractionEventHash(observationBasis)},f.events,await readFile(file,"utf8"));
+  f.events.push(observation);
+  // A later pending append does not make the earlier successful append pending.
+  assert.equal((await runtime.receipt("c","history-op")).maintenanceLog.state,"appended");
+  await appendRetractionMaintenanceLog(observation,f.events);
+  const complete=await readFile(file);
+  assert.equal((await runtime.receipt("c","history-op")).maintenanceLog.state,"appended");
+  assert.deepEqual(await readFile(file),complete);
+  await writeFile(file,complete.subarray(0,complete.length-5));
+  assert.equal((await runtime.receipt("c","history-op")).maintenanceLog.state,"unknown");
  }finally{await f.cleanup();}
 });
 test("a partial maintenance append is observed as unknown and is never automatically repeated",async()=>{
