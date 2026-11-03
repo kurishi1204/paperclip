@@ -93,7 +93,7 @@ import { getHiddenSettings } from "../services/settings-visibility.js";
 import { secretService } from "../services/secrets.js";
 import { wikiRetractionRuntime } from "../services/wiki-retraction-runtime.js";
 import { wikiRepublicationRuntime } from "../services/wiki-republication-runtime.js";
-import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { HttpError, badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 
 /**
  * Floor: when the hosting operator hides the Plugins settings surface
@@ -1303,12 +1303,20 @@ export function pluginRoutes(
     if(![issueId,documentKey,reviewId,operationId].every(v=>typeof v==="string"&&v.length>0&&v===v.trim())||
       !/^[0-9a-f-]{36}$/.test(operationId))throw badRequest("Fixed draft, review and UUID operationId are required");
     const runtime=wikiRepublicationRuntime(db,plugin.id);
-    await runtime.execute({companyId,issueId,documentKey,reviewId,operationId,actorId:getActorInfo(req).actorId});
+    let completionIssue:string|undefined;
+    try {
+      await runtime.execute({companyId,issueId,documentKey,reviewId,operationId,actorId:getActorInfo(req).actorId});
+    }catch(error){
+      const detail=error instanceof HttpError?error.details as {code?:string;operationId?:string}|undefined:undefined;
+      if(error instanceof HttpError&&error.status===409&&detail?.code==="wiki_republication_post_commit_unresolved"&&detail.operationId===operationId)
+        completionIssue=detail.code;
+      else throw error;
+    }
     const receipt=await runtime.receipt(companyId,operationId);
     // A committed publication is distinct from a completed file/log operation.
     // Repeated POSTs only read back: pending/unknown effects never auto-replay.
-    const complete=receipt.state==="published"&&receipt.file.matchesIntent===true&&receipt.maintenanceLog.state==="appended";
-    res.status(complete?200:409).json(receipt);
+    const complete=!completionIssue&&receipt.state==="published"&&receipt.file.matchesIntent===true&&receipt.maintenanceLog.state==="appended";
+    res.status(complete?200:409).json({...receipt,...(completionIssue?{completionIssue}:{})});
   });
   router.get("/plugins/:pluginId/wiki-retractions/republications/:operationId",async(req,res)=>{
     assertBoard(req);const companyId=requirePluginConfigCompanyId(req,req.query.companyId);

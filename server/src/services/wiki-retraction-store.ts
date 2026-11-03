@@ -1,3 +1,6 @@
+import { pluginDatabaseService } from "./plugin-database.js";
+import { publicationNeed } from "./wiki-publication-readback.js";
+import { retractionFolderGate } from "./wiki-retraction-gate.js";
 import { constants, promises as fs } from "node:fs";
 import path from "node:path";
 import { resolvePluginLocalFolderPath } from "./plugin-local-folders.js";
@@ -75,4 +78,30 @@ export async function appendRetractionMaintenanceLog(event: RetractionEvent, eve
   const contents = await fs.readFile(resolved.realPath, "utf8");
   retainedRetractionFile(scoped, log.path, log.resultingSHA256, contents);
   return { state: "appended" as const, alreadyPresent: false };
+}
+
+/** A physical fence cannot be rebased by changing the current namespace.
+ * The host calls this under its advisory lock before any folder effect. */
+export async function assertWikiRetractionSpaceBindings(db:Db,pluginId:string,companyId:string,events:RetractionEvent[]) {
+  const active=events.filter(e=>e.type==="executed"&&e.fence);
+  if(!active.length)return;
+  const pluginDb=pluginDatabaseService(db),ns=await pluginDb.getRuntimeNamespace(pluginId);
+  const scopes=new Map(active.map(e=>[JSON.stringify([e.wikiId,e.spaceSlug]),e]));
+  for(const event of scopes.values()) {
+    const rows=await pluginDb.query<{path_prefix:string|null;root_folder_key:string;status:string}>(pluginId,
+      `SELECT path_prefix,root_folder_key,status FROM ${ns}.wiki_spaces WHERE company_id=$1 AND wiki_id=$2 AND slug=$3 FOR SHARE`,
+      [companyId,event.wikiId,event.spaceSlug]);
+    publicationNeed(rows.length===1&&rows[0]!.root_folder_key==="wiki-root"&&rows[0]!.status==="active"&&
+      active.filter(e=>e.wikiId===event.wikiId&&e.spaceSlug===event.spaceSlug)
+        .every(e=>(rows[0]!.path_prefix??"")===e.fence!.pathPrefix),"republication_current_space_binding");
+  }
+}
+
+/** Normal operational reads/mutations use current bindings. Historical audit
+ * and receipt lookup intentionally use loadAllWikiRetractions instead. */
+export async function loadCurrentWikiRetractions(db:Db,pluginId:string,companyId:string) {
+  const events=await loadAllWikiRetractions(db,pluginId,companyId);
+  retractionFolderGate(events,companyId,"wiki-root");
+  await assertWikiRetractionSpaceBindings(db,pluginId,companyId,events);
+  return events;
 }

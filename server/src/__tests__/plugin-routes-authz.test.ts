@@ -1,4 +1,5 @@
 import express from "express";
+import { conflict } from "../errors.js";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -1255,6 +1256,19 @@ describe("reviewed Wiki republication HTTP boundary",()=>{
     expect(result.status).toBe(409);expect(result.body.maintenanceLog.state).toBe(state);
     expect(result.body.state).toBe("published");expect(result.body.automaticRetryAllowed).toBe(false);
     expect(mockRepublication.execute).toHaveBeenCalledTimes(1);
+  });
+  it("returns committed evidence on the first POST when the derived append fails",async()=>{
+    const {app}=await createApp(boardActor());
+    mockRepublication.execute.mockRejectedValue(conflict("Publication committed; append unresolved",{
+      code:"wiki_republication_post_commit_unresolved",operationId,automaticRetryAllowed:false,
+    }));
+    mockRepublication.receipt.mockResolvedValue({state:"published",file:{present:true,matchesIntent:true},maintenanceLog:{state:"pending"},automaticRetryAllowed:false});
+    const result=await request(app).post(endpoint).send(body);
+    expect(result.status).toBe(409);expect(result.body.state).toBe("published");
+    expect(result.body.maintenanceLog.state).toBe("pending");
+    expect(result.body.completionIssue).toBe("wiki_republication_post_commit_unresolved");
+    expect(mockRepublication.execute).toHaveBeenCalledTimes(1);
+    expect(mockRepublication.receipt).toHaveBeenCalledExactlyOnceWith(companyA,operationId);
   });
   it("refuses a noncanonical operation identity without any publication effect",async()=>{
     const {app}=await createApp(boardActor());

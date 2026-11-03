@@ -6,7 +6,7 @@ import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { assertConfiguredLocalFolder, createPluginLocalFolderTextExclusive, getStoredLocalFolders, inspectPluginLocalFolder,
   readPluginLocalFolderText, requireLocalFolderDeclaration } from "./plugin-local-folders.js";
-import { loadAllWikiRetractions, withWikiRetractionLock, appendRetractionMaintenanceLog } from "./wiki-retraction-store.js";
+import { loadAllWikiRetractions, withWikiRetractionLock, appendRetractionMaintenanceLog, assertWikiRetractionSpaceBindings } from "./wiki-retraction-store.js";
 import { retractionFolderGate, readRetractionFolderTextWithStatus, canonicalWikiRetractionPath } from "./wiki-retraction-gate.js";
 import { parsePublicationRegistry, publicationCanonical, publicationHash, publicationNeed, verifyWikiPublication, type JsonObject } from "./wiki-publication-readback.js";
 import { buildWikiRepublicationEvent, parseWikiRepublicationDraft, resolveReviewedWikiRepublication, verifyCurrentWikiRepublication } from "./wiki-republication.js";
@@ -17,22 +17,6 @@ const WIKI_PLUGIN="paperclipai.plugin-llm-wiki";
 export async function assertWikiRepublicationTargetPath(root:string,physicalPath:string) {
   publicationNeed(await canonicalWikiRetractionPath(root,physicalPath)===physicalPath,"republication_alias");
 }
-/** A physical fence cannot be rebased by changing the current namespace.
- * The host calls this under its advisory lock before any folder effect. */
-export async function assertWikiRetractionSpaceBindings(db:Db,pluginId:string,companyId:string,events:RetractionEvent[]) {
-  const active=events.filter(e=>e.type==="executed"&&e.fence);
-  if(!active.length)return;
-  const pluginDb=pluginDatabaseService(db),ns=await pluginDb.getRuntimeNamespace(pluginId);
-  const scopes=new Map(active.map(e=>[JSON.stringify([e.wikiId,e.spaceSlug]),e]));
-  for(const event of scopes.values()) {
-    const rows=await pluginDb.query<{path_prefix:string|null;root_folder_key:string;status:string}>(pluginId,
-      `SELECT path_prefix,root_folder_key,status FROM ${ns}.wiki_spaces WHERE company_id=$1 AND wiki_id=$2 AND slug=$3 FOR SHARE`,
-      [companyId,event.wikiId,event.spaceSlug]);
-    publicationNeed(rows.length===1&&rows[0]!.root_folder_key==="wiki-root"&&rows[0]!.status==="active"&&
-      active.filter(e=>e.wikiId===event.wikiId&&e.spaceSlug===event.spaceSlug)
-        .every(e=>(rows[0]!.path_prefix??"")===e.fence!.pathPrefix),"republication_current_space_binding");
-  }
-}
 /** Current proof for registered originals and new versions. The existing
  * export name is retained for the host/route contract. */
 export async function assertCurrentWikiRepublication(db:Db,pluginId:string,companyId:string,events:RetractionEvent[],physicalPath:string) {
@@ -40,8 +24,8 @@ export async function assertCurrentWikiRepublication(db:Db,pluginId:string,compa
   // a new prefix must not make every recorded target look unrelated.
   await assertWikiRetractionSpaceBindings(db,pluginId,companyId,events);
   const matches=events.filter(e=>e.type==="republished"&&e.republication?.physicalPath===physicalPath);
-  const original=events.find(e=>e.type==="executed"&&e.fence&&
-    [...e.fence.blocks,...e.fence.readable].some(p=>p.path===physicalPath));
+  const originals=events.filter(e=>e.type==="executed"&&e.fence&&
+    [...e.fence.blocks,...e.fence.readable].some(p=>p.path===physicalPath)),original=originals[0];
   if(!matches.length&&!original)return;
   publicationNeed(matches.length<=1,"republication_current_identity");const event=matches[0]??original!;
   const configs=await db.select().from(pluginConfig).where(and(eq(pluginConfig.pluginId,pluginId),eq(pluginConfig.companyId,companyId))).for("share");
@@ -56,8 +40,8 @@ export async function assertCurrentWikiRepublication(db:Db,pluginId:string,compa
   // Classification is persisted with the withdrawal, never inferred from
   // today's editable registry. Missing historical classification is unknown.
   if(!target){
-    publicationNeed(!matches.length&&original?.fence?.registeredPaths!==undefined&&
-      !original.fence.registeredPaths.includes(physicalPath),"republication_current_pin");
+    publicationNeed(!matches.length&&originals.length>0&&originals.every(e=>e.fence?.registeredPaths!==undefined&&
+      !e.fence.registeredPaths.includes(physicalPath)),"republication_current_pin");
     return;
   }
   if(matches.length)publicationNeed(physical(event.path)===physicalPath,"republication_current_physical_path");
@@ -205,9 +189,18 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
           action:"wiki.page.retraction",entityType:"wiki_retraction",entityId:pluginId,details:event as unknown as JsonObject});
         return event;
       });
-      await withWikiRetractionLock(db,pluginId,input.companyId,async tx=>{
-        await appendRetractionMaintenanceLog(receipt,await loadAllWikiRetractions(tx,pluginId,input.companyId));
-      });
+      try {
+        await withWikiRetractionLock(db,pluginId,input.companyId,async tx=>{
+          await appendRetractionMaintenanceLog(receipt,await loadAllWikiRetractions(tx,pluginId,input.companyId));
+        });
+      }catch(cause){
+        // Only this already-committed phase is normalized. Intent/file/DB
+        // failures and authorization conflicts retain their original errors.
+        const unresolved=conflict("Publication committed; maintenance append unresolved. Read the existing receipt; do not retry",{
+          code:"wiki_republication_post_commit_unresolved",operationId:input.operationId,eventId:receipt.id,automaticRetryAllowed:false,
+        });
+        unresolved.cause=cause;throw unresolved;
+      }
       return receipt;
     },
     async receipt(companyId:string,operationId:string) {

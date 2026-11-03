@@ -8,7 +8,7 @@ import { pluginDatabaseService } from "./plugin-database.js";
 import { assertConfiguredLocalFolder, getStoredLocalFolders, inspectPluginLocalFolder, readPluginLocalFolderText,
   requireLocalFolderDeclaration, resolvePluginLocalFolderPath } from "./plugin-local-folders.js";
 import { executeRetraction, withRetractionMaintenanceLog, retainedRetractionFile, RetractionError, type RetractionFence, type RetractionScope, type RetractionStore, type RetractionTarget } from "./wiki-retraction-ledger.js";
-import { loadAllWikiRetractions, withWikiRetractionLock, appendRetractionMaintenanceLog } from "./wiki-retraction-store.js";
+import { loadAllWikiRetractions, loadCurrentWikiRetractions, withWikiRetractionLock, appendRetractionMaintenanceLog } from "./wiki-retraction-store.js";
 import { resolveReviewedWikiRetraction } from "./wiki-retraction-approval.js";
 import { retractionFolderGate } from "./wiki-retraction-gate.js";
 import { buildRetractionGraph, assertNoUnregisteredRetractionDependants } from "./wiki-retraction-readback.js";
@@ -43,6 +43,7 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
     return path.relative(rootPath, resolved.realPath).split(path.sep).join("/");
   }
   async function snapshot(companyId: string, scope: RetractionScope, targetPath: string, reason: string, connection: Db): Promise<WikiRetractionProposal> {
+    const currentEvents=await loadCurrentWikiRetractions(connection,pluginId,companyId);
     const registry = pluginRegistryService(connection);
     const config = await registry.getConfig(pluginId, companyId);
     const pins = parsePublicationRegistry(config?.configJson?.publicationReadback, companyId);
@@ -60,14 +61,15 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
       source.latestRevisionId === targetPin.revisionId && source.createdByAgentId === targetPin.producerAgentId &&
       publicationHash(source.latestBody) === targetPin.documentBodySHA256, "retraction_published_source_identity");
     const pluginDb = pluginDatabaseService(connection); const ns = await pluginDb.getRuntimeNamespace(pluginId);
-    const spaces = await pluginDb.query<{ id: string; path_prefix: string | null }>(pluginId,
-      `SELECT id, path_prefix FROM ${ns}.wiki_spaces WHERE company_id = $1 AND wiki_id = $2 AND slug = $3`,
+    const spaces = await pluginDb.query<{ id: string; path_prefix: string | null; root_folder_key:string; status:string }>(pluginId,
+      `SELECT id, path_prefix, root_folder_key, status FROM ${ns}.wiki_spaces WHERE company_id = $1 AND wiki_id = $2 AND slug = $3 FOR SHARE`,
       [companyId, scope.wikiId, scope.spaceSlug]);
-    publicationNeed(spaces.length === 1, "retraction_space"); const space = spaces[0]!;
+    publicationNeed(spaces.length === 1&&spaces[0]!.root_folder_key==="wiki-root"&&spaces[0]!.status==="active", "retraction_space"); const space = spaces[0]!;
     const rows = await pluginDb.query<{ path: string; source_refs: unknown; content_hash: string }>(pluginId,
       `SELECT path, source_refs, content_hash FROM ${ns}.wiki_pages WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3`,
       [companyId, scope.wikiId, space.id]);
     const rootPath = await root(companyId, connection);
+    retractionFolderGate(currentEvents,companyId,"wiki-root").assertRoot(rootPath);
     const toPhysical = (p: string) => space.path_prefix ? `${space.path_prefix}/${p}` : p;
     const page = async (p: string): Promise<JsonObject> => {
       const matches = rows.filter(r => r.path === p); publicationNeed(matches.length === 1, "retraction_page_metadata");

@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { constants, promises as fs } from "node:fs";
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { activityLog, companies, createDb, agents, issues, documents, issueDocuments, issueThreadInteractions, heartbeatRuns, plugins, pluginConfig, pluginCompanySettings } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { executeRetraction } from "../services/wiki-retraction-ledger.js";
@@ -228,6 +231,14 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     await db.$client.unsafe(`UPDATE ${ns}.wiki_spaces SET path_prefix='alternate' WHERE company_id=$1`,[f.companyId]);
     await expect(withWikiRetractionLock(db,pluginId,f.companyId,tx=>readRetractionFolderTextWithStatus(f.dir,"alternate/wiki/p7.md",gate,
       path=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,path)))).rejects.toThrow(/current_space_binding/);
+    // A new withdrawal must use the same current binding as host reads.
+    // Copy all retained bytes so an unrelated missing-file error cannot hide
+    // the prefix discrepancy during preview.
+    for(const name of ["child.md","upstream.md","index.md","log.md"])
+      await writeFile(join(f.dir,"alternate/wiki",name),await readFile(join(f.dir,"wiki",name)));
+    await expect(wikiRetractionRuntime(db,pluginId).preview(
+      {companyId:f.companyId,wikiId:"default",spaceSlug:"default"},"wiki/upstream.md","Synthetic second withdrawal"
+    )).rejects.toThrow(/current_space_binding/);
     await db.$client.unsafe(`UPDATE ${ns}.wiki_spaces SET path_prefix=NULL WHERE company_id=$1`,[f.companyId]);
     // Removing an original pin cannot downgrade current proof to raw reading.
     const currentPins=config!.configJson.publicationReadback as PublicationRegistry;
@@ -285,6 +296,44 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
       await db.$client.unsafe(`DROP TRIGGER reject_synthetic_republication ON ${ns}.wiki_pages`);
       await db.$client.unsafe(`DROP FUNCTION ${ns}.reject_synthetic_republication()`);
     }
+    // Actual Express route + real SQL/file runtime; only the authenticated
+    // Board actor is injected here. No mocked publication runtime or store.
+    const [{pluginRoutes},{errorHandler}]=await Promise.all([import("../routes/plugins.js"),import("../middleware/index.js")]);
+    const appFor=(companyId:string)=>{
+      const app=express();app.use(express.json());
+      app.use((req,_res,next)=>{req.actor={type:"board",userId:"synthetic-owner",source:"session",isInstanceAdmin:false,companyIds:[companyId]};next();});
+      app.use("/api",pluginRoutes(db,{} as never));app.use(errorHandler);return app;
+    };
+    const endpoint=`/api/plugins/${pluginId}/wiki-retractions/republications`;
+    const httpHappy=await context("wiki/http-reviewed.md"),happyApp=appFor(httpHappy.companyId);
+    const publishedHTTP=await request(happyApp).post(endpoint).send(httpHappy.input);
+    expect(publishedHTTP.status,JSON.stringify(publishedHTTP.body)).toBe(200);
+    expect(publishedHTTP.body).toMatchObject({state:"published",file:{present:true,matchesIntent:true},maintenanceLog:{state:"appended"},automaticRetryAllowed:false});
+    const readHTTP=await request(happyApp).get(endpoint+"/"+httpHappy.input.operationId).query({companyId:httpHappy.companyId});
+    expect(readHTTP.status).toBe(200);expect(readHTTP.body.event.id).toBe(publishedHTTP.body.event.id);
+
+    // The first actual HTTP request may fail only after the SQL event commits.
+    // Return committed evidence immediately; never repeat its derived append.
+    const appendFailure=await context("wiki/append-failure.md"),originalOpen=fs.open,failedApp=appFor(appendFailure.companyId);
+    const spy=vi.spyOn(fs,"open").mockImplementation(async(path,flags,mode)=>{
+      if(String(path)===join(appendFailure.dir,"wiki/log.md")&&typeof flags==="number"&&(flags&constants.O_APPEND))
+        throw new Error("synthetic post-commit append failure");
+      return originalOpen(path,flags,mode);
+    });
+    try {
+      const failedPOST=await request(failedApp).post(endpoint).send(appendFailure.input);
+      expect(failedPOST.status,JSON.stringify(failedPOST.body)).toBe(409);
+      expect(failedPOST.body).toMatchObject({state:"published",completionIssue:"wiki_republication_post_commit_unresolved",
+        file:{present:true,matchesIntent:true},maintenanceLog:{state:"pending"},automaticRetryAllowed:false});
+    }finally{spy.mockRestore();}
+    const unresolved=await runtime.receipt(appendFailure.companyId,appendFailure.input.operationId);
+    expect(unresolved).toMatchObject({state:"published",file:{present:true,matchesIntent:true},maintenanceLog:{state:"pending"},automaticRetryAllowed:false});
+    const beforeRetry=await readFile(join(appendFailure.dir,"wiki/log.md"));
+    const duplicatePOST=await request(failedApp).post(endpoint).send(appendFailure.input);
+    expect(duplicatePOST.status).toBe(409);expect(duplicatePOST.body.event.id).toBe(unresolved.event!.id);
+    expect(await readFile(join(appendFailure.dir,"wiki/log.md"))).toEqual(beforeRetry);
+    expect((await runtime.receipt(appendFailure.companyId,appendFailure.input.operationId)).maintenanceLog.state).toBe("pending");
+
     // Read a prior completed receipt after a distinct valid publication
     // appends to the same maintenance log. Its append is still complete.
     const history=await context("wiki/history-first.md");

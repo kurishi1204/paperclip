@@ -294,3 +294,15 @@ requires matching publication bytes and an appended maintenance record. A
 committed event with a pending/unknown append returns HTTP 409 with its receipt,
 not a claim of operation completion. Repeated POSTs never resume the append;
 use GET to inspect the existing operation.
+
+
+Current-space validation is shared by normal folder access and withdrawal
+preview/execute; a second withdrawal cannot permanently mix incompatible roots
+or prefixes. Historical audit, completed-operation identity and receipt lookup
+retain access to their original records even when current configuration is invalid.
+
+If the first POST's derived append throws after the publication commit, the
+runtime marks that specific phase as `wiki_republication_post_commit_unresolved`.
+The route reads the committed receipt and returns409 with `completionIssue`, even
+if all bytes are visible after an unconfirmed sync. Earlier authorization, intent,
+file and SQL errors are not normalized as committed success. No append is retried.
