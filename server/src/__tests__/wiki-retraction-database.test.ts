@@ -223,10 +223,14 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
 
     // Fail after the actual immutable file effect, inside the metadata transaction.
     const bad=await context("wiki/fault-after-file.md");
-    await db.$client.unsafe(`CREATE FUNCTION ${ns}.reject_synthetic_republication() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic metadata failure'; END $$`);
+    await db.$client.unsafe(`CREATE FUNCTION ${ns}.reject_synthetic_republication() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING ERRCODE='P7001', MESSAGE='synthetic metadata failure'; END $$`);
     await db.$client.unsafe(`CREATE TRIGGER reject_synthetic_republication BEFORE INSERT ON ${ns}.wiki_pages FOR EACH ROW WHEN (NEW.path='wiki/fault-after-file.md') EXECUTE FUNCTION ${ns}.reject_synthetic_republication()`);
     try {
-      await expect(runtime.execute(bad.input)).rejects.toThrow(/synthetic metadata failure/);
+      // Drizzle wraps the database message as cause. Match the injected
+      // SQLSTATE and message, so a different INSERT failure cannot pass.
+      await expect(runtime.execute(bad.input)).rejects.toMatchObject({
+        cause:{code:"P7001",message:"synthetic metadata failure"},
+      });
       expect(await readFile(join(bad.dir,bad.newPath),"utf8")).toBe(bad.body);
       const receipt=await runtime.receipt(bad.companyId,bad.input.operationId);
       expect(receipt).toMatchObject({state:"prepared_or_unknown",automaticRetryAllowed:false,file:{present:true,matchesIntent:true}});
