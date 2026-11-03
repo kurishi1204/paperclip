@@ -1,14 +1,15 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { retractionFolderGate } from "../services/wiki-retraction-gate.js";
+import { retractionFolderGate, canonicalWikiRetractionPath } from "../services/wiki-retraction-gate.js";
+import { writePluginLocalFolderTextAtomic, createPluginLocalFolderTextExclusive, readPluginLocalFolderText } from "../services/plugin-local-folders.js";
 import { executeRetraction, type RetractionStore, type RetractionEvent } from "../services/wiki-retraction-ledger.js";
 import { publicationHash } from "../services/wiki-publication-readback.js";
 
 async function setup() {
-  const dir = await mkdtemp(join(tmpdir(), "wiki-retraction-runtime-"));
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "wiki-retraction-runtime-")));
   await mkdir(join(dir,"wiki"));
   const original = "A synthetic withdrawn assertion\n"; const upstream = "An unrelated upstream fact\n";
   await writeFile(join(dir, "wiki/target.md"), original); await writeFile(join(dir, "wiki/upstream.md"), upstream);
@@ -71,5 +72,45 @@ test("changed allowlisted bytes and cross-company/corrupt receipts fail visibly"
     await assert.rejects(f.read("wiki/upstream.md"), /readable_content_changed/);
     assert.throws(() => retractionFolderGate(f.events(), "another-company", "wiki-root"), /ledger_scope/);
     assert.throws(() => retractionFolderGate([{ ...f.events()[0]!, reason: "tampered" }], "c", "wiki-root"), /ledger_integrity/);
+  } finally { await f.close(); }
+});
+
+test("new leaves under a raw directory alias cannot escape the actual Wiki write hold", async () => {
+  const f = await setup(); try {
+    await mkdir(join(f.dir, "raw"));
+    await symlink(join(f.dir, "wiki"), join(f.dir, "raw/alias"));
+    await f.withdraw();
+    const gate = retractionFolderGate(f.events(), "c", "wiki-root");
+    gate.assertRoot(f.dir);
+    for (const [leaf, write] of [
+      ["new.md", writePluginLocalFolderTextAtomic],
+      ["exclusive.md", createPluginLocalFolderTextExclusive],
+    ] as const) {
+      const alias = `raw/alias/${leaf}`;
+      assert.equal(await canonicalWikiRetractionPath(f.dir, alias), `wiki/${leaf}`);
+      await assert.rejects((async () => {
+        gate.assertWrite(alias);
+        gate.assertWrite(await canonicalWikiRetractionPath(f.dir, alias));
+        await write(f.dir, alias, "Unreviewed assertion");
+      })(), /WRITE_HOLD/);
+      await assert.rejects(readFile(join(f.dir, "wiki", leaf)), { code: "ENOENT" });
+    }
+    const fresh = "raw/captures/day/new.md";
+    gate.assertWrite(await canonicalWikiRetractionPath(f.dir, fresh));
+    await createPluginLocalFolderTextExclusive(f.dir, fresh, "Fresh original");
+    assert.equal(await readPluginLocalFolderText(f.dir, fresh), "Fresh original");
+    assert.equal(await readFile(join(f.dir, "wiki/target.md"), "utf8"), f.original);
+  } finally { await f.close(); }
+});
+test("an active withdrawal keeps its recorded physical root; changing it cannot expose originals as raw", async () => {
+  const f = await setup(); try {
+    await f.withdraw();
+    const gate = retractionFolderGate(f.events(), "c", "wiki-root");
+    gate.assertRoot(f.dir);
+    assert.throws(() => gate.assertRoot(join(f.dir, "raw")), /runtime_root_changed/);
+    assert.throws(() => gate.assertRoot(join(f.dir, "..")), /runtime_root_changed/);
+    assert.throws(() => gate.assertRoot(""), /runtime_root_changed/);
+    retractionFolderGate([], "c", "wiki-root").assertRoot("another-root");
+    assert.equal(await readFile(join(f.dir, "wiki/target.md"), "utf8"), f.original);
   } finally { await f.close(); }
 });

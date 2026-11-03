@@ -50,7 +50,7 @@ import { pluginStateStore } from "./plugin-state-store.js";
 import { pluginLifecycleInbox } from "./plugin-lifecycle-inbox.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { loadAllWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
-import { retractionFolderGate } from "./wiki-retraction-gate.js";
+import { retractionFolderGate, canonicalWikiRetractionPath as canonicalFolderPath } from "./wiki-retraction-gate.js";
 import { pluginManagedAgentService } from "./plugin-managed-agents.js";
 import { pluginManagedRoutineService } from "./plugin-managed-routines.js";
 import { pluginManagedSkillService } from "./plugin-managed-skills.js";
@@ -825,28 +825,16 @@ export function buildHostServices(
     work: (gate: ReturnType<typeof retractionFolderGate>, connection: Db) => Promise<T>): Promise<T> => {
     if (pluginKey !== "paperclipai.plugin-llm-wiki" || folderKey !== "wiki-root")
       return work(retractionFolderGate([], companyId, folderKey), db);
-    return withWikiRetractionLock(db, pluginId, companyId, async tx =>
-      work(retractionFolderGate(await loadAllWikiRetractions(tx, pluginId, companyId), companyId, folderKey), tx));
-  };
-  const canonicalFolderPath = async (rootPath: string, relativePath: string) => {
-    try {
-      const resolved = await resolvePluginLocalFolderPath(rootPath, relativePath, { allowMissingLeaf: true });
-      return path.relative(rootPath, resolved.realPath).split(path.sep).join("/");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      // A new immutable raw capture can have new parent directories. Resolve
-      // the nearest existing ancestor without creating anything or ignoring
-      // containment/alias errors. The first resolver already validated syntax.
-      const parts = relativePath.split("/");
-      for (let n = parts.length - 1; n > 0; n--) {
-        try {
-          const ancestor = await resolvePluginLocalFolderPath(rootPath, parts.slice(0,n).join("/"), { mustExist: true });
-          return path.relative(rootPath, path.join(ancestor.realPath, ...parts.slice(n))).split(path.sep).join("/");
-        } catch (inner) { if ((inner as NodeJS.ErrnoException).code !== "ENOENT") throw inner; }
+    return withWikiRetractionLock(db, pluginId, companyId, async tx => {
+      const gate = retractionFolderGate(await loadAllWikiRetractions(tx, pluginId, companyId), companyId, folderKey);
+      if (gate.active) {
+        const folder = await inspectStoredLocalFolder(companyId, folderKey, tx);
+        gate.assertRoot(folder.realPath ?? "");
       }
-      return relativePath;
-    }
+      return work(gate, tx);
+    });
   };
+
 
   const inspectStoredLocalFolder = async (companyId: string, folderKey: string, connection: Db = db) =>
     inspectPluginLocalFolder({
@@ -1516,6 +1504,7 @@ export function buildHostServices(
         return withWikiFolderFence(params.companyId, params.folderKey, async (gate, connection) => {
           const status = await inspectStoredLocalFolder(params.companyId, params.folderKey, connection);
           assertConfiguredLocalFolder(status);
+          gate.assertRoot(status.realPath!);
           const listing = await listPluginLocalFolderEntries(status.realPath!, {
             relativePath: params.relativePath,
             recursive: params.recursive,
@@ -1534,6 +1523,7 @@ export function buildHostServices(
         return withWikiFolderFence(params.companyId, params.folderKey, async (gate, connection) => {
           const status = await inspectStoredLocalFolder(params.companyId, params.folderKey, connection);
           assertConfiguredLocalFolder(status);
+          gate.assertRoot(status.realPath!);
           gate.assertRead(params.relativePath);
           const canonical = await canonicalFolderPath(status.realPath!, params.relativePath);
           gate.assertRead(canonical);
@@ -1547,13 +1537,14 @@ export function buildHostServices(
         return withWikiFolderFence(params.companyId, params.folderKey, async (gate, connection) => {
           gate.assertWrite(params.relativePath);
           const companyId = ensureCompanyId(params.companyId);
-          await preparePluginLocalFolder({
+          if (!gate.active) await preparePluginLocalFolder({
             folderKey: params.folderKey,
             declaration: getLocalFolderDeclaration(params.folderKey),
             storedConfig: await getStoredLocalFolderConfig(companyId, params.folderKey, connection),
           });
           const status = await inspectStoredLocalFolder(companyId, params.folderKey, connection);
           assertWritableConfiguredLocalFolder(status);
+          gate.assertRoot(status.realPath!);
           if (gate.active) gate.assertWrite(await canonicalFolderPath(status.realPath!, params.relativePath));
           await writePluginLocalFolderTextAtomic(status.realPath!, params.relativePath, params.contents);
           return inspectStoredLocalFolder(companyId, params.folderKey, connection);
@@ -1564,13 +1555,14 @@ export function buildHostServices(
         return withWikiFolderFence(params.companyId, params.folderKey, async (gate, connection) => {
           gate.assertWrite(params.relativePath);
           const companyId = ensureCompanyId(params.companyId);
-          await preparePluginLocalFolder({
+          if (!gate.active) await preparePluginLocalFolder({
             folderKey: params.folderKey,
             declaration: getLocalFolderDeclaration(params.folderKey),
             storedConfig: await getStoredLocalFolderConfig(companyId, params.folderKey, connection),
           });
           const status = await inspectStoredLocalFolder(companyId, params.folderKey, connection);
           assertWritableConfiguredLocalFolder(status);
+          gate.assertRoot(status.realPath!);
           if (gate.active) gate.assertWrite(await canonicalFolderPath(status.realPath!, params.relativePath));
           if (status.access !== "readWrite" || !status.writable) {
             throw new Error("Local folder is not configured for writes");
@@ -1586,6 +1578,7 @@ export function buildHostServices(
           const companyId = ensureCompanyId(params.companyId);
           const status = await inspectStoredLocalFolder(companyId, params.folderKey, connection);
           assertWritableConfiguredLocalFolder(status);
+          gate.assertRoot(status.realPath!);
           if (gate.active) gate.assertWrite(await canonicalFolderPath(status.realPath!, params.relativePath));
           await deletePluginLocalFolderFile(status.realPath!, params.relativePath, params.folderKey);
           return inspectStoredLocalFolder(companyId, params.folderKey, connection);

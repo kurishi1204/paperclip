@@ -1,3 +1,5 @@
+import path from "node:path";
+import { resolvePluginLocalFolderPath } from "./plugin-local-folders.js";
 import { publicationHash } from "./wiki-publication-readback.js";
 import type { RetractionEvent, RetractionBlock } from "./wiki-retraction-ledger.js";
 import { RetractionError, validateRetractionEvents } from "./wiki-retraction-ledger.js";
@@ -27,6 +29,12 @@ export function retractionFolderGate(events: RetractionEvent[], companyId: strin
   }
   return {
     active: relevant.length > 0, block,
+    assertRoot(rootPath: string) {
+      // The recorded fence uses paths relative to this exact physical root.
+      // A different root needs an explicit reviewed transition, not rebasing.
+      if (relevant.some(event => event.fence!.rootPath !== rootPath))
+        throw new RetractionError("runtime_root_changed");
+    },
     assertRead(path: string, contents?: string) {
       const held = block(path);
       if (held) throw new Error("E_SOURCE_RETRACTED " + JSON.stringify(held));
@@ -41,3 +49,25 @@ export function retractionFolderGate(events: RetractionEvent[], companyId: strin
     },
   };
 }
+
+/** Resolve the existing parent even when a new leaf does not exist.
+ * allowMissingLeaf would preserve a symlinked parent as a lexical raw path. */
+export const canonicalWikiRetractionPath = async (rootPath: string, relativePath: string) => {
+    try {
+      const resolved = await resolvePluginLocalFolderPath(rootPath, relativePath, { mustExist: true });
+      return path.relative(rootPath, resolved.realPath).split(path.sep).join("/");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // A new immutable raw capture can have new parent directories. Resolve
+      // the nearest existing ancestor without creating anything or ignoring
+      // containment/alias errors. The first resolver already validated syntax.
+      const parts = relativePath.split("/");
+      for (let n = parts.length - 1; n > 0; n--) {
+        try {
+          const ancestor = await resolvePluginLocalFolderPath(rootPath, parts.slice(0,n).join("/"), { mustExist: true });
+          return path.relative(rootPath, path.join(ancestor.realPath, ...parts.slice(n))).split(path.sep).join("/");
+        } catch (inner) { if ((inner as NodeJS.ErrnoException).code !== "ENOENT") throw inner; }
+      }
+      return relativePath;
+    }
+  };

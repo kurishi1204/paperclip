@@ -82,3 +82,15 @@ must be an explicit rollout decision, not an unnoticed operational regression.
 
 An administrator able to rewrite the underlying DB or Wiki root is outside this
 ledger's trust boundary. Do not delete a receipt or overwrite a page to restore it.
+
+## Root identity during an active withdrawal
+
+A persisted fence is relative to its recorded physical root. Host folder operations
+reject a different current root with `runtime_root_changed`. Changing configuration
+does not rebase or retire the withdrawal. Restore the matching root or implement a
+separately reviewed transition. No original bytes are deleted by this rejection.
+
+New file leaves resolve their nearest existing parent before the write-hold check.
+An existing raw-directory alias into the Wiki tree cannot create a new Wiki page.
+Raw capture under the unchanged root remains available. While a withdrawal is
+active, raw writes do not run folder preparation that could recreate held metadata.
