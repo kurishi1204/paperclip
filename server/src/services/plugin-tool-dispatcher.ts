@@ -442,12 +442,15 @@ export function createPluginToolDispatcher(
           const resolvedPage = result.result.data as Record<string, unknown>;
           const persisted = await loadAllWikiRetractions(db, registered.pluginDbId, runContext.companyId);
           const gate = retractionFolderGate(persisted, runContext.companyId, "wiki-root");
-          const pluginDb = pluginDatabaseService(db);
-          const namespace = await pluginDb.getRuntimeNamespace(registered.pluginDbId);
-          const spaces = gate.active ? await pluginDb.query<{ path_prefix: string | null }>(registered.pluginDbId,
-            `SELECT path_prefix FROM ${namespace}.wiki_spaces WHERE company_id = $1 AND wiki_id = $2 AND slug = $3`,
-            [runContext.companyId, resolvedPage.wikiId, resolvedPage.spaceSlug]) : [];
-          if (gate.active) publicationNeed(spaces.length === 1, "retraction_space");
+          let spaces: Array<{ path_prefix: string | null }> = [];
+          if (gate.active) {
+            const pluginDb = pluginDatabaseService(db);
+            const namespace = await pluginDb.getRuntimeNamespace(registered.pluginDbId);
+            spaces = await pluginDb.query<{ path_prefix: string | null }>(registered.pluginDbId,
+              `SELECT path_prefix FROM ${namespace}.wiki_spaces WHERE company_id = $1 AND wiki_id = $2 AND slug = $3`,
+              [runContext.companyId, resolvedPage.wikiId, resolvedPage.spaceSlug]);
+            publicationNeed(spaces.length === 1, "retraction_space");
+          }
           const physical = (p: string) => spaces[0]?.path_prefix ? `${spaces[0].path_prefix}/${p}` : p;
           const documents = documentService(db);
           const interactions = issueThreadInteractionService(db);

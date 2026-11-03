@@ -10,11 +10,20 @@ const state = vi.hoisted(() => ({
   document: {} as Record<string, unknown>,
   review: {} as Record<string, unknown>,
   settingsReads: [] as unknown[][],
+  retractionReads: [] as unknown[][],
+  retractionReadError: null as Error | null,
 }));
 vi.mock("../services/plugin-registry.js", () => ({
   pluginRegistryService: () => ({ getConfig: async (...args: unknown[]) => {
     state.settingsReads.push(args); return { configJson: state.config };
   } }),
+}));
+vi.mock("../services/wiki-retraction-store.js", () => ({
+  loadAllWikiRetractions: async (...args: unknown[]) => {
+    state.retractionReads.push(args);
+    if (state.retractionReadError) throw state.retractionReadError;
+    return [];
+  },
 }));
 vi.mock("../services/documents.js", () => ({
   documentService: () => ({ getIssueDocumentByKey: async () => state.document }),
@@ -32,7 +41,7 @@ const pluginDbId = "00000000-0000-4000-8000-000000000001";
 const name = `${pluginKey}:wiki_read_page`;
 const context = { companyId: "company", agentId: "employee", runId: "run", projectId: "project" };
 
-beforeEach(() => { state.settingsReads = []; });
+beforeEach(() => { state.settingsReads = []; state.retractionReads = []; state.retractionReadError = null; });
 
 function setup() {
   const body = "Reviewed synthetic company document";
@@ -60,6 +69,7 @@ test("normal dispatcher adds current publication evidence through the UUID worke
   expect(result.result.content).toBe(f.body);
   expect(result.result.data).toMatchObject({ publicationReadback: { state: "verified", citation: { documentId: "document" } } });
   expect(state.settingsReads).toEqual([[pluginDbId, "company"]]);
+  expect(state.retractionReads).toEqual([[{}, pluginDbId, "company"]]);
   expect(f.call).toHaveBeenCalledWith(pluginDbId, "getData", { key: "page-content", companyId: "company", params: { companyId: "company", wikiId: "default", spaceSlug: "default", path: "wiki/note.md" } });
 });
 test("companies without the operator configuration keep their existing tool result", async () => {
@@ -104,4 +114,13 @@ test("the ordinary dispatcher binds an explicit publication reviewer without rep
   expect(result.result.data).toMatchObject({publicationReadback:{state:"verified"}});
   state.review.status = "rejected";
   await expect(f.run()).rejects.toThrow("wiki_publication_review_not_accepted");
+});
+
+
+test("the ordinary dispatcher refuses unreadable durable withdrawal state", async () => {
+  const f = setup();
+  state.retractionReadError = new Error("synthetic withdrawal store unavailable");
+  await expect(f.run()).rejects.toThrow("synthetic withdrawal store unavailable");
+  expect(f.call).toHaveBeenCalledTimes(1);
+  expect(state.retractionReads).toHaveLength(1);
 });

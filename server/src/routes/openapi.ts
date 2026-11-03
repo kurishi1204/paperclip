@@ -8995,6 +8995,58 @@ registry.registerPath({
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
+// Board-only withdrawal operations. These are not plugin worker tools.
+registry.registerPath({
+  method: "post",
+  path: "/api/plugins/{pluginId}/wiki-retractions/preview",
+  tags: ["plugins"],
+  summary: "Preview a Wiki withdrawal proposal",
+  description: "Board sessions only. Returns the current publication and dependent-page snapshot. Does not withdraw content.",
+  request: {
+    params: z.object({ pluginId: z.string() }),
+    body: jsonBody(z.object({
+      companyId: z.string(),
+      wikiId: z.string().min(1),
+      spaceSlug: z.string().min(1),
+      path: z.string().min(1),
+      reason: z.string().min(1),
+    })),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/plugins/{pluginId}/wiki-retractions/execute",
+  tags: ["plugins"],
+  summary: "Execute an independently reviewed Wiki withdrawal",
+  description: "Board sessions only. Resolves the current saved proposal and independent review on the server. Retains original files and returns the durable operation receipt. The authenticated request supplies the actor.",
+  request: {
+    params: z.object({ pluginId: z.string() }),
+    body: jsonBody(z.object({
+      companyId: z.string(),
+      issueId: z.string().min(1),
+      documentKey: z.string().min(1),
+      reviewId: z.string().min(1),
+      operationId: z.string().regex(/^[0-9a-f-]{36}$/),
+    })),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/plugins/{pluginId}/wiki-retractions/audit",
+  tags: ["plugins"],
+  summary: "Read retained Wiki withdrawal audit originals",
+  description: "Board sessions only. Reads the retained originals from the recorded root and verifies their hashes. Ordinary readers cannot use this audit route.",
+  request: {
+    params: z.object({ pluginId: z.string() }),
+    query: z.object({ companyId: z.string() }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
 registry.registerPath({
   method: "post",
   path: "/api/plugins/{pluginId}/config/test",
