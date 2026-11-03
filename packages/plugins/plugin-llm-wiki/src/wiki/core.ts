@@ -4155,7 +4155,11 @@ async function collectVisibleRows<T>(limit: number,
   check: (rows: T[]) => Promise<{ rows: T[]; retractionReadback?: { state: string; hiddenCount: number; tombstones: unknown[] } }>,
 ) {
   const rows: T[] = []; let scanned = 0;
-  const retractionReadback = { state: "inactive", hiddenCount: 0, tombstones: [] as unknown[] };
+  // Validate the boundary even when SQL has no rows. No-match is not proof
+  // that a withdrawal is inactive or that a moved root is healthy.
+  const initial = await check([]);
+  if (initial.rows.length) throw new Error("E_WIKI_PAGE_WINDOW_INVALID");
+  const retractionReadback = { state: initial.retractionReadback?.state ?? "not_checked", hiddenCount: 0, tombstones: [] as unknown[] };
   while (rows.length < limit) {
     if (scanned >= LOCAL_BROWSE_FILE_LIMIT) {
       if (!(await load(1, scanned)).length) break;

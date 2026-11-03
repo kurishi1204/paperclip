@@ -123,3 +123,7 @@ a materialized raw file, and inactive readable-only lists still omit unreadable
 files. The active root-change failure is exercised through the actual gate and
 UI consumers, with a fixed SDK status fixture; it is not an authenticated HTTP
 acceptance claim.
+
+The common collector checks the host boundary before loading SQL candidates,
+including a no-match query. An empty result cannot report an unchecked moved
+root as healthy or an active withdrawal as inactive.

@@ -34,7 +34,7 @@ test("actual registered Wiki tools and UI page read stop withdrawn bodies and di
         queryWindowCalls++;return rows.slice(offset,offset+limit);
       } },
       localFolders: {
-        status: async () => ({ wikiRetractions: { state: events.length ? "active" : "inactive" } }),
+        status: async () => { retractionFolderGate(events,"c","wiki-root").assertRoot(activeRoot);return { wikiRetractions: { state: events.length ? "active" : "inactive" } }; },
         readText: async (_c: string, _k: string, p: string) => { const gate = retractionFolderGate(events,"c","wiki-root"); gate.assertRoot(activeRoot); gate.assertRead(p); const physical=await canonicalWikiRetractionPath(dir,p);gate.assertRead(physical);const b=await readFile(join(dir,p),"utf8");gate.assertRead(physical,b);return b; },
         writeTextAtomic: async (_c: string, _k: string, p: string,b: string) => { retractionFolderGate(events,"c","wiki-root").assertWrite(p); await writeFile(join(dir,p),b); },
       },
@@ -92,6 +92,9 @@ test("actual registered Wiki tools and UI page read stop withdrawn bodies and di
     activeRoot=join(dir,"changed-root");await mkdir(activeRoot);
     await expect.soft(listPages(ctx,{...args,pageType:"source",includeRaw:false,limit:1})).rejects.toThrow(/runtime_root_changed/);
     await expect.soft(listSources(ctx,{...args,onlyReadable:true,limit:1})).rejects.toThrow(/runtime_root_changed/);
+    const retainedRows=allRows.splice(0);
+    await expect.soft(listPages(ctx,{...args,pageType:"source",includeRaw:false,limit:1})).rejects.toThrow(/runtime_root_changed/);
+    allRows.push(...retainedRows);
     activeRoot=dir;
     // Exhaustion must be reported, never disguised as an empty complete search.
     for(let i=0;i<2001;i++)allRows.push({kind:"page",path:`wiki/000-cap-${String(i).padStart(4,"0")}.md`,title:"WITHDRAWN SNIPPET",page_type:"source",match_text:"source"});
