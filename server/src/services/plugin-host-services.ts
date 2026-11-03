@@ -1523,7 +1523,7 @@ export function buildHostServices(
           });
           const entries = [];
           for (const entry of listing.entries) {
-            if (entry.kind === "directory" || !gate.block(await canonicalFolderPath(status.realPath!, entry.path))) entries.push(entry);
+            if (entry.kind === "directory" || (!gate.block(entry.path) && !gate.block(await canonicalFolderPath(status.realPath!, entry.path)))) entries.push(entry);
           }
           return { ...listing, entries, folderKey: params.folderKey,
             retractionReadback: { state: gate.active ? "checked" : "inactive", hiddenCount: listing.entries.length - entries.length } };
