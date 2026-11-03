@@ -101,8 +101,8 @@ export const canonicalWikiRetractionPath = async (rootPath: string, relativePath
 
 /** Metadata may precede a raw file. Only normalize that expected absence after
  * root, lexical and physical withdrawal checks; other boundary failures escape. */
-export async function readRetractionFolderText(rootPath: string, relativePath: string,
-  gate: ReturnType<typeof retractionFolderGate>, citationAware = false): Promise<string> {
+async function readRetractionText(rootPath: string, relativePath: string,
+  gate: ReturnType<typeof retractionFolderGate>, citationAware: boolean) {
   const assertRead = citationAware ? gate.assertCitationRead : gate.assertRead;
   gate.assertRoot(rootPath); assertRead(relativePath);
   const canonical = await canonicalWikiRetractionPath(rootPath, relativePath);
@@ -117,12 +117,18 @@ export async function readRetractionFolderText(rootPath: string, relativePath: s
     }
     throw error;
   }
-  assertRead(canonical, contents); return contents;
+  assertRead(canonical, contents); return { contents, canonical };
+}
+
+export async function readRetractionFolderText(rootPath: string, relativePath: string,
+  gate: ReturnType<typeof retractionFolderGate>): Promise<string> {
+  return (await readRetractionText(rootPath, relativePath, gate, false)).contents;
 }
 
 export async function readRetractionFolderTextWithStatus(rootPath: string, relativePath: string,
   gate: ReturnType<typeof retractionFolderGate>) {
-  const contents = await readRetractionFolderText(rootPath, relativePath, gate, true);
-  const canonical = await canonicalWikiRetractionPath(rootPath, relativePath);
+  const { contents, canonical } = await readRetractionText(rootPath, relativePath, gate, true);
+  // Report the identity used for the actual byte/hash check. Resolving it a
+  // second time could attach a different alias's citation status to these bytes.
   return { contents, citationHolds: gate.citationHolds(canonical) };
 }
