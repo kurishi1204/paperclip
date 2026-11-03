@@ -225,3 +225,21 @@ test("removing an original held publication pin does not remove its current-QA r
   await assert.rejects(assertCurrentWikiRepublication(tx as any,"plugin","c",f.events,"wiki/child.md"),/current_pin/);
  }finally{await f.cleanup();}
 });
+
+test("a body link cannot omit its exact declared dependency or revive a withdrawn source",async()=>{
+ const f=await fixture();try{
+  const base={companyId:"c",wikiId:"default",spaceSlug:"default",retractionId:"withdrawal",previousPath:"wiki/child.md",path:"wiki/child-revalidated.md",reason:"Responsible author checked the claim",dependencies:[]};
+  for(const [target,reason]of [["wiki/upstream.md",/undeclared_body_reference/],["wiki/p7.md",/E_SOURCE_RETRACTED/]]as const){
+   const body=encodeWikiRepublicationDraft(base,`# Revalidated\n\n[Evidence](${target})\n`);
+   await assert.rejects(resolveReviewedWikiRepublication({...f.input,document:{...f.doc,latestBody:body}}),reason);
+  }
+ }finally{await f.cleanup();}
+});
+test("publication link indexing ignores machine lineage metadata and permits an explicit self link",async()=>{
+ const f=await fixture();try{
+  const draft={companyId:"c",wikiId:"default",spaceSlug:"default",retractionId:"withdrawal",previousPath:"wiki/child.md",path:"wiki/child-revalidated.md",reason:"Responsible author checked the claim",dependencies:[]};
+  const body=encodeWikiRepublicationDraft(draft,"# Revalidated\n\n[This version](wiki/child-revalidated.md)\n");
+  const plan=await resolveReviewedWikiRepublication({...f.input,document:{...f.doc,latestBody:body}});
+  assert.deepEqual((plan as typeof plan&{backlinks:string[]}).backlinks,[draft.path]);
+ }finally{await f.cleanup();}
+});

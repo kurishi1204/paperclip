@@ -1,3 +1,4 @@
+import { extractWikiLinks } from "../../../packages/plugins/plugin-llm-wiki/src/wiki/core.js";
 import { publicationCanonical, publicationHash, publicationNeed, reviewBasis, verifyWikiPublication,
   type JsonObject, type PublicationPin, type PublicationReaders, type PublicationRegistry } from "./wiki-publication-readback.js";
 import { retractionEventHash, validateRetractionEvents, type RetractionEvent, type RetractionScope } from "./wiki-retraction-ledger.js";
@@ -68,6 +69,16 @@ export async function resolveReviewedWikiRepublication(input:{
     input.run?.id===review.resolvedByRunId&&input.run.companyId===input.companyId&&input.run.agentId===qa&&input.run.status==="succeeded",
     "republication_independent_same_version_review");
   publicationNeed(!registry.entries.some(p=>p.path===draft.path||p.documentId===doc.id),"republication_new_document_and_path");
+  // The machine header records lineage, including the held previous version.
+  // Only rendered Markdown links form the navigation/citation index.
+  const body=doc.latestBody.slice(doc.latestBody.indexOf(END,PREFIX.length)+END.length);
+  const backlinks=extractWikiLinks(body);
+  for(const path of backlinks){
+    if(path===draft.path)continue;
+    const held=await input.readers.retraction!(path);
+    if(held)throw new Error("E_SOURCE_RETRACTED "+JSON.stringify(held));
+    publicationNeed(draft.dependencies.some(ref=>ref.path===path),"republication_undeclared_body_reference");
+  }
   const refs:JsonObject[]=[{kind:"document",issueId:input.issueId,documentId:doc.id,documentKey:input.documentKey,revisionId:doc.latestRevisionId}];
   for(const ref of draft.dependencies){
     const matches=registry.entries.filter(p=>p.path===ref.path&&p.wikiSHA256===ref.wikiSHA256);
@@ -81,7 +92,7 @@ export async function resolveReviewedWikiRepublication(input:{
     documentBodySHA256:publicationHash(doc.latestBody),reviewRecordSHA256:publicationHash(publicationCanonical(reviewBasis(review as unknown as JsonObject))),
     sourceRefsSHA256:publicationHash(publicationCanonical(refs))};
   const nextRegistry={...registry,entries:[...registry.entries,pin]};
-  return {draft,parent,pin,sourceRefs:refs,contents:doc.latestBody,nextRegistry,
+  return {draft,parent,pin,sourceRefs:refs,backlinks,contents:doc.latestBody,nextRegistry,
     registryBeforeSHA256:publicationHash(publicationCanonical(registry)),registryAfterSHA256:publicationHash(publicationCanonical(nextRegistry)),
     reviewId:review.id,reviewerId:qa,reviewRunId:review.resolvedByRunId!};
 }

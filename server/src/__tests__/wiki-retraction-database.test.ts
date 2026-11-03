@@ -197,15 +197,17 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     const backlinkHost=buildHostServices(db,pluginId,wikiManifest.id,{forPlugin:()=>({clear:()=>{}})} as never,undefined,{manifest:wikiManifest});
     try {
       const handlers=new Map<string,(params:unknown)=>Promise<any>>();
+      const readWithStatus=backlinkHost.localFolders.readTextWithStatus;
+      if(!readWithStatus)throw new Error("Wiki host must provide citation-aware reading");
       await registerWikiTools({manifest:wikiManifest,tools:{register:(name:string,_schema:unknown,handler:(params:unknown)=>Promise<any>)=>handlers.set(name,handler)},
         db:{namespace:ns,query:(statement:string,params?:unknown[])=>pluginDb.query(pluginId,statement,params),execute:(statement:string,params?:unknown[])=>pluginDb.execute(pluginId,statement,params)},
         localFolders:{status:(companyId:string,folderKey:string)=>backlinkHost.localFolders.status({companyId,folderKey}),
           readText:(companyId:string,folderKey:string,relativePath:string)=>backlinkHost.localFolders.readText({companyId,folderKey,relativePath}),
-          readTextWithStatus:(companyId:string,folderKey:string,relativePath:string)=>backlinkHost.localFolders.readTextWithStatus({companyId,folderKey,relativePath})}} as unknown as PluginContext);
+          readTextWithStatus:(companyId:string,folderKey:string,relativePath:string)=>readWithStatus({companyId,folderKey,relativePath})}} as unknown as PluginContext);
       const lookup=await handlers.get("wiki_list_backlinks")!({companyId:f.companyId,wikiId:"default",spaceSlug:"default",path:"wiki/upstream.md"});
       expect(lookup.data.backlinks.some((row:{path:string})=>row.path===f.newPath)).toBe(true);
       const persisted=await db.$client.unsafe(`SELECT backlinks FROM ${ns}.wiki_pages WHERE company_id=$1 AND path=$2`,[f.companyId,f.newPath]);
-      expect(persisted[0]!.backlinks).toContain("wiki/upstream.md");
+      expect(persisted[0]!.backlinks).toEqual(["wiki/upstream.md"]);
     }finally{backlinkHost.dispose();}
     const events=await loadAllWikiRetractions(db,pluginId,f.companyId),gate=retractionFolderGate(events,f.companyId,"wiki-root");
     expect(events).toHaveLength(2);expect(await readRetractionFolderText(f.dir,f.newPath,gate)).toBe(f.body);
