@@ -763,3 +763,13 @@ describe("Wiki link page and space context",()=>{
   expect(extractWikiLinks(body,"wiki/revalidated.md")).toEqual([]);
  });
 });
+
+describe("Wiki URI components share one source identity",()=>{
+ for(const target of ["upstream.md?view=1#scope","./upstream.md?view=1#scope","./upstream?view=1#scope"])
+ it("preserves navigation query without adding it to the verified source: "+target,()=>{
+  const body="[source]("+target+")",context={currentPagePath:"wiki/revalidated.md",spaceSlug:"team"};
+  const html=renderMarkdown(body,[],{enableWikiLinks:true,resolveWikiLinkHref:(t)=>buildWikiReferenceHref(t,path=>path,context)});
+  expect(html).toContain('href="/wiki/spaces/team/page/wiki/upstream.md?view=1#scope"');
+  expect(extractWikiLinks(body,context.currentPagePath,{strictInvalidReferences:true})).toEqual(["wiki/upstream.md"]);
+ });
+});

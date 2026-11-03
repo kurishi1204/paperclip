@@ -303,3 +303,19 @@ test("extensionless relative references still enforce withdrawal: "+target,async
   await assert.rejects(resolveReviewedWikiRepublication({...f.input,document:{...f.doc,latestBody}}),/E_SOURCE_RETRACTED/);
  }finally{await f.cleanup();}
 });
+
+test("query and fragment preserve the declared canonical dependency",async()=>{
+ const f=await fixture();try{
+  const draft=JSON.parse(f.doc.latestBody.split("\n")[1]!);
+  const latestBody=encodeWikiRepublicationDraft(draft,"[source](upstream.md?view=1#scope) and [[./upstream?view=2#claim|source]].");
+  const plan=await resolveReviewedWikiRepublication({...f.input,document:{...f.doc,latestBody}});
+  assert.deepEqual(plan.backlinks,["wiki/upstream.md"]);
+ }finally{await f.cleanup();}
+});
+test("query parameters cannot hide a withdrawn dependency",async()=>{
+ const f=await fixture();try{
+  const draft=JSON.parse(f.doc.latestBody.split("\n")[1]!);draft.dependencies=[];
+  const latestBody=encodeWikiRepublicationDraft(draft,"[old](p7.md?view=1#claim)");
+  await assert.rejects(resolveReviewedWikiRepublication({...f.input,document:{...f.doc,latestBody}}),/E_SOURCE_RETRACTED/);
+ }finally{await f.cleanup();}
+});

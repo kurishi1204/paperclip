@@ -10,25 +10,23 @@ export interface WikiLinkAstNode {
 const ROOT_WIKI_LINK_PAGES=new Set(["WIKI.md","AGENTS.md","IDEA.md","index.md","log.md"]);
 
 /** The Wiki UI and publication host share this exact target interpretation. */
-export function normalizeWikiLinkPagePath(target:string,currentPagePath="wiki/index.md"):{path:string;fragment:string|null}|null {
+export function normalizeWikiLinkPagePath(target:string,currentPagePath="wiki/index.md"):{path:string;fragment:string|null;search:string}|null {
   const trimmed=target.trim();
-  if(!trimmed||/^[a-z][a-z\d+.-]*:/i.test(trimmed)||trimmed.startsWith("//"))return null;
-  const hash=trimmed.indexOf("#"),raw=(hash>=0?trimmed.slice(0,hash):trimmed).trim().replace(/^\/+/,"");
-  if(!raw||raw.includes("\\"))return null;
-  let resolved=raw;
-  const relative=/^\.\.?\//.test(raw);
-  if(relative){
-    try{
-      const base="https://wiki.invalid/"+currentPagePath.split("/").map(encodeURIComponent).join("/");
-      const url=new URL(raw,base);if(url.origin!=="https://wiki.invalid"||url.search)return null;
-      resolved=decodeURIComponent(url.pathname.slice(1));
-    }catch{return null;}
-  }
-  if(resolved.includes("\\")||resolved.split("/").some(part=>!part||part==="."||part===".."))return null;
-  let path=resolved.toLowerCase().endsWith(".md")?resolved:resolved+".md";
-  if(relative&&!path.startsWith("wiki/")&&!path.startsWith("raw/")&&!ROOT_WIKI_LINK_PAGES.has(path))return null;
-  if(!path.startsWith("wiki/")&&!path.startsWith("raw/")&&!ROOT_WIKI_LINK_PAGES.has(path))path="wiki/"+path;
-  return {path,fragment:hash>=0?trimmed.slice(hash+1).trim()||null:null};
+  if(!trimmed||trimmed.includes("\\")||/^[a-z][a-z\d+.-]*:/i.test(trimmed)||trimmed.startsWith("//"))return null;
+  // URI syntax owns path/query/fragment separation. Queries affect navigation,
+  // never the canonical page or its withdrawal/dependency proof.
+  const relative=/^\.\.?\//.test(trimmed);
+  try{
+    const base="https://wiki.invalid/"+(relative?currentPagePath.split("/").map(encodeURIComponent).join("/"):"");
+    const url=new URL(trimmed,base);
+    if(url.origin!=="https://wiki.invalid")return null;
+    const resolved=decodeURIComponent(url.pathname.slice(1));
+    if(!resolved||resolved.includes("\\")||resolved.split("/").some(part=>!part||part==="."||part===".."))return null;
+    let path=resolved.toLowerCase().endsWith(".md")?resolved:resolved+".md";
+    if(relative&&!path.startsWith("wiki/")&&!path.startsWith("raw/")&&!ROOT_WIKI_LINK_PAGES.has(path))return null;
+    if(!path.startsWith("wiki/")&&!path.startsWith("raw/")&&!ROOT_WIKI_LINK_PAGES.has(path))path="wiki/"+path;
+    return {path,fragment:url.hash?decodeURIComponent(url.hash.slice(1)).trim()||null:null,search:url.search};
+  }catch{return null;}
 }
 function internalMarkdownTarget(value:string) {
   const target=value.trim();
@@ -117,6 +115,6 @@ export function buildWikiPageHref(path:string,spaceSlug:string):string {
 }
 export function buildWikiReferenceHref(target:string,resolveHref:(path:string)=>string,context:{currentPagePath:string;spaceSlug:string}):string|null {
   const parsed=normalizeWikiLinkPagePath(target,context.currentPagePath);if(!parsed)return null;
-  const href=resolveHref(buildWikiPageHref(parsed.path,context.spaceSlug));
+  const href=resolveHref(buildWikiPageHref(parsed.path,context.spaceSlug)+parsed.search);
   return parsed.fragment?href+"#"+encodeURIComponent(parsed.fragment):href;
 }
