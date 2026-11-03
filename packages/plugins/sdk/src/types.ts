@@ -469,6 +469,8 @@ export interface PluginLocalFolderProblem {
 }
 
 export interface PluginLocalFolderStatus {
+  /** Host-owned Wiki hold state; absent on hosts/folders without this feature. */
+  wikiRetractions?: { state: "inactive" | "active" };
   folderKey: string;
   configured: boolean;
   path: string | null;

@@ -4130,6 +4130,26 @@ export async function fileQueryAnswerAsPage(ctx: PluginContext, input: FileQuery
   };
 }
 
+/** The host supplies withdrawal state through the common file boundary.
+ * Rebuild discovery text as well as data; never retain withdrawn snippets. */
+async function filterRetractionRows<T>(ctx: PluginContext, companyId: string, space: WikiSpace,
+  rows: T[], pathFor: (row: T) => string) {
+  const status = await ctx.localFolders.status(companyId, WIKI_ROOT_FOLDER_KEY);
+  if (status.wikiRetractions?.state !== "active") return { rows,
+    retractionReadback: { state: "inactive", hiddenCount: 0, tombstones: [] as unknown[] } };
+  const active: T[] = []; const tombstones: unknown[] = [];
+  for (const row of rows) {
+    try { await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, pathFor(row))); active.push(row); }
+    catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const marker = message.indexOf("E_SOURCE_RETRACTED ");
+      if (marker < 0) throw error;
+      tombstones.push(JSON.parse(message.slice(marker + "E_SOURCE_RETRACTED ".length)));
+    }
+  }
+  return { rows: active, retractionReadback: { state: "checked", hiddenCount: tombstones.length, tombstones } };
+}
+
 export async function registerWikiTools(ctx: PluginContext) {
   ctx.tools.register("wiki_search", {
     displayName: "Search Wiki",
@@ -4154,9 +4174,10 @@ export async function registerWikiTools(ctx: PluginContext) {
        LIMIT $4`,
       [companyId, wikiId, `%${query}%`, limit, space.id],
     );
+    const checked = await filterRetractionRows(ctx, companyId, space, rows, row => row.path);
     return {
-      content: rows.length ? rows.map((row) => `${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No wiki matches found.",
-      data: { companyId, wikiId, spaceSlug: space.slug, query, results: rows },
+      content: checked.rows.length ? checked.rows.map((row) => `${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No wiki matches found.",
+      data: { companyId, wikiId, spaceSlug: space.slug, query, results: checked.rows, retractionReadback: checked.retractionReadback },
     };
   });
 
@@ -4170,8 +4191,16 @@ export async function registerWikiTools(ctx: PluginContext) {
     const wikiId = normalizeWikiId(input.wikiId);
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
     const path = assertPagePath(requireString(input.path, "path"));
-    const contents = await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, path));
-    return { content: contents, data: { companyId, wikiId, spaceSlug: space.slug, path, hash: contentHash(contents) } };
+    try {
+      const contents = await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, path));
+      return { content: contents, data: { companyId, wikiId, spaceSlug: space.slug, path, hash: contentHash(contents) } };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const marker = message.indexOf("E_SOURCE_RETRACTED ");
+      if (marker < 0) throw error;
+      const tombstone = JSON.parse(message.slice(marker + "E_SOURCE_RETRACTED ".length));
+      return { content: JSON.stringify(tombstone), data: { companyId, wikiId, spaceSlug: space.slug, path, publicationReadback: tombstone } };
+    }
   });
 
   ctx.tools.register("wiki_write_page", {
@@ -4238,9 +4267,10 @@ export async function registerWikiTools(ctx: PluginContext) {
         LIMIT $3`,
       [companyId, wikiId, limit, space.id],
     );
+    const checked = await filterRetractionRows(ctx, companyId, space, rows, row => row.raw_path);
     return {
-      content: rows.length ? rows.map((row) => `${row.raw_path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No sources captured yet.",
-      data: { companyId, wikiId, spaceSlug: space.slug, sources: rows },
+      content: checked.rows.length ? checked.rows.map((row) => `${row.raw_path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No sources captured yet.",
+      data: { companyId, wikiId, spaceSlug: space.slug, sources: checked.rows, retractionReadback: checked.retractionReadback },
     };
   });
 
@@ -4323,9 +4353,10 @@ export async function registerWikiTools(ctx: PluginContext) {
         LIMIT 200`,
       [companyId, wikiId, path, space.id],
     );
+    const checked = await filterRetractionRows(ctx, companyId, space, rows, row => row.path);
     return {
-      content: rows.length ? rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No backlinks indexed.",
-      data: { companyId, wikiId, spaceSlug: space.slug, path, backlinks: rows },
+      content: checked.rows.length ? checked.rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No backlinks indexed.",
+      data: { companyId, wikiId, spaceSlug: space.slug, path, backlinks: checked.rows, retractionReadback: checked.retractionReadback },
     };
   });
 
@@ -4342,9 +4373,10 @@ export async function registerWikiTools(ctx: PluginContext) {
       `SELECT path, title, page_type FROM ${tableName(ctx.db.namespace, "wiki_pages")} WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 ORDER BY path LIMIT 200`,
       [companyId, wikiId, space.id],
     );
+    const checked = await filterRetractionRows(ctx, companyId, space, rows, row => row.path);
     return {
-      content: rows.length ? rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No pages indexed yet.",
-      data: { companyId, wikiId, spaceSlug: space.slug, pages: rows },
+      content: checked.rows.length ? checked.rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No pages indexed yet.",
+      data: { companyId, wikiId, spaceSlug: space.slug, pages: checked.rows, retractionReadback: checked.retractionReadback },
     };
   });
 }

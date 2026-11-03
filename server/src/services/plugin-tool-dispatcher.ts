@@ -41,6 +41,9 @@ import { pluginRegistryService } from "./plugin-registry.js";
 import { logger } from "../middleware/logger.js";
 import { documentService } from "./documents.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { loadAllWikiRetractions } from "./wiki-retraction-store.js";
+import { retractionFolderGate } from "./wiki-retraction-gate.js";
+import { pluginDatabaseService } from "./plugin-database.js";
 import { applyWikiPublicationReadback, publicationNeed } from "./wiki-publication-readback.js";
 
 // ---------------------------------------------------------------------------
@@ -437,11 +440,21 @@ export function createPluginToolDispatcher(
         );
         if (settings?.configJson && Object.prototype.hasOwnProperty.call(settings.configJson, "publicationReadback")) {
           const resolvedPage = result.result.data as Record<string, unknown>;
+          const persisted = await loadAllWikiRetractions(db, registered.pluginDbId, runContext.companyId);
+          const gate = retractionFolderGate(persisted, runContext.companyId, "wiki-root");
+          const pluginDb = pluginDatabaseService(db);
+          const namespace = await pluginDb.getRuntimeNamespace(registered.pluginDbId);
+          const spaces = gate.active ? await pluginDb.query<{ path_prefix: string | null }>(registered.pluginDbId,
+            `SELECT path_prefix FROM ${namespace}.wiki_spaces WHERE company_id = $1 AND wiki_id = $2 AND slug = $3`,
+            [runContext.companyId, resolvedPage.wikiId, resolvedPage.spaceSlug]) : [];
+          if (gate.active) publicationNeed(spaces.length === 1, "retraction_space");
+          const physical = (p: string) => spaces[0]?.path_prefix ? `${spaces[0].path_prefix}/${p}` : p;
           const documents = documentService(db);
           const interactions = issueThreadInteractionService(db);
           result.result = await applyWikiPublicationReadback(
             settings.configJson.publicationReadback, runContext.companyId,
             parameters, result.result, {
+              retraction: async (path) => gate.block(physical(path)),
               page: async (path) => await workerManager.call(
                 registered.pluginDbId, "getData", {
                   key: "page-content", companyId: runContext.companyId,

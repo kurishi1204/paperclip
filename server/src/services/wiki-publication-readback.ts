@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { RetractionBlock } from "./wiki-retraction-ledger.js";
 
 export type JsonObject = Record<string, unknown>;
 export interface PublicationPin {
@@ -17,6 +18,18 @@ export interface PublicationReaders {
   page(path: string): Promise<JsonObject>;
   document(issueId: string, key: string): Promise<JsonObject | null>;
   review(issueId: string, id: string): Promise<JsonObject | null>;
+  /** Host-owned durable state, never supplied by agent arguments or the worker. */
+  retraction?(path: string): Promise<RetractionBlock | null>;
+}
+export class PublicationRetractionError extends Error {
+  constructor(readonly block: RetractionBlock) { super(`wiki_publication_${block.state}`); }
+}
+function retractedToolResult<T>(registry: PublicationRegistry, path: string, source: RetractionBlock): T {
+  const block: RetractionBlock = { ...source, path,
+    state: source.retractedPath === path ? "retracted" : "blocked_by_retraction" };
+  // Only this explicitly constructed tombstone crosses the tool boundary.
+  return { content: JSON.stringify(block), data: { companyId: registry.companyId,
+    wikiId: registry.wikiId, spaceSlug: registry.spaceSlug, path, publicationReadback: block } } as T;
 }
 export function publicationNeed(ok: unknown, reason: string): asserts ok {
   if (!ok) throw new Error(`wiki_publication_${reason}`);
@@ -87,6 +100,8 @@ export interface PublicationProof {
 export async function verifyWikiPublication(registry: PublicationRegistry, path: string, readers: PublicationReaders, initialSeen = new Set<string>()): Promise<PublicationProof> {
   const verified = new Map<string, PublicationProof>();
   async function visit(path: string, seen: Set<string>): Promise<PublicationProof> {
+    const block = await readers.retraction?.(path);
+    if (block) throw new PublicationRetractionError(block);
     publicationNeed(!seen.has(path), "dependency_cycle");
     const cached = verified.get(path);
     if (cached) return cached;
@@ -146,12 +161,22 @@ export async function applyWikiPublicationReadback<T extends { content?: unknown
     registry.entries.some(p => p.path === data.path);
   // A canonical registered request must not be redirected by worker metadata.
   publicationNeed(!requestedRegistered || (resolvedRegistered && data.path === args.path), "tool_metadata_changed");
+  if (data.wikiId === registry.wikiId && data.spaceSlug === registry.spaceSlug) {
+    const direct = await readers.retraction?.(data.path);
+    if (direct) return retractedToolResult<T>(registry, data.path, direct);
+  }
   if (!resolvedRegistered) {
     return { ...result, content: "[Current publication receipt not registered for this Wiki page; treat it as unverified source material.]\n\n" + result.content, data: { ...data, publicationReadback: { state: "unregistered" } } };
   }
   const resolvedPath = data.path;
   let root: JsonObject | undefined;
-  const proof = await verifyWikiPublication(registry, resolvedPath, { ...readers, page: async path => { const value = await readers.page(path); if (path === resolvedPath) root = value; return value; } });
+  let proof: PublicationProof;
+  try {
+    proof = await verifyWikiPublication(registry, resolvedPath, { ...readers, page: async path => { const value = await readers.page(path); if (path === resolvedPath) root = value; return value; } });
+  } catch (error) {
+    if (!(error instanceof PublicationRetractionError)) throw error;
+    return retractedToolResult<T>(registry, resolvedPath, error.block);
+  }
   publicationNeed(result.content === root?.contents, "tool_body_changed");
   publicationNeed(data.companyId === companyId && data.wikiId === registry.wikiId &&
     data.spaceSlug === registry.spaceSlug && data.path === resolvedPath &&

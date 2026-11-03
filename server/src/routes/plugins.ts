@@ -91,6 +91,7 @@ import {
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { secretService } from "../services/secrets.js";
+import { wikiRetractionRuntime } from "../services/wiki-retraction-runtime.js";
 import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 
 /**
@@ -1267,6 +1268,38 @@ export function pluginRoutes(
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).json({ error: message });
     }
+  });
+
+  // Withdrawal is an explicit board operation. Ordinary plugin/agent calls
+  // cannot manufacture an approval, change the actor, or read audit originals.
+  router.post("/plugins/:pluginId/wiki-retractions/preview", async (req, res) => {
+    assertBoard(req);
+    const companyId = requirePluginConfigCompanyId(req, req.body.companyId);
+    const plugin = await resolvePlugin(registry, req.params.pluginId);
+    if (!plugin) throw notFound("Plugin not found");
+    const { wikiId, spaceSlug, path: pagePath, reason } = req.body;
+    if (![wikiId, spaceSlug, pagePath, reason].every(v => typeof v === "string" && v.length > 0 && v === v.trim()))
+      throw badRequest("Canonical wikiId, spaceSlug, path and reason are required");
+    res.json(await wikiRetractionRuntime(db, plugin.id).preview({ companyId, wikiId, spaceSlug }, pagePath, reason));
+  });
+  router.post("/plugins/:pluginId/wiki-retractions/execute", async (req, res) => {
+    assertBoard(req);
+    const companyId = requirePluginConfigCompanyId(req, req.body.companyId);
+    const plugin = await resolvePlugin(registry, req.params.pluginId);
+    if (!plugin) throw notFound("Plugin not found");
+    const { issueId, documentKey, reviewId, operationId } = req.body;
+    if (![issueId, documentKey, reviewId, operationId].every(v => typeof v === "string" && v.length > 0 && v === v.trim()) ||
+      !/^[0-9a-f-]{36}$/.test(operationId)) throw badRequest("Fixed proposal, review and UUID operationId are required");
+    const actor = getActorInfo(req);
+    res.json(await wikiRetractionRuntime(db, plugin.id).execute({ companyId, issueId, documentKey,
+      reviewId, operationId, actorId: actor.actorId, runId: actor.runId }));
+  });
+  router.get("/plugins/:pluginId/wiki-retractions/audit", async (req, res) => {
+    assertBoard(req);
+    const companyId = requirePluginConfigCompanyId(req, req.query.companyId);
+    const plugin = await resolvePlugin(registry, req.params.pluginId);
+    if (!plugin) throw notFound("Plugin not found");
+    res.json(await wikiRetractionRuntime(db, plugin.id).audit(companyId));
   });
 
   // ===========================================================================
