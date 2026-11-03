@@ -1,12 +1,14 @@
+import { createHash } from "node:crypto";
+import { conflict } from "../errors.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { publicationNeed } from "./wiki-publication-readback.js";
 import { retractionFolderGate } from "./wiki-retraction-gate.js";
 import { constants, promises as fs } from "node:fs";
 import path from "node:path";
-import { resolvePluginLocalFolderPath } from "./plugin-local-folders.js";
+import { getStoredLocalFolders, readPluginLocalFolderText, resolvePluginLocalFolderPath } from "./plugin-local-folders.js";
 import { RetractionError, retainedRetractionFile, validateRetractionEvents } from "./wiki-retraction-ledger.js";
 import { and, eq, sql } from "drizzle-orm";
-import { activityLog, type Db } from "@paperclipai/db";
+import { activityLog, pluginCompanySettings, type Db } from "@paperclipai/db";
 import type { RetractionEvent, RetractionScope, RetractionStore } from "./wiki-retraction-ledger.js";
 
 /** Existing append-only activity storage is the authoritative withdrawal ledger.
@@ -104,4 +106,47 @@ export async function loadCurrentWikiRetractions(db:Db,pluginId:string,companyId
   retractionFolderGate(events,companyId,"wiki-root");
   await assertWikiRetractionSpaceBindings(db,pluginId,companyId,events);
   return events;
+}
+
+/** Each company needs an exclusive physical Wiki root, including nested roots.
+ * An instance administrator can still edit files outside this host boundary. */
+export async function assertWikiRootOwnership(db:Db,pluginId:string,companyId:string,root:string) {
+  const own=await fs.realpath(root);
+  const rows=await db.select().from(pluginCompanySettings).where(eq(pluginCompanySettings.pluginId,pluginId));
+  const contains=(a:string,b:string)=>{const r=path.relative(a,b);return r===""||(!r.startsWith(".."+path.sep)&&r!==".."&&!path.isAbsolute(r));};
+  for(const row of rows) {
+    if(row.companyId===companyId)continue;
+    const configured=getStoredLocalFolders(row.settingsJson)["wiki-root"]?.path;
+    if(!configured)continue;
+    let other:string;
+    try{other=await fs.realpath(configured);}catch(error){
+      if(["ENOENT","ENOTDIR"].includes((error as NodeJS.ErrnoException).code??""))continue;
+      throw new RetractionError("runtime_root_ownership_unknown");
+    }
+    if(contains(own,other)||contains(other,own))throw new RetractionError("runtime_root_shared");
+  }
+}
+
+/** Derived append completion is shared by withdrawal and republication.
+ * The authoritative SQL event already exists. Never retry its failed effect. */
+export async function appendCommittedWikiMaintenance(db:Db,pluginId:string,companyId:string,event:RetractionEvent,kind:"retraction"|"republication",operationId:string) {
+  try {
+    await withWikiRetractionLock(db,pluginId,companyId,async tx=>{
+      await appendRetractionMaintenanceLog(event,await loadAllWikiRetractions(tx,pluginId,companyId));
+    });
+  }catch(cause){
+    const error=conflict("Wiki event committed; maintenance append unresolved. Read the existing receipt; do not retry",{
+      code:`wiki_${kind}_post_commit_unresolved`,operationId,eventId:event.id,automaticRetryAllowed:false,
+    });error.cause=cause;throw error;
+  }
+}
+export async function readWikiMaintenanceState(event:RetractionEvent,events:RetractionEvent[]) {
+  const log=event.maintenanceLog;
+  if(!log)return {state:"not_recorded"};
+  try {
+    const contents=await readPluginLocalFolderText(log.rootPath,log.path);
+    retainedRetractionFile(events.filter(e=>e.wikiId===event.wikiId&&e.spaceSlug===event.spaceSlug),log.path,log.prefixSHA256,contents);
+    const sha256=createHash("sha256").update(contents).digest("hex"),appendEnd=log.prefixBytes+Buffer.byteLength(log.appendText);
+    return {state:Buffer.byteLength(contents)>=appendEnd?"appended":"pending",sha256};
+  }catch(error){return {state:"unknown",error:error instanceof Error?error.message:"log read failed"};}
 }

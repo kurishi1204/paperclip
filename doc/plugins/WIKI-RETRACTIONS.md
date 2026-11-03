@@ -306,3 +306,18 @@ runtime marks that specific phase as `wiki_republication_post_commit_unresolved`
 The route reads the committed receipt and returns409 with `completionIssue`, even
 if all bytes are visible after an unconfirmed sync. Earlier authorization, intent,
 file and SQL errors are not normalized as committed success. No append is retried.
+
+
+Withdrawal and republication use the same post-commit append and HTTP response
+boundary. Withdrawal POST also returns its receipt, with409 on unresolved log
+completion. GET `wiki-retractions/operations/:operationId` reads that evidence
+without repeating the effect. The successful withdrawal response is now a
+receipt envelope with `state`, `event`, `maintenanceLog` and
+`automaticRetryAllowed`; callers must read `event` for the historical event.
+
+Wiki-root access and both Board transitions also require an exclusive physical
+root for the company. A same or nested root configured for another company is
+refused before files are read or written. Missing other roots cannot be used for
+an operation; once created they are checked again. Other ownership lookup errors
+fail closed. Instance-administrator edits outside the host remain outside this
+boundary.

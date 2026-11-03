@@ -527,6 +527,22 @@ interface PluginToolExecuteRequest {
  * @param bridgeDeps - Optional bridge proxy dependencies for getData/performAction
  * @returns Express router with plugin routes mounted
  */
+type WikiOperationReceipt={state:string;file?:{matchesIntent?:boolean};maintenanceLog:{state:string}};
+async function sendWikiOperationReceipt(res:Response,operationId:string,kind:"retraction"|"republication",
+  execute:()=>Promise<unknown>,read:()=>Promise<WikiOperationReceipt>) {
+  let completionIssue:string|undefined;
+  try{await execute();}catch(error){
+    const detail=error instanceof HttpError?error.details as {code?:string;operationId?:string}|undefined:undefined;
+    if(error instanceof HttpError&&error.status===409&&detail?.code===`wiki_${kind}_post_commit_unresolved`&&detail.operationId===operationId)
+      completionIssue=detail.code;
+    else throw error;
+  }
+  const receipt=await read();
+  const complete=!completionIssue&&receipt.maintenanceLog.state==="appended"&&
+    (kind==="retraction"?receipt.state==="withdrawn":receipt.state==="published"&&receipt.file?.matchesIntent===true);
+  res.status(complete?200:409).json({...receipt,...(completionIssue?{completionIssue}:{})});
+}
+
 export function pluginRoutes(
   db: Db,
   loader: ReturnType<typeof pluginLoader>,
@@ -1292,8 +1308,10 @@ export function pluginRoutes(
     if (![issueId, documentKey, reviewId, ownerDecisionId, operationId].every(v => typeof v === "string" && v.length > 0 && v === v.trim()) ||
       !/^[0-9a-f-]{36}$/.test(operationId)) throw badRequest("Fixed proposal, review and UUID operationId are required");
     const actor = getActorInfo(req);
-    res.json(await wikiRetractionRuntime(db, plugin.id).execute({ companyId, issueId, documentKey,
-      reviewId, ownerDecisionId, operationId, actorId: actor.actorId, runId: actor.runId }));
+    const runtime=wikiRetractionRuntime(db,plugin.id);
+    await sendWikiOperationReceipt(res,operationId,"retraction",
+      ()=>runtime.execute({companyId,issueId,documentKey,reviewId,ownerDecisionId,operationId,actorId:actor.actorId,runId:actor.runId}),
+      ()=>runtime.receipt(companyId,operationId));
   });
   router.post("/plugins/:pluginId/wiki-retractions/republications", async (req,res)=>{
     assertBoard(req);
@@ -1303,25 +1321,19 @@ export function pluginRoutes(
     if(![issueId,documentKey,reviewId,operationId].every(v=>typeof v==="string"&&v.length>0&&v===v.trim())||
       !/^[0-9a-f-]{36}$/.test(operationId))throw badRequest("Fixed draft, review and UUID operationId are required");
     const runtime=wikiRepublicationRuntime(db,plugin.id);
-    let completionIssue:string|undefined;
-    try {
-      await runtime.execute({companyId,issueId,documentKey,reviewId,operationId,actorId:getActorInfo(req).actorId});
-    }catch(error){
-      const detail=error instanceof HttpError?error.details as {code?:string;operationId?:string}|undefined:undefined;
-      if(error instanceof HttpError&&error.status===409&&detail?.code==="wiki_republication_post_commit_unresolved"&&detail.operationId===operationId)
-        completionIssue=detail.code;
-      else throw error;
-    }
-    const receipt=await runtime.receipt(companyId,operationId);
-    // A committed publication is distinct from a completed file/log operation.
-    // Repeated POSTs only read back: pending/unknown effects never auto-replay.
-    const complete=!completionIssue&&receipt.state==="published"&&receipt.file.matchesIntent===true&&receipt.maintenanceLog.state==="appended";
-    res.status(complete?200:409).json({...receipt,...(completionIssue?{completionIssue}:{})});
+    await sendWikiOperationReceipt(res,operationId,"republication",
+      ()=>runtime.execute({companyId,issueId,documentKey,reviewId,operationId,actorId:getActorInfo(req).actorId}),
+      ()=>runtime.receipt(companyId,operationId));
   });
   router.get("/plugins/:pluginId/wiki-retractions/republications/:operationId",async(req,res)=>{
     assertBoard(req);const companyId=requirePluginConfigCompanyId(req,req.query.companyId);
     const plugin=await resolvePlugin(registry,req.params.pluginId);if(!plugin)throw notFound("Plugin not found");
     res.json(await wikiRepublicationRuntime(db,plugin.id).receipt(companyId,req.params.operationId));
+  });
+  router.get("/plugins/:pluginId/wiki-retractions/operations/:operationId",async(req,res)=>{
+    assertBoard(req);const companyId=requirePluginConfigCompanyId(req,req.query.companyId);
+    const plugin=await resolvePlugin(registry,req.params.pluginId);if(!plugin)throw notFound("Plugin not found");
+    res.json(await wikiRetractionRuntime(db,plugin.id).receipt(companyId,req.params.operationId));
   });
   router.get("/plugins/:pluginId/wiki-retractions/audit", async (req, res) => {
     assertBoard(req);

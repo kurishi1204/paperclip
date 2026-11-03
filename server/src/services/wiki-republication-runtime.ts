@@ -6,7 +6,7 @@ import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { assertConfiguredLocalFolder, createPluginLocalFolderTextExclusive, getStoredLocalFolders, inspectPluginLocalFolder,
   readPluginLocalFolderText, requireLocalFolderDeclaration } from "./plugin-local-folders.js";
-import { loadAllWikiRetractions, withWikiRetractionLock, appendRetractionMaintenanceLog, assertWikiRetractionSpaceBindings } from "./wiki-retraction-store.js";
+import { loadAllWikiRetractions, withWikiRetractionLock, appendCommittedWikiMaintenance, readWikiMaintenanceState, assertWikiRootOwnership, assertWikiRetractionSpaceBindings } from "./wiki-retraction-store.js";
 import { retractionFolderGate, readRetractionFolderTextWithStatus, canonicalWikiRetractionPath } from "./wiki-retraction-gate.js";
 import { parsePublicationRegistry, publicationCanonical, publicationHash, publicationNeed, verifyWikiPublication, type JsonObject } from "./wiki-publication-readback.js";
 import { buildWikiRepublicationEvent, parseWikiRepublicationDraft, resolveReviewedWikiRepublication, verifyCurrentWikiRepublication } from "./wiki-republication.js";
@@ -108,6 +108,7 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
     const folder=await inspectPluginLocalFolder({folderKey:"wiki-root",declaration:requireLocalFolderDeclaration(plugin.manifestJson.localFolders,"wiki-root"),
       storedConfig:getStoredLocalFolders(settings?.settingsJson)["wiki-root"]??null});
     assertConfiguredLocalFolder(folder);publicationNeed(folder.writable,"republication_folder_write_access");const root=folder.realPath!;
+    await assertWikiRootOwnership(tx,pluginId,input.companyId,root);
     const gate=retractionFolderGate(all,input.companyId,"wiki-root");gate.assertRoot(root);
     const pluginDb=pluginDatabaseService(tx),ns=await pluginDb.getRuntimeNamespace(pluginId);
     const spaces=await pluginDb.query<{id:string;path_prefix:string|null;root_folder_key:string;status:string}>(pluginId,
@@ -189,18 +190,7 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
           action:"wiki.page.retraction",entityType:"wiki_retraction",entityId:pluginId,details:event as unknown as JsonObject});
         return event;
       });
-      try {
-        await withWikiRetractionLock(db,pluginId,input.companyId,async tx=>{
-          await appendRetractionMaintenanceLog(receipt,await loadAllWikiRetractions(tx,pluginId,input.companyId));
-        });
-      }catch(cause){
-        // Only this already-committed phase is normalized. Intent/file/DB
-        // failures and authorization conflicts retain their original errors.
-        const unresolved=conflict("Publication committed; maintenance append unresolved. Read the existing receipt; do not retry",{
-          code:"wiki_republication_post_commit_unresolved",operationId:input.operationId,eventId:receipt.id,automaticRetryAllowed:false,
-        });
-        unresolved.cause=cause;throw unresolved;
-      }
+      await appendCommittedWikiMaintenance(db,pluginId,input.companyId,receipt,"republication",input.operationId);
       return receipt;
     },
     async receipt(companyId:string,operationId:string) {
@@ -214,20 +204,7 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
         let file:{present:boolean;sha256?:string;matchesIntent?:boolean}={present:false};
         if(intent)try{const body=await readPluginLocalFolderText(intent.rootPath,intent.path);const sha256=publicationHash(body);file={present:true,sha256,matchesIntent:sha256===intent.contentHash};}
         catch(error){if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;}
-        let maintenanceLog: {state:string;sha256?:string;error?:string}={state:"not_recorded"};
-        if(event?.maintenanceLog) {
-          const log=event.maintenanceLog;
-          try {
-            const contents=await readPluginLocalFolderText(log.rootPath,log.path);
-            retainedRetractionFile(events.filter(e=>e.wikiId===event.wikiId&&e.spaceSlug===event.spaceSlug),log.path,log.prefixSHA256,contents);
-            const sha256=publicationHash(contents);
-            // The complete log may contain later valid appends. The verifier
-            // above has checked every recorded prefix and exact append; use
-            // this event's byte range rather than the latest file hash.
-            const appendEnd=log.prefixBytes+Buffer.byteLength(log.appendText);
-            maintenanceLog={state:Buffer.byteLength(contents)>=appendEnd?"appended":"pending",sha256};
-          } catch(error) {maintenanceLog={state:"unknown",error:error instanceof Error?error.message:"log read failed"};}
-        }
+        const maintenanceLog=event?await readWikiMaintenanceState(event,events):{state:"not_recorded"};
         return {state:event?"published":"prepared_or_unknown",event:event??null,file,maintenanceLog,automaticRetryAllowed:false};
       });
     },

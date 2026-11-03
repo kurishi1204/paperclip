@@ -49,7 +49,7 @@ import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginStateStore } from "./plugin-state-store.js";
 import { pluginLifecycleInbox } from "./plugin-lifecycle-inbox.js";
 import { pluginDatabaseService } from "./plugin-database.js";
-import { loadCurrentWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
+import { assertWikiRootOwnership, loadCurrentWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
 import { assertCurrentWikiRepublication } from "./wiki-republication-runtime.js";
 import { retractionFolderGate, readRetractionFolderText, readRetractionFolderTextWithStatus, canonicalWikiRetractionPath as canonicalFolderPath } from "./wiki-retraction-gate.js";
 import { pluginManagedAgentService } from "./plugin-managed-agents.js";
@@ -828,10 +828,9 @@ export function buildHostServices(
     return withWikiRetractionLock(db, pluginId, companyId, async tx => {
       const events=await loadCurrentWikiRetractions(tx, pluginId, companyId);
       const gate = retractionFolderGate(events, companyId, folderKey);
-      if (gate.active) {
-        const folder = await inspectStoredLocalFolder(companyId, folderKey, tx);
-        gate.assertRoot(folder.realPath ?? "");
-      }
+      const folder = await inspectStoredLocalFolder(companyId, folderKey, tx);
+      if(folder.realPath)await assertWikiRootOwnership(tx,pluginId,companyId,folder.realPath);
+      if(gate.active)gate.assertRoot(folder.realPath??"");
       return work(gate, tx, physicalPath=>assertCurrentWikiRepublication(tx,pluginId,companyId,events,physicalPath));
     });
   };

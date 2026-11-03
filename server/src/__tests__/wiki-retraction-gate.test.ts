@@ -1,3 +1,4 @@
+import { assertWikiRootOwnership } from "../services/wiki-retraction-store.js";
 import { test } from "vitest";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, realpath } from "node:fs/promises";
@@ -143,5 +144,22 @@ test("citation-aware reader cannot weaken an old freeze fence",async()=>{
  const f=await setup();try{await f.withdraw();const gate=retractionFolderGate(f.events(),"c","wiki-root");
   await assert.rejects(readRetractionFolderTextWithStatus(f.dir,"wiki/target.md",gate),/E_SOURCE_RETRACTED/);
   await assert.rejects(readRetractionFolderTextWithStatus(f.dir,"wiki/not-registered.md",gate),/E_SOURCE_RETRACTED/);
+ }finally{await f.close();}
+});
+
+test("company Wiki roots cannot share physical files through equal, nested or aliased roots",async()=>{
+ const f=await setup();try{
+  await mkdir(join(f.dir,"separate"));await mkdir(join(f.dir,"nested"));await symlink(f.dir,join(f.dir,"separate/alias"));
+  let configured=f.dir;
+  const db={select:()=>({from:()=>({where:async()=>[{companyId:"other-company",settingsJson:{localFolders:{"wiki-root":{path:configured}}}}]})})};
+  for(const other of [f.dir,join(f.dir,"nested"),join(f.dir,"separate/alias")]){
+   configured=other;await assert.rejects(assertWikiRootOwnership(db as any,"plugin","c",f.dir),/runtime_root_shared/);
+  }
+  configured=f.dir;await assert.rejects(assertWikiRootOwnership(db as any,"plugin","c",join(f.dir,"nested")),/runtime_root_shared/);
+  // A distinct sibling stays usable; an absent nested path is checked again
+  // once it exists, before it can perform a folder operation.
+  configured=join(f.dir,"nested/not-created");await assertWikiRootOwnership(db as any,"plugin","c",f.dir);
+  await mkdir(configured);await assert.rejects(assertWikiRootOwnership(db as any,"plugin","c",f.dir),/runtime_root_shared/);
+  configured=join(f.dir,"separate");await assertWikiRootOwnership(db as any,"plugin","c",join(f.dir,"nested"));
  }finally{await f.close();}
 });

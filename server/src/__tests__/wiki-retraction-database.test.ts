@@ -127,7 +127,7 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     const pluginDb=pluginDatabaseService(db);
     await pluginDb.applyMigrations(pluginId,wikiManifest,fileURLToPath(new URL("../../../packages/plugins/plugin-llm-wiki/",import.meta.url)));
     const ns=await pluginDb.getRuntimeNamespace(pluginId);
-    async function context(newPath:string) {
+    async function context(newPath:string,withdraw?:(input:Parameters<ReturnType<typeof wikiRetractionRuntime>["execute"]>[0],dir:string)=>Promise<{retractionId:string}>) {
       const companyId=randomUUID(),author=randomUUID(),qa=randomUUID(),spaceId=randomUUID();
       await db.insert(companies).values({id:companyId,name:"Synthetic reviewed republication",issuePrefix:"R"+companyId.replaceAll("-","").slice(0,12)});
       await db.insert(agents).values([{id:author,companyId,name:"Responsible author"},{id:qa,companyId,name:"Independent reviewer"}]);
@@ -172,8 +172,9 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
         effectiveResolverPolicy:"human_only",addresseeUserId:"synthetic-owner",resolvedByUserId:"synthetic-owner",
         payload:{version:1,prompt:"Withdraw this exact synthetic proposal",target:{type:"issue_document",issueId:proposal.issueId,documentId:proposal.documentId,key:proposal.documentKey,revisionId:proposal.revisionId}},
         result:{version:1,outcome:"accepted"}});
-      const withdrawal=await wikiRetractionRuntime(db,pluginId).execute({companyId,issueId:proposal.issueId,documentKey:proposal.documentKey,
-        reviewId:proposal.reviewId,ownerDecisionId,operationId:randomUUID(),actorId:"synthetic-owner",runId:null});
+      const withdrawalInput={companyId,issueId:proposal.issueId,documentKey:proposal.documentKey,
+        reviewId:proposal.reviewId,ownerDecisionId,operationId:randomUUID(),actorId:"synthetic-owner",runId:null};
+      const withdrawal=await (withdraw?withdraw(withdrawalInput,dir):wikiRetractionRuntime(db,pluginId).execute(withdrawalInput));
       const body=encodeWikiRepublicationDraft({companyId,wikiId:"default",spaceSlug:"default",retractionId:withdrawal.retractionId,previousPath:"wiki/child.md",path:newPath,
         reason:"Responsible author checked current evidence",dependencies:[{path:"wiki/upstream.md",wikiSHA256:registry.entries[2]!.wikiSHA256}]},"# Revalidated conclusion\n\nUse current independent evidence.\n");
       const draft=await reviewedDocument("revalidated",body);
@@ -305,7 +306,12 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
       app.use("/api",pluginRoutes(db,{} as never));app.use(errorHandler);return app;
     };
     const endpoint=`/api/plugins/${pluginId}/wiki-retractions/republications`;
-    const httpHappy=await context("wiki/http-reviewed.md"),happyApp=appFor(httpHappy.companyId);
+    const withdrawalEndpoint=`/api/plugins/${pluginId}/wiki-retractions/execute`;
+    const httpHappy=await context("wiki/http-reviewed.md",async(input)=>{
+      const response=await request(appFor(input.companyId)).post(withdrawalEndpoint).send(input);
+      expect(response.status,JSON.stringify(response.body)).toBe(200);expect(response.body.state).toBe("withdrawn");
+      return response.body.event;
+    }),happyApp=appFor(httpHappy.companyId);
     const publishedHTTP=await request(happyApp).post(endpoint).send(httpHappy.input);
     expect(publishedHTTP.status,JSON.stringify(publishedHTTP.body)).toBe(200);
     expect(publishedHTTP.body).toMatchObject({state:"published",file:{present:true,matchesIntent:true},maintenanceLog:{state:"appended"},automaticRetryAllowed:false});
@@ -333,6 +339,38 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     expect(duplicatePOST.status).toBe(409);expect(duplicatePOST.body.event.id).toBe(unresolved.event!.id);
     expect(await readFile(join(appendFailure.dir,"wiki/log.md"))).toEqual(beforeRetry);
     expect((await runtime.receipt(appendFailure.companyId,appendFailure.input.operationId)).maintenanceLog.state).toBe("pending");
+
+    // The same post-commit/receipt contract also covers actual withdrawal.
+    await context("wiki/withdrawal-append-failure.md",async(input,dir)=>{
+      const app=appFor(input.companyId),open=fs.open;
+      const fault=vi.spyOn(fs,"open").mockImplementation(async(path,flags,mode)=>{
+        if(String(path)===join(dir,"wiki/log.md")&&typeof flags==="number"&&(flags&constants.O_APPEND))throw new Error("synthetic withdrawal append failure");
+        return open(path,flags,mode);
+      });
+      let event:{id:string;retractionId:string};
+      try {
+        const failed=await request(app).post(withdrawalEndpoint).send(input);
+        expect(failed.status,JSON.stringify(failed.body)).toBe(409);
+        expect(failed.body).toMatchObject({state:"withdrawn",completionIssue:"wiki_retraction_post_commit_unresolved",maintenanceLog:{state:"pending"},automaticRetryAllowed:false});
+        event=failed.body.event;
+      }finally{fault.mockRestore();}
+      const before=await readFile(join(dir,"wiki/log.md")),duplicate=await request(app).post(withdrawalEndpoint).send(input);
+      expect(duplicate.status).toBe(409);expect(duplicate.body.event.id).toBe(event!.id);
+      expect(await readFile(join(dir,"wiki/log.md"))).toEqual(before);
+      const read=await request(app).get(`/api/plugins/${pluginId}/wiki-retractions/operations/${input.operationId}`).query({companyId:input.companyId});
+      expect(read.status).toBe(200);expect(read.body.maintenanceLog.state).toBe("pending");return event!;
+    });
+    // A different company's real host must not overwrite the retained root,
+    // even though that company has no withdrawal events of its own.
+    const otherCompany=randomUUID();await db.insert(companies).values({id:otherCompany,name:"Synthetic other root owner",issuePrefix:"X"+otherCompany.replaceAll("-","").slice(0,12)});
+    await db.insert(pluginCompanySettings).values({companyId:otherCompany,pluginId,settingsJson:{localFolders:{"wiki-root":{path:f.dir,access:"readWrite"}}}});
+    const {buildHostServices}=await import("../services/plugin-host-services.js");
+    const host=buildHostServices(db,pluginId,wikiManifest.id,{forPlugin:()=>({clear:()=>{}})} as never,undefined,{manifest:wikiManifest});
+    try {
+      const before=await readFile(join(f.dir,"wiki/p7.md"));
+      await expect(host.localFolders.writeTextAtomic({companyId:otherCompany,folderKey:"wiki-root",relativePath:"wiki/p7.md",contents:"cross-company overwrite"})).rejects.toThrow(/runtime_root_shared/);
+      expect(await readFile(join(f.dir,"wiki/p7.md"))).toEqual(before);
+    }finally{host.dispose();await db.delete(pluginCompanySettings).where(eq(pluginCompanySettings.companyId,otherCompany));}
 
     // Read a prior completed receipt after a distinct valid publication
     // appends to the same maintenance log. Its append is still complete.

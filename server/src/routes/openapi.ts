@@ -12013,3 +12013,7 @@ for (const [method, path, summary] of [
     404: r.notFound, 409: r.conflict, 422: r.unprocessable,
   },
 });
+
+registry.registerPath({method:"get",path:"/api/plugins/{pluginId}/wiki-retractions/operations/{operationId}",tags:["plugins"],
+  summary:"Read committed withdrawal and maintenance state without replay",request:{params:z.object({pluginId:z.string(),operationId:z.string()}),query:z.object({companyId:z.string()})},
+  responses:{200:r.ok(),401:r.unauthorized,403:r.forbidden,404:r.notFound}});

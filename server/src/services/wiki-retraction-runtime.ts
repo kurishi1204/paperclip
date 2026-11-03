@@ -8,7 +8,7 @@ import { pluginDatabaseService } from "./plugin-database.js";
 import { assertConfiguredLocalFolder, getStoredLocalFolders, inspectPluginLocalFolder, readPluginLocalFolderText,
   requireLocalFolderDeclaration, resolvePluginLocalFolderPath } from "./plugin-local-folders.js";
 import { executeRetraction, withRetractionMaintenanceLog, retainedRetractionFile, RetractionError, type RetractionFence, type RetractionScope, type RetractionStore, type RetractionTarget } from "./wiki-retraction-ledger.js";
-import { loadAllWikiRetractions, loadCurrentWikiRetractions, withWikiRetractionLock, appendRetractionMaintenanceLog } from "./wiki-retraction-store.js";
+import { loadAllWikiRetractions, loadCurrentWikiRetractions, withWikiRetractionLock, assertWikiRootOwnership, appendCommittedWikiMaintenance, readWikiMaintenanceState } from "./wiki-retraction-store.js";
 import { resolveReviewedWikiRetraction } from "./wiki-retraction-approval.js";
 import { retractionFolderGate } from "./wiki-retraction-gate.js";
 import { buildRetractionGraph, assertNoUnregisteredRetractionDependants } from "./wiki-retraction-readback.js";
@@ -70,6 +70,7 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
       [companyId, scope.wikiId, space.id]);
     const rootPath = await root(companyId, connection);
     retractionFolderGate(currentEvents,companyId,"wiki-root").assertRoot(rootPath);
+    await assertWikiRootOwnership(connection,pluginId,companyId,rootPath);
     const toPhysical = (p: string) => space.path_prefix ? `${space.path_prefix}/${p}` : p;
     const page = async (p: string): Promise<JsonObject> => {
       const matches = rows.filter(r => r.path === p); publicationNeed(matches.length === 1, "retraction_page_metadata");
@@ -156,10 +157,16 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
       });
       // The DB receipt is authoritative before the derived maintenance append.
       // An unknown append never rolls back or replays the withdrawal.
-      if (created) await withWikiRetractionLock(db,pluginId,input.companyId,async tx=>{
-        await appendRetractionMaintenanceLog(receipt,await loadAllWikiRetractions(tx,pluginId,input.companyId));
-      });
+      if(created)await appendCommittedWikiMaintenance(db,pluginId,input.companyId,receipt,"retraction",input.operationId);
       return receipt;
+    },
+    async receipt(companyId:string,operationId:string) {
+      return withWikiRetractionLock(db,pluginId,companyId,async tx=>{
+        const events=await loadAllWikiRetractions(tx,pluginId,companyId);retractionFolderGate(events,companyId,"wiki-root");
+        const event=events.find(e=>e.type==="executed"&&e.retractionId===operationId);
+        if(!event)throw notFound("Withdrawal operation not found");
+        return {state:"withdrawn",event,maintenanceLog:await readWikiMaintenanceState(event,events),automaticRetryAllowed:false};
+      });
     },
     async audit(companyId: string) {
       return withWikiRetractionLock(db, pluginId, companyId, async tx => {
