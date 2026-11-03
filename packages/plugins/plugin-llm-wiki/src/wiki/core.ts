@@ -4135,6 +4135,9 @@ async function filterWikiRows<T>(ctx: PluginContext, companyId: string, space: P
     } catch (error) {
       if (!held) return { row: null, tombstone: null as unknown };
       const message = error instanceof Error ? error.message : String(error);
+      // A host-defined absence is safe metadata, after the host has checked
+      // root and physical aliases. It is not a readable body or a generic error.
+      if (message === "E_WIKI_SOURCE_NOT_MATERIALIZED") return { row: onlyReadable ? null : row, tombstone: null as unknown };
       const marker = message.indexOf("E_SOURCE_RETRACTED ");
       if (marker < 0) throw error;
       return { row: null, tombstone: JSON.parse(message.slice(marker + "E_SOURCE_RETRACTED ".length)) as unknown };

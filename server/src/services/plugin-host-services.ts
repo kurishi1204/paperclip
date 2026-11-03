@@ -50,7 +50,7 @@ import { pluginStateStore } from "./plugin-state-store.js";
 import { pluginLifecycleInbox } from "./plugin-lifecycle-inbox.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { loadAllWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
-import { retractionFolderGate, canonicalWikiRetractionPath as canonicalFolderPath } from "./wiki-retraction-gate.js";
+import { retractionFolderGate, readRetractionFolderText, canonicalWikiRetractionPath as canonicalFolderPath } from "./wiki-retraction-gate.js";
 import { pluginManagedAgentService } from "./plugin-managed-agents.js";
 import { pluginManagedRoutineService } from "./plugin-managed-routines.js";
 import { pluginManagedSkillService } from "./plugin-managed-skills.js";
@@ -62,7 +62,6 @@ import {
   inspectPluginLocalFolder,
   listPluginLocalFolderEntries,
   preparePluginLocalFolder,
-  readPluginLocalFolderText,
   resolvePluginLocalFolderPath,
   requireLocalFolderDeclaration,
   setStoredLocalFolder,
@@ -1523,13 +1522,7 @@ export function buildHostServices(
         return withWikiFolderFence(params.companyId, params.folderKey, async (gate, connection) => {
           const status = await inspectStoredLocalFolder(params.companyId, params.folderKey, connection);
           assertConfiguredLocalFolder(status);
-          gate.assertRoot(status.realPath!);
-          gate.assertRead(params.relativePath);
-          const canonical = await canonicalFolderPath(status.realPath!, params.relativePath);
-          gate.assertRead(canonical);
-          const contents = await readPluginLocalFolderText(status.realPath!, params.relativePath);
-          gate.assertRead(canonical, contents);
-          return contents;
+          return readRetractionFolderText(status.realPath!, params.relativePath, gate);
         });
       },
 

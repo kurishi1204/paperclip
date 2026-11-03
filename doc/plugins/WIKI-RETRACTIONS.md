@@ -127,3 +127,14 @@ acceptance claim.
 The common collector checks the host boundary before loading SQL candidates,
 including a no-match query. An empty result cannot report an unchecked moved
 root as healthy or an active withdrawal as inactive.
+
+An active hold does not make every raw metadata row require materialized bytes.
+The common host read helper performs root, lexical and canonical-path checks
+first. Only a final ENOENT with the same existing physical root is normalized to
+`E_WIKI_SOURCE_NOT_MATERIALIZED`. Default metadata lists may retain that row;
+readable-only lists omit it. All other boundary errors fail the request. An
+alias in another space that points to a held Wiki file is rejected before this
+absence outcome, so space names cannot bypass the file fence. Other plugins and
+inactive Wiki reads retain their previous errors. The actual host helper, file
+paths, aliases and both metadata/readable consumers are exercised together;
+space resolution and SQL selection remain fixtures in the local journey.

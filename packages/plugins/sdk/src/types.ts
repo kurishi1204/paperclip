@@ -526,7 +526,10 @@ export interface PluginLocalFoldersClient {
   status(companyId: string, folderKey: string): Promise<PluginLocalFolderStatus>;
   /** List entries below a configured folder after containment checks. */
   list(companyId: string, folderKey: string, options?: PluginLocalFolderListOptions): Promise<PluginLocalFolderListing>;
-  /** Read a UTF-8 text file below a configured folder after containment checks. */
+  /** Read a UTF-8 text file below a configured folder after containment checks.
+   * During an active Wiki withdrawal, the host may return the exact error
+   * message E_WIKI_SOURCE_NOT_MATERIALIZED only after root and physical-path
+   * checks succeed. This represents absent file bytes, not a boundary failure. */
   readText(companyId: string, folderKey: string, relativePath: string): Promise<string>;
   /** Write a UTF-8 text file below a configured folder using atomic rename. */
   writeTextAtomic(

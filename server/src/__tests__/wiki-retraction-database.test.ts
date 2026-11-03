@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -7,7 +7,7 @@ import { activityLog, companies, createDb } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { executeRetraction } from "../services/wiki-retraction-ledger.js";
 import { loadAllWikiRetractions, wikiRetractionStore, withWikiRetractionLock } from "../services/wiki-retraction-store.js";
-import { retractionFolderGate } from "../services/wiki-retraction-gate.js";
+import { retractionFolderGate, readRetractionFolderText } from "../services/wiki-retraction-gate.js";
 import { registerWikiTools, listPages } from "../../../packages/plugins/plugin-llm-wiki/src/wiki/core.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { publicationHash } from "../services/wiki-publication-readback.js";
@@ -28,7 +28,7 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
   async function fixture() {
     const companyId = randomUUID(); const pluginId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Synthetic withdrawal company", issuePrefix: "W" + companyId.replaceAll("-","").slice(0,12) });
-    const dir = await mkdtemp(join(tmpdir(), "wiki-withdrawal-sql-")); roots.push(dir);
+    const dir = await realpath(await mkdtemp(join(tmpdir(), "wiki-withdrawal-sql-"))); roots.push(dir);
     await mkdir(join(dir,"wiki"));
     const file = join(dir, "wiki/p7.md"); const body = "Synthetic original retained for audit\n"; await writeFile(file,body);
     const target = { companyId, wikiId: "default", spaceSlug: "default", path: "wiki/p7.md", contentHash: publicationHash(body) };
@@ -97,7 +97,7 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
           query:async(q:string,args:unknown[]=[])=>q.includes("wiki_spaces")?[{id:"space",company_id:f.companyId,wiki_id:"default",slug:"default",display_name:"default",space_type:"local_folder",folder_mode:"managed_subfolder",root_folder_key:"wiki-root",path_prefix:null,access_scope:"shared",settings:{},status:"active"}]:[...await db.$client.unsafe(q,args as never[])]},
         localFolders:{status:async()=>({wikiRetractions:{state:"active"}}),readText:async(_c:string,_k:string,path:string)=>{
           const gate=retractionFolderGate(await loadAllWikiRetractions(db,f.pluginId,f.companyId),f.companyId,"wiki-root");
-          gate.assertRoot(f.dir);gate.assertRead(path);const body=await readFile(join(f.dir,path),"utf8");gate.assertRead(path,body);return body;
+          return readRetractionFolderText(f.dir,path,gate);
         }}} as unknown as PluginContext;
       await registerWikiTools(ctx);
       const args={companyId:f.companyId,wikiId:"default",spaceSlug:"default",query:"wiki",path:"wiki/parent.md",limit:1};

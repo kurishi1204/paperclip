@@ -1,5 +1,6 @@
 import path from "node:path";
-import { resolvePluginLocalFolderPath } from "./plugin-local-folders.js";
+import { realpath } from "node:fs/promises";
+import { resolvePluginLocalFolderPath, readPluginLocalFolderText } from "./plugin-local-folders.js";
 import { publicationHash } from "./wiki-publication-readback.js";
 import type { RetractionEvent, RetractionBlock } from "./wiki-retraction-ledger.js";
 import { RetractionError, validateRetractionEvents } from "./wiki-retraction-ledger.js";
@@ -71,3 +72,23 @@ export const canonicalWikiRetractionPath = async (rootPath: string, relativePath
       return relativePath;
     }
   };
+
+/** Metadata may precede a raw file. Only normalize that expected absence after
+ * root, lexical and physical withdrawal checks; other boundary failures escape. */
+export async function readRetractionFolderText(rootPath: string, relativePath: string,
+  gate: ReturnType<typeof retractionFolderGate>): Promise<string> {
+  gate.assertRoot(rootPath); gate.assertRead(relativePath);
+  const canonical = await canonicalWikiRetractionPath(rootPath, relativePath);
+  gate.assertRead(canonical);
+  let contents: string;
+  try { contents = await readPluginLocalFolderText(rootPath, relativePath); }
+  catch (error) {
+    if (gate.active && (error as NodeJS.ErrnoException | null)?.code === "ENOENT") {
+      // A missing or changed root is not a not-yet-materialized source file.
+      gate.assertRoot(await realpath(rootPath));
+      throw new Error("E_WIKI_SOURCE_NOT_MATERIALIZED");
+    }
+    throw error;
+  }
+  gate.assertRead(canonical, contents); return contents;
+}

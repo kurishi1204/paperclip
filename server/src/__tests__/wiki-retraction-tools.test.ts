@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { registerWikiTools, readWikiPage, writeWikiPage, listPages, listSources } from "../../../packages/plugins/plugin-llm-wiki/src/wiki/core.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { retractionFolderGate, canonicalWikiRetractionPath } from "../services/wiki-retraction-gate.js";
+import { retractionFolderGate, readRetractionFolderText } from "../services/wiki-retraction-gate.js";
 import { executeRetraction, type RetractionEvent, type RetractionStore } from "../services/wiki-retraction-ledger.js";
 import { listPluginLocalFolderEntries } from "../services/plugin-local-folders.js";
 import { publicationHash } from "../services/wiki-publication-readback.js";
@@ -35,7 +35,7 @@ test("actual registered Wiki tools and UI page read stop withdrawn bodies and di
       } },
       localFolders: {
         status: async () => { retractionFolderGate(events,"c","wiki-root").assertRoot(activeRoot);return { wikiRetractions: { state: events.length ? "active" : "inactive" } }; },
-        readText: async (_c: string, _k: string, p: string) => { const gate = retractionFolderGate(events,"c","wiki-root"); gate.assertRoot(activeRoot); gate.assertRead(p); const physical=await canonicalWikiRetractionPath(dir,p);gate.assertRead(physical);const b=await readFile(join(dir,p),"utf8");gate.assertRead(physical,b);return b; },
+        readText: async (_c: string, _k: string, p: string) => readRetractionFolderText(activeRoot,p,retractionFolderGate(events,"c","wiki-root")),
         writeTextAtomic: async (_c: string, _k: string, p: string,b: string) => { retractionFolderGate(events,"c","wiki-root").assertWrite(p); await writeFile(join(dir,p),b); },
       },
     } as unknown as PluginContext;
@@ -88,6 +88,21 @@ test("actual registered Wiki tools and UI page read stop withdrawn bodies and di
     (ctx.localFolders as unknown as {list:()=>Promise<unknown>}).list=async()=>({...rawWindow,entries:[]});
     await expect.soft(listPages(ctx,{...args,pageType:"source",includeRaw:true,limit:1})).rejects.toThrow(/E_WIKI_LOCAL_SCAN_INCOMPLETE/);
 
+
+    await mkdir(join(dir,"spaces/other/raw"),{recursive:true});
+    await symlink(join(dir,"wiki/p7.md"),join(dir,"spaces/other/raw/a-held.md"));
+    const savedSources=sourceRows.splice(0);
+    sourceRows.push({raw_path:"raw/a-held.md",title:"Held alias in another space",source_type:"manual",url:null,status:"captured",created_at:"2026-11-03"},
+      {raw_path:"raw/z-not-materialized.md",title:"Other space metadata",source_type:"manual",url:null,status:"captured",created_at:"2026-11-03"});
+    const otherHandlers=new Map<string,(input:unknown)=>Promise<any>>();
+    const otherCtx={...ctx,tools:{register:(name:string,_meta:unknown,handler:(input:unknown)=>Promise<any>)=>otherHandlers.set(name,handler)},
+      db:{...ctx.db,query:async(sql:string,params:unknown[]=[])=>sql.includes("wiki_spaces")?[{id:"other",company_id:"c",wiki_id:"default",slug:"other",display_name:"other",space_type:"local_folder",folder_mode:"managed_subfolder",root_folder_key:"wiki-root",path_prefix:"spaces/other",access_scope:"shared",settings:{},status:"active"}]:ctx.db.query(sql,params)}} as unknown as PluginContext;
+    await registerWikiTools(otherCtx);
+    const otherArgs={companyId:"c",wikiId:"default",spaceSlug:"other",limit:1};
+    await expect.soft(listSources(otherCtx,otherArgs).then(r=>r.sources.map(x=>x.rawPath))).resolves.toEqual(["raw/z-not-materialized.md"]);
+    await expect.soft(otherHandlers.get("wiki_list_sources")!(otherArgs).then(r=>r.data.sources.map((x:{raw_path:string})=>x.raw_path))).resolves.toEqual(["raw/z-not-materialized.md"]);
+    await expect.soft(listSources(otherCtx,{...otherArgs,onlyReadable:true}).then(r=>r.sources)).resolves.toEqual([]);
+    sourceRows.splice(0);sourceRows.push(...savedSources);
 
     activeRoot=join(dir,"changed-root");await mkdir(activeRoot);
     await expect.soft(listPages(ctx,{...args,pageType:"source",includeRaw:false,limit:1})).rejects.toThrow(/runtime_root_changed/);
