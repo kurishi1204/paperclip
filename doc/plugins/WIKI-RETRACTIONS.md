@@ -263,3 +263,14 @@ remain unexecuted locally; the physical merge and actual tree-label function are
 exercised with isolated files.
 
 A publication receipt checks its own verified maintenance-log byte range. Later valid appends do not turn an earlier completed append into pending. Partial or foreign suffixes remain unknown and are never automatically retried.
+
+
+Registered original pages and reviewed new versions use the same current
+publication proof during host reads. A matching document revision/body alone
+does not suffice: the actual creator and last agent editor must match the pin,
+no user editor may replace that author, and the independently resolved QA Run
+must still be succeeded in the same company for the named reviewer. Host-owned
+review readers supply that Run; it is excluded from the historical review hash
+and is never accepted from worker arguments. Current space root-folder ownership
+and active status are read under a shared row lock. Unregistered retained files
+keep their separate byte/hold contract and receive no registered proof.

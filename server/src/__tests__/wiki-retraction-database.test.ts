@@ -7,7 +7,7 @@ import { activityLog, companies, createDb, agents, issues, documents, issueDocum
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { executeRetraction } from "../services/wiki-retraction-ledger.js";
 import { loadAllWikiRetractions, wikiRetractionStore, withWikiRetractionLock } from "../services/wiki-retraction-store.js";
-import { retractionFolderGate, readRetractionFolderText } from "../services/wiki-retraction-gate.js";
+import { retractionFolderGate, readRetractionFolderText, readRetractionFolderTextWithStatus } from "../services/wiki-retraction-gate.js";
 import { registerWikiTools, listPages } from "../../../packages/plugins/plugin-llm-wiki/src/wiki/core.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { publicationHash, publicationCanonical, reviewBasis, type PublicationRegistry, type JsonObject } from "../services/wiki-publication-readback.js";
@@ -196,6 +196,31 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     expect((config!.configJson.publicationReadback as PublicationRegistry).entries).toHaveLength(4);
     expect(await db.$client.unsafe(`SELECT * FROM ${ns}.wiki_page_revisions WHERE company_id=$1`,[f.companyId])).toHaveLength(1);
     await withWikiRetractionLock(db,pluginId,f.companyId,tx=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,f.newPath));
+    // The host/UI boundary also validates original held publications,
+    // rather than applying the current QA proof only to newly republished files.
+    const oldChild=f.registry.entries[1]!;
+    const readHeld=()=>withWikiRetractionLock(db,pluginId,f.companyId,tx=>
+      readRetractionFolderTextWithStatus(f.dir,oldChild.path,retractionFolderGate(events,f.companyId,"wiki-root"),
+        path=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,path)));
+    expect((await readHeld()).contents).toBe(await readFile(join(f.dir,oldChild.path),"utf8"));
+    expect((await readHeld()).citationHolds).toHaveLength(1);
+    await db.update(issueThreadInteractions).set({status:"rejected"}).where(eq(issueThreadInteractions.id,oldChild.reviewId));
+    await expect(readHeld()).rejects.toThrow(/review_not_accepted/);
+    await db.update(issueThreadInteractions).set({status:"accepted"}).where(eq(issueThreadInteractions.id,oldChild.reviewId));
+    const [oldReview]=await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id,oldChild.reviewId));
+    await db.update(heartbeatRuns).set({status:"failed"}).where(eq(heartbeatRuns.id,oldReview!.resolvedByRunId!));
+    await expect(readHeld()).rejects.toThrow(/review_run/);
+    await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,oldReview!.resolvedByRunId!));
+    for(const field of ["createdByAgentId","updatedByAgentId"] as const){
+      await db.update(documents).set({[field]:oldReview!.resolvedByAgentId}).where(eq(documents.id,oldChild.documentId));
+      await expect(readHeld()).rejects.toThrow(/document_author_changed/);
+      await db.update(documents).set({[field]:oldChild.producerAgentId}).where(eq(documents.id,oldChild.documentId));
+    }
+    for(const [field,badValue,goodValue]of [["root_folder_key","other-root","wiki-root"],["status","archived","active"]] as const){
+      await db.$client.unsafe(`UPDATE ${ns}.wiki_spaces SET ${field}=$2 WHERE company_id=$1`,[f.companyId,badValue]);
+      await expect(withWikiRetractionLock(db,pluginId,f.companyId,tx=>assertCurrentWikiRepublication(tx,pluginId,f.companyId,events,f.newPath))).rejects.toThrow(/current_space/);
+      await db.$client.unsafe(`UPDATE ${ns}.wiki_spaces SET ${field}=$2 WHERE company_id=$1`,[f.companyId,goodValue]);
+    }
     const currentPage=await db.$client.unsafe(`SELECT source_refs FROM ${ns}.wiki_pages WHERE company_id=$1 AND path=$2`,[f.companyId,f.newPath]);
     const p7=f.registry.entries[0]!;
     const withdrawnRef={kind:"document",issueId:p7.issueId,documentId:p7.documentId,documentKey:p7.documentKey,revisionId:p7.revisionId};

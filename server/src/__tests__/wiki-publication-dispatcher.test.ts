@@ -9,6 +9,7 @@ const state = vi.hoisted(() => ({
   config: undefined as Record<string, unknown> | undefined,
   document: {} as Record<string, unknown>,
   review: {} as Record<string, unknown>,
+  run: {} as Record<string,unknown>,
   settingsReads: [] as unknown[][],
   retractionReads: [] as unknown[][],
   retractionReadError: null as Error | null,
@@ -46,8 +47,9 @@ beforeEach(() => { state.settingsReads = []; state.retractionReads = []; state.r
 function setup() {
   const body = "Reviewed synthetic company document";
   const ref = { kind: "document", issueId: "issue", documentId: "document", documentKey: "note", revisionId: "revision" };
-  state.document = { id: "document", companyId: "company", issueId: "issue", latestRevisionId: "revision", body };
+  state.document = { id: "document", companyId: "company", issueId: "issue", latestRevisionId: "revision", body,createdByAgentId:"writer",updatedByAgentId:"writer",updatedByUserId:null };
   state.review = { id: "review", companyId: "company", issueId: "issue", status: "accepted", sourceRunId: "writer-run", resolvedByAgentId: "qa", resolvedByRunId: "qa-run", resolvedAt: null, payload: {}, result: { outcome: "accepted" } };
+  state.run={id:"qa-run",companyId:"company",agentId:"qa",status:"succeeded"};
   const page = { path: "wiki/note.md", wikiId: "default", spaceSlug: "default", contents: body, hash: publicationHash(body), sourceRefs: [ref] };
   state.config = { publicationReadback: { schema: "colo.shared-wiki-publication-readback/v1", companyId: "company", wikiId: "default", spaceSlug: "default", qaAgentId: "qa", entries: [{ path: page.path, ...ref, producerAgentId: "writer", reviewId: "review", wikiSHA256: page.hash, documentBodySHA256: publicationHash(body), reviewRecordSHA256: publicationHash(publicationCanonical(state.review)), sourceRefsSHA256: publicationHash(publicationCanonical(page.sourceRefs)) }] } };
   const workerResult = { content: body, data: { companyId: "company", wikiId: "default", spaceSlug: "default", path: page.path, hash: page.hash } };
@@ -58,10 +60,11 @@ function setup() {
     throw new Error("unexpected worker operation");
   });
   const workerManager = { isRunning: () => true, call } as unknown as PluginWorkerManager;
-  const dispatcher = createPluginToolDispatcher({ db: {} as Db, workerManager });
+  const db={select:()=>({from:()=>({where:async()=>[state.run]})})} as unknown as Db;
+  const dispatcher = createPluginToolDispatcher({ db, workerManager });
   dispatcher.registerPluginTools(pluginKey, { id: pluginKey, tools: [{ name: "wiki_read_page", displayName: "Read", description: "Read", parametersSchema: { type: "object" } }] } as unknown as PaperclipPluginManifestV1, pluginDbId);
   const run = (args = { companyId: "company", path: page.path } as Record<string, unknown>) => dispatcher.executeTool(name, args, context);
-  return { run, call, body, workerResult };
+  return { run, call, body, workerResult, db };
 }
 
 test("normal dispatcher adds current publication evidence through the UUID worker", async () => {
@@ -69,7 +72,7 @@ test("normal dispatcher adds current publication evidence through the UUID worke
   expect(result.result.content).toBe(f.body);
   expect(result.result.data).toMatchObject({ publicationReadback: { state: "verified", citation: { documentId: "document" } } });
   expect(state.settingsReads).toEqual([[pluginDbId, "company"]]);
-  expect(state.retractionReads).toEqual([[{}, pluginDbId, "company"]]);
+  expect(state.retractionReads).toEqual([[f.db, pluginDbId, "company"]]);
   expect(f.call).toHaveBeenCalledWith(pluginDbId, "getData", { key: "page-content", companyId: "company", params: { companyId: "company", wikiId: "default", spaceSlug: "default", path: "wiki/note.md" } });
 });
 test("companies without the operator configuration keep their existing tool result", async () => {
@@ -107,7 +110,7 @@ test("the ordinary dispatcher binds an explicit publication reviewer without rep
   const registry = state.config!.publicationReadback as {qaAgentId: string; entries: Record<string, unknown>[]};
   registry.entries[0]!.qaAgentId = "new-qa";
   await expect(f.run()).rejects.toThrow("wiki_publication_review_not_independent");
-  state.review.resolvedByAgentId = "new-qa";
+  state.review.resolvedByAgentId = "new-qa";state.run.agentId="new-qa";
   registry.entries[0]!.reviewRecordSHA256 = publicationHash(publicationCanonical(state.review));
   const result = await f.run();
   expect(registry.qaAgentId).toBe("qa");
@@ -123,4 +126,13 @@ test("the ordinary dispatcher refuses unreadable durable withdrawal state", asyn
   await expect(f.run()).rejects.toThrow("synthetic withdrawal store unavailable");
   expect(f.call).toHaveBeenCalledTimes(1);
   expect(state.retractionReads).toHaveLength(1);
+});
+
+test("the ordinary dispatcher rejects a failed current QA Run",async()=>{
+ const f=setup();state.run.status="failed";
+ await expect(f.run()).rejects.toThrow("review_run_not_completed");
+});
+test("the ordinary dispatcher rejects a different stored author",async()=>{
+ const f=setup();state.document.createdByAgentId="qa";
+ await expect(f.run()).rejects.toThrow("document_author_changed");
 });

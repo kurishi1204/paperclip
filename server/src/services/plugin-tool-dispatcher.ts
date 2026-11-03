@@ -22,7 +22,8 @@
  * @see PLUGIN_SPEC.md §13.10 — `executeTool`
  */
 
-import type { Db } from "@paperclipai/db";
+import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
 import type {
   PaperclipPluginManifestV1,
   PluginRecord,
@@ -471,9 +472,13 @@ export function createPluginToolDispatcher(
               document: async (issueId, key) => await documents.getIssueDocumentByKey(
                 issueId, key,
               ) as Record<string, unknown> | null,
-              review: async (issueId, id) => (
-                (await interactions.listForIssue(issueId)).find(r => r.id === id) ?? null
-              ) as unknown as Record<string, unknown> | null,
+              review: async (issueId, id) => {
+                const review=(await interactions.listForIssue(issueId)).find(r=>r.id===id);
+                if(!review)return null;
+                const rows=review.resolvedByRunId?await db.select().from(heartbeatRuns).where(and(
+                  eq(heartbeatRuns.id,review.resolvedByRunId),eq(heartbeatRuns.companyId,runContext.companyId))):[];
+                return {...review,resolvedRun:rows[0]??null} as unknown as Record<string,unknown>;
+              },
             },
           );
         }

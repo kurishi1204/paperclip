@@ -121,6 +121,9 @@ export async function verifyWikiPublication(registry: PublicationRegistry, path:
     publicationNeed(Array.isArray(page.sourceRefs) && publicationHash(publicationCanonical(page.sourceRefs)) === pin.sourceRefsSHA256, "references_changed");
     const document = await readers.document(pin.issueId, pin.documentKey);
     publicationNeed(document && document.companyId === registry.companyId && document.issueId === pin.issueId && document.id === pin.documentId && document.latestRevisionId === pin.revisionId && typeof document.body === "string" && publicationHash(document.body) === pin.documentBodySHA256, "document_changed");
+    publicationNeed(document.createdByAgentId===pin.producerAgentId &&
+      document.updatedByAgentId===pin.producerAgentId && !document.updatedByUserId,
+      "document_author_changed");
     const bytes = Buffer.from(page.contents); const body = Buffer.from(document.body as string); const start = bytes.indexOf(body);
     publicationNeed(body.length > 0 && start >= 0 && bytes.indexOf(body, start + 1) === -1, "body_not_unique_exact_copy");
     const review = await readers.review(pin.issueId, pin.reviewId);
@@ -131,6 +134,10 @@ export async function verifyWikiPublication(registry: PublicationRegistry, path:
     const qaAgentId = Object.hasOwn(pin, "qaAgentId") ? pin.qaAgentId : registry.qaAgentId;
     publicationNeed(typeof qaAgentId === "string" && qaAgentId.trim().length > 0 && qaAgentId === qaAgentId.trim(), "registry_pin_reviewer");
     publicationNeed(review.resolvedByAgentId === qaAgentId && review.resolvedByAgentId !== pin.producerAgentId && review.resolvedByRunId && review.resolvedByRunId !== review.sourceRunId, "review_not_independent");
+    const resolvedRun=review.resolvedRun as JsonObject|null|undefined;
+    publicationNeed(resolvedRun&&resolvedRun.id===review.resolvedByRunId&&
+      resolvedRun.companyId===registry.companyId&&resolvedRun.agentId===qaAgentId&&
+      resolvedRun.status==="succeeded","review_run_not_completed");
     publicationNeed(publicationHash(publicationCanonical(reviewBasis(review))) === pin.reviewRecordSHA256, "review_changed");
     const refs = page.sourceRefs.map(object); const own = refs.filter(r => r.kind === "document" && r.documentId === pin.documentId);
     publicationNeed(own.length === 1 && ["issueId", "documentId", "documentKey", "revisionId"].every(k => own[0]![k] === pin[k as keyof PublicationPin]), "own_reference_changed");

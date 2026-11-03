@@ -17,19 +17,28 @@ const WIKI_PLUGIN="paperclipai.plugin-llm-wiki";
 export async function assertWikiRepublicationTargetPath(root:string,physicalPath:string) {
   publicationNeed(await canonicalWikiRetractionPath(root,physicalPath)===physicalPath,"republication_alias");
 }
+/** Current proof for registered originals and new versions. The existing
+ * export name is retained for the host/route contract. */
 export async function assertCurrentWikiRepublication(db:Db,pluginId:string,companyId:string,events:RetractionEvent[],physicalPath:string) {
   const matches=events.filter(e=>e.type==="republished"&&e.republication?.physicalPath===physicalPath);
-  if(!matches.length)return;
-  publicationNeed(matches.length===1,"republication_current_identity");const event=matches[0]!;
+  const original=events.find(e=>e.type==="executed"&&e.fence&&
+    [...e.fence.blocks,...e.fence.readable].some(p=>p.path===physicalPath));
+  if(!matches.length&&!original)return;
+  publicationNeed(matches.length<=1,"republication_current_identity");const event=matches[0]??original!;
   const configs=await db.select().from(pluginConfig).where(and(eq(pluginConfig.pluginId,pluginId),eq(pluginConfig.companyId,companyId))).for("share");
   const registry=parsePublicationRegistry(configs[0]?.configJson.publicationReadback,companyId);
   const pluginDb=pluginDatabaseService(db),ns=await pluginDb.getRuntimeNamespace(pluginId);
-  const spaces=await pluginDb.query<{id:string;path_prefix:string|null}>(pluginId,
-    `SELECT id,path_prefix FROM ${ns}.wiki_spaces WHERE company_id=$1 AND wiki_id=$2 AND slug=$3`,[companyId,registry.wikiId,registry.spaceSlug]);
-  publicationNeed(spaces.length===1&&registry.wikiId===event.wikiId&&registry.spaceSlug===event.spaceSlug,"republication_current_space");
+  const spaces=await pluginDb.query<{id:string;path_prefix:string|null;root_folder_key:string;status:string}>(pluginId,
+    `SELECT id,path_prefix,root_folder_key,status FROM ${ns}.wiki_spaces WHERE company_id=$1 AND wiki_id=$2 AND slug=$3 FOR SHARE`,[companyId,registry.wikiId,registry.spaceSlug]);
+  publicationNeed(spaces.length===1&&spaces[0]!.root_folder_key==="wiki-root"&&spaces[0]!.status==="active"&&
+    registry.wikiId===event.wikiId&&registry.spaceSlug===event.spaceSlug,"republication_current_space");
   const physical=(p:string)=>spaces[0]!.path_prefix?spaces[0]!.path_prefix+"/"+p:p;
-  publicationNeed(physical(event.path)===physicalPath,"republication_current_physical_path");
-  const gate=retractionFolderGate(events,companyId,"wiki-root"),root=event.republication!.rootPath;gate.assertRoot(root);
+  const target=registry.entries.find(p=>physical(p.path)===physicalPath);
+  // Unregistered retained files (for example the maintenance log) keep their
+  // own byte/hold contract; they never receive a registered publication proof.
+  if(!target){publicationNeed(!matches.length,"republication_current_pin");return;}
+  if(matches.length)publicationNeed(physical(event.path)===physicalPath,"republication_current_physical_path");
+  const gate=retractionFolderGate(events,companyId,"wiki-root"),root=event.republication?.rootPath??original!.fence!.rootPath;gate.assertRoot(root);
   const loadDocument=async(issueId:string,key:string)=>{
     const rows=await db.select({doc:documents}).from(issueDocuments).innerJoin(documents,eq(issueDocuments.documentId,documents.id))
       .where(and(eq(issueDocuments.companyId,companyId),eq(issueDocuments.issueId,issueId),eq(issueDocuments.key,key))).for("share",{of:documents});
@@ -41,12 +50,12 @@ export async function assertCurrentWikiRepublication(db:Db,pluginId:string,compa
   const loadReview=async(issueId:string,id:string)=>{
     const rows=await db.select().from(issueThreadInteractions).where(and(eq(issueThreadInteractions.id,id),eq(issueThreadInteractions.companyId,companyId),eq(issueThreadInteractions.issueId,issueId))).for("share");
     const review=rows[0]??null,run=review?.resolvedByRunId?await loadRun(review.resolvedByRunId):null;
-    publicationNeed(run&&run.status==="succeeded"&&run.agentId===review?.resolvedByAgentId,"republication_dependency_review_run");return review;
+    publicationNeed(run&&run.status==="succeeded"&&run.agentId===review?.resolvedByAgentId,"republication_dependency_review_run");return {...review,resolvedRun:run};
   };
   // UI and planning use the same recursive publication proof as the tool.
   // Actual namespace rows, current document/review/run and guarded file bytes
   // participate; a parallel partial UI proof is not maintained here.
-  await verifyWikiPublication(registry,event.path,{
+  await verifyWikiPublication(registry,target.path,{
     retraction:async p=>gate.block(physical(p)),document:loadDocument,review:loadReview,
     page:async p=>{
       const rows=await pluginDb.query<{source_refs:unknown;content_hash:string}>(pluginId,
@@ -94,7 +103,7 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
     const gate=retractionFolderGate(all,input.companyId,"wiki-root");gate.assertRoot(root);
     const pluginDb=pluginDatabaseService(tx),ns=await pluginDb.getRuntimeNamespace(pluginId);
     const spaces=await pluginDb.query<{id:string;path_prefix:string|null;root_folder_key:string;status:string}>(pluginId,
-      `SELECT id,path_prefix,root_folder_key,status FROM ${ns}.wiki_spaces WHERE company_id=$1 AND wiki_id=$2 AND slug=$3`,[input.companyId,draft.wikiId,draft.spaceSlug]);
+      `SELECT id,path_prefix,root_folder_key,status FROM ${ns}.wiki_spaces WHERE company_id=$1 AND wiki_id=$2 AND slug=$3 FOR SHARE`,[input.companyId,draft.wikiId,draft.spaceSlug]);
     publicationNeed(spaces.length===1&&spaces[0]!.root_folder_key==="wiki-root"&&spaces[0]!.status==="active","republication_space");
     const space=spaces[0]!,physical=(p:string)=>space.path_prefix?space.path_prefix+"/"+p:p;
     const rows=await pluginDb.query<{path:string;source_refs:unknown;content_hash:string;page_type:string|null}>(pluginId,
@@ -107,7 +116,7 @@ export function wikiRepublicationRuntime(db:Db,pluginId:string) {
       readers:{document:(issueId,key)=>document(tx,input.companyId,issueId,key),review:async(issueId,id)=>{
         const current=await review(tx,input.companyId,issueId,id);
         const currentRuns=current?.resolvedByRunId?await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,current.resolvedByRunId),eq(heartbeatRuns.companyId,input.companyId))).for("share"):[];
-        publicationNeed(currentRuns[0]?.status==="succeeded"&&currentRuns[0]?.agentId===current?.resolvedByAgentId,"republication_dependency_review_run");return current;
+        publicationNeed(currentRuns[0]?.status==="succeeded"&&currentRuns[0]?.agentId===current?.resolvedByAgentId,"republication_dependency_review_run");return {...current,resolvedRun:currentRuns[0]};
       },
         retraction:async p=>gate.block(physical(p)),page:async p=>{
           await assertCurrentWikiRepublication(tx,pluginId,input.companyId,all,physical(p));

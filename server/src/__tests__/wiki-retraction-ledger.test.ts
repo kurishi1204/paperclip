@@ -113,7 +113,7 @@ test("the existing publication reader returns a tombstone without the old body o
       const body = "body-" + name; const review: JsonObject = { id: "qa-" + name, companyId: "company", issueId: name,
         status: "accepted", sourceRunId: "writer-run", resolvedByAgentId: "qa", resolvedByRunId: "qa-run",
         resolvedAt: null, payload: {}, result: { outcome: "accepted" } };
-      documents[name] = { id: ref.documentId, ...scope, issueId: name, latestRevisionId: ref.revisionId, body };
+      documents[name] = { id: ref.documentId, ...scope, issueId: name, latestRevisionId: ref.revisionId, body,createdByAgentId:"writer",updatedByAgentId:"writer",updatedByUserId:null };
       reviews[name] = review; pages[name] = { path: name, ...scope, contents: body, hash: publicationHash(body),
         sourceRefs: [ref, ...parents.map(p => (pages[p]!.sourceRefs as JsonObject[])[0])] };
       registry.entries.push({ path: name, ...ref, producerAgentId: "writer", reviewId: review.id as string,
@@ -122,7 +122,7 @@ test("the existing publication reader returns a tombstone without the old body o
     };
     const source = f.target.path;
     add(source, []); add("dependent", [source]);
-    const readers = { page: async (p: string) => pages[p]!, document: async (p: string) => documents[p]!, review: async (p: string) => reviews[p]!,
+    const readers = { page: async (p: string) => pages[p]!, document: async (p: string) => documents[p]!, review: async (p: string) => ({...reviews[p]!,resolvedRun:{id:reviews[p]!.resolvedByRunId,companyId:"company",agentId:"qa",status:"succeeded"}}),
       retraction: async (p: string) => retractionBlock(p, new Map(), events) };
     let events: RetractionEvent[] = [];
     const run = (path: string) => applyWikiPublicationReadback(registry, "company", { companyId: "company", path },
