@@ -15,6 +15,7 @@ import { publicationHash, publicationCanonical, reviewBasis, type PublicationReg
 import { eq } from "drizzle-orm";
 import { fileURLToPath } from "node:url";
 import { pluginDatabaseService } from "../services/plugin-database.js";
+import { wikiRetractionRuntime } from "../services/wiki-retraction-runtime.js";
 import { wikiRepublicationRuntime } from "../services/wiki-republication-runtime.js";
 import { encodeWikiRepublicationDraft } from "../services/wiki-republication.js";
 import wikiManifest from "../../../packages/plugins/plugin-llm-wiki/src/manifest.js";
@@ -157,10 +158,15 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
       }
       await db.insert(pluginConfig).values({pluginId,companyId,configJson:{publicationReadback:registry,syntheticPreservedSetting:true}});
       const target={companyId,wikiId:"default",spaceSlug:"default",path:"wiki/p7.md",contentHash:registry.entries[0]!.wikiSHA256};
+      const preview=await wikiRetractionRuntime(db,pluginId).preview(target,target.path,"Synthetic revalidation");
+      // Matching registry metadata cannot hide a different stored creator.
+      await db.update(documents).set({createdByAgentId:qa}).where(eq(documents.id,registry.entries[0]!.documentId));
+      await expect(wikiRetractionRuntime(db,pluginId).preview(target,target.path,"Synthetic revalidation")).rejects.toThrow(/published_source_identity/);
+      await db.update(documents).set({createdByAgentId:author}).where(eq(documents.id,registry.entries[0]!.documentId));
+      expect(preview.fence.mode).toBe("citation-holds");
       const withdrawal=await executeRetraction(wikiRetractionStore(db,pluginId),{target,retractionId:randomUUID(),reason:"Synthetic revalidation",actorId:"synthetic-owner",runId:null,eventId:randomUUID(),at:new Date().toISOString(),
         approval:{id:randomUUID(),companyId,target,reason:"Synthetic revalidation",reviewerId:qa,reviewRunId:randomUUID(),ownerDecisionId:randomUUID()},
-        fence:{folderKey:"wiki-root",rootPath:dir,pathPrefix:"",mode:"citation-holds",blocks:[{path:target.path,contentHash:target.contentHash,state:"retracted"},
-          {path:"wiki/child.md",contentHash:registry.entries[1]!.wikiSHA256,state:"blocked_by_retraction"}],readable:[{path:"wiki/upstream.md",contentHash:registry.entries[2]!.wikiSHA256}]},readCurrent:async()=>target});
+        fence:preview.fence,readCurrent:async()=>target});
       const body=encodeWikiRepublicationDraft({companyId,wikiId:"default",spaceSlug:"default",retractionId:withdrawal.retractionId,previousPath:"wiki/child.md",path:newPath,
         reason:"Responsible author checked current evidence",dependencies:[{path:"wiki/upstream.md",wikiSHA256:registry.entries[2]!.wikiSHA256}]},"# Revalidated conclusion\n\nUse current independent evidence.\n");
       const draft=await reviewedDocument("revalidated",body);

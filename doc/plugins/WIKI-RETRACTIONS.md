@@ -35,7 +35,7 @@ No new employee mutation tool or general permission grant is introduced.
 
 1. `POST /api/plugins/:pluginId/wiki-retractions/preview` with `companyId`,
    canonical `wikiId`, `spaceSlug`, `path`, and `reason` returns a JSON proposal.
-   Preview has no mutation effect. It checks every registered page's file hash
+   Preview has no mutation effect. It resolves the original publication document and requires its stored creator, document ID, revision and body hash to match the target pin. It also checks every registered page's file hash
    and source-reference hash, computes direct/indirect dependencies, and refuses
    an indexed unregistered document-dependent page rather than silently omitting it.
 2. Save that exact JSON as an issue document and obtain a normal independent

@@ -49,6 +49,16 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
     publicationNeed(pins.wikiId === scope.wikiId && pins.spaceSlug === scope.spaceSlug, "retraction_scope");
     const targetPin = pins.entries.find(p => p.path === targetPath);
     publicationNeed(targetPin, "retraction_target_unregistered");
+    // A configured producer ID alone is not proof of the published document's
+    // origin. Resolve its actual stored link and creator under the same lock.
+    const sources = await connection.select({ doc: documents }).from(issueDocuments)
+      .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
+      .where(and(eq(issueDocuments.companyId, companyId), eq(issueDocuments.issueId, targetPin.issueId),
+        eq(issueDocuments.key, targetPin.documentKey))).for("update", { of: documents });
+    const source = sources[0]?.doc;
+    publicationNeed(source && source.companyId === companyId && source.id === targetPin.documentId &&
+      source.latestRevisionId === targetPin.revisionId && source.createdByAgentId === targetPin.producerAgentId &&
+      publicationHash(source.latestBody) === targetPin.documentBodySHA256, "retraction_published_source_identity");
     const pluginDb = pluginDatabaseService(connection); const ns = await pluginDb.getRuntimeNamespace(pluginId);
     const spaces = await pluginDb.query<{ id: string; path_prefix: string | null }>(pluginId,
       `SELECT id, path_prefix FROM ${ns}.wiki_spaces WHERE company_id = $1 AND wiki_id = $2 AND slug = $3`,
