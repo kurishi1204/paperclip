@@ -337,6 +337,6 @@ receive no probe writes. Tests count attempted probe writes, not just final file
 
 
 Immutable republication uses the same `extractWikiLinks` function as ordinary
-page registration. Its `wiki_pages.backlinks` index participates in normal
+page registration. The function is exported through the SDK package; the server does not import optional-plugin source files. Its `wiki_pages.backlinks` index participates in normal
 `wiki_list_backlinks` discovery. This navigation index does not replace the
 independent document-version/source-reference publication proof. Only the rendered body is indexed, not the machine lineage header. Recognized Wiki links in that body must have an exact declared dependency pin (an explicit self link is allowed); a withdrawn or held target is refused before publication.

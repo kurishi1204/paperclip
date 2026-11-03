@@ -1,4 +1,4 @@
-import { extractWikiLinks } from "../../../packages/plugins/plugin-llm-wiki/src/wiki/core.js";
+import { extractWikiLinks } from "@paperclipai/plugin-sdk";
 import { publicationCanonical, publicationHash, publicationNeed, reviewBasis, verifyWikiPublication,
   type JsonObject, type PublicationPin, type PublicationReaders, type PublicationRegistry } from "./wiki-publication-readback.js";
 import { retractionEventHash, validateRetractionEvents, type RetractionEvent, type RetractionScope } from "./wiki-retraction-ledger.js";

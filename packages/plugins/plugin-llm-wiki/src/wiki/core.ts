@@ -1,3 +1,5 @@
+import { extractWikiLinks } from "@paperclipai/plugin-sdk";
+export { extractWikiLinks } from "@paperclipai/plugin-sdk";
 import { createHash, randomUUID } from "node:crypto";
 import type { Agent, AgentSessionEvent, Issue, IssueComment, PluginContext, PluginEvent, PluginLocalFolderEntry, PluginWikiCitationHold, Project, ToolResult } from "@paperclipai/plugin-sdk";
 import type { IssueDocument, PluginIssueOriginKind, PluginManagedRoutineResolution, PluginManagedSkillResolution } from "@paperclipai/plugin-sdk/types";
@@ -1709,21 +1711,6 @@ function inferPageType(path: string): string | null {
   return match?.[1] ?? (path === "index.md" || path === "wiki/index.md" ? "index" : path === "log.md" || path === "wiki/log.md" ? "log" : null);
 }
 
-export function extractWikiLinks(contents: string): string[] {
-  const links = new Set<string>();
-  const markdownLinkPattern = /\[[^\]]+\]\(([^)]+)\)/g;
-  for (const match of contents.matchAll(markdownLinkPattern)) {
-    const target = match[1]?.split("#")[0]?.trim();
-    if (target && (target.startsWith("wiki/") || target === "index.md" || target === "log.md" || target === "AGENTS.md" || target === "IDEA.md")) {
-      links.add(target);
-    }
-  }
-  const wikiTokenPattern = /\bwiki\/[A-Za-z0-9._/-]+\.md\b/g;
-  for (const match of contents.matchAll(wikiTokenPattern)) {
-    links.add(match[0]);
-  }
-  return [...links].sort();
-}
 
 async function readCurrentWithHash(
   ctx: PluginContext,
