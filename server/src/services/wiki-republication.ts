@@ -72,7 +72,7 @@ export async function resolveReviewedWikiRepublication(input:{
   // The machine header records lineage, including the held previous version.
   // Only rendered Markdown links form the navigation/citation index.
   const body=doc.latestBody.slice(doc.latestBody.indexOf(END,PREFIX.length)+END.length);
-  const backlinks=extractWikiLinks(body,draft.path);
+  const backlinks=extractWikiLinks(body,draft.path,{strictInvalidReferences:true});
   for(const path of backlinks){
     if(path===draft.path)continue;
     const held=await input.readers.retraction!(path);

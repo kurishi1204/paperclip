@@ -294,3 +294,12 @@ test("an unresolved relative source refuses publication explicitly",async()=>{
   await assert.rejects(resolveReviewedWikiRepublication({...f.input,document:{...f.doc,latestBody}}),/E_INVALID_WIKI_REFERENCE/);
  }finally{await f.cleanup();}
 });
+
+for(const [path,target]of [["wiki/revalidated.md","p7"],["wiki/revalidated.md","./p7"],["wiki/group/revalidated.md","../p7"]]as const)
+test("extensionless relative references still enforce withdrawal: "+target,async()=>{
+ const f=await fixture();try{
+  const draft=JSON.parse(f.doc.latestBody.split("\n")[1]!);draft.path=path;draft.dependencies=[];
+  const latestBody=encodeWikiRepublicationDraft(draft,"[old premise]("+target+")");
+  await assert.rejects(resolveReviewedWikiRepublication({...f.input,document:{...f.doc,latestBody}}),/E_SOURCE_RETRACTED/);
+ }finally{await f.cleanup();}
+});

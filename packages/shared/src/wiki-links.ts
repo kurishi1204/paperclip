@@ -32,9 +32,12 @@ export function normalizeWikiLinkPagePath(target:string,currentPagePath="wiki/in
 }
 function internalMarkdownTarget(value:string) {
   const target=value.trim();
+  // URI classes, not filename spellings: a path-bearing relative link is a
+  // Wiki reference here; schemes, absolute app routes and same-page query/hash
+  // navigation are opaque. Extension and dot-segment handling live solely in
+  // the common resolver below the classification boundary.
   if(/^[a-z][a-z\d+.-]*:/i.test(target)||target.startsWith("/"))return false;
-  const path=target.split("#")[0]??"";
-  return /\.md$/i.test(path)||/^\/?(?:wiki|raw)\//.test(path);
+  return Boolean(target.split(/[?#]/)[0]?.trim());
 }
 const SKIP_PARENTS=new Set(["definition","image","imageReference","code","inlineCode","html"]);
 
@@ -81,10 +84,16 @@ export function transformWikiLinks(tree:WikiLinkAstNode,resolveHref:(target:stri
   walk(tree);
 }
 const markdown=unified().use(remarkParse).use(remarkGfm);
-export function extractWikiLinks(contents:string,currentPagePath="wiki/index.md"):string[] {
+export function extractWikiLinks(contents:string,currentPagePath="wiki/index.md",options:{strictInvalidReferences?:boolean}={}):string[] {
   const links=new Set<string>(),tree=markdown.parse(contents) as WikiLinkAstNode;
   transformWikiLinks(tree,(target)=>{
-    const parsed=normalizeWikiLinkPagePath(target,currentPagePath);if(!parsed)throw new Error("E_INVALID_WIKI_REFERENCE "+JSON.stringify({target,currentPagePath}));
+    const parsed=normalizeWikiLinkPagePath(target,currentPagePath);
+    if(!parsed){
+      if(options.strictInvalidReferences)throw new Error("E_INVALID_WIKI_REFERENCE "+JSON.stringify({target,currentPagePath}));
+      // Navigation indexing has never been publication proof. Preserve that
+      // existing capture contract; verified republication explicitly opts in.
+      return null;
+    }
     links.add(parsed.path);return parsed.path;
   });
   // Preserve existing plain Wiki-path references, but only in actual prose:

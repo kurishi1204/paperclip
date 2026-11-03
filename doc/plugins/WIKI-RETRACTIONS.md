@@ -366,3 +366,13 @@ declare a Wiki source; use canonical Wiki links and declared source pins for tha
 proof. A local source path that cannot be resolved causes E_INVALID_WIKI_REFERENCE
 before publication. The renderer preserves unresolved ordinary Markdown anchors
 for author inspection instead of deleting them silently.
+
+
+All path-bearing relative Markdown links share the Wiki resolver, including
+extensionless paths. Schemes, absolute application URLs, and same-page query/hash
+navigation are opaque URI classes. There is no extension/prefix allowlist for
+relative citations. Navigation indexing remains separate from publication proof:
+ordinary source capture retains its existing indexing behavior, while reviewed
+immutable publication sets strictInvalidReferences and refuses unresolved source
+targets before any file effect. Its withdrawn/dependency checks always apply to
+the resolved canonical references, whether an extension was present or not.
