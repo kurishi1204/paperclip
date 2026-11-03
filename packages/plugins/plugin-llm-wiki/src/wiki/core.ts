@@ -1758,19 +1758,24 @@ async function filterReadableRows<T>(
 }
 
 async function listLocalFiles(ctx: PluginContext, input: { companyId: string; space: Pick<WikiSpace, "pathPrefix">; relativePath: "wiki" | "raw" }): Promise<PluginLocalFolderEntry[]> {
+  const relativePath = spaceRelativePath(input.space, input.relativePath);
+  let listing: Awaited<ReturnType<PluginContext["localFolders"]["list"]>>;
   try {
-    const relativePath = spaceRelativePath(input.space, input.relativePath);
-    const listing = await ctx.localFolders.list(input.companyId, WIKI_ROOT_FOLDER_KEY, {
-      relativePath,
-      recursive: true,
-      maxEntries: LOCAL_BROWSE_FILE_LIMIT,
+    listing = await ctx.localFolders.list(input.companyId, WIKI_ROOT_FOLDER_KEY, {
+      relativePath, recursive: true, maxEntries: LOCAL_BROWSE_FILE_LIMIT,
     });
-    return listing.entries
-      .filter((entry) => entry.kind === "file")
-      .map((entry) => ({ ...entry, path: logicalPathFromSpacePath(input.space, entry.path) }));
-  } catch {
+  } catch (error) {
+    // Initial, unconfigured folders historically have no local rows. During an
+    // active withdrawal, a failed boundary check must remain a visible failure.
+    const status = await ctx.localFolders.status(input.companyId, WIKI_ROOT_FOLDER_KEY);
+    if (status.wikiRetractions?.state === "active") throw error;
     return [];
   }
+  // The host retains the walker's pre-filter truncation bit. Never convert
+  // a partial physical inventory into an apparently complete empty UI result.
+  if (listing.truncated) throw new Error(`E_WIKI_LOCAL_SCAN_INCOMPLETE: ${relativePath}; maximum=${LOCAL_BROWSE_FILE_LIMIT}; refine the folder`);
+  return listing.entries.filter(entry => entry.kind === "file")
+    .map(entry => ({ ...entry, path: logicalPathFromSpacePath(input.space, entry.path) }));
 }
 
 function mergeLocalPageRows(pages: WikiPageRow[], entries: PluginLocalFolderEntry[]): WikiPageRow[] {
@@ -4163,12 +4168,12 @@ async function collectVisibleRows<T>(limit: number,
       if (!(await load(1, scanned)).length) break;
       throw new Error(`E_WIKI_RETRACTION_SCAN_INCOMPLETE: scanned=${scanned}, visible=${rows.length}, requested=${limit}; refine the query`);
     }
-    const take = Math.min(limit - rows.length, LOCAL_BROWSE_FILE_LIMIT - scanned);
+    const take = Math.min(Math.max(limit - rows.length, 50), LOCAL_BROWSE_FILE_LIMIT - scanned);
     const batch = await load(take, scanned);
     if (!batch.length) break;
     if (batch.length > take) throw new Error("E_WIKI_PAGE_WINDOW_INVALID");
     const checked = await check(batch);
-    rows.push(...checked.rows);
+    rows.push(...checked.rows.slice(0, limit - rows.length));
     if (checked.retractionReadback) {
       if (checked.retractionReadback.state === "checked") retractionReadback.state = "checked";
       retractionReadback.hiddenCount += checked.retractionReadback.hiddenCount;
@@ -4543,8 +4548,9 @@ export async function listSources(ctx: PluginContext, input: {
       ORDER BY created_at DESC, raw_path
       LIMIT $3 OFFSET $5`,
     [input.companyId, wikiId, take, space.id, offset],
-  ), async rows => ({ rows: input.onlyReadable
-    ? await filterReadableRows(ctx, input.companyId, space, rows, row => row.raw_path) : rows }));
+  ), rows => input.onlyReadable
+    ? filterReadableRows(ctx, input.companyId, space, rows, row => row.raw_path).then(rows => ({ rows }))
+    : filterRetractionRows(ctx, input.companyId, space, rows, row => row.raw_path));
   const sourceRows = sourceResult.rows;
   return {
     sources: sourceRows.map((row) => ({

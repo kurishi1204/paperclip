@@ -1,4 +1,4 @@
-import { test } from "vitest";
+import { test, expect } from "vitest";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, readFile, rm, realpath, symlink } from "node:fs/promises";
 import { join } from "node:path";
@@ -7,6 +7,7 @@ import { registerWikiTools, readWikiPage, writeWikiPage, listPages, listSources 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { retractionFolderGate, canonicalWikiRetractionPath } from "../services/wiki-retraction-gate.js";
 import { executeRetraction, type RetractionEvent, type RetractionStore } from "../services/wiki-retraction-ledger.js";
+import { listPluginLocalFolderEntries } from "../services/plugin-local-folders.js";
 import { publicationHash } from "../services/wiki-publication-readback.js";
 
 test("actual registered Wiki tools and UI page read stop withdrawn bodies and discovery snippets", async () => {
@@ -19,6 +20,7 @@ test("actual registered Wiki tools and UI page read stop withdrawn bodies and di
     const handlers = new Map<string, (input: unknown) => Promise<any>>();
     const allRows = Object.keys(bodies).map(p => ({ kind: "page", path: p, title: p === "wiki/upstream.md" ? "Usable" : "WITHDRAWN SNIPPET", page_type: "source", match_text: "source" }));
     const sourceRows: Array<Record<string, unknown>> = [];
+    let queryWindowCalls=0;
     const ctx = { manifest: {}, tools: { register: (name: string, _meta: unknown, handler: (input: unknown) => Promise<any>) => handlers.set(name,handler) },
       db: { namespace: "synthetic", execute: async () => ({ rowCount: 0 }), query: async (sql: string, params: unknown[] = []) => {
         if (sql.includes("wiki_spaces")) return [];
@@ -29,7 +31,7 @@ test("actual registered Wiki tools and UI page read stop withdrawn bodies and di
         const bound = (token: string | undefined, fallback: number) => token ? token.startsWith("$") ? Number(params[Number(token.slice(1))-1]) : Number(token) : fallback;
         const limit = bound(sql.match(/LIMIT\s+(\$\d+|\d+)/i)?.[1], rows.length);
         const offset = bound(sql.match(/OFFSET\s+(\$\d+|\d+)/i)?.[1], 0);
-        return rows.slice(offset,offset+limit);
+        queryWindowCalls++;return rows.slice(offset,offset+limit);
       } },
       localFolders: {
         status: async () => ({ wikiRetractions: { state: events.length ? "active" : "inactive" } }),
@@ -71,9 +73,22 @@ test("actual registered Wiki tools and UI page read stop withdrawn bodies and di
       {raw_path:"raw/z-upstream.md",title:"Available raw original",source_type:"manual",url:null,status:"captured",created_at:"2026-11-03"});
     assert.deepEqual((await handlers.get("wiki_list_sources")!({...args,limit:1})).data.sources.map((row:{raw_path:string})=>row.raw_path),["raw/z-upstream.md"]);
     assert.deepEqual((await listSources(ctx,{...args,limit:1,onlyReadable:true})).sources.map(row=>row.rawPath),["raw/z-upstream.md"]);
+    // The worker's sources data handler omits onlyReadable: its default must
+    // still exclude held metadata, while inactive ordinary metadata stays usable.
+    expect.soft((await listSources(ctx,{...args,limit:1})).sources.map(row=>row.rawPath)).toEqual(["raw/z-upstream.md"]);
+    await writeFile(join(dir,"raw/zz-unindexed.md"),"Usable unindexed raw file");
+    const rawWindow=await listPluginLocalFolderEntries(dir,{relativePath:"raw",recursive:true,maxEntries:1});
+    assert.equal(rawWindow.truncated,true);assert.equal(rawWindow.entries[0]?.path,"raw/a-held.md");
+    // The real walker has hit its bound before the host removes the held alias.
+    // Preserve that observed incomplete state at the UI's list boundary.
+    (ctx.localFolders as unknown as {list:()=>Promise<unknown>}).list=async()=>({...rawWindow,entries:[]});
+    await expect.soft(listPages(ctx,{...args,pageType:"source",includeRaw:true,limit:1})).rejects.toThrow(/E_WIKI_LOCAL_SCAN_INCOMPLETE/);
+
     // Exhaustion must be reported, never disguised as an empty complete search.
     for(let i=0;i<2001;i++)allRows.push({kind:"page",path:`wiki/000-cap-${String(i).padStart(4,"0")}.md`,title:"WITHDRAWN SNIPPET",page_type:"source",match_text:"source"});
+    queryWindowCalls=0;
     await assert.rejects(handlers.get("wiki_search")!({...args,limit:1}),/E_WIKI_RETRACTION_SCAN_INCOMPLETE.*scanned=2000/);
+    assert.ok(queryWindowCalls<100,`A one-result request must not cause one SQL round trip per held row: ${queryWindowCalls}`);
     await assert.rejects(readWikiPage(ctx,args),/E_SOURCE_RETRACTED/);
     await assert.rejects(writeWikiPage(ctx,{...args,path:"wiki/upstream.md",contents:"overwrite"}),/WRITE_HOLD/);
     assert.equal(await readFile(join(dir,"wiki/upstream.md"),"utf8"),bodies["wiki/upstream.md"]);

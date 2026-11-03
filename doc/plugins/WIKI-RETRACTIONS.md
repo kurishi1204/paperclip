@@ -106,3 +106,11 @@ the operation fails with `E_WIKI_RETRACTION_SCAN_INCOMPLETE` and observed counts
 it does not report a false empty complete result. Raw-source ordering includes a
 path tie-breaker. This does not claim a transactional snapshot across concurrent
 metadata changes or define the still-unaccepted in-flight response contract.
+
+The worker's ordinary `sources` data handler uses the same withdrawal visibility
+rule even when it does not request `onlyReadable`. Inactive ordinary metadata
+listing remains separate from a full readable-file inventory. A physical local
+walk's `truncated` bit is preserved through the host; the UI consumer reports
+`E_WIKI_LOCAL_SCAN_INCOMPLETE` rather than presenting a partial or empty list as
+complete. SQL collection uses batches even when the caller requests one result;
+the caller's visible count and the existing scan bound are still respected.
