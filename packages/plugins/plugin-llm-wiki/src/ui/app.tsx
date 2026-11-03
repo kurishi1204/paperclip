@@ -1,4 +1,4 @@
-import { normalizeWikiLinkPagePath } from "@paperclipai/plugin-sdk/ui";
+import { buildWikiSpacePrefix, buildWikiPageHref, buildWikiReferenceHref } from "@paperclipai/plugin-sdk/ui";
 import {
   AssigneePicker,
   FileTree,
@@ -1429,11 +1429,7 @@ function readSettingsSpaceSlugFromLocation(pathname: string): string | null {
   return typeof slug === "string" && slug.length > 0 ? slug : null;
 }
 
-function buildSpacePrefix(spaceSlug: string): string {
-  return spaceSlug && spaceSlug !== DEFAULT_SPACE_SLUG
-    ? `/wiki/spaces/${encodeURIComponent(spaceSlug)}`
-    : `/wiki`;
-}
+function buildSpacePrefix(spaceSlug:string):string {return buildWikiSpacePrefix(spaceSlug);}
 
 function buildSectionHref(section: SectionKey, spaceSlug: string = DEFAULT_SPACE_SLUG): string {
   const prefix = buildSpacePrefix(spaceSlug);
@@ -1463,11 +1459,7 @@ function readSelectedTreePathFromLocation(pathname: string, search: string): str
   return readSelectedTreePathFromSearch(search);
 }
 
-function buildPageHref(treePath: string, spaceSlug: string = DEFAULT_SPACE_SLUG): string {
-  const prefix = buildSpacePrefix(spaceSlug);
-  const encodedPath = routeSegmentsFromTreePath(treePath).map((segment) => encodeURIComponent(segment)).join("/");
-  return encodedPath ? `${prefix}/page/${encodedPath}` : prefix;
-}
+function buildPageHref(treePath:string,spaceSlug:string=DEFAULT_SPACE_SLUG):string {return buildWikiPageHref(treePath,spaceSlug);}
 
 function wikiSidebarNavigationState(treePath: string): Record<typeof WIKI_SIDEBAR_NAV_STATE_KEY, string> {
   return { [WIKI_SIDEBAR_NAV_STATE_KEY]: treePath };
@@ -1505,14 +1497,6 @@ function writeRouteSidebarExpandedPaths(storageKey: string, paths: ReadonlySet<s
   } catch {
     // Ignore storage failures; the tree still works for the current render.
   }
-}
-
-function buildWikiLinkHref(target: string, resolveHref: (to: string) => string): string | null {
-  const normalized = normalizeWikiLinkPagePath(target);
-  if (!normalized) return null;
-
-  const href = resolveHref(buildPageHref(normalized.path));
-  return normalized.fragment ? `${href}#${encodeURIComponent(normalized.fragment)}` : href;
 }
 
 function routeSegmentsFromTreePath(treePath: string): string[] {
@@ -3269,8 +3253,8 @@ function PageDetail({ context, path, spaceSlug }: { context: { companyId: string
 
   const editable = path ? isEditableWikiPagePath(path) : false;
   const resolveWikiLinkHref = useCallback(
-    (target: string) => buildWikiLinkHref(target, hostNavigation.resolveHref),
-    [hostNavigation.resolveHref],
+    (target: string) => path?buildWikiReferenceHref(target,hostNavigation.resolveHref,{currentPagePath:path,spaceSlug:spaceSlug??DEFAULT_SPACE_SLUG}):null,
+    [hostNavigation.resolveHref,path,spaceSlug],
   );
   const handleTocClick = useCallback((event: React.MouseEvent<HTMLAnchorElement>, id: string) => {
     const root = markdownBodyRef.current;

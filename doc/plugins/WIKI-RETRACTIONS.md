@@ -343,7 +343,7 @@ independent document-version/source-reference publication proof. Only the render
 
 
 Wiki display and publication now share a Markdown AST walk and target normalizer
-from the SDK. The parser uses the same CommonMark/GFM grammar as the renderer.
+from the shared runtime, with compatibility exports through the SDK. The host UI already builds and consumes that shared runtime; it does not acquire a new runtime dependency on prebuilt SDK UI artifacts. The parser uses the same CommonMark/GFM grammar as the renderer.
 Wiki shorthand, local Markdown page links and reference-style definitions resolve
 to canonical page paths before dependency checks and backlink indexing. The Wiki
 renderer uses this same walk when Wiki links are enabled; ordinary non-Wiki routes
@@ -356,3 +356,13 @@ React Markdown renderer and publication resolver have paired synthetic cases;
 the real PostgreSQL publication fixture includes a shorthand and reference-style
 link to one declared source, alongside an external URL, and checks one canonical
 backlink through the registered discovery tool.
+
+
+Reference resolution carries the current logical page path and space. Explicit
+relative Markdown paths resolve against that page without escaping the Wiki/raw
+namespace. Link destinations use the same space as the page whose evidence was
+verified. Absolute application URLs remain application navigation and do not
+declare a Wiki source; use canonical Wiki links and declared source pins for that
+proof. A local source path that cannot be resolved causes E_INVALID_WIKI_REFERENCE
+before publication. The renderer preserves unresolved ordinary Markdown anchors
+for author inspection instead of deleting them silently.

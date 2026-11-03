@@ -1,4 +1,4 @@
-import { transformWikiLinks } from "@paperclipai/plugin-sdk/ui";
+import { transformWikiLinks } from "@paperclipai/shared";
 import { isValidElement, memo, useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Copy, ExternalLink, WrapText } from "lucide-react";

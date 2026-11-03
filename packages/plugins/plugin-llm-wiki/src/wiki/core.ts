@@ -1825,7 +1825,7 @@ async function upsertPageMetadata(ctx: PluginContext, input: {
   const hash = contentHash(input.contents);
   const title = inferTitle(input.path, input.contents);
   const pageType = inferPageType(input.path);
-  const backlinks = extractWikiLinks(input.contents);
+  const backlinks = extractWikiLinks(input.contents,input.path);
   const sourceRefs = Array.isArray(input.sourceRefs) ? input.sourceRefs : [];
 
   await ctx.db.execute(

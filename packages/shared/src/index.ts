@@ -2835,3 +2835,5 @@ export { isAppAggregator, aggregatorManagementUrl, aggregatorAppsSyncSchema, agg
 
 export * from "./connection-instructions.js";
 export * from "./customer-success.js";
+
+export { extractWikiLinks, normalizeWikiLinkPagePath, transformWikiLinks, buildWikiSpacePrefix, buildWikiPageHref, buildWikiReferenceHref, type WikiLinkAstNode } from "./wiki-links.js";

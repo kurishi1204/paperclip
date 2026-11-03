@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { normalizeWikiLinkPagePath, extractWikiLinks } from "@paperclipai/plugin-sdk";
+import { normalizeWikiLinkPagePath, extractWikiLinks, buildWikiReferenceHref } from "@paperclipai/shared";
 
 import type { ComponentProps, ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -744,5 +744,21 @@ describe("shared Wiki publication link interpretation",()=>{
   }});
   expect(html).toContain('href="https://example.test/wiki/p7.md"');expect(html).toMatch(/<code\b[^>]*>\[\[p7\]\]<\/code>/);
   expect(html).not.toContain('data-paperclip-wiki-link="true"');expect(extractWikiLinks(content)).toEqual([]);
+ });
+});
+
+describe("Wiki link page and space context",()=>{
+ it("opens the same non-default space and canonical relative source that publication verifies",()=>{
+  const body="[source](../upstream.md#scope) and [[../upstream.md#scope|source]]";
+  const context={currentPagePath:"wiki/group/revalidated.md",spaceSlug:"team two"};
+  const html=renderMarkdown(body,[],{enableWikiLinks:true,resolveWikiLinkHref:(target)=>buildWikiReferenceHref(target,path=>"/plugin"+path,context)});
+  expect(html.match(/href="\/plugin\/wiki\/spaces\/team%20two\/page\/wiki\/upstream.md#scope"/g)).toHaveLength(2);
+  expect(extractWikiLinks(body,context.currentPagePath)).toEqual(["wiki/upstream.md"]);
+ });
+ it("preserves app URLs and unresolved Markdown links rather than silently losing anchors",()=>{
+  const body="[Settings](/wiki/settings) and [source](../outside.md)";
+  const html=renderMarkdown(body,[],{enableWikiLinks:true,resolveWikiLinkHref:(target)=>buildWikiReferenceHref(target,path=>path,{currentPagePath:"wiki/revalidated.md",spaceSlug:"team"})});
+  expect(html).toContain('href="/wiki/settings"');expect(html).toContain('href="../outside.md"');
+  expect(()=>extractWikiLinks(body,"wiki/revalidated.md")).toThrow(/E_INVALID_WIKI_REFERENCE/);
  });
 });

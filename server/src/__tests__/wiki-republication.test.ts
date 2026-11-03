@@ -270,3 +270,27 @@ test("Markdown reference-style links and Wiki shorthand share one canonical depe
   assert.deepEqual(plan.backlinks,["wiki/upstream.md"]);assert.equal(plan.sourceRefs.length,2);
  }finally{await f.cleanup();}
 });
+
+for(const [path,target]of [["wiki/child-revalidated.md","./upstream.md"],["wiki/section/revalidated.md","../upstream.md"]]as const)
+test("relative publication references use the current page: "+target,async()=>{
+ const f=await fixture();try{
+  const draft=JSON.parse(f.doc.latestBody.split("\n")[1]!);draft.path=path;
+  const latestBody=encodeWikiRepublicationDraft(draft,"[evidence]("+target+"#scope)");
+  const plan=await resolveReviewedWikiRepublication({...f.input,document:{...f.doc,latestBody}});
+  assert.deepEqual(plan.backlinks,["wiki/upstream.md"]);
+ }finally{await f.cleanup();}
+});
+test("application URLs remain application links rather than source declarations",async()=>{
+ const f=await fixture();try{
+  const draft=JSON.parse(f.doc.latestBody.split("\n")[1]!);draft.dependencies=[];
+  const latestBody=encodeWikiRepublicationDraft(draft,"[Settings](/wiki/settings) and [document](/documents/example.md)");
+  const plan=await resolveReviewedWikiRepublication({...f.input,document:{...f.doc,latestBody}});assert.deepEqual(plan.backlinks,[]);
+ }finally{await f.cleanup();}
+});
+test("an unresolved relative source refuses publication explicitly",async()=>{
+ const f=await fixture();try{
+  const draft=JSON.parse(f.doc.latestBody.split("\n")[1]!);draft.dependencies=[];
+  const latestBody=encodeWikiRepublicationDraft(draft,"[source](../outside.md)");
+  await assert.rejects(resolveReviewedWikiRepublication({...f.input,document:{...f.doc,latestBody}}),/E_INVALID_WIKI_REFERENCE/);
+ }finally{await f.cleanup();}
+});

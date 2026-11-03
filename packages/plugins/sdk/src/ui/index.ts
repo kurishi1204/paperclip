@@ -161,4 +161,4 @@ export type {
 } from "./types.js";
 
 // Shared Markdown link interpretation used by the Wiki plugin and host.
-export { normalizeWikiLinkPagePath, transformWikiLinks } from "../wiki-links.js";
+export { normalizeWikiLinkPagePath, transformWikiLinks, buildWikiSpacePrefix, buildWikiPageHref, buildWikiReferenceHref } from "../wiki-links.js";
