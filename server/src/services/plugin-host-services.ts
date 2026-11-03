@@ -828,9 +828,13 @@ export function buildHostServices(
     return withWikiRetractionLock(db, pluginId, companyId, async tx => {
       const events=await loadCurrentWikiRetractions(tx, pluginId, companyId);
       const gate = retractionFolderGate(events, companyId, folderKey);
-      const folder = await inspectStoredLocalFolder(companyId, folderKey, tx);
-      if(!rootConfiguration&&(folder.realPath??folder.path))await assertWikiRootOwnership(tx,pluginId,companyId,(folder.realPath??folder.path)!);
-      if(!rootConfiguration&&gate.active)gate.assertRoot(folder.realPath??"");
+      // Configuration validates its proposed target inside work. Inspecting
+      // an old invalid mapping here would prevent the operator from fixing it.
+      if(!rootConfiguration){
+        const folder=await inspectStoredLocalFolder(companyId,folderKey,tx);
+        if(folder.realPath??folder.path)await assertWikiRootOwnership(tx,pluginId,companyId,(folder.realPath??folder.path)!);
+        if(gate.active)gate.assertRoot(folder.realPath??"");
+      }
       return work(gate, tx, physicalPath=>assertCurrentWikiRepublication(tx,pluginId,companyId,events,physicalPath));
     },rootConfiguration);
   };
