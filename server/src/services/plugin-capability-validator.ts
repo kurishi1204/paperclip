@@ -86,6 +86,7 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "localFolders.status": ["local.folders"],
   "localFolders.list": ["local.folders"],
   "localFolders.readText": ["local.folders"],
+  "localFolders.readTextWithStatus": ["local.folders"],
   "localFolders.writeTextAtomic": ["local.folders"],
   "localFolders.createTextExclusive": ["local.folders"],
 

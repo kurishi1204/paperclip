@@ -4130,8 +4130,9 @@ async function filterWikiRows<T>(ctx: PluginContext, companyId: string, space: P
   // withdrawal may hide a row. Root/permission/transport errors remain errors.
   const checked = await Promise.all(rows.map(async row => {
     try {
-      await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, pathFor(row)));
-      return { row, tombstone: null as unknown };
+      const read=await readWikiTextWithStatus(ctx, companyId, spaceRelativePath(space, pathFor(row)));
+      return { row: read.citationHolds.length ? Object.assign({},row,{citationHolds:read.citationHolds}) : row,
+        tombstone: null as unknown };
     } catch (error) {
       if (!held) return { row: null, tombstone: null as unknown };
       const message = error instanceof Error ? error.message : String(error);
@@ -4210,7 +4211,7 @@ export async function registerWikiTools(ctx: PluginContext) {
       [companyId, wikiId, `%${query}%`, take, space.id, offset],
     ), rows => filterWikiRows(ctx, companyId, space, rows, row => row.path));
     return {
-      content: checked.rows.length ? checked.rows.map((row) => `${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No wiki matches found.",
+      content: checked.rows.length ? checked.rows.map((row) => `${citationRowLabel(row)}${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No wiki matches found.",
       data: { companyId, wikiId, spaceSlug: space.slug, query, results: checked.rows, retractionReadback: checked.retractionReadback },
     };
   });
@@ -4226,8 +4227,10 @@ export async function registerWikiTools(ctx: PluginContext) {
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
     const path = assertPagePath(requireString(input.path, "path"));
     try {
-      const contents = await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, path));
-      return { content: contents, data: { companyId, wikiId, spaceSlug: space.slug, path, hash: contentHash(contents) } };
+      const read = await readWikiTextWithStatus(ctx, companyId, spaceRelativePath(space, path));
+      return { content: citationWarning(read.citationHolds) + read.contents,
+        data: { companyId, wikiId, spaceSlug: space.slug, path, hash: contentHash(read.contents),
+          ...(read.citationHolds.length ? { contents: read.contents, citationHolds: read.citationHolds } : {}) } };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const marker = message.indexOf("E_SOURCE_RETRACTED ");
@@ -4302,7 +4305,7 @@ export async function registerWikiTools(ctx: PluginContext) {
       [companyId, wikiId, take, space.id, offset],
     ), rows => filterWikiRows(ctx, companyId, space, rows, row => row.raw_path));
     return {
-      content: checked.rows.length ? checked.rows.map((row) => `${row.raw_path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No sources captured yet.",
+      content: checked.rows.length ? checked.rows.map((row) => `${citationRowLabel(row)}${row.raw_path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No sources captured yet.",
       data: { companyId, wikiId, spaceSlug: space.slug, sources: checked.rows, retractionReadback: checked.retractionReadback },
     };
   });
@@ -4388,7 +4391,7 @@ export async function registerWikiTools(ctx: PluginContext) {
       [companyId, wikiId, path, space.id, take, offset],
     ), rows => filterWikiRows(ctx, companyId, space, rows, row => row.path));
     return {
-      content: checked.rows.length ? checked.rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No backlinks indexed.",
+      content: checked.rows.length ? checked.rows.map((row) => `${citationRowLabel(row)}${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No backlinks indexed.",
       data: { companyId, wikiId, spaceSlug: space.slug, path, backlinks: checked.rows, retractionReadback: checked.retractionReadback },
     };
   });
@@ -4408,7 +4411,7 @@ export async function registerWikiTools(ctx: PluginContext) {
       [companyId, wikiId, space.id, take, offset],
     ), rows => filterWikiRows(ctx, companyId, space, rows, row => row.path));
     return {
-      content: checked.rows.length ? checked.rows.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No pages indexed yet.",
+      content: checked.rows.length ? checked.rows.map((row) => `${citationRowLabel(row)}${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No pages indexed yet.",
       data: { companyId, wikiId, spaceSlug: space.slug, pages: checked.rows, retractionReadback: checked.retractionReadback },
     };
   });
@@ -4514,6 +4517,7 @@ export async function listPages(ctx: PluginContext, input: {
     pageType: row.page_type,
     backlinkCount: Array.isArray(row.backlinks) ? row.backlinks.length : 0,
     sourceCount: Array.isArray(row.source_refs) ? row.source_refs.length : 0,
+    ...citationRowMetadata(row),
     contentHash: row.content_hash,
     updatedAt: row.updated_at,
   }));
@@ -4562,11 +4566,28 @@ export async function listSources(ctx: PluginContext, input: {
   };
 }
 
+async function readWikiTextWithStatus(ctx: PluginContext, companyId: string, path: string) {
+  if (ctx.localFolders.readTextWithStatus)
+    return ctx.localFolders.readTextWithStatus(companyId, WIKI_ROOT_FOLDER_KEY, path);
+  return { contents: await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, path), citationHolds: [] };
+}
+function citationRowMetadata(row: unknown) {
+  const holds=(row as {citationHolds?:unknown[]})?.citationHolds;
+  return holds?.length ? {citationHolds:holds} : {};
+}
+function citationRowLabel(row: unknown) {
+  return citationRowMetadata(row).citationHolds?.length ? "[引用利用保留] " : "";
+}
+function citationWarning(holds: unknown[]) {
+  return holds.length ? "[E_WIKI_CITATION_HOLD " + JSON.stringify(holds) + "]\n利用保留、誤り認定ではない。該当引用を根拠に使わず、無関係な内容のみ再利用してください。\n\n" : "";
+}
+
 export async function readWikiPage(ctx: PluginContext, input: { companyId: string; wikiId?: string | null; spaceSlug?: string | null; path: string }) {
   const wikiId = normalizeWikiId(input.wikiId);
   const space = await resolveSpace(ctx, { companyId: input.companyId, wikiId, spaceSlug: input.spaceSlug });
   const path = assertWikiPath(input.path);
-  const contents = await ctx.localFolders.readText(input.companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, path));
+  const read = await readWikiTextWithStatus(ctx, input.companyId, spaceRelativePath(space, path));
+  const { contents, citationHolds } = read;
   const meta = await ctx.db.query<{ title: string | null; page_type: string | null; backlinks: unknown; source_refs: unknown; updated_at: string }>(
     `SELECT title, page_type, backlinks, source_refs, updated_at::text AS updated_at
        FROM ${tableName(ctx.db.namespace, "wiki_pages")}
@@ -4580,6 +4601,8 @@ export async function readWikiPage(ctx: PluginContext, input: { companyId: strin
     spaceSlug: space.slug,
     path,
     contents,
+    citationHolds,
+    warnings: citationHolds.length ? ["利用保留、誤り認定ではない。失効した引用以外の内容は再利用できます。"] : [],
     title: row?.title ?? inferTitle(path, contents),
     pageType: row?.page_type ?? inferPageType(path),
     backlinks: Array.isArray(row?.backlinks) ? row?.backlinks : [],

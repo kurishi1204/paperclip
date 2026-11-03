@@ -92,16 +92,23 @@ export interface PublicationCitation {
   path: string; wikiSHA256: string; documentId: string; revisionId: string;
   documentBodySHA256: string; bodyByteStart: number; bodyByteEndExclusive: number; reviewId: string;
 }
+export interface PublicationCitationHold {
+  path: string; documentId: string; revisionId: string; wikiSHA256: string;
+  retractedPath: string; retractionId: string; eventHash: string; reason: string;
+  state: "citation_use_held";
+}
 export interface PublicationProof {
-  state: "verified";
+  state: "verified" | "verified_with_citation_holds";
   citation: PublicationCitation;
   dependencies: PublicationCitation[];
+  invalidatedCitations?: PublicationCitationHold[];
 }
 export async function verifyWikiPublication(registry: PublicationRegistry, path: string, readers: PublicationReaders, initialSeen = new Set<string>()): Promise<PublicationProof> {
   const verified = new Map<string, PublicationProof>();
   async function visit(path: string, seen: Set<string>): Promise<PublicationProof> {
     const block = await readers.retraction?.(path);
-    if (block) throw new PublicationRetractionError(block);
+    if (block && !(block.state === "blocked_by_retraction" && block.readPolicy === "citation-holds"))
+      throw new PublicationRetractionError(block);
     publicationNeed(!seen.has(path), "dependency_cycle");
     const cached = verified.get(path);
     if (cached) return cached;
@@ -128,15 +135,35 @@ export async function verifyWikiPublication(registry: PublicationRegistry, path:
     const refs = page.sourceRefs.map(object); const own = refs.filter(r => r.kind === "document" && r.documentId === pin.documentId);
     publicationNeed(own.length === 1 && ["issueId", "documentId", "documentKey", "revisionId"].every(k => own[0]![k] === pin[k as keyof PublicationPin]), "own_reference_changed");
     const dependencies: PublicationCitation[] = [];
+    const invalidated: PublicationCitationHold[] = [];
     for (const ref of refs) {
       publicationNeed(ref.kind === "document", "unregistered_source_kind");
       if (ref.documentId === pin.documentId) continue;
       const parents = registry.entries.filter(p => ["issueId", "documentId", "documentKey", "revisionId"].every(k => p[k as keyof PublicationPin] === ref[k]));
       publicationNeed(parents.length === 1, "unregistered_dependency");
-      const parent = await visit(parents[0]!.path, nextSeen); dependencies.push(parent.citation);
+      try {
+        const parent = await visit(parents[0]!.path, nextSeen);
+        dependencies.push(parent.citation);
+        invalidated.push(...(parent.invalidatedCitations ?? []));
+      } catch (error) {
+        // Only a host-recorded citation policy permits a partial proof.
+        // A v1 fence, transport error, changed body or bad QA still fails.
+        if (!(error instanceof PublicationRetractionError) || block?.readPolicy !== "citation-holds" ||
+          block.state !== "blocked_by_retraction" || error.block.readPolicy !== "citation-holds") throw error;
+        const pin=parents[0]!;
+        invalidated.push({ path: pin.path, documentId: pin.documentId, revisionId: pin.revisionId,
+          wikiSHA256: pin.wikiSHA256, retractedPath: error.block.retractedPath,
+          retractionId: error.block.retractionId, eventHash: error.block.eventHash,
+          reason: error.block.reason, state: "citation_use_held" });
+      }
     }
     publicationNeed(new Set(dependencies.map(p => p.path)).size === dependencies.length, "duplicate_dependency");
-    const proof: PublicationProof = { state: "verified", citation: { path, wikiSHA256: pin.wikiSHA256, documentId: pin.documentId, revisionId: pin.revisionId, documentBodySHA256: pin.documentBodySHA256, bodyByteStart: start, bodyByteEndExclusive: start + body.length, reviewId: pin.reviewId }, dependencies };
+    const holds = [...new Map(invalidated.map(h => [JSON.stringify([h.path,h.retractionId,h.eventHash]),h])).values()];
+    // A recorded downstream hold must resolve to an invalid reference. Never
+    // silently present an unexplained hold as fully verified.
+    publicationNeed(!block || holds.length > 0, "citation_hold_unresolved");
+    const proof: PublicationProof = { state: holds.length ? "verified_with_citation_holds" : "verified",
+      ...(holds.length ? { invalidatedCitations: holds } : {}), citation: { path, wikiSHA256: pin.wikiSHA256, documentId: pin.documentId, revisionId: pin.revisionId, documentBodySHA256: pin.documentBodySHA256, bodyByteStart: start, bodyByteEndExclusive: start + body.length, reviewId: pin.reviewId }, dependencies };
     // Only successful proofs are reused, only within this tool call. A later
     // employee read always checks current documents and QA records again.
     verified.set(path, proof);
@@ -163,7 +190,8 @@ export async function applyWikiPublicationReadback<T extends { content?: unknown
   publicationNeed(!requestedRegistered || (resolvedRegistered && data.path === args.path), "tool_metadata_changed");
   if (data.wikiId === registry.wikiId && data.spaceSlug === registry.spaceSlug) {
     const direct = await readers.retraction?.(data.path);
-    if (direct) return retractedToolResult<T>(registry, data.path, direct);
+    if (direct && !(direct.state === "blocked_by_retraction" && direct.readPolicy === "citation-holds"))
+      return retractedToolResult<T>(registry, data.path, direct);
   }
   if (!resolvedRegistered) {
     return { ...result, content: "[Current publication receipt not registered for this Wiki page; treat it as unverified source material.]\n\n" + result.content, data: { ...data, publicationReadback: { state: "unregistered" } } };
@@ -177,9 +205,17 @@ export async function applyWikiPublicationReadback<T extends { content?: unknown
     if (!(error instanceof PublicationRetractionError)) throw error;
     return retractedToolResult<T>(registry, resolvedPath, error.block);
   }
-  publicationNeed(result.content === root?.contents, "tool_body_changed");
+  publicationNeed(proof.state === "verified_with_citation_holds"
+    ? data.contents === root?.contents : result.content === root?.contents, "tool_body_changed");
   publicationNeed(data.companyId === companyId && data.wikiId === registry.wikiId &&
     data.spaceSlug === registry.spaceSlug && data.path === resolvedPath &&
     data.hash === proof.citation.wikiSHA256, "tool_metadata_changed");
+  if (proof.state === "verified_with_citation_holds") {
+    const warning="[E_WIKI_CITATION_HOLD " + JSON.stringify(proof.invalidatedCitations) + "]\n利用保留、誤り認定ではない。該当引用を根拠に使わず、無関係な内容のみ再利用してください。\n\n";
+    // Re-render from the exact pinned bytes and host proof, discarding any
+    // worker-supplied warning, extra prose or invented hold metadata.
+    return { ...result, content: warning + root!.contents,
+      data: { ...data, contents: root!.contents, citationHolds: proof.invalidatedCitations, publicationReadback: proof } };
+  }
   return { ...result, data: { ...data, publicationReadback: proof } };
 }

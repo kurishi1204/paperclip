@@ -20,16 +20,32 @@ export function retractionFolderGate(events: RetractionEvent[], companyId: strin
   for (const event of active) if (!event.fence) throw new RetractionError("missing_runtime_fence");
   const relevant = active.filter(e => e.fence!.folderKey === folderKey);
   function block(path: string): RetractionBlock | null {
+    const blocks = relevant.map(event => retractionFolderGateSingle(event, path)).filter((b): b is RetractionBlock => b !== null);
+    return blocks.find(b => b.state === "retracted" || b.readPolicy !== "citation-holds") ?? blocks[0] ?? null;
+  }
+  function citationHolds(filePath: string) {
+    return relevant.flatMap(event => {
+      const match=event.fence!.blocks.find(b => b.path === filePath);
+      return event.fence!.mode === "citation-holds" && match?.state === "blocked_by_retraction"
+        ? [{ state: "blocked_by_retraction" as const, path: filePath, retractedPath: event.path,
+          retractionId: event.retractionId, reason: event.reason, eventHash: event.eventHash,
+          readPolicy: "citation-holds" as const }] : [];
+    });
+  }
+  function assertCitationRead(filePath: string, contents?: string) {
     for (const event of relevant) {
-      const match = event.fence!.blocks.find(b => b.path === path);
-      const prefix = event.fence!.pathPrefix ? event.fence!.pathPrefix + "/wiki/" : "wiki/";
-      if (match || (path.startsWith(prefix) && !event.fence!.readable.some(p => p.path === path))) return { state: match?.state ?? "blocked_by_retraction", path, retractionId: event.retractionId,
-        retractedPath: event.path, reason: event.reason, eventHash: event.eventHash };
+      // Evaluate every fence. A legacy hold or direct withdrawal must not be
+      // hidden by the first, citation-only fence affecting the same page.
+      const single = retractionFolderGateSingle(event, filePath);
+      if (single && !(event.fence!.mode === "citation-holds" && single.state === "blocked_by_retraction"))
+        throw new Error("E_SOURCE_RETRACTED " + JSON.stringify(single));
+      const pin = event.fence!.blocks.find(p => p.path === filePath) ?? event.fence!.readable.find(p => p.path === filePath);
+      if (contents !== undefined && pin && publicationHash(contents) !== pin.contentHash)
+        throw new RetractionError("readable_content_changed");
     }
-    return null;
   }
   return {
-    active: relevant.length > 0, block,
+    active: relevant.length > 0, block, citationHolds, assertCitationRead,
     assertRoot(rootPath: string) {
       // The recorded fence uses paths relative to this exact physical root.
       // A different root needs an explicit reviewed transition, not rebasing.
@@ -49,6 +65,16 @@ export function retractionFolderGate(events: RetractionEvent[], companyId: strin
         throw new Error("E_WIKI_RETRACTION_WRITE_HOLD: Wiki writes are held; raw capture and originals are retained");
     },
   };
+}
+
+function retractionFolderGateSingle(event: RetractionEvent, filePath: string): RetractionBlock | null {
+  const match=event.fence!.blocks.find(b => b.path === filePath);
+  const prefix=event.fence!.pathPrefix ? event.fence!.pathPrefix + "/wiki/" : "wiki/";
+  if (!match && !(filePath.startsWith(prefix) && !event.fence!.readable.some(p => p.path === filePath))) return null;
+  // Unknown pages are never treated as reviewed downstream citations.
+  return { state: match?.state ?? "retracted", path: filePath, retractedPath: event.path,
+    retractionId: event.retractionId, reason: event.reason, eventHash: event.eventHash,
+    ...(match && event.fence!.mode === "citation-holds" ? { readPolicy: "citation-holds" as const } : {}) };
 }
 
 /** Resolve the existing parent even when a new leaf does not exist.
@@ -76,10 +102,11 @@ export const canonicalWikiRetractionPath = async (rootPath: string, relativePath
 /** Metadata may precede a raw file. Only normalize that expected absence after
  * root, lexical and physical withdrawal checks; other boundary failures escape. */
 export async function readRetractionFolderText(rootPath: string, relativePath: string,
-  gate: ReturnType<typeof retractionFolderGate>): Promise<string> {
-  gate.assertRoot(rootPath); gate.assertRead(relativePath);
+  gate: ReturnType<typeof retractionFolderGate>, citationAware = false): Promise<string> {
+  const assertRead = citationAware ? gate.assertCitationRead : gate.assertRead;
+  gate.assertRoot(rootPath); assertRead(relativePath);
   const canonical = await canonicalWikiRetractionPath(rootPath, relativePath);
-  gate.assertRead(canonical);
+  assertRead(canonical);
   let contents: string;
   try { contents = await readPluginLocalFolderText(rootPath, relativePath); }
   catch (error) {
@@ -90,5 +117,12 @@ export async function readRetractionFolderText(rootPath: string, relativePath: s
     }
     throw error;
   }
-  gate.assertRead(canonical, contents); return contents;
+  assertRead(canonical, contents); return contents;
+}
+
+export async function readRetractionFolderTextWithStatus(rootPath: string, relativePath: string,
+  gate: ReturnType<typeof retractionFolderGate>) {
+  const contents = await readRetractionFolderText(rootPath, relativePath, gate, true);
+  const canonical = await canonicalWikiRetractionPath(rootPath, relativePath);
+  return { contents, citationHolds: gate.citationHolds(canonical) };
 }

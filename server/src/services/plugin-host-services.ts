@@ -50,7 +50,7 @@ import { pluginStateStore } from "./plugin-state-store.js";
 import { pluginLifecycleInbox } from "./plugin-lifecycle-inbox.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { loadAllWikiRetractions, withWikiRetractionLock } from "./wiki-retraction-store.js";
-import { retractionFolderGate, readRetractionFolderText, canonicalWikiRetractionPath as canonicalFolderPath } from "./wiki-retraction-gate.js";
+import { retractionFolderGate, readRetractionFolderText, readRetractionFolderTextWithStatus, canonicalWikiRetractionPath as canonicalFolderPath } from "./wiki-retraction-gate.js";
 import { pluginManagedAgentService } from "./plugin-managed-agents.js";
 import { pluginManagedRoutineService } from "./plugin-managed-routines.js";
 import { pluginManagedSkillService } from "./plugin-managed-skills.js";
@@ -1511,7 +1511,11 @@ export function buildHostServices(
           });
           const entries = [];
           for (const entry of listing.entries) {
-            if (entry.kind === "directory" || (!gate.block(entry.path) && !gate.block(await canonicalFolderPath(status.realPath!, entry.path)))) entries.push(entry);
+            if (entry.kind === "directory") { entries.push(entry); continue; }
+            const canonical=await canonicalFolderPath(status.realPath!, entry.path);
+            const holds=[gate.block(entry.path),gate.block(canonical)].filter(Boolean);
+            if (holds.every(hold => hold!.state === "blocked_by_retraction" && hold!.readPolicy === "citation-holds"))
+              entries.push({...entry,...(holds.length ? {citationHolds:gate.citationHolds(canonical)} : {})});
           }
           return { ...listing, entries, folderKey: params.folderKey,
             retractionReadback: { state: gate.active ? "checked" : "inactive", hiddenCount: listing.entries.length - entries.length } };
@@ -1523,6 +1527,14 @@ export function buildHostServices(
           const status = await inspectStoredLocalFolder(params.companyId, params.folderKey, connection);
           assertConfiguredLocalFolder(status);
           return readRetractionFolderText(status.realPath!, params.relativePath, gate);
+        });
+      },
+
+      async readTextWithStatus(params) {
+        return withWikiFolderFence(params.companyId, params.folderKey, async (gate, connection) => {
+          const status = await inspectStoredLocalFolder(params.companyId, params.folderKey, connection);
+          assertConfiguredLocalFolder(status);
+          return readRetractionFolderTextWithStatus(status.realPath!, params.relativePath, gate);
         });
       },
 

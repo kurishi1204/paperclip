@@ -185,3 +185,35 @@ test("a new reviewer's revoked receipt still blocks the dependent page", async (
   f.reviews.source!.status = "rejected";
   await assert.rejects(f.run(), /review_not_accepted/);
 });
+
+function citationReaders(f: ReturnType<typeof fixture>, legacy=false) {
+ return {page:async(p:string)=>f.pages[p]!,document:async(id:string)=>f.documents[id]!,review:async(id:string)=>f.reviews[id]!,
+  retraction:async(p:string)=>({state:p==="source"?"retracted" as const:"blocked_by_retraction" as const,path:p,retractedPath:"source",retractionId:"withdrawal",reason:"Needs revalidation",eventHash:"e".repeat(64),...(legacy?{}:{readPolicy:"citation-holds" as const})})};
+}
+test("citation policy keeps exact downstream body and reconstructs held reference proof",async()=>{
+ const f=fixture();const body=f.pages.synthesis!.contents;
+ const input={...f.result,content:"worker warning is replaced",data:{...f.result.data,contents:body,citationHolds:[{invented:true}]}};
+ const out=await applyWikiPublicationReadback(f.registry,"company",{companyId:"company",path:"synthesis"},input,citationReaders(f));
+ const proof=(out.data as JsonObject).publicationReadback as JsonObject;
+ assert.equal(proof.state,"verified_with_citation_holds");
+ assert.deepEqual((proof.invalidatedCitations as JsonObject[]).map(h=>[h.path,h.documentId,h.revisionId]),[["source","doc-source","rev-source"]]);
+ assert.ok(out.content.endsWith(body as string));assert.match(out.content,/利用保留、誤り認定ではない/);
+ assert.equal(out.content.includes("invented"),false);
+ assert.equal(f.pages.synthesis!.contents,body);
+});
+test("direct source stays a tombstone; legacy downstream stays blocked",async()=>{
+ const f=fixture();
+ const direct=await applyWikiPublicationReadback(f.registry,"company",{companyId:"company",path:"source"},{content:"untrusted body",data:{companyId:"company",wikiId:"default",spaceSlug:"default",path:"source"}},citationReaders(f));
+ assert.equal(direct.content.includes(f.pages.source!.contents as string),false);
+ assert.equal(((direct.data as JsonObject).publicationReadback as JsonObject).state,"retracted");
+ const legacy=await applyWikiPublicationReadback(f.registry,"company",{companyId:"company",path:"synthesis"},f.result,citationReaders(f,true));
+ assert.equal(legacy.content.includes(f.pages.synthesis!.contents as string),false);
+});
+test("citation policy still rejects changed downstream text, invalid QA and worker substitution",async()=>{
+ for(const mutation of ["page","qa","worker"]){const f=fixture();const input={...f.result,data:{...f.result.data,contents:f.pages.synthesis!.contents}};
+  if(mutation==="page")f.pages.synthesis!.contents="modified";
+  if(mutation==="qa")f.reviews.synthesis!.status="pending";
+  if(mutation==="worker")input.data.contents="substituted";
+  await assert.rejects(applyWikiPublicationReadback(f.registry,"company",{companyId:"company",path:"synthesis"},input,citationReaders(f)));
+ }
+});

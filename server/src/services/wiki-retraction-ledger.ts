@@ -24,7 +24,7 @@ export interface RetractionFence {
   folderKey: "wiki-root";
   rootPath: string;
   pathPrefix: string;
-  mode: "freeze-wiki";
+  mode: "freeze-wiki" | "citation-holds";
   readable: Array<{ path: string; contentHash: string }>;
   blocks: Array<{ path: string; contentHash: string; state: "retracted" | "blocked_by_retraction" }>;
 }
@@ -100,7 +100,7 @@ export function validateRetractionEvents(scope: RetractionScope, events: Retract
     need([event.id, event.retractionId, event.reason, event.actorId, event.at].every(text) &&
       Number.isFinite(Date.parse(event.at)) && (event.runId === null || text(event.runId)), "ledger_event");
     if (event.fence) {
-      need(typeof event.fence.pathPrefix === "string" && text(event.fence.rootPath) && event.fence.folderKey === "wiki-root" && event.fence.mode === "freeze-wiki" &&
+      need(typeof event.fence.pathPrefix === "string" && text(event.fence.rootPath) && event.fence.folderKey === "wiki-root" && ["freeze-wiki", "citation-holds"].includes(event.fence.mode) &&
         Array.isArray(event.fence.readable) && Array.isArray(event.fence.blocks) && event.fence.blocks.length > 0, "fence_shape");
       const paths = new Set<string>();
       for (const block of event.fence.blocks) {
@@ -171,6 +171,7 @@ export async function executeRetraction(store: RetractionStore, input: {
 /** The content of dependants is retained; its use is held, never declared false. */
 export interface RetractionBlock {
   state: "retracted" | "blocked_by_retraction";
+  readPolicy?: "citation-holds";
   path: string;
   retractionId: string;
   retractedPath: string;

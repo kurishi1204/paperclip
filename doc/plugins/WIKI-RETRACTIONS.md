@@ -12,6 +12,21 @@ pages, until a separately reviewed publication transition is available. Immutabl
 raw capture and raw reading continue. Other companies and other Wiki spaces are
 outside that path fence.
 
+## Citation-aware read work in progress
+
+The experimental `citation-holds` fence policy preserves pinned downstream
+bytes and marks invalid citations separately. `localFolders.readTextWithStatus`
+is a capability-gated host method; the string reader still refuses held pages.
+The Wiki read tool and page UI retain the body with explicit citation warnings.
+The publication verifier independently reconstructs invalid reference metadata;
+it never upgrades the whole page to an unconditional proof. Legacy fences stay
+strict and cannot be weakened by the new reader. Indexed discovery retains downstream rows with machine-readable citation holds and text warnings; direct withdrawals remain hidden. Writes remain frozen.
+
+The current execute/preview route still emits only `freeze-wiki`. Owner-consent
+resolution, new-publication release and production
+acceptance of the citation policy are not complete. Do not activate it by
+rewriting a ledger event or configuration.
+
 ## Operator path
 
 All three routes require authenticated board access and company authorization.

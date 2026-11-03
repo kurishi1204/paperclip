@@ -329,6 +329,7 @@ type PageContentData = {
   pageType: string | null;
   backlinks: string[];
   sourceRefs: Array<Record<string, unknown> | string>;
+  citationHolds?: Array<{ retractedPath: string; retractionId: string; eventHash: string }>;
   updatedAt: string | null;
   hash: string;
 };
@@ -3364,6 +3365,13 @@ function PageDetail({ context, path, spaceSlug }: { context: { companyId: string
 
   return (
     <article style={{ padding: isMobile ? "16px" : "24px 28px", display: "grid", gap: isMobile ? 12 : 14, minWidth: 0 }}>
+      {content.data.citationHolds?.length ? <Callout tone="warn">
+        <strong>引用の利用保留（本文の誤り認定ではありません）</strong>
+        <p>以下の出典に依存する引用は使わず、無関係な内容のみ再利用してください。</p>
+        <ul>{content.data.citationHolds.map(hold => <li key={hold.retractionId}>
+          <Mono>{hold.retractedPath}</Mono> — <Mono>{hold.retractionId}</Mono>
+        </li>)}</ul>
+      </Callout> : null}
       <header style={{ display: "grid", gap: 8, minWidth: 0 }}>
         <div style={{ display: "flex", alignItems: "flex-start", gap: 12, flexWrap: "wrap", minWidth: 0 }}>
           <div style={{ flex: "1 1 260px", minWidth: 0 }}>

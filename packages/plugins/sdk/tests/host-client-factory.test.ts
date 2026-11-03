@@ -433,3 +433,21 @@ describe("createHostClientHandlers capability gating for LOOA-641 methods", () =
     expect(list).not.toHaveBeenCalled();
   });
 });
+
+describe("citation-aware local-folder reader",()=>{
+ it("keeps capability and company checks ahead of the real structured read",async()=>{
+  const readTextWithStatus=vi.fn(async()=>({contents:"body",citationHolds:[]}));const services={localFolders:{readTextWithStatus}} as unknown as HostServices;
+  const args={companyId:"company-a",folderKey:"wiki-root",relativePath:"wiki/a.md"};
+  const denied=createHostClientHandlers({pluginId:"test",capabilities:[],services});
+  await expect(denied["localFolders.readTextWithStatus"](args,{invocationScope:{companyId:"company-a"}})).rejects.toBeInstanceOf(CapabilityDeniedError);
+  const allowed=createHostClientHandlers({pluginId:"test",capabilities:["local.folders"],services});
+  await expect(allowed["localFolders.readTextWithStatus"]({...args,companyId:"company-b"},{invocationScope:{companyId:"company-a"}})).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+  expect(readTextWithStatus).not.toHaveBeenCalled();
+  await expect(allowed["localFolders.readTextWithStatus"](args,{invocationScope:{companyId:"company-a"}})).resolves.toEqual({contents:"body",citationHolds:[]});expect(readTextWithStatus).toHaveBeenCalledTimes(1);
+ });
+ it("older service fallback remains strict and is not retried after a boundary rejection",async()=>{
+  const readText=vi.fn(async()=>{throw new Error("E_SOURCE_RETRACTED");});const services={localFolders:{readText}} as unknown as HostServices;
+  const h=createHostClientHandlers({pluginId:"test",capabilities:["local.folders"],services});
+  await expect(h["localFolders.readTextWithStatus"]({companyId:"c",folderKey:"wiki-root",relativePath:"wiki/a.md"},{invocationScope:{companyId:"c"}})).rejects.toThrow("E_SOURCE_RETRACTED");expect(readText).toHaveBeenCalledTimes(1);
+ });
+});

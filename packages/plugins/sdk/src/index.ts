@@ -236,6 +236,8 @@ export type {
   PluginLocalFolderListOptions,
   PluginLocalFolderEntry,
   PluginLocalFolderListing,
+  PluginWikiCitationHold,
+  PluginLocalFolderTextRead,
   PluginLocalFoldersClient,
   PluginEventsClient,
   ResourceLifecycleEvent,

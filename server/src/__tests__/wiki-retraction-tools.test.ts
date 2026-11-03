@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { registerWikiTools, readWikiPage, writeWikiPage, listPages, listSources } from "../../../packages/plugins/plugin-llm-wiki/src/wiki/core.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { retractionFolderGate, readRetractionFolderText } from "../services/wiki-retraction-gate.js";
+import { retractionFolderGate, readRetractionFolderText, readRetractionFolderTextWithStatus } from "../services/wiki-retraction-gate.js";
 import { executeRetraction, type RetractionEvent, type RetractionStore } from "../services/wiki-retraction-ledger.js";
 import { listPluginLocalFolderEntries } from "../services/plugin-local-folders.js";
 import { publicationHash } from "../services/wiki-publication-readback.js";
@@ -121,4 +121,32 @@ test("actual registered Wiki tools and UI page read stop withdrawn bodies and di
     assert.equal(await readFile(join(dir,"wiki/upstream.md"),"utf8"),bodies["wiki/upstream.md"]);
     assert.equal(await readFile(join(dir,"wiki/p7.md"),"utf8"),bodies["wiki/p7.md"]);
   } finally { await rm(dir,{recursive:true}); }
+});
+
+test("registered Wiki tool and page UI receive the same unchanged downstream body and citation holds",async()=>{
+ const dir=await realpath(await mkdtemp(join(tmpdir(),"wiki-citation-tool-")));try{
+  await mkdir(join(dir,"wiki"));const bodies={"wiki/p7.md":"Retracted source", "wiki/child.md":"Dependent assertion. Independent usable fact."};
+  for(const [p,b] of Object.entries(bodies))await writeFile(join(dir,p),b);
+  const events:RetractionEvent[]=[];const store:RetractionStore={read:async()=>events,transaction:async(_s,work)=>work({events:async()=>events,append:async(e)=>{events.push(e);}})};
+  const target={companyId:"c",wikiId:"default",spaceSlug:"default",path:"wiki/p7.md",contentHash:publicationHash(bodies["wiki/p7.md"])};
+  await executeRetraction(store,{target,retractionId:"c-op",reason:"Revalidation needed",actorId:"owner",runId:null,eventId:"e",at:"2026-11-03T02:00:00Z",
+   approval:{id:"qa",companyId:"c",target,reason:"Revalidation needed",reviewerId:"reviewer",reviewRunId:"r",ownerDecisionId:"op"},
+   fence:{folderKey:"wiki-root",rootPath:dir,pathPrefix:"",mode:"citation-holds",readable:[],blocks:Object.entries(bodies).map(([p,b])=>({path:p,contentHash:publicationHash(b),state:p===target.path?"retracted":"blocked_by_retraction"}))},readCurrent:async()=>({path:target.path,contentHash:target.contentHash})});
+  const handlers=new Map<string,(args:unknown)=>Promise<any>>();
+  const ctx={manifest:{},tools:{register:(n:string,_m:unknown,h:(a:unknown)=>Promise<any>)=>handlers.set(n,h)},db:{namespace:"synthetic",execute:async()=>({rowCount:0}),query:async(sql:string)=>sql.includes("wiki_spaces")?[]:Object.entries(bodies).map(([path,body])=>({path,kind:"page",title:path===target.path?"Source":"Child",page_type:"synthesis",source_refs:[],backlinks:[],updated_at:null,content_hash:publicationHash(body)}))},
+   localFolders:{status:async()=>({ready:true,wikiRetractions:{state:"active"}}),readText:async(_c:string,_f:string,p:string)=>readRetractionFolderText(dir,p,retractionFolderGate(events,"c","wiki-root")),readTextWithStatus:async(_c:string,_f:string,p:string)=>readRetractionFolderTextWithStatus(dir,p,retractionFolderGate(events,"c","wiki-root"))}} as unknown as PluginContext;
+  await registerWikiTools(ctx);const args={companyId:"c",path:"wiki/child.md"};const output=await handlers.get("wiki_read_page")!(args);
+  assert.equal(output.data.contents,bodies["wiki/child.md"]);assert.equal(output.data.hash,publicationHash(bodies["wiki/child.md"]));
+  assert.match(output.content,/E_WIKI_CITATION_HOLD/);assert.match(output.content,/Independent usable fact/);assert.equal(output.data.citationHolds.length,1);
+  const page=await readWikiPage(ctx,args);assert.equal(page.contents,output.data.contents);assert.deepEqual(page.citationHolds,output.data.citationHolds);
+  for(const tool of ["wiki_search","wiki_list_pages","wiki_list_backlinks"]){
+   const discovery=await handlers.get(tool)!({...args,query:"fact"});
+   const rows=discovery.data.results??discovery.data.pages??discovery.data.backlinks;
+   assert.deepEqual(rows.map((r:{path:string})=>r.path),["wiki/child.md"]);
+   assert.equal(rows[0].citationHolds.length,1);assert.match(discovery.content,/引用利用保留/);
+  }
+  const listed=await listPages(ctx,{companyId:"c",pageType:"synthesis"});assert.equal((listed.pages[0] as unknown as {citationHolds:unknown[]}).citationHolds.length,1);
+  const direct=await handlers.get("wiki_read_page")!({companyId:"c",path:target.path});assert.equal(direct.data.publicationReadback.state,"retracted");assert.equal(direct.content.includes(bodies["wiki/p7.md"]),false);
+  assert.equal(await readFile(join(dir,"wiki/child.md"),"utf8"),bodies["wiki/child.md"]);
+ }finally{await rm(dir,{recursive:true});}
 });

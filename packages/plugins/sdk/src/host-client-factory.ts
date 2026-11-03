@@ -113,6 +113,7 @@ export interface HostServices {
     status(params: WorkerToHostMethods["localFolders.status"][0]): Promise<WorkerToHostMethods["localFolders.status"][1]>;
     list(params: WorkerToHostMethods["localFolders.list"][0]): Promise<WorkerToHostMethods["localFolders.list"][1]>;
     readText(params: WorkerToHostMethods["localFolders.readText"][0]): Promise<WorkerToHostMethods["localFolders.readText"][1]>;
+    readTextWithStatus?(params: WorkerToHostMethods["localFolders.readTextWithStatus"][0]): Promise<WorkerToHostMethods["localFolders.readTextWithStatus"][1]>;
     writeTextAtomic(params: WorkerToHostMethods["localFolders.writeTextAtomic"][0]): Promise<WorkerToHostMethods["localFolders.writeTextAtomic"][1]>;
     createTextExclusive(params: WorkerToHostMethods["localFolders.createTextExclusive"][0]): Promise<WorkerToHostMethods["localFolders.createTextExclusive"][1]>;
     deleteFile(params: WorkerToHostMethods["localFolders.deleteFile"][0]): Promise<WorkerToHostMethods["localFolders.deleteFile"][1]>;
@@ -389,6 +390,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "localFolders.status": "local.folders",
   "localFolders.list": "local.folders",
   "localFolders.readText": "local.folders",
+  "localFolders.readTextWithStatus": "local.folders",
   "localFolders.writeTextAtomic": "local.folders",
   "localFolders.createTextExclusive": "local.folders",
   "localFolders.deleteFile": "local.folders",
@@ -730,6 +732,11 @@ export function createHostClientHandlers(
     }),
     "localFolders.readText": gated("localFolders.readText", async (params) => {
       return services.localFolders.readText(params);
+    }),
+    "localFolders.readTextWithStatus": gated("localFolders.readTextWithStatus", async (params) => {
+      if (services.localFolders.readTextWithStatus) return services.localFolders.readTextWithStatus(params);
+      // Old hosts/mocks remain stricter; no retry after a boundary error.
+      return { contents: await services.localFolders.readText(params), citationHolds: [] };
     }),
     "localFolders.writeTextAtomic": gated("localFolders.writeTextAtomic", async (params) => {
       return services.localFolders.writeTextAtomic(params);

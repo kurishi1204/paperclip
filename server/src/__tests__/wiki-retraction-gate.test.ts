@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { retractionFolderGate, canonicalWikiRetractionPath } from "../services/wiki-retraction-gate.js";
+import { retractionFolderGate, canonicalWikiRetractionPath, readRetractionFolderText, readRetractionFolderTextWithStatus } from "../services/wiki-retraction-gate.js";
 import { writePluginLocalFolderTextAtomic, createPluginLocalFolderTextExclusive, readPluginLocalFolderText } from "../services/plugin-local-folders.js";
-import { executeRetraction, type RetractionStore, type RetractionEvent } from "../services/wiki-retraction-ledger.js";
+import { executeRetraction, retractionEventHash, type RetractionStore, type RetractionEvent } from "../services/wiki-retraction-ledger.js";
 import { publicationHash } from "../services/wiki-publication-readback.js";
 
 async function setup() {
@@ -113,4 +113,35 @@ test("an active withdrawal keeps its recorded physical root; changing it cannot 
     retractionFolderGate([], "c", "wiki-root").assertRoot("another-root");
     assert.equal(await readFile(join(f.dir, "wiki/target.md"), "utf8"), f.original);
   } finally { await f.close(); }
+});
+
+test("citation reader preserves downstream bytes with invalid-reference marks; legacy reader stays strict", async () => {
+  const f=await setup();try {
+    await writeFile(join(f.dir,"wiki/child.md"),"Held citation plus an unrelated usable paragraph");
+    await f.withdraw();
+    const events=structuredClone(f.events());const e=events[0]!;
+    e.fence!.mode="citation-holds";
+    e.fence!.blocks.push({path:"wiki/child.md",contentHash:publicationHash("Held citation plus an unrelated usable paragraph"),state:"blocked_by_retraction"});
+    const {eventHash:_,...basis}=e;e.eventHash=retractionEventHash(basis);
+    const gate=retractionFolderGate(events,"c","wiki-root");
+    const read=await readRetractionFolderTextWithStatus(f.dir,"wiki/child.md",gate);
+    assert.equal(read.contents,"Held citation plus an unrelated usable paragraph");
+    assert.equal(read.citationHolds[0]!.retractedPath,"wiki/target.md");
+    assert.equal(read.citationHolds[0]!.readPolicy,"citation-holds");
+    await assert.rejects(readRetractionFolderText(f.dir,"wiki/child.md",gate),/E_SOURCE_RETRACTED/);
+    await assert.rejects(readRetractionFolderTextWithStatus(f.dir,"wiki/target.md",gate),/E_SOURCE_RETRACTED/);
+    assert.equal((await readRetractionFolderTextWithStatus(f.dir,"wiki/upstream.md",gate)).contents,f.upstream);
+    await mkdir(join(f.dir,"raw"));await symlink(join(f.dir,"wiki/target.md"),join(f.dir,"raw/alias.md"));
+    await assert.rejects(readRetractionFolderTextWithStatus(f.dir,"raw/alias.md",gate),/E_SOURCE_RETRACTED/);
+    assert.throws(()=>gate.assertWrite("wiki/new.md"),/WRITE_HOLD/);
+    await writeFile(join(f.dir,"wiki/child.md"),"changed after the snapshot");
+    await assert.rejects(readRetractionFolderTextWithStatus(f.dir,"wiki/child.md",gate),/readable_content_changed/);
+    assert.equal(await readFile(join(f.dir,"wiki/target.md"),"utf8"),f.original);
+  }finally{await f.close();}
+});
+test("citation-aware reader cannot weaken an old freeze fence",async()=>{
+ const f=await setup();try{await f.withdraw();const gate=retractionFolderGate(f.events(),"c","wiki-root");
+  await assert.rejects(readRetractionFolderTextWithStatus(f.dir,"wiki/target.md",gate),/E_SOURCE_RETRACTED/);
+  await assert.rejects(readRetractionFolderTextWithStatus(f.dir,"wiki/not-registered.md",gate),/E_SOURCE_RETRACTED/);
+ }finally{await f.close();}
 });

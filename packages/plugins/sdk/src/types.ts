@@ -517,6 +517,17 @@ export interface PluginLocalFolderListing {
   truncated: boolean;
 }
 
+export interface PluginWikiCitationHold {
+  state: "blocked_by_retraction"; path: string; retractedPath: string;
+  retractionId: string; reason: string; eventHash: string;
+  readPolicy: "citation-holds";
+}
+export interface PluginLocalFolderTextRead {
+  contents: string;
+  /** Host-generated. The bytes remain unchanged; only these citations are held. */
+  citationHolds: PluginWikiCitationHold[];
+}
+
 export interface PluginLocalFoldersClient {
   /** Manifest-declared local folders for this plugin. */
   declarations(): import("@paperclipai/shared").PluginLocalFolderDeclaration[];
@@ -531,6 +542,9 @@ export interface PluginLocalFoldersClient {
    * message E_WIKI_SOURCE_NOT_MATERIALIZED only after root and physical-path
    * checks succeed. This represents absent file bytes, not a boundary failure. */
   readText(companyId: string, folderKey: string, relativePath: string): Promise<string>;
+  /** Citation-aware Wiki reader. A missing method uses the stricter string path.
+   * Directly withdrawn sources still fail with E_SOURCE_RETRACTED. */
+  readTextWithStatus?(companyId: string, folderKey: string, relativePath: string): Promise<PluginLocalFolderTextRead>;
   /** Write a UTF-8 text file below a configured folder using atomic rename. */
   writeTextAtomic(
     companyId: string,
