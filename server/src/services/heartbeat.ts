@@ -620,6 +620,7 @@ import {
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
+import { isCurrentPendingDocumentReviewWake, hasServerRecordedNonAssigneeWake } from "./pending-document-review-wake.js";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
 import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
@@ -17847,8 +17848,12 @@ export function heartbeatService(
       );
       const readiness = dependencyReadiness.get(issueId);
       const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
+      const pendingDocumentReview = await isCurrentPendingDocumentReviewWake(db, {
+        companyId: run.companyId, issueId, agentId: run.agentId, runId: run.id, contextSnapshot: context,
+      });
       if (
         unresolvedBlockerCount > 0 &&
+        !pendingDocumentReview &&
         !allowsIssueInteractionWake(
           context,
           ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
@@ -22638,7 +22643,7 @@ export function heartbeatService(
             // Use the authority recorded by the locked admission gate, never
             // the issue's mutable assignee observed during runtime preparation.
             const authorizedNonAssigneeWake =
-              parseObject(run.runnerProfileJson).aiConnectionNonAssigneeCommentWake === true ||
+              hasServerRecordedNonAssigneeWake(run.runnerProfileJson) ||
               (run.scheduledRetryReason === AI_CONNECTION_BUSY_RETRY_REASON &&
                 isNonAssigneeWorkspaceBusyRetry(run.scheduledRetryReason, parseObject(run.contextSnapshot)));
             await finalizeAiConnectionBusyDeferral(run, error, !authorizedNonAssigneeWake);
@@ -23782,6 +23787,7 @@ export function heartbeatService(
         if (
           !issueId ||
           (!readNonEmptyString(context.qaDecisionId) &&
+            !readNonEmptyString(parseObject(run.runnerProfileJson).pendingDocumentReviewInteractionId) &&
             !isResolvedInteractionContinuationWakeContext(context) &&
             !["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? ""))
         ) {
@@ -29709,13 +29715,17 @@ export function heartbeatService(
           // Blocked descendants should stay idle until the final blocker resolves.
           // Human comment/mention wakes are the exception: they may run in a
           // bounded interaction mode so the assignee can answer or triage.
+          const pendingDocumentReview = await isCurrentPendingDocumentReviewWake(tx as unknown as Db, {
+            companyId: issue.companyId, issueId: issue.id, agentId,
+            contextSnapshot: enrichedContextSnapshot, lock: true,
+          });
           const blockedInteractionWake =
             dependencyReadiness &&
             !dependencyReadiness.isDependencyReady &&
-            allowsIssueInteractionWake(
+            (pendingDocumentReview || allowsIssueInteractionWake(
               enrichedContextSnapshot,
               ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
-            );
+            ));
 
           if (blockedInteractionWake) {
             enrichedContextSnapshot.dependencyBlockedInteraction = true;

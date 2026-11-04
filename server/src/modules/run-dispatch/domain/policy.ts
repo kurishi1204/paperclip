@@ -112,6 +112,7 @@ export type QueuedRunStalenessErrorCode =
   | "issue_dependencies_blocked"
   | "issue_not_found"
   | "issue_assignee_changed"
+  | "interaction_review_stale"
   | "issue_terminal_status"
   | "issue_not_in_progress"
   | "issue_execution_lock_changed"
@@ -146,6 +147,8 @@ export type QueuedRunFacts = {
   /** A connection resolution or tool refresh can resume an agent waiting in review. */
   isConnectionContinuation?: boolean;
   isInteractionWake: boolean;
+  /** Server-loaded pending card and current independent document, not a wake label. */
+  pendingDocumentReview?: boolean;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
 

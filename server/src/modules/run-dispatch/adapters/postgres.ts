@@ -1,4 +1,5 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
+import { isCurrentPendingDocumentReviewWake } from "../../../services/pending-document-review-wake.js";
 import { getExecutionBlocker, isIndependentQaDocumentEpisode } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
@@ -528,7 +529,11 @@ export function createPostgresRunDispatchAdapter(
     );
 
     const wakeCommentId = deriveCommentId(context);
-    const isInteractionWake = allowsIssueInteractionWake(
+    const pendingDocumentReview = await isCurrentPendingDocumentReviewWake(dbOrTx, {
+      companyId: input.companyId, issueId, agentId: input.agentId, runId: input.runId,
+      contextSnapshot: context, lock: Boolean(tx),
+    });
+    const isInteractionWake = pendingDocumentReview || allowsIssueInteractionWake(
       context,
       ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
     );
@@ -605,6 +610,7 @@ export function createPostgresRunDispatchAdapter(
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
+      pendingDocumentReview,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
@@ -992,6 +998,15 @@ export function createPostgresRunDispatchAdapter(
       now,
       tx,
     );
+    const recordedReview = readNonEmptyString(parseObject(run.runnerProfileJson).pendingDocumentReviewInteractionId);
+    if (recordedReview && (!facts.pendingDocumentReview ||
+        recordedReview !== readNonEmptyString(contextSnapshot.interactionId))) {
+      return { issueId, facts, decision: { stale: true as const,
+        errorCode: "interaction_review_stale" as const,
+        reason: "Cancelled because the addressed independent document review is no longer current",
+        details: { issueId, interactionId: recordedReview },
+      } };
+    }
     return { issueId, facts, decision: decideQueuedRunStaleness(facts, now) };
   }
 
@@ -1009,7 +1024,10 @@ export function createPostgresRunDispatchAdapter(
           await tx.update(heartbeatRuns).set({
             runnerProfileJson: {
               ...parseObject(run.runnerProfileJson),
-              aiConnectionNonAssigneeCommentWake: facts.issueAssigneeAgentId !== run.agentId,
+              aiConnectionNonAssigneeWake: facts.issueAssigneeAgentId !== run.agentId,
+              ...(facts.pendingDocumentReview ? {
+                pendingDocumentReviewInteractionId: readNonEmptyString(parseObject(run.contextSnapshot).interactionId),
+              } : {}),
             },
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
         }

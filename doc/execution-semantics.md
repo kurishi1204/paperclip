@@ -811,6 +811,24 @@ the outcome commits. Resolution records an answer; every continuation, task
 creation, tool/provider call, execution-policy transition, spend, deployment, or
 other effect independently re-runs its own authorization and approval gates.
 
+### Named independent document-review wakes
+
+A pending `request_confirmation` addressed to an agent can request an independent
+review of a current issue document without transferring the issue's assignee.
+Dispatch reads the current company-scoped interaction and linked document. The
+card must still be pending, address that agent, permit that agent under its
+stored resolver audience, and target the exact current document/key/revision.
+The reviewer must not be the document's creator or latest agent editor.
+Tool-action and secret confirmations do not use this review entry.
+
+A wake reason or caller-supplied interaction ID is not sufficient authority.
+Admission records the accepted review binding under the issue/run locks and
+checks it again immediately before provider handoff. A resolved request,
+changed document, detached link, or mismatched scope cancels dispatch. Human-only
+resolution, issue holds, budget and provider gates, tool permissions, and the
+existing serialized execution lock remain in force. Previously recorded
+non-assignee comment wakes retain their compatibility reader.
+
 ## 11. Task Watchdog for Issue Trees
 
 A task watchdog watches a configured issue subtree after that subtree has stopped moving. It is a product-level verification and recovery mechanism for selected work, not a process monitor.
