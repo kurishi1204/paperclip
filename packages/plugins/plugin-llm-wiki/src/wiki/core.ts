@@ -4575,7 +4575,7 @@ function citationRowLabel(row: unknown) {
   return citationRowMetadata(row).citationHolds?.length ? "[引用利用保留] " : "";
 }
 function citationWarning(holds: unknown[]) {
-  return holds.length ? "[E_WIKI_CITATION_HOLD " + JSON.stringify(holds) + "]\n利用保留、誤り認定ではない。該当引用を根拠に使わず、無関係な内容のみ再利用してください。\n\n" : "";
+  return holds.length ? "[E_WIKI_CITATION_HOLD " + JSON.stringify(holds) + "]\n利用保留、誤り認定ではありません。出典未検証または撤回済みの引用は、出典の確認と独立QAが済むまで根拠に使わないでください。\n\n" : "";
 }
 
 export async function readWikiPage(ctx: PluginContext, input: { companyId: string; wikiId?: string | null; spaceSlug?: string | null; path: string }) {
@@ -4598,7 +4598,7 @@ export async function readWikiPage(ctx: PluginContext, input: { companyId: strin
     path,
     contents,
     citationHolds,
-    warnings: citationHolds.length ? ["利用保留、誤り認定ではない。失効した引用以外の内容は再利用できます。"] : [],
+    warnings: citationHolds.length ? ["利用保留、誤り認定ではありません。出典未検証または撤回済みの引用は、出典の確認と独立QAが済むまで根拠に使わないでください。"] : [],
     title: row?.title ?? inferTitle(path, contents),
     pageType: row?.page_type ?? inferPageType(path),
     backlinks: Array.isArray(row?.backlinks) ? row?.backlinks : [],
