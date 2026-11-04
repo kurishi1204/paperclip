@@ -73,6 +73,7 @@ import { documentService } from "../documents.js";
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext, type NativeReviewAssignmentContext } from "./native-review-participant.js";
+import { getNativeDocumentReviewAssignment } from "./native-document-review-participant.js";
 import { childReviewOutcomes } from "./child-review-outcomes.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
 import { captureRunIdentity } from "../run-identity.js";
@@ -138,6 +139,8 @@ const APPROVAL_STAGE_DEFINITION = {
 type Binding = {
   /** Server-derived scope for one addressed native completion review. */
   nativeReview?: NativeReviewAssignmentContext;
+  /** Server-bound request ID, revalidated on every call. */
+  documentReviewInteractionId?: string;
   companyId: string;
   issueId: string;
   runId: string;
@@ -216,7 +219,7 @@ export class PaperclipRunnerToolAuthority {
   constructor(readonly db: Db, readonly binding: Binding) {}
 
   definitions(): Array<Record<string, unknown>> {
-    if (this.binding.nativeReview) {
+    if (this.binding.nativeReview || this.binding.documentReviewInteractionId) {
       // Scope Paperclip control-plane actions. Provider file and shell access
       // still follow the configured agent/environment policy, including tests.
       return [
@@ -225,7 +228,7 @@ export class PaperclipRunnerToolAuthority {
           .map((tool) => ({ name: tool.operationId, description: tool.description, inputSchema: tool.inputSchema })),
         {
           name: "resolve_review",
-          description: "Record your decision on the one completion review assigned to this run. Inspect the submitted work first. Accept only if it meets the request; otherwise reject with specific changes. This does not change task ownership. After recording the decision, report your review complete with paperclip_finish. Do not redo the worker's task or wait for your own parent task to become runnable.",
+          description: "Record your decision on the one review assigned to this run. Inspect the submitted work first. Accept only if it meets the request; otherwise reject with specific changes. This does not change task ownership. After recording the decision, report your review complete with paperclip_finish. Do not redo the worker's task or wait for your own parent task to become runnable.",
           inputSchema: {
             type: "object", additionalProperties: false,
             properties: {
@@ -303,14 +306,14 @@ export class PaperclipRunnerToolAuthority {
     arguments: unknown;
   }): Promise<unknown> {
     if (call.tool === APPROVAL_STAGE_TOOL) {
-      if (this.binding.nativeReview || (this.binding.workMode ?? "standard") !== "standard") {
+      if (this.binding.nativeReview || this.binding.documentReviewInteractionId || (this.binding.workMode ?? "standard") !== "standard") {
         throw forbidden("Approval stage decision is unavailable in this run mode");
       }
       // A prior verdict may have returned the task to its worker. Receipt
       // recovery therefore precedes #boundContext, which requires assignment.
       return this.#decideIssueApprovalStage(call.callId, call.arguments);
     }
-    if (this.binding.nativeReview) {
+    if (this.binding.nativeReview || this.binding.documentReviewInteractionId) {
       if (call.tool === "resolve_review") return this.#resolveReview(call.arguments);
       if (!NATIVE_REVIEW_READ_TOOLS.has(call.tool)) {
         throw forbidden("This review run may only inspect the assigned task and resolve its review.");
@@ -544,7 +547,9 @@ export class PaperclipRunnerToolAuthority {
           acceptedPlan: await this.#acceptedPlan(context.run.contextSnapshot),
           sourcePlanApproval: await handoffPlanContext(this.db, context.issue),
           childReviewOutcomes: await childReviewOutcomes(this.db, this.binding.companyId, this.binding.issueId),
-          ...(this.binding.nativeReview ? {
+          ...(this.binding.documentReviewInteractionId ? {
+            assignedReview: (await getNativeDocumentReviewAssignment(this.db, { ...this.binding, allowResolved: true }))?.interaction,
+          } : this.binding.nativeReview ? {
             assignedReview: (await getNativeReviewAssignment(this.db, {
               ...this.binding, contextSnapshot: this.binding.nativeReview,
               allowResolvedByRunId: this.binding.runId,
@@ -579,15 +584,39 @@ export class PaperclipRunnerToolAuthority {
           && (!statuses || statuses.size === 0 || statuses.has(task.status))
         ).slice(0, boundedLimit(input.limit)).map(redactedTask) };
       }
-      case "list_documents":
-        return { documents: await documentService(this.db).listIssueDocuments(this.binding.issueId) };
+      case "list_documents": {
+        const documents = await documentService(this.db).listIssueDocuments(this.binding.issueId);
+        const review = this.binding.documentReviewInteractionId
+          ? await getNativeDocumentReviewAssignment(this.db, { ...this.binding, allowResolved: true }) : null;
+        if (this.binding.documentReviewInteractionId && !review) throw forbidden("The fixed document review is no longer available.");
+        return { documents: review ? documents.filter(document => document.key === review.binding.key) : documents };
+      }
       case "read_document": {
+        const review = await this.#assertDocumentReviewKey(input.key);
         const document = await documentService(this.db).getIssueDocumentByKey(this.binding.issueId, requiredString(input.key));
         if (!document) throw new Error("paperclip_runner_document_not_found");
+        if (review && (document.id !== review.binding.documentId || document.latestRevisionId !== review.binding.revisionId)) {
+          throw forbidden("The fixed document revision changed before the read completed.");
+        }
         return { document };
       }
-      case "list_document_revisions":
-        return { revisions: await documentService(this.db).listIssueDocumentRevisions(this.binding.issueId, requiredString(input.key)) };
+      case "list_document_revisions": {
+        const review=await this.#assertDocumentReviewKey(input.key);
+        const service=documentService(this.db), key=requiredString(input.key);
+        // Bound the query itself: a newer revision can arrive after admission
+        // was read, but this request must never fetch/return its body.
+        const revisions=review
+          ? await service.listIssueDocumentRevisions(this.binding.issueId,key,{
+              companyId:review.binding.companyId,documentId:review.binding.documentId,revisionId:review.binding.revisionId,
+            })
+          : await service.listIssueDocumentRevisions(this.binding.issueId,key);
+        if(review && (revisions.length!==1 || revisions[0]!.documentId!==review.binding.documentId ||
+            revisions[0]!.id!==review.binding.revisionId)) {
+          throw forbidden("The fixed document revision is no longer available.");
+        }
+        return {revisions,...(review?{scope:{mode:"assigned_revision",documentId:review.binding.documentId,
+          revisionId:review.binding.revisionId}}:{})};
+      }
       case "write_document": return this.#writeDocument(input);
       case "list_agents":
         return { actors: (await agentService(this.db).list(this.binding.companyId)).map(redactedActor) };
@@ -1016,7 +1045,7 @@ export class PaperclipRunnerToolAuthority {
         eq(heartbeatRuns.agentId, this.binding.agentId),
         eq(heartbeatRuns.nativeIssueId, this.binding.issueId),
         eq(issues.companyId, this.binding.companyId),
-        ...(this.binding.nativeReview ? [] : [
+        ...(this.binding.nativeReview || this.binding.documentReviewInteractionId ? [] : [
           eq(issues.assigneeAgentId, this.binding.agentId),
           eq(issues.executionRunId, this.binding.runId),
         ]),
@@ -1031,7 +1060,12 @@ export class PaperclipRunnerToolAuthority {
     ) {
       throw new Error("paperclip_runner_tool_binding_not_authorized");
     }
-    if (this.binding.nativeReview) {
+    if (this.binding.documentReviewInteractionId) {
+      const review = await getNativeDocumentReviewAssignment(this.db, { ...this.binding, allowResolved: true });
+      if (!review || review.interaction.id !== this.binding.documentReviewInteractionId) {
+        throw forbidden("The fixed document review is no longer available to this run.");
+      }
+    } else if (this.binding.nativeReview) {
       const admitted = readNativeReviewAssignmentContext(row.run.contextSnapshot);
       if (!admitted || admitted.nativeReviewInteractionId !== this.binding.nativeReview.nativeReviewInteractionId
         || admitted.nativeReviewDecisionId !== this.binding.nativeReview.nativeReviewDecisionId) {
@@ -1048,6 +1082,13 @@ export class PaperclipRunnerToolAuthority {
     return row;
   }
 
+  async #assertDocumentReviewKey(key: unknown) {
+    if (!this.binding.documentReviewInteractionId) return;
+    const review = await getNativeDocumentReviewAssignment(this.db, { ...this.binding, allowResolved: true });
+    if (!review || key !== review.binding.key) throw forbidden("Read only the fixed document assigned to this review.");
+    return review;
+  }
+
   async #resolveReview(value: unknown) {
     const input = record(value);
     if (Object.keys(input).some((key) => !["decision", "reason"].includes(key))
@@ -1057,10 +1098,12 @@ export class PaperclipRunnerToolAuthority {
     const reason = typeof input.reason === "string" ? input.reason.trim() : "";
     if (input.decision === "reject" && !reason) throw badRequest("Explain the changes required before rejecting the review.");
     const context = await this.#boundContext();
-    const review = await getNativeReviewAssignment(this.db, {
-      ...this.binding, contextSnapshot: this.binding.nativeReview,
-      allowResolvedByRunId: this.binding.runId,
-    });
+    const review = this.binding.documentReviewInteractionId
+      ? await getNativeDocumentReviewAssignment(this.db, { ...this.binding, allowResolved: true })
+      : await getNativeReviewAssignment(this.db, {
+          ...this.binding, contextSnapshot: this.binding.nativeReview,
+          allowResolvedByRunId: this.binding.runId,
+        });
     if (!review) throw forbidden("Review is no longer assigned to this run.");
     const expectedStatus = input.decision === "accept" ? "accepted" : "rejected";
     if (review.interaction.status !== "pending") {

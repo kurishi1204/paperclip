@@ -1,3 +1,6 @@
+import { getNativeDocumentReviewAssignment } from "./native-document-review-participant.js";
+import type { PendingDocumentReviewBinding } from "../../modules/run-dispatch/index.js";
+import { releaseNativeRunCheckout } from "./native-run-checkout.js";
 import { readNativePlanWait, type NativePlanWaitSource } from "./native-plan-wait.js";
 import { readFormalIssueApprovalDecision } from "./formal-issue-approval-decision.js";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
@@ -1488,45 +1491,11 @@ async function materializeDecisionEffect(input: {
     };
   }
   if (effect.kind === "release_checkout") {
-    if (input.formalApprovalDecisionId) {
-      // The verdict may already have reassigned the issue. Release only lease
-      // fields that still name this run; never clear a successor's checkout.
-      const [released] = await input.tx.update(issues).set({
-        checkoutRunId: sql`case when ${issues.checkoutRunId} = ${input.runId}::uuid then null else ${issues.checkoutRunId} end`,
-        executionRunId: sql`case when ${issues.executionRunId} = ${input.runId}::uuid then null else ${issues.executionRunId} end`,
-        executionAgentNameKey: sql`case when ${issues.executionRunId} = ${input.runId}::uuid then null else ${issues.executionAgentNameKey} end`,
-        executionLockedAt: sql`case when ${issues.executionRunId} = ${input.runId}::uuid then null else ${issues.executionLockedAt} end`,
-        updatedAt: new Date(),
-      }).where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.companyId),
-        or(eq(issues.checkoutRunId, input.runId), eq(issues.executionRunId, input.runId))))
-        .returning({ id: issues.id, checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId });
-      return { effectKind: effect.kind, targetType: "issue_checkout", targetId: input.issue.id,
-        payload: { checkoutRunId: released ? released.checkoutRunId : input.issue.checkoutRunId,
-          executionRunId: released ? released.executionRunId : input.issue.executionRunId } };
-    }
-    const [released] = await input.tx
-      .update(issues)
-      .set({
-        checkoutRunId: null,
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(issues.id, input.issue.id),
-          eq(issues.companyId, input.companyId),
-        ),
-      )
-      .returning({ id: issues.id });
-    if (!released) throw new Error("native_checkout_not_released");
-    return {
-      effectKind: effect.kind,
-      targetType: "issue_checkout",
-      targetId: released.id,
-      payload: { checkoutRunId: null, executionRunId: null },
-    };
+    const released = await releaseNativeRunCheckout(input.tx, {
+      companyId:input.companyId,issueId:input.issue.id,runId:input.runId,
+    });
+    return {effectKind:effect.kind,targetType:"issue_checkout",targetId:released.id,
+      payload:{checkoutRunId:released.checkoutRunId,executionRunId:released.executionRunId}};
   }
   if (effect.kind === "record_recovery") {
     failAt("recovery_materialization", input.failpoint);
@@ -1546,7 +1515,7 @@ async function materializeDecisionEffect(input: {
       }),
       evidence: { runId: input.runId, decisionId: input.decisionId },
       nextAction: effect.nextAction,
-      wakePolicy: { kind: "resume_native_run", runId: input.runId },
+      wakePolicy: effect.resumeNativeRun === false ? null : { kind: "resume_native_run", runId: input.runId },
       maxAttempts: 3,
     });
     return {
@@ -1580,6 +1549,7 @@ export async function commitNativeStatusDecision(input: {
   requireBoardResponseWaitSource?: NativeBoardResponseWaitSource;
   requireBoardResponseWaitOrigin?: NativeBoardResponseWaitOrigin;
   requireFormalApprovalDecision?: { id: string; agentId: string };
+  requireDocumentReview?: { agentId: string; binding: PendingDocumentReviewBinding | null; interactionStatus: string | null };
   reviewResponsePresentation?: {
     agentId: string;
     resultId: string;
@@ -1598,6 +1568,9 @@ export async function commitNativeStatusDecision(input: {
   }
   if ((reasonCode === "formal_approval_decision_recorded") !== Boolean(input.requireFormalApprovalDecision)) {
     throw new Error("native_formal_approval_source_required");
+  }
+  if (reasonCode.startsWith("native_document_review_") && !input.requireDocumentReview) {
+    throw new Error("native_document_review_commit_source_required");
   }
   const publications: ActivityPublication[] = [];
   const terminalRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
@@ -1672,6 +1645,20 @@ export async function commitNativeStatusDecision(input: {
       issue.lastStatusDecisionId !== input.priorDecisionId
     ) {
       throw new NativeStatusRaceError();
+    }
+    // Already-committed decisions were returned above as historical receipts.
+    // A NEW decision must retain the exact document and verdict observed by
+    // the finalizer, under the same transaction as the status/effect commit.
+    if (input.requireDocumentReview) {
+      const expected=input.requireDocumentReview;
+      const current=await getNativeDocumentReviewAssignment(tx as unknown as Db,{
+        companyId:input.companyId,issueId:input.issueId,runId:input.runId,agentId:expected.agentId,
+        allowResolved:true,finalizationOnly:true,lock:true,
+      });
+      if (nativeSha256({binding:current?.binding??null,interactionStatus:current?.interaction.status??null}) !==
+          nativeSha256({binding:expected.binding,interactionStatus:expected.interactionStatus})) {
+        throw new NativeStatusRaceError();
+      }
     }
     // Recheck under the parent status lock: a child can finish between the
     // finalizer's read and this commit. Re-arbitrate instead of discarding its wake.

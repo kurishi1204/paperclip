@@ -620,7 +620,7 @@ import {
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
-import { isCurrentPendingDocumentReviewWake, hasServerRecordedNonAssigneeWake, pendingDocumentReviewRetryProfile, hasPendingDocumentReviewAdmission } from "./pending-document-review-wake.js";
+import { readCurrentPendingDocumentReviewWake, isCurrentPendingDocumentReviewWake, hasServerRecordedNonAssigneeWake, pendingDocumentReviewRetryProfile, hasPendingDocumentReviewAdmission } from "./pending-document-review-wake.js";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
 import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
@@ -24718,11 +24718,16 @@ export function heartbeatService(
             contextSnapshot: nativeReviewContext,
           }) : null;
           if (nativeReviewContext && !nativeReview) throw new Error("native_review_assignment_no_longer_available");
-          const nativeReviewRequest = nativeReview
+          const documentReview = hasPendingDocumentReviewAdmission(run.runnerProfileJson)
+            ? await readCurrentPendingDocumentReviewWake(db, { companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, runId: run.id, contextSnapshot: context })
+            : null;
+          if (hasPendingDocumentReviewAdmission(run.runnerProfileJson) && !documentReview) throw new Error("native_document_review_assignment_no_longer_available");
+          const assignedReview = nativeReview?.interaction ?? documentReview?.interaction;
+          const nativeReviewRequest = assignedReview
             ? buildNativeReviewRequest({
-                title: nativeReview.interaction.title,
-                summary: nativeReview.interaction.summary,
-                payload: nativeReview.interaction.payload,
+                title: assignedReview.title,
+                summary: assignedReview.summary,
+                payload: assignedReview.payload,
               })
             : null;
           const persistedContract = run.completionContractId

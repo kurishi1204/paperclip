@@ -35,6 +35,7 @@ import type { StorageService } from "../../storage/types.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import { issueService } from "../issues.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
+import { getNativeDocumentReviewAssignment, isNativeDocumentReviewRun } from "./native-document-review-participant.js";
 
 export type RemoteWorkspaceFileReader = (input: Pick<NativeRunnerFileHandoffInput, "contentRef" | "byteSize" | "sha256">) => Promise<Buffer>;
 
@@ -816,6 +817,8 @@ export async function stageNativeRunnerWakeAttachments(input: {
   const [run] = await input.db
     .select({
       contextSnapshot: heartbeatRuns.contextSnapshot,
+      runnerProfileJson: heartbeatRuns.runnerProfileJson,
+      retryOfRunId: heartbeatRuns.retryOfRunId,
       agentStatus: agents.status,
       assigneeAgentId: issues.assigneeAgentId,
     })
@@ -867,10 +870,16 @@ export async function stageNativeRunnerWakeAttachments(input: {
         contextSnapshot: reviewContext,
       })
     : null;
-  if (run.assigneeAgentId !== input.binding.agentId && !nativeReview) {
+  const isDocumentReview = await isNativeDocumentReviewRun(input.db, {...input.binding,...run});
+  const documentReview = isDocumentReview
+    ? await getNativeDocumentReviewAssignment(input.db, input.binding) : null;
+  if ((isDocumentReview && !documentReview) ||
+      (run.assigneeAgentId !== input.binding.agentId && !nativeReview && !documentReview)) {
     throw new Error("paperclip_runner_attachment_staging_not_authorized");
   }
-  const selections = wakeAttachmentSelections(run.contextSnapshot);
+  // A fixed document request grants no chat-attachment access. Still scrub
+  // abandoned staging bytes before entering the restricted session.
+  const selections = documentReview ? [] : wakeAttachmentSelections(run.contextSnapshot);
   if (selections.length > MAX_NATIVE_STAGED_ATTACHMENTS) {
     throw new Error("paperclip_runner_attachment_staging_count_denied");
   }

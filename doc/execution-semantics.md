@@ -1697,3 +1697,41 @@ Resolved and cancelled actions remain resolved.
 ### Pending review requests in runner inputs
 
 A named issue-document review is an unresolved request for the addressed reviewer. The runner response bridge does not require a verdict before that reviewer can start. It excludes only a current document review bound to the same run, source wake receipt, creator and fixed revision from the resolved-response envelope. The request itself remains pending for the reviewer to inspect and decide through normal tools. Other unresolved interactions, stale revisions, invalid receipts and missing response IDs keep their existing refusal behavior.
+
+
+A native named document-review run uses that same receipt-bound role throughout
+startup, its restricted tool session, and finalization. It receives the fixed
+review request instead of the worker objective, stages no chat attachments, and
+can inspect the task and fixed document and resolve only its own review. It
+cannot use worker mutations, connection tools or assigned MCP tools. Ordinary
+provider file/shell policy remains unchanged. After a verdict, only the exact
+resolving run may finish while the current document binding remains unchanged.
+Finalization preserves task status and assignment and releases the review lock;
+a missing or stale review never falls through to worker completion.
+
+The verdict still follows the confirmation request's existing stored continuation
+and plan workflow. For example, rejecting a `wake_assignee` confirmation may
+return work to its worker; the reviewer's final report preserves that resulting
+state and cannot turn it into worker completion. This review role does not grant
+an independent task mutation or assignment capability. Missing or inconsistent
+saved role markers are refused. Resolved, unresolved and stale fixed document
+reviews receive distinct finalization reason codes. Unresolved/stale reviews
+record explicit recovery without replaying the old run or claiming business QA
+success.
+
+Document-review decisions recheck the saved run role, wake receipt and fixed
+revision under the decision transaction's locks. Losing that binding cannot
+fall through to ordinary attachment staging. Finalization releases only lease
+fields still owned by the finishing run, preserving any successor's lease.
+Pending/stale document-review recovery records have no resume-run wake policy;
+provider failures cannot skip that explicit non-replay disposition.
+
+Document-review purpose is identified separately from current authority: the original run-bound interaction receipts (including resource-deferral ancestry) retain that purpose if serialized admission/context is lost. Every native startup, staging, completion and verdict path rejects missing current admission rather than converting it into a worker. All interaction kinds share the fixed-review verdict authorization, including direct run-JWT HTTP requests.
+
+Interaction writes also enforce this role at the common transaction boundary: document-review runs are denied by default, and only the fixed confirmation accept/reject writers supply the allowed verdict target. Withdrawal and other card effects cannot inherit persistent agent authority. Resolution checks inside a transaction use that transaction connection and lock order.
+
+After the controller has made a run and wake terminal, the finalizer alone may still observe that exact run's already-committed verdict against its original receipt and current fixed revision. This observation does not restore tool, staging or verdict authority. The internal connection-intent writer also uses the common transaction write fence and binds the source run to its requesting agent.
+
+A new native document-review status decision carries its observed binding and verdict into the commit transaction. The committer locks and rechecks that snapshot before recording the decision/effects; a changed document, receipt or verdict requests existing re-arbitration. An already-committed decision remains an idempotent historical receipt, and is not reinterpreted against later document updates.
+
+A fixed document-review history query is constrained at the data source to its assigned document/revision IDs and returns explicit assigned-revision scope metadata. It does not fetch newer bodies that may arrive after admission was read; ordinary document histories retain their existing behavior.

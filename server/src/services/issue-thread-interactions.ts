@@ -1,3 +1,4 @@
+import { getNativeDocumentReviewAssignment, isNativeDocumentReviewRun } from "./native-runtime/native-document-review-participant.js";
 import { activeIssueInteractionCondition, historicalQuestionCondition } from "./issue-question-context.js";
 import {
   currentContinuationOrigins,
@@ -154,12 +155,29 @@ type InteractionActor = {
   resolutionDetails?: Record<string, unknown>;
 };
 
-async function assertInteractionRunWriteAllowed(tx: Db, issue: { id: string; companyId: string }, actor: InteractionActor) {
+async function assertInteractionRunWriteAllowed(tx: Db, issue: { id: string; companyId: string }, actor: InteractionActor,
+  documentReviewVerdictId?: string,
+) {
   if (!actor.agentId || !actor.runId) return;
   // Keep the same issue -> run lock order as task mutation and checkout.
   await tx.select({ id: issues.id }).from(issues)
     .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("update");
   await assertAgentRunWriteAllowed(tx, issue.companyId, actor);
+  const [run] = await tx.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id,actor.runId),eq(heartbeatRuns.companyId,issue.companyId),
+    eq(heartbeatRuns.agentId,actor.agentId))).limit(1);
+  if (run?.runtimeMode === "native" && await isNativeDocumentReviewRun(tx,{...run,runId:run.id})) {
+    // Default deny at the common write boundary: only the confirmation verdict
+    // writers receive the one fixed target. Creation, withdrawal and other
+    // interaction effects cannot inherit an agent's wider persistent authority.
+    if (!documentReviewVerdictId) throw forbidden("A document-review run may only resolve its fixed review.");
+    const review=await getNativeDocumentReviewAssignment(tx,{
+      companyId:issue.companyId,issueId:issue.id,agentId:actor.agentId,runId:actor.runId,lock:true,
+    });
+    if (!review || review.interaction.id !== documentReviewVerdictId) {
+      throw conflict("The fixed document review binding changed before the decision.");
+    }
+  }
 }
 
 type CreateInteractionOptions = {
@@ -460,10 +478,26 @@ function resolverActor(actor: InteractionActor) {
   return { type: "agent" as const, agentId: null, runId: null };
 }
 
-function assertInteractionResolutionAllowed(
+async function assertInteractionResolutionAllowed(
+  db: Db,
   current: IssueThreadInteractionRow,
   actor: InteractionActor,
 ) {
+  // Apply the fixed role to every interaction kind, including direct HTTP
+  // requests. The tool catalog is not the server authorization boundary.
+  if (actor.agentId && actor.runId) {
+    const [run] = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id,actor.runId),eq(heartbeatRuns.companyId,current.companyId),
+      eq(heartbeatRuns.agentId,actor.agentId))).limit(1);
+    if (run?.runtimeMode === "native" && await isNativeDocumentReviewRun(db,{...run,runId:run.id})) {
+      const review = await getNativeDocumentReviewAssignment(db,{
+        companyId:current.companyId,issueId:current.issueId,agentId:actor.agentId,runId:actor.runId,lock:true,
+      });
+      if (!review || review.interaction.id !== current.id) {
+        throw conflict("The fixed document review binding changed before the decision.");
+      }
+    }
+  }
   return assertIssueThreadInteractionResolverAudience({
     actor: resolverActor(actor),
     interaction: current,
@@ -509,7 +543,7 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
     isRequestConfirmationLikeKind(interaction.kind) &&
     (await isIssueReviewVerdictInteraction(tx, { issue, interaction }));
 
-  assertInteractionResolutionAllowed(interaction, actor);
+  await assertInteractionResolutionAllowed(tx, interaction, actor);
   if (actor.agentId && isNativeCompletionReview(interaction)) {
     const target = (interaction.payload as { target?: { revisionId?: string } }).target;
     if (!actor.runId || !await getNativeReviewAssignment(tx, {
@@ -2161,7 +2195,7 @@ export function issueThreadInteractionService(
     const now = new Date();
     const postCommitActivityPublications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
-      await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor);
+      await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor, args.current.id);
       await args.mutationOptions?.beforeResolveInTransaction?.(tx);
       // Policy mutations and review transitions use the same issue-row lock,
       // so the authoritative review policy and requester are stable through
@@ -2443,7 +2477,7 @@ export function issueThreadInteractionService(
 
     const now = new Date();
     const updated = await db.transaction(async (tx) => {
-      await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor);
+      await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor, args.current.id);
       await args.mutationOptions?.beforeResolveInTransaction?.(tx);
       const issueContext = await tx
         .select({
@@ -2568,7 +2602,10 @@ export function issueThreadInteractionService(
           {
             status: "todo",
             assigneeAgentId: issueContext.assigneeAgentId,
-            assigneeUserId: null,
+            // A document verdict may resume work, but must not discard its
+            // existing human owner. Native completion reviews retain their
+            // existing worker-only transition contract.
+            assigneeUserId: isNativeCompletionReview(lockedCurrent) ? null : issueContext.assigneeUserId,
             actorAgentId: args.actor.agentId ?? null,
             actorUserId: args.actor.userId ?? null,
           },
@@ -2630,6 +2667,9 @@ export function issueThreadInteractionService(
 
       let inserted = false;
       const created = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db,issue,{
+          agentId:payload.requestingAgentId,runId:input.sourceRunId,
+        });
         const issueRow = await tx
           .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
           .from(issues)
@@ -2656,7 +2696,8 @@ export function issueThreadInteractionService(
         if (reusable) return reusable;
 
         const [sourceRun] = await tx.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
-          .where(and(eq(heartbeatRuns.id, input.sourceRunId), eq(heartbeatRuns.companyId, issue.companyId)));
+          .where(and(eq(heartbeatRuns.id, input.sourceRunId), eq(heartbeatRuns.companyId, issue.companyId),
+            eq(heartbeatRuns.agentId,payload.requestingAgentId)));
         if (!sourceRun) throw unprocessable("Interaction source run is unavailable");
         const originCommentIds = await currentContinuationOrigins(tx as unknown as Db, issue.companyId, issue.id, sourceRun.context);
         const [row] = await tx
@@ -2755,7 +2796,7 @@ export function issueThreadInteractionService(
           "Only connection_intent interactions have a connection phase",
         );
       }
-      assertInteractionResolutionAllowed(current, actor);
+      await assertInteractionResolutionAllowed(db, current, actor);
       const payload = connectionIntentPayloadSchema.parse(current.payload);
       const [updated] = await db
         .update(issueThreadInteractions)
@@ -2793,7 +2834,7 @@ export function issueThreadInteractionService(
       }
       if (!actor.userId)
         throw forbidden("Connection intents require a human resolver");
-      assertInteractionResolutionAllowed(current, actor);
+      await assertInteractionResolutionAllowed(db, current, actor);
       const status =
         result.outcome === "connected"
           ? "accepted"
@@ -3828,7 +3869,7 @@ export function issueThreadInteractionService(
         issue,
         interactionId,
       });
-      assertInteractionResolutionAllowed(current, actor);
+      await assertInteractionResolutionAllowed(db, current, actor);
       switch (current.kind) {
         case "suggest_tasks":
           // Accepting suggest_tasks only creates follow-up issues; it does not
@@ -3911,7 +3952,7 @@ export function issueThreadInteractionService(
       ) {
         throw interactionNotFoundError();
       }
-      assertInteractionResolutionAllowed(current, actor);
+      await assertInteractionResolutionAllowed(db, current, actor);
       if (current.kind !== "suggest_tasks") {
         throw unprocessable("Only suggest_tasks interactions can be accepted");
       }
@@ -4099,7 +4140,7 @@ export function issueThreadInteractionService(
         issue,
         interactionId,
       });
-      assertInteractionResolutionAllowed(current, actor);
+      await assertInteractionResolutionAllowed(db, current, actor);
       switch (current.kind) {
         case "suggest_tasks":
           return issueThreadInteractionService(db).rejectSuggestedTasks(
@@ -4158,7 +4199,7 @@ export function issueThreadInteractionService(
           );
         }
 
-        assertInteractionResolutionAllowed(current, actor);
+        await assertInteractionResolutionAllowed(tx as unknown as Db, current, actor);
         const interaction = hydrateInteraction(
           current,
         ) as RequestItemVerdictsInteraction;
@@ -4934,7 +4975,7 @@ export function issueThreadInteractionService(
       ) {
         throw interactionNotFoundError();
       }
-      assertInteractionResolutionAllowed(current, actor);
+      await assertInteractionResolutionAllowed(db, current, actor);
       if (current.kind !== "ask_user_questions") {
         throw unprocessable(
           "Only ask_user_questions interactions can be answered",

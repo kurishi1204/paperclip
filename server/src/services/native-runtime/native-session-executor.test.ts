@@ -143,6 +143,8 @@ const durableRunnerState = (
 });
 
 const state = vi.hoisted(() => ({
+  documentReviewPurpose: vi.fn(async () => false),
+  documentReviewAssignment: vi.fn(async () => null),
   createAssignedMcpTools: vi.fn(),
   execute: vi.fn(),
   cleanup: vi.fn(),
@@ -242,6 +244,13 @@ vi.mock("./paperclip-runner-tool-authority.js", () => ({
   },
 }));
 
+// Worker-only fixtures have no document-review receipt. Real admission and
+// tampering cases run against the DB/HTTP suite, not this mock database.
+vi.mock("./native-document-review-participant.js", () => ({
+  isNativeDocumentReviewRun: state.documentReviewPurpose,
+  getNativeDocumentReviewAssignment: state.documentReviewAssignment,
+}));
+
 vi.mock("./assigned-mcp-tools.js", () => ({
   createAssignedMcpTools: state.createAssignedMcpTools,
   getAssignedMcpGateway: () => ({}),
@@ -337,6 +346,8 @@ import {
 } from "./native-session-executor.js";
 
 beforeEach(() => {
+  state.documentReviewPurpose.mockReset().mockResolvedValue(false);
+  state.documentReviewAssignment.mockReset().mockResolvedValue(null);
   state.createAssignedMcpTools.mockReset();
   state.resolveRunnerBinary.mockReset().mockReturnValue("/tmp/paperclip-runnerd");
   state.resolveCurrentWakeCommentsBinding.mockReset().mockResolvedValue(null);
@@ -8329,6 +8340,15 @@ describe("native process ownership", () => {
 });
 
 describe("runnerd provider runtime wiring", () => {
+  it("does not construct a provider when original review purpose survives but admission is missing", async () => {
+    state.documentReviewPurpose.mockResolvedValueOnce(true);
+    state.createBackend.mockClear();
+    await expect(createRunnerdBackend({db:leaseDb(execution),execution,runnerInstanceId:"missing-review-admission"}))
+      .rejects.toThrow("native_document_review_assignment_no_longer_available");
+    expect(state.documentReviewAssignment).toHaveBeenCalledOnce();
+    expect(state.createBackend).not.toHaveBeenCalled();
+  });
+
   let isolatedStateDirectory: string;
   let previousStateDirectory: string | undefined;
 
