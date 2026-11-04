@@ -219,7 +219,7 @@ suite("pending independent document review through real dispatch", () => {
         status:"pending",continuationPolicy:"none",requestedResolverPolicy:"not_creator",effectiveResolverPolicy:"not_creator",
         createdByAgentId:x.ownerId,addresseeAgentId:x.reviewerId,
         payload:kind==="request_confirmation"?{version:1,prompt:"Another synthetic confirmation"}:
-          {version:1,prompt:"Another synthetic checklist",items:[{id:"one",label:"Synthetic item"}]}});
+          {version:1,prompt:"Another synthetic checklist",options:[{id:"one",label:"Synthetic item"}]}});
       const previousSecret=process.env.PAPERCLIP_AGENT_JWT_SECRET;
       process.env.PAPERCLIP_AGENT_JWT_SECRET="synthetic-fixed-review-http-secret";
       const workspaceRoot=await mkdtemp(path.join(tmpdir(),"paperclip-review-http-fence-"));
@@ -232,6 +232,37 @@ suite("pending independent document review through real dispatch", () => {
           .set("Authorization",`Bearer ${token}`).set("X-Paperclip-Run-Id",x.runId).send({});
         expect(response.status,JSON.stringify(response.body)).toBe(409);
         expect(JSON.stringify(response.body)).toContain("fixed document review binding changed");
+        const cards=await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId,x.issueId));
+        expect(cards.every(card=>card.status==="pending")).toBe(true);
+      } finally {
+        if(previousSecret===undefined)delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+        else process.env.PAPERCLIP_AGENT_JWT_SECRET=previousSecret;
+        await rm(workspaceRoot,{recursive:true,force:true});
+      }
+    });
+  it.each(["withdraw","verdicts"] as const)(
+    "denies other interaction effects at the common transactional write boundary (%s)", async operation => {
+      const x=await nativeReviewFixture(),otherId=randomUUID();
+      await db.insert(issueThreadInteractions).values({id:otherId,companyId:x.companyId,issueId:x.issueId,
+        kind:operation==="withdraw"?"request_confirmation":"request_item_verdicts",status:"pending",continuationPolicy:"none",
+        requestedResolverPolicy:"not_creator",effectiveResolverPolicy:"not_creator",
+        createdByAgentId:operation==="withdraw"?x.reviewerId:x.ownerId,
+        addresseeAgentId:operation==="withdraw"?x.ownerId:x.reviewerId,
+        payload:operation==="withdraw"?{version:1,prompt:"Previously created synthetic card"}:
+          {version:1,prompt:"Other synthetic item verdict",items:[{id:"one",label:"Synthetic item"}],verdicts:["approve","reject"]}});
+      const previousSecret=process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      process.env.PAPERCLIP_AGENT_JWT_SECRET="synthetic-common-effect-http-secret";
+      const workspaceRoot=await mkdtemp(path.join(tmpdir(),"paperclip-review-effects-"));
+      try {
+        const token=createLocalAgentJwt(x.reviewerId,x.companyId,"paperclip_runner",x.runId,x.responsibleUserId);
+        const app=express();app.use(express.json());app.use(actorMiddleware(db,{deploymentMode:"authenticated"}));
+        app.use("/api",issueRoutes(db,createStorageService(createLocalDiskStorageProvider(path.join(workspaceRoot,"storage")))));
+        app.use(errorHandler);
+        const response=await request(app).post(`/api/issues/${x.issueId}/interactions/${otherId}/${operation}`)
+          .set("Authorization",`Bearer ${token}`).set("X-Paperclip-Run-Id",x.runId)
+          .send(operation==="withdraw"?{reason:"Synthetic forbidden withdrawal"}:{verdicts:[{id:"one",verdict:"approve"}]});
+        expect(response.status,JSON.stringify(response.body)).toBe(403);
+        expect(JSON.stringify(response.body)).toContain("document-review run may only resolve its fixed review");
         const cards=await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId,x.issueId));
         expect(cards.every(card=>card.status==="pending")).toBe(true);
       } finally {

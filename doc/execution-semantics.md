@@ -1727,3 +1727,5 @@ Pending/stale document-review recovery records have no resume-run wake policy;
 provider failures cannot skip that explicit non-replay disposition.
 
 Document-review purpose is identified separately from current authority: the original run-bound interaction receipts (including resource-deferral ancestry) retain that purpose if serialized admission/context is lost. Every native startup, staging, completion and verdict path rejects missing current admission rather than converting it into a worker. All interaction kinds share the fixed-review verdict authorization, including direct run-JWT HTTP requests.
+
+Interaction writes also enforce this role at the common transaction boundary: document-review runs are denied by default, and only the fixed confirmation accept/reject writers supply the allowed verdict target. Withdrawal and other card effects cannot inherit persistent agent authority. Resolution checks inside a transaction use that transaction connection and lock order.

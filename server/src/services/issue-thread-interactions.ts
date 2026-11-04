@@ -155,12 +155,29 @@ type InteractionActor = {
   resolutionDetails?: Record<string, unknown>;
 };
 
-async function assertInteractionRunWriteAllowed(tx: Db, issue: { id: string; companyId: string }, actor: InteractionActor) {
+async function assertInteractionRunWriteAllowed(tx: Db, issue: { id: string; companyId: string }, actor: InteractionActor,
+  documentReviewVerdictId?: string,
+) {
   if (!actor.agentId || !actor.runId) return;
   // Keep the same issue -> run lock order as task mutation and checkout.
   await tx.select({ id: issues.id }).from(issues)
     .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("update");
   await assertAgentRunWriteAllowed(tx, issue.companyId, actor);
+  const [run] = await tx.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id,actor.runId),eq(heartbeatRuns.companyId,issue.companyId),
+    eq(heartbeatRuns.agentId,actor.agentId))).limit(1);
+  if (run?.runtimeMode === "native" && await isNativeDocumentReviewRun(tx,{...run,runId:run.id})) {
+    // Default deny at the common write boundary: only the confirmation verdict
+    // writers receive the one fixed target. Creation, withdrawal and other
+    // interaction effects cannot inherit an agent's wider persistent authority.
+    if (!documentReviewVerdictId) throw forbidden("A document-review run may only resolve its fixed review.");
+    const review=await getNativeDocumentReviewAssignment(tx,{
+      companyId:issue.companyId,issueId:issue.id,agentId:actor.agentId,runId:actor.runId,lock:true,
+    });
+    if (!review || review.interaction.id !== documentReviewVerdictId) {
+      throw conflict("The fixed document review binding changed before the decision.");
+    }
+  }
 }
 
 type CreateInteractionOptions = {
@@ -2178,7 +2195,7 @@ export function issueThreadInteractionService(
     const now = new Date();
     const postCommitActivityPublications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
-      await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor);
+      await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor, args.current.id);
       await args.mutationOptions?.beforeResolveInTransaction?.(tx);
       // Policy mutations and review transitions use the same issue-row lock,
       // so the authoritative review policy and requester are stable through
@@ -2460,7 +2477,7 @@ export function issueThreadInteractionService(
 
     const now = new Date();
     const updated = await db.transaction(async (tx) => {
-      await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor);
+      await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor, args.current.id);
       await args.mutationOptions?.beforeResolveInTransaction?.(tx);
       const issueContext = await tx
         .select({
@@ -4178,7 +4195,7 @@ export function issueThreadInteractionService(
           );
         }
 
-        await assertInteractionResolutionAllowed(db, current, actor);
+        await assertInteractionResolutionAllowed(tx as unknown as Db, current, actor);
         const interaction = hydrateInteraction(
           current,
         ) as RequestItemVerdictsInteraction;
