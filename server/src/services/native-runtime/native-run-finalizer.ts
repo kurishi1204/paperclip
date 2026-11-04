@@ -1399,6 +1399,9 @@ export async function finalizeNativeRun(input: {
         priorStatusVersion: Number(authoritativeIssue.statusVersion),
         priorDecisionId: authoritativeIssue.lastStatusDecisionId,
         decision,
+        requireDocumentReview: isDocumentReview ? {
+          agentId:run.agentId,binding:documentReview?.binding??null,interactionStatus:documentReview?.interaction.status??null,
+        } : undefined,
         requireFormalApprovalDecision: decision.reasonCode === "formal_approval_decision_recorded" && formalApprovalDecision
           ? { id: formalApprovalDecision.id, agentId: run.agentId } : undefined,
         requirePlanWaitSource:

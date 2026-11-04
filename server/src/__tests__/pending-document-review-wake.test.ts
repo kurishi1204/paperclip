@@ -1,4 +1,5 @@
 import express from "express";
+import {commitNativeStatusDecision,NativeStatusRaceError} from "../services/native-runtime/status-decision-committer.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import request from "supertest";
 import { actorMiddleware } from "../middleware/auth.js";
@@ -11,7 +12,8 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, companies, createDb, documents, documentRevisions,
-  heartbeatRuns, issueDocuments, issueThreadInteractions, issues, authUsers, companyMemberships } from "@paperclipai/db";
+  heartbeatRuns, issueDocuments, issueThreadInteractions, issues, authUsers, companyMemberships,
+  completionContracts,nativeRunResults,workAssessments,nativeRunFinalizations,statusDecisions,statusDecisionEffects } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
 import { hasServerRecordedNonAssigneeWake, isCurrentPendingDocumentReviewWake, pendingDocumentReviewRetryProfile, pendingDocumentReviewProfileFields } from "../services/pending-document-review-wake.js";
@@ -99,6 +101,50 @@ suite("pending independent document review through real dispatch", () => {
       documentReviewInteractionId:x.interactionId, apiUrl:"http://synthetic.invalid" };
     return { ...x, responsibleUserId, binding, authority:new PaperclipRunnerToolAuthority(db,binding) };
   }
+  async function nativeReviewDecisionFixture(pending=false) {
+    const x=await nativeReviewFixture();
+    if(!pending)await db.update(issueThreadInteractions).set({status:"accepted",resolvedByAgentId:x.reviewerId,resolvedByRunId:x.runId})
+      .where(eq(issueThreadInteractions.id,x.interactionId));
+    const observed=await getNativeDocumentReviewAssignment(db,{...x.binding,allowResolved:true,finalizationOnly:true});
+    expect(observed).not.toBeNull();
+    const contractId=randomUUID(),resultId=randomUUID(),assessmentId=randomUUID();
+    await db.insert(completionContracts).values({id:contractId,companyId:x.companyId,issueId:x.issueId,revision:1,
+      schemaVersion:"paperclip.completion-contract.v1",policyVersion:"phase6-v1",risk:"standard",completionAuthority:"server_arbiter",
+      incompleteCriteriaPolicy:"preserve_non_terminal",contractJson:{revision:"synthetic-review",criteria:[]},canonicalSha256:"synthetic-contract",
+      createdByActorType:"system",createdByActorId:"synthetic-review"});
+    await db.update(heartbeatRuns).set({completionContractId:contractId,completionContractSha256:"synthetic-contract"}).where(eq(heartbeatRuns.id,x.runId));
+    await db.insert(nativeRunResults).values({id:resultId,companyId:x.companyId,issueId:x.issueId,runId:x.runId,
+      completionContractId:contractId,serverFingerprint:"synthetic-review",schemaStatus:"accepted",canonicalSha256:"synthetic-result",
+      resultJson:{result:{reportedWorkDisposition:"done"},terminal:{runTerminalState:"succeeded"}}});
+    const decision=resolveNativeFinalizerStatus({assessment:{reportedDisposition:"done"} as Parameters<typeof resolveNativeFinalizerStatus>[0]["assessment"],
+      terminalState:"succeeded",workspaceFinalizeStatus:"succeeded",documentReviewOutcome:pending?"pending":"resolved",agentId:x.reviewerId,priorIssueStatus:"blocked"});
+    await db.insert(workAssessments).values({id:assessmentId,companyId:x.companyId,issueId:x.issueId,runId:x.runId,contractId,resultId,
+      triggerKind:"native_result",triggerActorCompanyId:x.companyId,priorIssueStatus:"blocked",priorStatusVersion:0,
+      policyVersion:decision.policyVersion,assessmentJson:{synthetic:true},inputDigest:"synthetic-assessment"});
+    await db.insert(nativeRunFinalizations).values({runId:x.runId,companyId:x.companyId,issueId:x.issueId,phase:"arbitrating",resultId,assessmentId});
+    const input={db,companyId:x.companyId,issueId:x.issueId,runId:x.runId,assessmentId,priorStatus:"blocked",priorStatusVersion:0,
+      priorDecisionId:null,decision,requireDocumentReview:{agentId:x.reviewerId,binding:observed!.binding,interactionStatus:observed!.interaction.status}};
+    return {x,input};
+  }
+  it.each(["revision","receipt","verdict"] as const)("refuses a %s race before the actual final decision transaction commits",async defect=>{
+    const {x,input}=await nativeReviewDecisionFixture(defect==="verdict");
+    if(defect==="revision")await db.update(documents).set({latestRevisionId:randomUUID()}).where(eq(documents.id,x.documentId));
+    if(defect==="receipt")await db.update(agentWakeupRequests).set({requestedByActorId:x.reviewerId}).where(eq(agentWakeupRequests.id,x.wakeupRequestId));
+    if(defect==="verdict")await issueThreadInteractionService(db).acceptInteraction({id:x.issueId,companyId:x.companyId,projectId:null,goalId:null},x.interactionId,{},
+      {agentId:x.reviewerId,runId:x.runId});
+    await expect(commitNativeStatusDecision(input)).rejects.toBeInstanceOf(NativeStatusRaceError);
+    expect(await db.select().from(statusDecisions).where(eq(statusDecisions.issueId,x.issueId))).toHaveLength(0);
+    expect(await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.issueId,x.issueId))).toHaveLength(0);
+    const [task]=await db.select().from(issues).where(eq(issues.id,x.issueId));expect(Number(task!.statusVersion)).toBe(0);
+  });
+  it("commits an exact review once and returns its historical receipt after a later document change",async()=>{
+    const {x,input}=await nativeReviewDecisionFixture();
+    const committed=await commitNativeStatusDecision(input);expect(committed.replayed).toBe(false);
+    expect(committed.decision.reasonCode).toBe("native_document_review_resolved");
+    await db.update(documents).set({latestRevisionId:randomUUID()}).where(eq(documents.id,x.documentId));
+    const replay=await commitNativeStatusDecision(input);expect(replay.replayed).toBe(true);expect(replay.decision.id).toBe(committed.decision.id);
+    expect(await db.select().from(statusDecisions).where(eq(statusDecisions.issueId,x.issueId))).toHaveLength(1);
+  });
   it("carries one fixed native document review through staging, read, actual decision and finish", async () => {
     const x = await nativeReviewFixture(), workspaceRoot = await mkdtemp(path.join(tmpdir(),"paperclip-document-review-"));
     const previousSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;

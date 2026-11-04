@@ -1,3 +1,5 @@
+import { getNativeDocumentReviewAssignment } from "./native-document-review-participant.js";
+import type { PendingDocumentReviewBinding } from "../../modules/run-dispatch/index.js";
 import { releaseNativeRunCheckout } from "./native-run-checkout.js";
 import { readNativePlanWait, type NativePlanWaitSource } from "./native-plan-wait.js";
 import { readFormalIssueApprovalDecision } from "./formal-issue-approval-decision.js";
@@ -1547,6 +1549,7 @@ export async function commitNativeStatusDecision(input: {
   requireBoardResponseWaitSource?: NativeBoardResponseWaitSource;
   requireBoardResponseWaitOrigin?: NativeBoardResponseWaitOrigin;
   requireFormalApprovalDecision?: { id: string; agentId: string };
+  requireDocumentReview?: { agentId: string; binding: PendingDocumentReviewBinding | null; interactionStatus: string | null };
   reviewResponsePresentation?: {
     agentId: string;
     resultId: string;
@@ -1565,6 +1568,9 @@ export async function commitNativeStatusDecision(input: {
   }
   if ((reasonCode === "formal_approval_decision_recorded") !== Boolean(input.requireFormalApprovalDecision)) {
     throw new Error("native_formal_approval_source_required");
+  }
+  if (reasonCode.startsWith("native_document_review_") && !input.requireDocumentReview) {
+    throw new Error("native_document_review_commit_source_required");
   }
   const publications: ActivityPublication[] = [];
   const terminalRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
@@ -1639,6 +1645,20 @@ export async function commitNativeStatusDecision(input: {
       issue.lastStatusDecisionId !== input.priorDecisionId
     ) {
       throw new NativeStatusRaceError();
+    }
+    // Already-committed decisions were returned above as historical receipts.
+    // A NEW decision must retain the exact document and verdict observed by
+    // the finalizer, under the same transaction as the status/effect commit.
+    if (input.requireDocumentReview) {
+      const expected=input.requireDocumentReview;
+      const current=await getNativeDocumentReviewAssignment(tx as unknown as Db,{
+        companyId:input.companyId,issueId:input.issueId,runId:input.runId,agentId:expected.agentId,
+        allowResolved:true,finalizationOnly:true,lock:true,
+      });
+      if (nativeSha256({binding:current?.binding??null,interactionStatus:current?.interaction.status??null}) !==
+          nativeSha256({binding:expected.binding,interactionStatus:expected.interactionStatus})) {
+        throw new NativeStatusRaceError();
+      }
     }
     // Recheck under the parent status lock: a child can finish between the
     // finalizer's read and this commit. Re-arbitrate instead of discarding its wake.
