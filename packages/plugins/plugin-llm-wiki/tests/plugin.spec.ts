@@ -98,6 +98,7 @@ let mockPageContentsByPath: Record<string, string> = {};
 let mockPageMetadataByPath: Record<string, {
   backlinks?: string[];
   sourceRefs?: Array<Record<string, unknown> | string>;
+  citationHolds?: Array<{retractedPath:string; retractionId:string; eventHash:string; reason:string}>;
 }> = {};
 
 beforeEach(() => {
@@ -334,6 +335,7 @@ beforeEach(() => {
               pageType: path === "AGENTS.md" ? null : "index",
               backlinks: mockPageMetadataByPath[path]?.backlinks ?? [],
               sourceRefs: mockPageMetadataByPath[path]?.sourceRefs ?? [],
+              citationHolds: mockPageMetadataByPath[path]?.citationHolds ?? [],
               updatedAt: null,
               hash: "abc123",
             },
@@ -865,6 +867,38 @@ describe("LLM Wiki plugin scaffold", () => {
     expect(markup).not.toContain(">Backlinks</");
     expect(markup).not.toContain("PAP-FOOTER-1");
     expect(markup).not.toContain("hidden-footer-link");
+  });
+
+  it("shows the unverified-source citation hold above the preserved page body", () => {
+    const path = "wiki/sources/legacy-note.md";
+    mockPathname = "/PAP/wiki/page/" + path;
+    mockPageContentsByPath[path] = "# Legacy note\n\nOriginal body stays viewable.";
+    mockPageMetadataByPath[path] = { citationHolds: [{
+      retractedPath: "wiki/syntheses/withdrawn.md", retractionId: "withdrawal-1", eventHash: "event-hash",
+      reason: "未検証の旧出典を持つ保全頁です。正規化と独立QAまで引用利用を保留します。",
+    }] };
+    const markup = renderToStaticMarkup(createElement(WikiPage, {
+      context: { companyId: COMPANY_ID, companyPrefix: "PAP" },
+    } as never));
+    expect(markup).toContain("Original body stays viewable.");
+    expect(markup).toContain("出典未検証");
+    expect(markup).toContain("独立QA");
+    expect(markup).toContain("未検証の旧出典を持つ保全頁です。");
+    expect(markup).toContain("withdrawal-1");
+    expect(markup.indexOf("出典未検証")).toBeLessThan(markup.indexOf("Original body stays viewable."));
+    expect(markup).not.toContain("無関係な内容のみ再利用してください");
+  });
+
+  it("keeps an unaffected page readable without a citation hold notice", () => {
+    const path = "wiki/sources/accepted-note.md";
+    mockPathname = "/PAP/wiki/page/" + path;
+    mockPageContentsByPath[path] = "# Accepted note\n\nUnchanged accepted body.";
+    const markup = renderToStaticMarkup(createElement(WikiPage, {
+      context: { companyId: COMPANY_ID, companyPrefix: "PAP" },
+    } as never));
+    expect(markup).toContain("Unchanged accepted body.");
+    expect(markup).not.toContain("引用の利用保留");
+    expect(markup).not.toContain("出典未検証");
   });
 
   it("renders YAML frontmatter as foldable properties without duplicating title", () => {

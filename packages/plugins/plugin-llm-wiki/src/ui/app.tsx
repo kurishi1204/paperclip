@@ -331,7 +331,7 @@ type PageContentData = {
   pageType: string | null;
   backlinks: string[];
   sourceRefs: Array<Record<string, unknown> | string>;
-  citationHolds?: Array<{ retractedPath: string; retractionId: string; eventHash: string }>;
+  citationHolds?: Array<{ retractedPath: string; retractionId: string; eventHash: string; reason: string }>;
   updatedAt: string | null;
   hash: string;
 };
@@ -3315,9 +3315,10 @@ function PageDetail({ context, path, spaceSlug }: { context: { companyId: string
     <article style={{ padding: isMobile ? "16px" : "24px 28px", display: "grid", gap: isMobile ? 12 : 14, minWidth: 0 }}>
       {content.data.citationHolds?.length ? <Callout tone="warn">
         <strong>引用の利用保留（本文の誤り認定ではありません）</strong>
-        <p>以下の出典に依存する引用は使わず、無関係な内容のみ再利用してください。</p>
+        <p>この頁は出典未検証または撤回済みの引用を含みます。対象の引用は、出典を確認して独立QAを通すまで根拠に使わないでください。本文の閲覧は原文保全のために残しています。</p>
         <ul>{content.data.citationHolds.map(hold => <li key={hold.retractionId}>
           <Mono>{hold.retractedPath}</Mono> — <Mono>{hold.retractionId}</Mono>
+          <details><summary>保留の理由</summary><p>{hold.reason}</p></details>
         </li>)}</ul>
       </Callout> : null}
       <header style={{ display: "grid", gap: 8, minWidth: 0 }}>

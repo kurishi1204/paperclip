@@ -402,3 +402,12 @@ ordinary source capture retains its existing indexing behavior, while reviewed
 immutable publication sets strictInvalidReferences and refuses unresolved source
 targets before any file effect. Its withdrawn/dependency checks always apply to
 the resolved canonical references, whether an extension was present or not.
+
+## Visible preservation warning
+
+The page UI, page API and tool text identify citation holds from withdrawn or
+unverified sources. The UI shows the hold before the retained body and exposes
+the server-provided reason in a disclosure. Viewing preserved bytes does not
+clear the hold: source verification and independent QA are still required before
+the affected citation can be reused. This changes presentation only, retaining
+the same withdrawal event, source hashes, publication pins and write hold.
