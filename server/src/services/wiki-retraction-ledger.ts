@@ -307,8 +307,11 @@ export function retractionBlock(path: string, dependencies: Map<string, string[]
     for (const parent of dependencies.get(current) ?? []) { const result = visit(parent); if (result) return result; }
     return null;
   }
-  const event = visit(path) ?? events.find(e => e.type === "executed" && e.fence?.preservedPages?.some(p =>
-    p.path === (e.fence.pathPrefix ? e.fence.pathPrefix + "/" : "") + path));
+  const event = visit(path) ?? events.find(e => {
+    if (e.type !== "executed" || !e.fence) return false;
+    const fence = e.fence;
+    return fence.preservedPages?.some(p => p.path === (fence.pathPrefix ? fence.pathPrefix + "/" : "") + path);
+  });
   return event ? { state: event.path === path ? "retracted" : "blocked_by_retraction", path,
     retractionId: event.retractionId, retractedPath: event.path,
     reason: retractionCitationReason(event,(event.fence?.pathPrefix ? event.fence.pathPrefix + "/" : "") + path),eventHash: event.eventHash } : null;
