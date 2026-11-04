@@ -1,3 +1,4 @@
+import { parseObject } from "../../adapters/utils.js";
 import { and, eq } from "drizzle-orm";
 import { agents, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { hasPendingDocumentReviewAdmission, readCurrentPendingDocumentReviewWake } from "../pending-document-review-wake.js";
@@ -21,6 +22,12 @@ export async function getNativeDocumentReviewAssignment(db: Db, input: {
     ...input, contextSnapshot: row.run.contextSnapshot ?? {},
     ...(input.allowResolved ? { allowResolvedByRunId: input.runId } : {}),
   });
-  if (!review || (review.interaction.status === "pending" && row.issue.executionRunId !== input.runId)) return null;
+  // This standalone role can decide only a non-continuing document request.
+  // Plan confirmations and task-transition requests keep their separate workflows.
+  if (!review || review.interaction.continuationPolicy !== "none" || review.binding.key === "plan") return null;
+  const admission = parseObject(parseObject(row.run.runnerProfileJson).pendingDocumentReviewAdmission);
+  if (typeof admission.nonAssignee !== "boolean" ||
+      admission.nonAssignee !== (row.issue.assigneeAgentId !== input.agentId) ||
+      (review.interaction.status === "pending" && row.issue.executionRunId !== input.runId)) return null;
   return review;
 }

@@ -1316,7 +1316,7 @@ export async function finalizeNativeRun(input: {
       providerFailureSuperseded: providerFailure?.errorCode === "native_provider_overloaded" && !ownsProviderFailureDecision,
       formalApprovalDecisionId: formalApprovalDecision?.id ?? null,
       failureRetryCount: executionFailureRetryCount(run),
-      ...(isDocumentReview ? { nativeReviewOutcome: documentReview
+      ...(isDocumentReview ? { documentReviewOutcome: documentReview
         ? documentReview.interaction.status === "pending" ? "pending" as const : "resolved" as const
         : "stale" as const } : reviewContext ? { nativeReviewOutcome: nativeReview
         ? nativeReview.interaction.status === "pending" ? "pending" as const : "resolved" as const

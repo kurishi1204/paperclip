@@ -120,6 +120,8 @@ export function arbitrateNativeStatus(input: {
   reviewOwnerUserId?: string | null;
   /** Review decisions own task state; a reviewer's finish report cannot override them. */
   nativeReviewOutcome?: "resolved" | "pending" | "stale";
+  /** A fixed document verdict is separate from worker completion. */
+  documentReviewOutcome?: "resolved" | "pending" | "stale";
   /** The committed issue_execution_decisions row for this exact run and formal approval stage. */
   formalApprovalDecisionId?: string | null;
   /** Re-derived from the committed runner terminal and pinned execution identity. */
@@ -222,6 +224,22 @@ export function arbitrateNativeStatus(input: {
       effects: [
         { kind: "schedule_retry", cause: NATIVE_PROVIDER_OVERLOADED_CODE, summary: "Retry after model capacity becomes available.", agentId: input.agentId },
         ...(input.nativeReviewOutcome === "pending" ? [{ kind: "release_checkout" as const }] : []),
+      ],
+    };
+  }
+  if (input.documentReviewOutcome) {
+    const outcome = input.documentReviewOutcome;
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve", toStatus: input.priorIssueStatus,
+      reasonCode: `native_document_review_${outcome}`, unblockDescriptor: null,
+      effects: [
+        { kind: "release_checkout" },
+        ...(outcome !== "resolved" ? [{
+          kind: "record_recovery" as const, cause: `native_document_review_${outcome}`,
+          nextAction: "Inspect the saved fixed-document review and its current authority. Do not mark QA complete or replay the prior run.",
+          agentId: input.agentId,
+        }] : []),
       ],
     };
   }

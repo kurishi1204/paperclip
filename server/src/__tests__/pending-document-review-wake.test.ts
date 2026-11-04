@@ -16,6 +16,7 @@ import path from "node:path";
 import { getNativeDocumentReviewAssignment } from "../services/native-runtime/native-document-review-participant.js";
 import { stageNativeRunnerWakeAttachments } from "../services/native-runtime/native-runner-file-handoff.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
+import { resolveNativeFinalizerStatus } from "../services/native-runtime/native-run-finalizer.js";
 import { nativeCompletionFeedback } from "../services/native-runtime/native-completion-feedback.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import type { PrpStructuredRunResult } from "../vendor/paperclip-runner/index.js";
@@ -116,6 +117,10 @@ suite("pending independent document review through real dispatch", () => {
         .toMatchObject({interaction:{status:"accepted",resolvedByRunId:x.runId,resolvedByAgentId:x.reviewerId}});
       const [task] = await db.select().from(issues).where(eq(issues.id,x.issueId));
       expect(task).toMatchObject({assigneeAgentId:x.ownerId,status:"blocked"});
+      const { arbitrateNativeStatus } = await import("../services/native-runtime/status-arbiter.js");
+      const assessment = { reportedDisposition:"done" } as Parameters<typeof arbitrateNativeStatus>[0]["assessment"];
+      const decision = resolveNativeFinalizerStatus({ assessment, terminalState:"succeeded", workspaceFinalizeStatus:"succeeded", documentReviewOutcome:"resolved", agentId:x.reviewerId, priorIssueStatus:"blocked" });
+      expect(decision).toMatchObject({statusAction:"preserve",toStatus:"blocked",reasonCode:"native_document_review_resolved",effects:[{kind:"release_checkout"}]});
     } finally {
       vi.unstubAllGlobals();
       if (previousSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
@@ -123,13 +128,30 @@ suite("pending independent document review through real dispatch", () => {
       await rm(workspaceRoot,{recursive:true,force:true});
     }
   });
-  it.each(["wrong_receipt","lost_lock","stale_revision","wrong_addressee"] as const)(
+  it.each(["wrong_receipt","lost_lock","stale_revision","wrong_addressee","continuing_request","plan_workflow","missing_role_marker","wrong_role_marker","malformed_role_marker"] as const)(
     "refuses %s across native staging and tool reads", async defect => {
       const x = await nativeReviewFixture();
       if (defect === "wrong_receipt") await db.update(agentWakeupRequests).set({requestedByActorId:x.reviewerId}).where(eq(agentWakeupRequests.id,x.wakeupRequestId));
       if (defect === "lost_lock") await db.update(issues).set({executionRunId:null}).where(eq(issues.id,x.issueId));
       if (defect === "stale_revision") await db.update(documents).set({latestRevisionId:randomUUID()}).where(eq(documents.id,x.documentId));
       if (defect === "wrong_addressee") await db.update(issueThreadInteractions).set({addresseeAgentId:x.ownerId}).where(eq(issueThreadInteractions.id,x.interactionId));
+      if (defect === "continuing_request") await db.update(issueThreadInteractions).set({continuationPolicy:"wake_assignee"}).where(eq(issueThreadInteractions.id,x.interactionId));
+      if (defect === "plan_workflow") {
+        await db.update(issueDocuments).set({key:"plan"}).where(eq(issueDocuments.documentId,x.documentId));
+        await db.update(issueThreadInteractions).set({payload:{version:1,prompt:"Plan review",target:{...x.target,key:"plan"}}}).where(eq(issueThreadInteractions.id,x.interactionId));
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
+        const profile = run!.runnerProfileJson as Record<string,unknown>;
+        const admission = profile.pendingDocumentReviewAdmission as Record<string,unknown>;
+        await db.update(heartbeatRuns).set({runnerProfileJson:{...profile,pendingDocumentReviewAdmission:{...admission,binding:{...(admission.binding as Record<string,unknown>),key:"plan"}}}}).where(eq(heartbeatRuns.id,x.runId));
+      }
+      if (["missing_role_marker","wrong_role_marker","malformed_role_marker"].includes(defect)) {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
+        const profile = run!.runnerProfileJson as Record<string,unknown>;
+        const admission = {...profile.pendingDocumentReviewAdmission as Record<string,unknown>};
+        if (defect === "missing_role_marker") delete admission.nonAssignee;
+        else admission.nonAssignee = defect === "wrong_role_marker" ? false : "true";
+        await db.update(heartbeatRuns).set({runnerProfileJson:{...profile,pendingDocumentReviewAdmission:admission}}).where(eq(heartbeatRuns.id,x.runId));
+      }
       expect(await getNativeDocumentReviewAssignment(db,x.binding)).toBeNull();
       await expect(stageNativeRunnerWakeAttachments({db,binding:{...x.binding,workspaceRoot:"/unused-synthetic-workspace",executionTargetKind:"local"}}))
         .rejects.toThrow("paperclip_runner_attachment_staging_not_authorized");

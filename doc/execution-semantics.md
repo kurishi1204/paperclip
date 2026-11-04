@@ -1708,3 +1708,11 @@ provider file/shell policy remains unchanged. After a verdict, only the exact
 resolving run may finish while the current document binding remains unchanged.
 Finalization preserves task status and assignment and releases the review lock;
 a missing or stale review never falls through to worker completion.
+
+This standalone native document-review role accepts only requests with no task
+continuation and excludes plan confirmations, whose existing workflow can change
+task state. Those requests retain their own review/plan workflow; they do not
+receive standalone inspection authority. Missing or inconsistent saved role
+markers are refused. At finalization, resolved, unresolved and stale fixed
+document reviews receive distinct reason codes. Unresolved/stale reviews record
+explicit recovery without retrying the old run or claiming business QA success.

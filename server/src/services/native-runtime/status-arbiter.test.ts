@@ -95,6 +95,15 @@ describe("native status authority", () => {
     expect(arbitrate({ priorIssueStatus: "in_review", terminalState: "failed", providerModelRejected: true, nativeReviewOutcome: "pending" }))
       .toMatchObject({ statusAction: "preserve", toStatus: "in_review", reasonCode: "native_provider_model_rejected", unblockDescriptor: null, effects: [{ kind: "release_checkout" }] });
   });
+  it.each(["resolved", "pending", "stale"] as const)("records fixed document QA as %s without worker completion", documentReviewOutcome => {
+    const decision = arbitrate({ priorIssueStatus:"blocked", documentReviewOutcome });
+    expect(decision).toMatchObject({statusAction:"preserve",toStatus:"blocked",reasonCode:`native_document_review_${documentReviewOutcome}`});
+    expect(decision.effects).toContainEqual({kind:"release_checkout"});
+    if (documentReviewOutcome !== "resolved") expect(decision.effects).toContainEqual(expect.objectContaining({kind:"record_recovery",cause:`native_document_review_${documentReviewOutcome}`}));
+    else expect(decision.effects).not.toContainEqual(expect.objectContaining({kind:"record_recovery"}));
+    expect(decision.effects.some(effect=>["enqueue_continuation","schedule_retry"].includes(effect.kind))).toBe(false);
+  });
+
   it("a reviewer finishes its decision without completing rejected or still-reviewed work", () => {
     for (const priorIssueStatus of ["in_progress", "in_review"] as const) {
       const decision = arbitrate({ priorIssueStatus, nativeReviewOutcome: "resolved" });
