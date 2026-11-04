@@ -208,6 +208,16 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
       expect(proposal.fence.preservedPages).toEqual([{path:preserved,contentHash:publicationHash(original),
         sourceRefsSHA256:publicationHash(publicationCanonical([{kind:"historical_reference",note:"existing input"}]))}]);
       const preview=(paths:string[])=>service.preview(scope,target,"Synthetic revalidation",paths);
+      // An otherwise readable registered page cannot alias an unpinned path.
+      await fs.rename(join(dir,"wiki/upstream.md"),join(dir,"wiki/real-upstream.md"));
+      try {
+        await fs.symlink("real-upstream.md",join(dir,"wiki/upstream.md"));
+        await expect(preview([preserved])).rejects.toThrow(/retraction_alias/);
+      }finally{
+        await fs.unlink(join(dir,"wiki/upstream.md"));
+        await fs.rename(join(dir,"wiki/real-upstream.md"),join(dir,"wiki/upstream.md"));
+      }
+
       await expect(preview([preserved,preserved])).rejects.toThrow(/preserve_paths/);
       await expect(preview([target])).rejects.toThrow(/preserve_path/);
       await expect(preview(["wiki/absent.md"])).rejects.toThrow(/preserve_metadata/);

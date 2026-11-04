@@ -79,7 +79,9 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
     const toPhysical = (p: string) => space.path_prefix ? `${space.path_prefix}/${p}` : p;
     const page = async (p: string): Promise<JsonObject> => {
       const matches = rows.filter(r => r.path === p); publicationNeed(matches.length === 1, "retraction_page_metadata");
-      const contents = await readPluginLocalFolderText(rootPath, toPhysical(p)); const pin = pins.entries.find(e => e.path === p)!;
+      const rel=toPhysical(p);
+      publicationNeed(await physical(rootPath,rel)===rel,"retraction_alias");
+      const contents = await readPluginLocalFolderText(rootPath,rel); const pin = pins.entries.find(e => e.path === p)!;
       publicationNeed(publicationHash(contents) === pin.wikiSHA256 && matches[0]!.content_hash === pin.wikiSHA256, "retraction_page_changed");
       return { path: p, wikiId: scope.wikiId, spaceSlug: scope.spaceSlug, sourceRefs: matches[0]!.source_refs };
     };
