@@ -28,23 +28,26 @@ the server-resolved same-version human decision and separate independent QA.
 This code is not deployed. A reviewed immutable republication entry is connected locally; its real PostgreSQL/HTTP acceptance and production acceptance remain incomplete. Existing `freeze-wiki` ledger events are unchanged and remain
 strict; never activate the policy by rewriting an event or configuration.
 
-## Preserving existing unrelated pages
+## Retaining existing unregistered bytes for inspection
 
-An operator may supply `preservePaths` to the preview route for existing
-unregistered pages whose reading should continue. The saved proposal records
-their physical paths, byte hashes and complete source-reference hashes in
-`fence.preservedPages` and includes their byte pins in `readable`. Selection is
-explicit and must receive the same independent QA and human-only decision as
-the rest of the proposal. It does not register those pages, grant write access,
-or claim their content has publication QA.
+An operator may supply `preservePaths` to keep existing unregistered pages
+viewable without pretending their arbitrary legacy source metadata is verified.
+Their physical paths, byte hashes and complete source-reference hashes are
+pinned in `fence.preservedPages`. Each page is also a `blocked_by_retraction`
+entry with the citation-holds policy; it is never put into `readable`.
 
-The host rejects missing metadata, byte mismatches, aliases, target/dependent
-references, and body links outside the retained registered or selected pages.
-Execution rebuilds those pins; changed references invalidate the proposal. The
-common reader checks the retained metadata and bytes again after execution. Preservation also requires the current read to pass every earlier durable fence; it cannot revive an existing refusal. Partial references containing the affected immutable issue, document or revision identity are refused without depending on a reference-kind or key-name list.
-Pages not selected in the proposal, future pages, direct withdrawals and old
-strict fences retain their existing refusal behavior. Ordinary Wiki writes
-remain held. Existing event records are never rewritten.
+The structured reader retains the original body and an explicit unverified-source
+warning. Plain/string reading and verified citation reuse remain refused. This
+is deliberately not an automatic related/unrelated classifier: unknown reference
+formats cannot silently grant verified use. Normalization, independent QA and
+any new publication remain separate operations.
+
+Selection receives the same exact-proposal independent QA and human-only
+consent. Execution rebuilds every pin, and the common reader rechecks metadata
+and bytes. Earlier durable refusals cannot be revived. Missing metadata, byte
+changes and physical aliases are rejected. Unselected/future pages, direct
+withdrawals, old strict fences and the ordinary Wiki write hold keep their
+existing controls. Existing event records are never rewritten.
 
 ## Operator path
 

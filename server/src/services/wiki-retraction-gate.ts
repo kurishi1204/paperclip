@@ -3,7 +3,7 @@ import { realpath } from "node:fs/promises";
 import { resolvePluginLocalFolderPath, readPluginLocalFolderText } from "./plugin-local-folders.js";
 import { publicationHash } from "./wiki-publication-readback.js";
 import type { RetractionEvent, RetractionBlock } from "./wiki-retraction-ledger.js";
-import { RetractionError, validateRetractionEvents, retainedRetractionFile } from "./wiki-retraction-ledger.js";
+import { RetractionError, validateRetractionEvents, retainedRetractionFile, retractionCitationReason } from "./wiki-retraction-ledger.js";
 
 /** The persisted physical-path fence does not depend on publication config.
  * v1 deliberately freezes writes in the affected Wiki tree. No new page or metadata
@@ -41,7 +41,7 @@ export function retractionFolderGate(events: RetractionEvent[], companyId: strin
       const match=event.fence!.blocks.find(b => b.path === filePath);
       return event.fence!.mode === "citation-holds" && match?.state === "blocked_by_retraction"
         ? [{ state: "blocked_by_retraction" as const, path: filePath, retractedPath: event.path,
-          retractionId: event.retractionId, reason: event.reason, eventHash: event.eventHash,
+          retractionId: event.retractionId, reason: retractionCitationReason(event,filePath), eventHash: event.eventHash,
           readPolicy: "citation-holds" as const }] : [];
     });
   }
@@ -87,7 +87,7 @@ function retractionFolderGateSingle(event: RetractionEvent, filePath: string): R
   if (!match && !(filePath.startsWith(prefix) && !event.fence!.readable.some(p => p.path === filePath))) return null;
   // Unknown pages are never treated as reviewed downstream citations.
   return { state: match?.state ?? "retracted", path: filePath, retractedPath: event.path,
-    retractionId: event.retractionId, reason: event.reason, eventHash: event.eventHash,
+    retractionId: event.retractionId, reason: retractionCitationReason(event,filePath), eventHash: event.eventHash,
     ...(match && event.fence!.mode === "citation-holds" ? { readPolicy: "citation-holds" as const } : {}) };
 }
 

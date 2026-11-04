@@ -1,10 +1,10 @@
-import { mkdtemp,mkdir,readFile,rm,writeFile } from "node:fs/promises";
+import { mkdtemp,mkdir,readFile,realpath,rm,writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe,it,expect } from "vitest";
 import { executeRetraction,validateRetractionEvents,retractionEventHash,type RetractionEvent,type RetractionStore } from "../services/wiki-retraction-ledger.js";
-import { retractionFolderGate,readRetractionFolderText } from "../services/wiki-retraction-gate.js";
-import { preserveUnrelatedRetractionPages } from "../services/wiki-retraction-readback.js";
+import { retractionFolderGate,readRetractionFolderText,readRetractionFolderTextWithStatus } from "../services/wiki-retraction-gate.js";
+import { preserveExistingRetractionPages } from "../services/wiki-retraction-readback.js";
 import { publicationCanonical,publicationHash,type PublicationRegistry } from "../services/wiki-publication-readback.js";
 
 const hash=publicationHash("synthetic");
@@ -19,14 +19,14 @@ const noPriorHold=retractionFolderGate([],"synthetic-company","wiki-root");
 
 describe("explicit existing-page preservation",()=>{
   it("pins actual retained bytes and complete references without registering a page",async()=>{
-    const dir=await mkdtemp(join(tmpdir(),"wiki-preserved-page-"));
+    const dir=await realpath(await mkdtemp(join(tmpdir(),"wiki-preserved-page-")));
     try{
       await mkdir(join(dir,"wiki"));
       await writeFile(join(dir,kept),body);
-      const measured=await preserveUnrelatedRetractionPages(pins,[row],held,[kept],async path=>({path,contents:await readFile(join(dir,kept),"utf8")}),noPriorHold);
+      const measured=await preserveExistingRetractionPages(pins,[row],held,[kept],async path=>({path,contents:await readFile(join(dir,kept),"utf8")}),noPriorHold);
       expect(measured).toEqual([{path:kept,contentHash:publicationHash(body),sourceRefsSHA256:publicationHash(publicationCanonical(refs))}]);
       expect(pins.some(pin=>pin.path===kept)).toBe(false);
-      expect(await preserveUnrelatedRetractionPages(pins,[row],held,[],read,noPriorHold)).toEqual([]);
+      expect(await preserveExistingRetractionPages(pins,[row],held,[],read,noPriorHold)).toEqual([]);
       expect(await readFile(join(dir,kept),"utf8")).toBe(body);
       const events:RetractionEvent[]=[];
       const store:RetractionStore={read:async()=>events,transaction:async(_scope,work)=>work({events:async()=>events,append:async e=>{events.push(e);}})};
@@ -36,10 +36,14 @@ describe("explicit existing-page preservation",()=>{
         approval:{id:"synthetic-review",companyId:target.companyId,target,reason:"Synthetic retained-page read",
           reviewerId:"synthetic-qa",reviewRunId:"synthetic-run",ownerDecisionId:"synthetic-human"},
         fence:{folderKey:"wiki-root",rootPath:dir,pathPrefix:"",mode:"citation-holds",registeredPaths:[target.path],
-          blocks:[{path:target.path,contentHash:hash,state:"retracted"}],readable:measured.map(({path,contentHash})=>({path,contentHash})),preservedPages:measured},
+          blocks:[{path:target.path,contentHash:hash,state:"retracted"},...measured.map(({path,contentHash})=>({path,contentHash,state:"blocked_by_retraction" as const}))],readable:[],preservedPages:measured},
         readCurrent:async()=>target});
       const gate=retractionFolderGate(events,target.companyId,"wiki-root");
-      expect(await readRetractionFolderText(dir,kept,gate)).toBe(body);
+      const inspected=await readRetractionFolderTextWithStatus(dir,kept,gate);
+      expect(inspected.contents).toBe(body);
+      expect(inspected.citationHolds).toHaveLength(1);
+      expect(inspected.citationHolds[0]!.reason).toContain("未検証の旧出典");
+      await expect(readRetractionFolderText(dir,kept,gate)).rejects.toThrow(/E_SOURCE_RETRACTED/);
       await expect(readRetractionFolderText(dir,target.path,gate)).rejects.toThrow(/E_SOURCE_RETRACTED/);
       await writeFile(join(dir,"wiki/future.md"),"Not selected");
       await expect(readRetractionFolderText(dir,"wiki/future.md",gate)).rejects.toThrow(/E_SOURCE_RETRACTED/);
@@ -55,38 +59,46 @@ describe("explicit existing-page preservation",()=>{
       const {eventHash:_prior,...priorBasis}=prior;prior.eventHash=retractionEventHash(priorBasis);
       const priorGate=retractionFolderGate([prior],target.companyId,"wiki-root");
       expect(()=>priorGate.assertRead(kept,body)).toThrow(/E_SOURCE_RETRACTED/);
-      await expect(preserveUnrelatedRetractionPages(pins,[row],held,[kept],read,priorGate)).rejects.toThrow(/E_SOURCE_RETRACTED/);
+      await expect(preserveExistingRetractionPages(pins,[row],held,[kept],read,priorGate)).rejects.toThrow(/E_SOURCE_RETRACTED/);
     }finally{await rm(dir,{recursive:true,force:true});}
   });
   it("refuses missing, duplicate, registered and held selections",async()=>{
-    await expect(preserveUnrelatedRetractionPages(pins,[row],held,[kept,kept],read,noPriorHold)).rejects.toThrow(/preserve_paths/);
-    await expect(preserveUnrelatedRetractionPages(pins,[row],held,["wiki/absent.md"],read,noPriorHold)).rejects.toThrow(/preserve_metadata/);
-    await expect(preserveUnrelatedRetractionPages(pins,[row],held,["wiki/upstream.md"],read,noPriorHold)).rejects.toThrow(/preserve_path/);
-    await expect(preserveUnrelatedRetractionPages(pins,[row],held,["wiki/p7.md"],read,noPriorHold)).rejects.toThrow(/preserve_path/);
+    await expect(preserveExistingRetractionPages(pins,[row],held,[kept,kept],read,noPriorHold)).rejects.toThrow(/preserve_paths/);
+    await expect(preserveExistingRetractionPages(pins,[row],held,["wiki/absent.md"],read,noPriorHold)).rejects.toThrow(/preserve_metadata/);
+    await expect(preserveExistingRetractionPages(pins,[row],held,["wiki/upstream.md"],read,noPriorHold)).rejects.toThrow(/preserve_path/);
+    await expect(preserveExistingRetractionPages(pins,[row],held,["wiki/p7.md"],read,noPriorHold)).rejects.toThrow(/preserve_path/);
   });
-  it("rejects affected references even inside an unfamiliar nested metadata shape",async()=>{
-    const rows=[{...row,source_refs:[{kind:"new-format",arbitrary:{nested:["doc-p7"]}}]}];
-    await expect(preserveUnrelatedRetractionPages(pins,rows,held,[kept],read,noPriorHold)).rejects.toThrow(/preserve_dependency/);
+  it("keeps opaque, partial and fragment references unverified without guessing independence",async()=>{
+    const values=["doc-p7","issue-p7","revision-p7","wiki/p7.md#claim","wiki/p7.md?view=source#claim","./p7.md#claim","%77iki/p7.md#claim","[[p7#claim|reference]]","[input](p7.md#claim)"];
+    for(const value of values){
+      const source_refs=[{kind:"unfamiliar-shape",nested:{arbitrary:value}}];
+      const measured=await preserveExistingRetractionPages(pins,[{...row,source_refs}],held,[kept],read,noPriorHold);
+      expect(measured).toEqual([{path:kept,contentHash:row.content_hash,sourceRefsSHA256:publicationHash(publicationCanonical(source_refs))}]);
+      // Every selected result is a metadata pin, never a readable decision.
+      expect(Object.keys(measured[0]!).sort()).toEqual(["contentHash","path","sourceRefsSHA256"]);
+    }
   });
-  it("rejects a partial reference containing the withdrawn issue identity",async()=>{
-    const rows=[{...row,source_refs:[{kind:"unknown-shape",nested:{issue:"issue-p7"}}]}];
-    await expect(preserveUnrelatedRetractionPages(pins,rows,held,[kept],read,noPriorHold)).rejects.toThrow(/preserve_dependency/);
+  it("never upgrades retained unregistered data to an unconditional readable event",()=>{
+    const target={companyId:"synthetic-company",wikiId:"default",spaceSlug:"default",path:"wiki/p7.md",contentHash:hash};
+    const basis={...target,schema:"paperclip.wiki-retraction/v1" as const,id:"synthetic-event",retractionId:"synthetic-operation",sequence:1,previousHash:null,type:"executed" as const,reason:"Synthetic retained legacy source",actorId:"synthetic-owner",runId:null,at:new Date().toISOString(),
+      approval:{id:"synthetic-review",companyId:target.companyId,target,reason:"Synthetic retained legacy source",reviewerId:"synthetic-qa",reviewRunId:"synthetic-run",ownerDecisionId:"synthetic-human"},
+      fence:{folderKey:"wiki-root" as const,rootPath:"/synthetic",pathPrefix:"",mode:"citation-holds" as const,registeredPaths:[target.path],blocks:[{path:target.path,contentHash:hash,state:"retracted" as const}],
+        readable:[{path:kept,contentHash:row.content_hash}],preservedPages:[{path:kept,contentHash:row.content_hash,sourceRefsSHA256:publicationHash(publicationCanonical(refs))}]}};
+    const event={...basis,eventHash:retractionEventHash(basis)};
+    expect(()=>validateRetractionEvents(target,[event])).toThrow(/fence_preserved_page/);
   });
-  it("rejects a partial reference containing the withdrawn revision identity",async()=>{
-    const rows=[{...row,source_refs:[{kind:"unknown-shape",nested:{revision:"revision-p7"}}]}];
-    await expect(preserveUnrelatedRetractionPages(pins,rows,held,[kept],read,noPriorHold)).rejects.toThrow(/preserve_dependency/);
-  });
-  it("rejects body dependencies on held or unselected pages",async()=>{
+  it("retains linked original bytes as inspection input without classifying their sources",async()=>{
     for(const link of ["p7.md","unreviewed.md"]){
       const contents=`[Input](${link})\n`,rows=[{...row,content_hash:publicationHash(contents)}];
-      await expect(preserveUnrelatedRetractionPages(pins,rows,held,[kept],async path=>({path,contents}),noPriorHold)).rejects.toThrow(/preserve_body_dependency/);
+      const measured=await preserveExistingRetractionPages(pins,rows,held,[kept],async path=>({path,contents}),noPriorHold);
+      expect(measured[0]!.contentHash).toBe(publicationHash(contents));
     }
   });
   it("pins reference changes and refuses a changed file or missing reference array",async()=>{
-    await expect(preserveUnrelatedRetractionPages(pins,[{...row,content_hash:hash}],held,[kept],read,noPriorHold)).rejects.toThrow(/preserve_content_changed/);
-    await expect(preserveUnrelatedRetractionPages(pins,[{...row,source_refs:null}],held,[kept],read,noPriorHold)).rejects.toThrow(/preserve_metadata/);
-    const a=await preserveUnrelatedRetractionPages(pins,[row],held,[kept],read,noPriorHold);
-    const b=await preserveUnrelatedRetractionPages(pins,[{...row,source_refs:[...refs,{note:"new reference"}]}],held,[kept],read,noPriorHold);
+    await expect(preserveExistingRetractionPages(pins,[{...row,content_hash:hash}],held,[kept],read,noPriorHold)).rejects.toThrow(/preserve_content_changed/);
+    await expect(preserveExistingRetractionPages(pins,[{...row,source_refs:null}],held,[kept],read,noPriorHold)).rejects.toThrow(/preserve_metadata/);
+    const a=await preserveExistingRetractionPages(pins,[row],held,[kept],read,noPriorHold);
+    const b=await preserveExistingRetractionPages(pins,[{...row,source_refs:[...refs,{note:"new reference"}]}],held,[kept],read,noPriorHold);
     expect(a[0]!.sourceRefsSHA256).not.toBe(b[0]!.sourceRefsSHA256);
     expect(a[0]!.contentHash).toBe(b[0]!.contentHash);
   });

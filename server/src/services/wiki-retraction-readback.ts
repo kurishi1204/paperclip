@@ -1,4 +1,3 @@
-import { extractWikiLinks } from "@paperclipai/plugin-sdk";
 import type { RetractionEvent, RetractionBlock, RetractionFence } from "./wiki-retraction-ledger.js";
 import { retractionBlock } from "./wiki-retraction-ledger.js";
 import { publicationCanonical, publicationHash, publicationNeed,
@@ -71,10 +70,10 @@ export function assertNoUnregisteredRetractionDependants(
 }
 
 
-/** Retain explicitly reviewed existing pages, without publishing them or
- * changing the default refusal for unselected/future pages. Meaning is reviewed
- * in the proposal; physical bytes and complete reference metadata are pinned. */
-export async function preserveUnrelatedRetractionPages(
+/** Retain existing bytes for inspection, never as verified unrelated sources.
+ * Arbitrary legacy references stay unverified. All selected pages become
+ * citation holds; no guessed reference classification can grant citation use. */
+export async function preserveExistingRetractionPages(
   pins: PublicationRegistry["entries"],
   rows: Array<{path:string;source_refs:unknown;content_hash:string}>,
   held: ReadonlySet<string>, preservePaths: string[],
@@ -84,25 +83,14 @@ export async function preserveUnrelatedRetractionPages(
   publicationNeed(Array.isArray(preservePaths) && new Set(preservePaths).size === preservePaths.length,
     "retraction_preserve_paths");
   const preserved: NonNullable<RetractionFence["preservedPages"]> = [];
-  const allowedLinks = new Set([...pins.filter(p => !held.has(p.path)).map(p => p.path), ...preservePaths]);
-  const heldIdentities = new Set([...held, ...pins.filter(p => held.has(p.path)).flatMap(p => [p.issueId,p.documentId,p.revisionId])]);
-  // Check nested values without depending on a source-kind or field-name list.
-  // A conservative identity collision needs review, rather than auto-admission.
-  const mentionsHeld = (value: unknown): boolean => typeof value === "string" ? heldIdentities.has(value)
-    : Array.isArray(value) ? value.some(mentionsHeld)
-    : value !== null && typeof value === "object" ? Object.values(value).some(mentionsHeld) : false;
   for (const p of [...preservePaths].sort()) {
     publicationNeed(typeof p === "string" && p.startsWith("wiki/") && !held.has(p) &&
       !pins.some(pin => pin.path === p), "retraction_preserve_path");
     const matches = rows.filter(row => row.path === p);
     publicationNeed(matches.length === 1 && Array.isArray(matches[0]!.source_refs), "retraction_preserve_metadata");
-    publicationNeed(!mentionsHeld(matches[0]!.source_refs), "retraction_preserve_dependency");
     const current = await read(p), hash = publicationHash(current.contents);
-    // Retention cannot revive a refusal from any earlier durable fence.
     priorRead.assertRead(current.path,current.contents);
     publicationNeed(matches[0]!.content_hash === hash, "retraction_preserve_content_changed");
-    publicationNeed(extractWikiLinks(current.contents, p, {strictInvalidReferences:true})
-      .every(link => allowedLinks.has(link)), "retraction_preserve_body_dependency");
     preserved.push({path:current.path,contentHash:hash,
       sourceRefsSHA256:publicationHash(publicationCanonical(matches[0]!.source_refs))});
   }

@@ -27,8 +27,8 @@ export interface RetractionFence {
   mode: "freeze-wiki" | "citation-holds";
   /** Physical paths registered at withdrawal; absent on historical events. */
   registeredPaths?: string[];
-  /** Existing unregistered pages explicitly retained by the reviewed proposal.
-   * This preserves read access, not publication or independent-content QA. */
+  /** Existing unregistered bytes retained for citation-aware inspection only.
+   * Each is also a citation-held block, never an unconditional readable page. */
   preservedPages?: Array<{ path: string; contentHash: string; sourceRefsSHA256: string }>;
   readable: Array<{ path: string; contentHash: string }>;
   blocks: Array<{ path: string; contentHash: string; state: "retracted" | "blocked_by_retraction" }>;
@@ -192,7 +192,7 @@ export function validateRetractionEvents(scope: RetractionScope, events: Retract
           validTarget({ ...event, ...item });
           need(/^[0-9a-f]{64}$/.test(item.sourceRefsSHA256) &&
             !event.fence.registeredPaths.includes(item.path) &&
-            event.fence.readable.some(p => p.path === item.path && p.contentHash === item.contentHash),
+            event.fence.blocks.some(p => p.path === item.path && p.contentHash === item.contentHash && p.state === "blocked_by_retraction"),
             "fence_preserved_page");
         }
       }
@@ -292,6 +292,11 @@ export interface RetractionBlock {
   reason: string;
   eventHash: string;
 }
+export function retractionCitationReason(event: RetractionEvent, physicalPath: string): string {
+  return event.fence?.preservedPages?.some(p => p.path === physicalPath)
+    ? "未検証の旧出典です。本文は確認用に保持し、正規化・独立QAまで引用を保留します。 " + event.reason
+    : event.reason;
+}
 export function retractionBlock(path: string, dependencies: Map<string, string[]>, events: RetractionEvent[]): RetractionBlock | null {
   const withdrawn = new Map(events.filter(e => e.type === "executed").map(e => [e.path, e]));
   const seen = new Set<string>();
@@ -302,7 +307,9 @@ export function retractionBlock(path: string, dependencies: Map<string, string[]
     for (const parent of dependencies.get(current) ?? []) { const result = visit(parent); if (result) return result; }
     return null;
   }
-  const event = visit(path);
+  const event = visit(path) ?? events.find(e => e.type === "executed" && e.fence?.preservedPages?.some(p =>
+    p.path === (e.fence.pathPrefix ? e.fence.pathPrefix + "/" : "") + path));
   return event ? { state: event.path === path ? "retracted" : "blocked_by_retraction", path,
-    retractionId: event.retractionId, retractedPath: event.path, reason: event.reason, eventHash: event.eventHash } : null;
+    retractionId: event.retractionId, retractedPath: event.path,
+    reason: retractionCitationReason(event,(event.fence?.pathPrefix ? event.fence.pathPrefix + "/" : "") + path),eventHash: event.eventHash } : null;
 }

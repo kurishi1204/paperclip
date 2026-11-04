@@ -11,7 +11,7 @@ import { executeRetraction, withRetractionMaintenanceLog, retainedRetractionFile
 import { loadAllWikiRetractions, loadCurrentWikiRetractions, withWikiRetractionLock, inspectWikiLocalFolder, assertWikiRootOwnership, appendCommittedWikiMaintenance, readWikiMaintenanceState } from "./wiki-retraction-store.js";
 import { resolveReviewedWikiRetraction } from "./wiki-retraction-approval.js";
 import { retractionFolderGate } from "./wiki-retraction-gate.js";
-import { buildRetractionGraph, assertNoUnregisteredRetractionDependants, preserveUnrelatedRetractionPages } from "./wiki-retraction-readback.js";
+import { buildRetractionGraph, assertNoUnregisteredRetractionDependants, preserveExistingRetractionPages } from "./wiki-retraction-readback.js";
 import { parsePublicationRegistry, publicationCanonical, publicationHash, publicationNeed, type JsonObject } from "./wiki-publication-readback.js";
 
 export interface WikiRetractionProposal {
@@ -85,7 +85,7 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
     // Existing unregistered pages cannot silently escape dependency analysis.
     // A target-linked document reference outside the registered graph requires
     // registration/review before preview; no guessed classification is accepted.
-    assertNoUnregisteredRetractionDependants(pins.entries, rows, held);
+
     // Index/log bytes remain untouched. Citation-aware views may expose them
     // with the same hold warning; legacy string readers remain strict.
     held.add("wiki/index.md"); held.add("wiki/log.md");
@@ -96,19 +96,23 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
       blocks.push({ path: canonical, contentHash: publicationHash(await readPluginLocalFolderText(rootPath, rel)),
         state: p === targetPath ? "retracted" : "blocked_by_retraction" });
     }
-    const preservedPages = await preserveUnrelatedRetractionPages(pins.entries, rows, held, preservePaths, async p => {
+    const preservedPages = await preserveExistingRetractionPages(pins.entries, rows, held, preservePaths, async p => {
       const rel = toPhysical(p), canonical = await physical(rootPath, rel);
       publicationNeed(canonical === rel, "retraction_alias");
       return {path:canonical,contents:await readPluginLocalFolderText(rootPath, rel)};
     },currentGate);
+    // Every removed row is now represented by an explicit, hash-bound hold.
+    // Unselected unregistered dependants retain the existing refusal policy.
+    const selected = new Set(preservePaths);
+    assertNoUnregisteredRetractionDependants(pins.entries, rows.filter(row => !selected.has(row.path)), held);
+    blocks.push(...preservedPages.map(({path,contentHash}) => ({path,contentHash,state:"blocked_by_retraction" as const})));
     return { schema: "paperclip.wiki-retraction-request/v1", pluginId,
       target: { ...scope, path: targetPath, contentHash: targetPin.wikiSHA256 }, reason,
       publicationRegistrySHA256: publicationHash(publicationCanonical(pins)),
       fence: { folderKey: "wiki-root", rootPath, pathPrefix: space.path_prefix ?? "", mode: "citation-holds", blocks,
         registeredPaths: pins.entries.map(p=>toPhysical(p.path)).sort(),
         ...(preservedPages.length ? {preservedPages} : {}),
-        readable: [...pins.entries.filter(p => !held.has(p.path)).map(p => ({ path: toPhysical(p.path), contentHash: p.wikiSHA256 })),
-          ...preservedPages.map(({path,contentHash}) => ({path,contentHash}))].sort((a,b)=>a.path.localeCompare(b.path)) } };
+        readable: pins.entries.filter(p => !held.has(p.path)).map(p => ({ path: toPhysical(p.path), contentHash: p.wikiSHA256 })).sort((a,b)=>a.path.localeCompare(b.path)) } };
   }
   return {
     preview: (scope: RetractionScope, targetPath: string, reason: string, preservePaths: string[] = []) =>

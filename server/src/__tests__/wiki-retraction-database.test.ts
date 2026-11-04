@@ -128,7 +128,7 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     await pluginDb.applyMigrations(pluginId,wikiManifest,fileURLToPath(new URL("../../../packages/plugins/plugin-llm-wiki/",import.meta.url)));
     const ns=await pluginDb.getRuntimeNamespace(pluginId);
     const {buildHostServices}=await import("../services/plugin-host-services.js");
-    async function context(newPath:string,withdraw?:(input:Parameters<ReturnType<typeof wikiRetractionRuntime>["execute"]>[0],dir:string)=>Promise<{retractionId:string}>, preserveUnrelated=false) {
+    async function context(newPath:string,withdraw?:(input:Parameters<ReturnType<typeof wikiRetractionRuntime>["execute"]>[0],dir:string)=>Promise<{retractionId:string}>, preserveExisting=false) {
       const companyId=randomUUID(),author=randomUUID(),qa=randomUUID(),spaceId=randomUUID();
       await db.insert(companies).values({id:companyId,name:"Synthetic reviewed republication",issuePrefix:"R"+companyId.replaceAll("-","").slice(0,12)});
       await db.insert(agents).values([{id:author,companyId,name:"Responsible author"},{id:qa,companyId,name:"Independent reviewer"}]);
@@ -162,7 +162,7 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
       }
       await db.insert(pluginConfig).values({pluginId,companyId,configJson:{publicationReadback:registry,syntheticPreservedSetting:true}});
       const target={companyId,wikiId:"default",spaceSlug:"default",path:"wiki/p7.md",contentHash:registry.entries[0]!.wikiSHA256};
-      if (preserveUnrelated) {
+      if (preserveExisting) {
         const body = "# Existing unrelated page\n\n[Independent input](upstream.md)\n";
         await writeFile(join(dir,"wiki/unregistered.md"),body);
         await db.$client.unsafe(`INSERT INTO ${ns}.wiki_pages(id,company_id,wiki_id,space_id,path,page_type,source_refs,content_hash)
@@ -170,7 +170,7 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
           [randomUUID(),companyId,spaceId,JSON.stringify([{kind:"historical_reference",note:"existing input"}]),publicationHash(body)]);
       }
       const preview=await wikiRetractionRuntime(db,pluginId).preview(target,target.path,"Synthetic revalidation",
-        preserveUnrelated ? ["wiki/unregistered.md"] : []);
+        preserveExisting ? ["wiki/unregistered.md"] : []);
       // Matching registry metadata cannot hide a different stored creator.
       await db.update(documents).set({createdByAgentId:qa}).where(eq(documents.id,registry.entries[0]!.documentId));
       await expect(wikiRetractionRuntime(db,pluginId).preview(target,target.path,"Synthetic revalidation")).rejects.toThrow(/published_source_identity/);
@@ -212,19 +212,23 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
       await expect(preview([target])).rejects.toThrow(/preserve_path/);
       await expect(preview(["wiki/absent.md"])).rejects.toThrow(/preserve_metadata/);
       await expect(preview(["wiki/../wiki/unregistered.md"])).rejects.toThrow(/preserve_metadata/);
-      // A real body link to the withdrawn page cannot be labelled unrelated.
+      // Even a direct body dependency is viewable only as explicitly warned inspection input.
       const linked="[Withdrawn input](p7.md)\n";
       await writeFile(join(dir,preserved),linked);
       await db.$client.unsafe(`UPDATE ${ns}.wiki_pages SET content_hash=$2 WHERE company_id=$1 AND path=$3`,[company,publicationHash(linked),preserved]);
-      await expect(preview([preserved])).rejects.toThrow(/preserve_body_dependency/);
+      const linkedPreview=await preview([preserved]);
+      expect(linkedPreview.fence.readable.some(p=>p.path===preserved)).toBe(false);
+      expect(linkedPreview.fence.blocks).toContainEqual({path:preserved,contentHash:publicationHash(linked),state:"blocked_by_retraction"});
       await writeFile(join(dir,preserved),original);
       await db.$client.unsafe(`UPDATE ${ns}.wiki_pages SET content_hash=$2 WHERE company_id=$1 AND path=$3`,[company,publicationHash(original),preserved]);
-      // Reference identity is checked without relying on a particular kind or key alias.
+      // No metadata representation can upgrade these unverified bytes into readable citations.
       const targetRegistry=(await db.select().from(pluginConfig).where(eq(pluginConfig.companyId,company)))[0]!.configJson.publicationReadback as PublicationRegistry;
       const affectedDocument=targetRegistry.entries.find(p=>p.path===target)!.documentId;
       await db.$client.unsafe(`UPDATE ${ns}.wiki_pages SET source_refs=$2::jsonb WHERE company_id=$1 AND path=$3`,
         [company,JSON.stringify([{kind:"issue_document",nested:{value:affectedDocument}}]),preserved]);
-      await expect(preview([preserved])).rejects.toThrow(/preserve_dependency/);
+      const opaquePreview=await preview([preserved]);
+      expect(opaquePreview.fence.readable.some(p=>p.path===preserved)).toBe(false);
+      expect(opaquePreview.fence.preservedPages).toHaveLength(1);
       const changed=[{kind:"historical_reference",note:"different input"}];
       await db.$client.unsafe(`UPDATE ${ns}.wiki_pages SET source_refs=$2::jsonb WHERE company_id=$1 AND path=$3`,[company,JSON.stringify(changed),preserved]);
       await expect(service.execute(input)).rejects.toThrow(/Withdrawal proposal changed/);
@@ -245,8 +249,18 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     const keptEvents=await loadAllWikiRetractions(db,pluginId,kept.companyId);
     const keptGate=retractionFolderGate(keptEvents,kept.companyId,"wiki-root"),keptPath="wiki/unregistered.md";
     const readKept=()=>withWikiRetractionLock(db,pluginId,kept.companyId,tx=>
-      readRetractionFolderText(kept.dir,keptPath,keptGate,p=>assertCurrentWikiRepublication(tx,pluginId,kept.companyId,keptEvents,p)));
-    const keptBody=await readKept();expect(keptBody).toContain("Existing unrelated page");
+      readRetractionFolderTextWithStatus(kept.dir,keptPath,keptGate,p=>assertCurrentWikiRepublication(tx,pluginId,kept.companyId,keptEvents,p)));
+    const inspectedKept=await readKept(),keptBody=inspectedKept.contents;
+    expect(keptBody).toContain("Existing unrelated page");
+    expect(inspectedKept.citationHolds).toHaveLength(1);
+    expect(inspectedKept.citationHolds[0]!.reason).toContain("未検証の旧出典");
+    await expect(readRetractionFolderText(kept.dir,keptPath,keptGate)).rejects.toThrow(/E_SOURCE_RETRACTED/);
+    const keptHost=buildHostServices(db,pluginId,wikiManifest.id,{forPlugin:()=>({clear:()=>{}})} as never,undefined,{manifest:wikiManifest});
+    try {
+      const actual=await keptHost.localFolders.readTextWithStatus!({companyId:kept.companyId,folderKey:"wiki-root",relativePath:keptPath});
+      expect(actual).toMatchObject(inspectedKept);
+      await expect(keptHost.localFolders.readText({companyId:kept.companyId,folderKey:"wiki-root",relativePath:keptPath})).rejects.toThrow(/E_SOURCE_RETRACTED/);
+    }finally{keptHost.dispose();}
     const notPreviouslyKept="wiki/not-in-earlier-proposal.md",unrelatedBody="# Existing but not retained before\n";
     await writeFile(join(kept.dir,notPreviouslyKept),unrelatedBody);
     await db.$client.unsafe(`INSERT INTO ${ns}.wiki_pages(id,company_id,wiki_id,space_id,path,page_type,source_refs,content_hash)
@@ -261,7 +275,7 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
     await writeFile(join(kept.dir,keptPath),"changed retained body");
     await expect(readKept()).rejects.toThrow(/readable_content_changed/);
     await writeFile(join(kept.dir,keptPath),keptBody);
-    expect(await readKept()).toBe(keptBody);
+    expect((await readKept()).contents).toBe(keptBody);
     await expect(readRetractionFolderText(kept.dir,"wiki/p7.md",keptGate)).rejects.toThrow(/E_SOURCE_RETRACTED/);
     await writeFile(join(kept.dir,"wiki/future.md"),"not reviewed or selected");
     await expect(readRetractionFolderText(kept.dir,"wiki/future.md",keptGate)).rejects.toThrow(/E_SOURCE_RETRACTED/);
