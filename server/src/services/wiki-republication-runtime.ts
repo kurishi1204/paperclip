@@ -37,6 +37,16 @@ export async function assertCurrentWikiRepublication(db:Db,pluginId:string,compa
     registry.wikiId===event.wikiId&&registry.spaceSlug===event.spaceSlug,"republication_current_space");
   const physical=(p:string)=>spaces[0]!.path_prefix?spaces[0]!.path_prefix+"/"+p:p;
   const target=registry.entries.find(p=>physical(p.path)===physicalPath);
+  const preserved = originals.flatMap(e => e.fence?.preservedPages?.filter(p => p.path === physicalPath) ?? []);
+  if (preserved.length) {
+    const logicalPath = spaces[0]!.path_prefix ? physicalPath.slice(spaces[0]!.path_prefix.length + 1) : physicalPath;
+    const rows = await pluginDb.query<{source_refs:unknown;content_hash:string}>(pluginId,
+      `SELECT source_refs,content_hash FROM ${ns}.wiki_pages WHERE company_id=$1 AND wiki_id=$2 AND space_id=$3 AND path=$4 FOR SHARE`,
+      [companyId,registry.wikiId,spaces[0]!.id,logicalPath]);
+    publicationNeed(rows.length === 1 && Array.isArray(rows[0]!.source_refs) && preserved.every(pin =>
+      rows[0]!.content_hash === pin.contentHash &&
+      publicationHash(publicationCanonical(rows[0]!.source_refs)) === pin.sourceRefsSHA256), "republication_preserved_page_changed");
+  }
   // Classification is persisted with the withdrawal, never inferred from
   // today's editable registry. Missing historical classification is unknown.
   if(!target){

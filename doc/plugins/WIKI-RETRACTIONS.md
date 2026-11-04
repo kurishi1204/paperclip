@@ -28,6 +28,24 @@ the server-resolved same-version human decision and separate independent QA.
 This code is not deployed. A reviewed immutable republication entry is connected locally; its real PostgreSQL/HTTP acceptance and production acceptance remain incomplete. Existing `freeze-wiki` ledger events are unchanged and remain
 strict; never activate the policy by rewriting an event or configuration.
 
+## Preserving existing unrelated pages
+
+An operator may supply `preservePaths` to the preview route for existing
+unregistered pages whose reading should continue. The saved proposal records
+their physical paths, byte hashes and complete source-reference hashes in
+`fence.preservedPages` and includes their byte pins in `readable`. Selection is
+explicit and must receive the same independent QA and human-only decision as
+the rest of the proposal. It does not register those pages, grant write access,
+or claim their content has publication QA.
+
+The host rejects missing metadata, byte mismatches, aliases, target/dependent
+references, and body links outside the retained registered or selected pages.
+Execution rebuilds those pins; changed references invalidate the proposal. The
+common reader checks the retained metadata and bytes again after execution.
+Pages not selected in the proposal, future pages, direct withdrawals and old
+strict fences retain their existing refusal behavior. Ordinary Wiki writes
+remain held. Existing event records are never rewritten.
+
 ## Operator path
 
 All three routes require authenticated board access and company authorization.

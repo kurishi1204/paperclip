@@ -11,7 +11,7 @@ import { executeRetraction, withRetractionMaintenanceLog, retainedRetractionFile
 import { loadAllWikiRetractions, loadCurrentWikiRetractions, withWikiRetractionLock, inspectWikiLocalFolder, assertWikiRootOwnership, appendCommittedWikiMaintenance, readWikiMaintenanceState } from "./wiki-retraction-store.js";
 import { resolveReviewedWikiRetraction } from "./wiki-retraction-approval.js";
 import { retractionFolderGate } from "./wiki-retraction-gate.js";
-import { buildRetractionGraph, assertNoUnregisteredRetractionDependants } from "./wiki-retraction-readback.js";
+import { buildRetractionGraph, assertNoUnregisteredRetractionDependants, preserveUnrelatedRetractionPages } from "./wiki-retraction-readback.js";
 import { parsePublicationRegistry, publicationCanonical, publicationHash, publicationNeed, type JsonObject } from "./wiki-publication-readback.js";
 
 export interface WikiRetractionProposal {
@@ -42,7 +42,7 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
     // Resolve aliases before consulting the durable physical-path fence.
     return path.relative(rootPath, resolved.realPath).split(path.sep).join("/");
   }
-  async function snapshot(companyId: string, scope: RetractionScope, targetPath: string, reason: string, connection: Db): Promise<WikiRetractionProposal> {
+  async function snapshot(companyId: string, scope: RetractionScope, targetPath: string, reason: string, connection: Db, preservePaths: string[] = []): Promise<WikiRetractionProposal> {
     const currentEvents=await loadCurrentWikiRetractions(connection,pluginId,companyId);
     const registry = pluginRegistryService(connection);
     const config = await registry.getConfig(pluginId, companyId);
@@ -66,7 +66,7 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
       [companyId, scope.wikiId, scope.spaceSlug]);
     publicationNeed(spaces.length === 1&&spaces[0]!.root_folder_key==="wiki-root"&&spaces[0]!.status==="active", "retraction_space"); const space = spaces[0]!;
     const rows = await pluginDb.query<{ path: string; source_refs: unknown; content_hash: string }>(pluginId,
-      `SELECT path, source_refs, content_hash FROM ${ns}.wiki_pages WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3`,
+      `SELECT path, source_refs, content_hash FROM ${ns}.wiki_pages WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 FOR SHARE`,
       [companyId, scope.wikiId, space.id]);
     const rootPath = await root(companyId, connection);
     retractionFolderGate(currentEvents,companyId,"wiki-root").assertRoot(rootPath);
@@ -95,16 +95,23 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
       blocks.push({ path: canonical, contentHash: publicationHash(await readPluginLocalFolderText(rootPath, rel)),
         state: p === targetPath ? "retracted" : "blocked_by_retraction" });
     }
+    const preservedPages = await preserveUnrelatedRetractionPages(pins.entries, rows, held, preservePaths, async p => {
+      const rel = toPhysical(p), canonical = await physical(rootPath, rel);
+      publicationNeed(canonical === rel, "retraction_alias");
+      return {path:canonical,contents:await readPluginLocalFolderText(rootPath, rel)};
+    });
     return { schema: "paperclip.wiki-retraction-request/v1", pluginId,
       target: { ...scope, path: targetPath, contentHash: targetPin.wikiSHA256 }, reason,
       publicationRegistrySHA256: publicationHash(publicationCanonical(pins)),
       fence: { folderKey: "wiki-root", rootPath, pathPrefix: space.path_prefix ?? "", mode: "citation-holds", blocks,
         registeredPaths: pins.entries.map(p=>toPhysical(p.path)).sort(),
-        readable: pins.entries.filter(p => !held.has(p.path)).map(p => ({ path: toPhysical(p.path), contentHash: p.wikiSHA256 })).sort((a,b)=>a.path.localeCompare(b.path)) } };
+        ...(preservedPages.length ? {preservedPages} : {}),
+        readable: [...pins.entries.filter(p => !held.has(p.path)).map(p => ({ path: toPhysical(p.path), contentHash: p.wikiSHA256 })),
+          ...preservedPages.map(({path,contentHash}) => ({path,contentHash}))].sort((a,b)=>a.path.localeCompare(b.path)) } };
   }
   return {
-    preview: (scope: RetractionScope, targetPath: string, reason: string) =>
-      withWikiRetractionLock(db, pluginId, scope.companyId, tx => snapshot(scope.companyId, scope, targetPath, reason, tx)),
+    preview: (scope: RetractionScope, targetPath: string, reason: string, preservePaths: string[] = []) =>
+      withWikiRetractionLock(db, pluginId, scope.companyId, tx => snapshot(scope.companyId, scope, targetPath, reason, tx, preservePaths)),
     async execute(input: { companyId: string; issueId: string; documentKey: string; reviewId: string;
       operationId: string; ownerDecisionId: string; actorId: string; runId: string | null }) {
       let created = false;
@@ -134,7 +141,12 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
           ownerDecision: owners[0] ?? null, registry: pins });
         const { proposal } = resolved;
         const events = allEvents.filter(e => e.wikiId === proposal.target.wikiId && e.spaceSlug === proposal.target.spaceSlug).sort((a,b)=>a.sequence-b.sequence);
-        const fresh = await snapshot(input.companyId, proposal.target, proposal.target.path, proposal.reason, tx);
+        const prefix = proposal.fence.pathPrefix ? proposal.fence.pathPrefix + "/" : "";
+        const preservePaths = (proposal.fence.preservedPages ?? []).map(p => {
+          publicationNeed(p.path.startsWith(prefix), "retraction_preserve_scope");
+          return p.path.slice(prefix.length);
+        });
+        const fresh = await snapshot(input.companyId, proposal.target, proposal.target.path, proposal.reason, tx, preservePaths);
         if (publicationCanonical(fresh) !== publicationCanonical(proposal)) throw conflict("Withdrawal proposal changed; review the new snapshot");
         const store: RetractionStore = { read: async () => events, transaction: async (_scope, work) => work({
           events: async () => events, append: async event => { await tx.insert(activityLog).values({ id: event.id,
@@ -152,7 +164,7 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
             const logPath = (proposal.fence.pathPrefix ? proposal.fence.pathPrefix + "/" : "") + "wiki/log.md";
             return withRetractionMaintenanceLog(event, prior, await readPluginLocalFolderText(proposal.fence.rootPath,logPath));
           },
-          readCurrent: async () => { const fresh = await snapshot(input.companyId, proposal.target, proposal.target.path, proposal.reason, tx); return { path: fresh.target.path, contentHash: fresh.target.contentHash }; },
+          readCurrent: async () => { const fresh = await snapshot(input.companyId, proposal.target, proposal.target.path, proposal.reason, tx, preservePaths); return { path: fresh.target.path, contentHash: fresh.target.contentHash }; },
         });
       });
       // The DB receipt is authoritative before the derived maintenance append.

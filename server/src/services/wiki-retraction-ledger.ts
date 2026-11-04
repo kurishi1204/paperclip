@@ -27,6 +27,9 @@ export interface RetractionFence {
   mode: "freeze-wiki" | "citation-holds";
   /** Physical paths registered at withdrawal; absent on historical events. */
   registeredPaths?: string[];
+  /** Existing unregistered pages explicitly retained by the reviewed proposal.
+   * This preserves read access, not publication or independent-content QA. */
+  preservedPages?: Array<{ path: string; contentHash: string; sourceRefsSHA256: string }>;
   readable: Array<{ path: string; contentHash: string }>;
   blocks: Array<{ path: string; contentHash: string; state: "retracted" | "blocked_by_retraction" }>;
 }
@@ -179,6 +182,19 @@ export function validateRetractionEvents(scope: RetractionScope, events: Retract
       if(event.fence.registeredPaths!==undefined) {
         need(Array.isArray(event.fence.registeredPaths)&&new Set(event.fence.registeredPaths).size===event.fence.registeredPaths.length&&
           event.fence.registeredPaths.every(p=>typeof p==="string"&&paths.has(p)),"fence_registered_paths");
+      }
+      if (event.fence.preservedPages !== undefined) {
+        const preserved = event.fence.preservedPages;
+        need(event.fence.mode === "citation-holds" && Array.isArray(preserved) &&
+          event.fence.registeredPaths !== undefined && new Set(preserved.map(p => p.path)).size === preserved.length,
+          "fence_preserved_pages");
+        for (const item of preserved) {
+          validTarget({ ...event, ...item });
+          need(/^[0-9a-f]{64}$/.test(item.sourceRefsSHA256) &&
+            !event.fence.registeredPaths.includes(item.path) &&
+            event.fence.readable.some(p => p.path === item.path && p.contentHash === item.contentHash),
+            "fence_preserved_page");
+        }
       }
     }
     const { eventHash, ...basis } = event;
