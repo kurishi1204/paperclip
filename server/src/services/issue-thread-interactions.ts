@@ -2568,7 +2568,10 @@ export function issueThreadInteractionService(
           {
             status: "todo",
             assigneeAgentId: issueContext.assigneeAgentId,
-            assigneeUserId: null,
+            // A document verdict may resume work, but must not discard its
+            // existing human owner. Native completion reviews retain their
+            // existing worker-only transition contract.
+            assigneeUserId: isNativeCompletionReview(lockedCurrent) ? null : issueContext.assigneeUserId,
             actorAgentId: args.actor.agentId ?? null,
             actorUserId: args.actor.userId ?? null,
           },

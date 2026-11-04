@@ -170,6 +170,17 @@ suite("pending independent document review through real dispatch", () => {
       priorIssueStatus:task!.status as "todo"|"in_review"});
     expect(decision).toMatchObject({statusAction:"preserve",toStatus:task!.status,reasonCode:"native_document_review_resolved"});
   });
+  it("keeps a human task owner when rejecting a continuing document confirmation", async () => {
+    const x = await nativeReviewFixture();
+    await db.update(issues).set({status:"in_review",assigneeAgentId:null,assigneeUserId:"synthetic-human-owner"}).where(eq(issues.id,x.issueId));
+    await db.update(issueThreadInteractions).set({continuationPolicy:"wake_assignee"}).where(eq(issueThreadInteractions.id,x.interactionId));
+    await issueThreadInteractionService(db).rejectInteraction({id:x.issueId,companyId:x.companyId},x.interactionId,
+      {reason:"Synthetic required changes"},{agentId:x.reviewerId,runId:x.runId});
+    const [task] = await db.select().from(issues).where(eq(issues.id,x.issueId));
+    expect(task).toMatchObject({status:"todo",assigneeAgentId:null,assigneeUserId:"synthetic-human-owner"});
+    expect(await getNativeDocumentReviewAssignment(db,{...x.binding,allowResolved:true}))
+      .toMatchObject({interaction:{status:"rejected",resolvedByRunId:x.runId}});
+  });
   it.each(["wrong_resolver_run","wrong_resolver_agent","changed_revision"] as const)(
     "does not allow post-verdict finishing with %s", async defect => {
       const x = await nativeReviewFixture();
