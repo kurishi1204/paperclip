@@ -22,12 +22,10 @@ export async function getNativeDocumentReviewAssignment(db: Db, input: {
     ...input, contextSnapshot: row.run.contextSnapshot ?? {},
     ...(input.allowResolved ? { allowResolvedByRunId: input.runId } : {}),
   });
-  // This standalone role can decide only a non-continuing document request.
-  // Plan confirmations and task-transition requests keep their separate workflows.
-  if (!review || review.interaction.continuationPolicy !== "none" || review.binding.key === "plan") return null;
+  if (!review) return null;
   const admission = parseObject(parseObject(row.run.runnerProfileJson).pendingDocumentReviewAdmission);
   if (typeof admission.nonAssignee !== "boolean" ||
-      admission.nonAssignee !== (row.issue.assigneeAgentId !== input.agentId) ||
+      (review.interaction.status === "pending" && admission.nonAssignee !== (row.issue.assigneeAgentId !== input.agentId)) ||
       (review.interaction.status === "pending" && row.issue.executionRunId !== input.runId)) return null;
   return review;
 }

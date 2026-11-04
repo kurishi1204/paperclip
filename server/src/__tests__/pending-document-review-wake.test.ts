@@ -112,7 +112,7 @@ suite("pending independent document review through real dispatch", () => {
       }));
       expect(await x.authority.execute({ tool:"resolve_review", callId:"verdict", arguments:{decision:"accept"} }))
         .toMatchObject({interactionId:x.interactionId,status:"accepted"});
-      expect(await nativeCompletionFeedback(db,x.runId,report)).toContain("task assignment and status remain unchanged");
+      expect(await nativeCompletionFeedback(db,x.runId,report)).toContain("report cannot override");
       expect(await getNativeDocumentReviewAssignment(db,{...x.binding,allowResolved:true}))
         .toMatchObject({interaction:{status:"accepted",resolvedByRunId:x.runId,resolvedByAgentId:x.reviewerId}});
       const [task] = await db.select().from(issues).where(eq(issues.id,x.issueId));
@@ -128,22 +128,13 @@ suite("pending independent document review through real dispatch", () => {
       await rm(workspaceRoot,{recursive:true,force:true});
     }
   });
-  it.each(["wrong_receipt","lost_lock","stale_revision","wrong_addressee","continuing_request","plan_workflow","missing_role_marker","wrong_role_marker","malformed_role_marker"] as const)(
+  it.each(["wrong_receipt","lost_lock","stale_revision","wrong_addressee","missing_role_marker","wrong_role_marker","malformed_role_marker"] as const)(
     "refuses %s across native staging and tool reads", async defect => {
       const x = await nativeReviewFixture();
       if (defect === "wrong_receipt") await db.update(agentWakeupRequests).set({requestedByActorId:x.reviewerId}).where(eq(agentWakeupRequests.id,x.wakeupRequestId));
       if (defect === "lost_lock") await db.update(issues).set({executionRunId:null}).where(eq(issues.id,x.issueId));
       if (defect === "stale_revision") await db.update(documents).set({latestRevisionId:randomUUID()}).where(eq(documents.id,x.documentId));
       if (defect === "wrong_addressee") await db.update(issueThreadInteractions).set({addresseeAgentId:x.ownerId}).where(eq(issueThreadInteractions.id,x.interactionId));
-      if (defect === "continuing_request") await db.update(issueThreadInteractions).set({continuationPolicy:"wake_assignee"}).where(eq(issueThreadInteractions.id,x.interactionId));
-      if (defect === "plan_workflow") {
-        await db.update(issueDocuments).set({key:"plan"}).where(eq(issueDocuments.documentId,x.documentId));
-        await db.update(issueThreadInteractions).set({payload:{version:1,prompt:"Plan review",target:{...x.target,key:"plan"}}}).where(eq(issueThreadInteractions.id,x.interactionId));
-        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
-        const profile = run!.runnerProfileJson as Record<string,unknown>;
-        const admission = profile.pendingDocumentReviewAdmission as Record<string,unknown>;
-        await db.update(heartbeatRuns).set({runnerProfileJson:{...profile,pendingDocumentReviewAdmission:{...admission,binding:{...(admission.binding as Record<string,unknown>),key:"plan"}}}}).where(eq(heartbeatRuns.id,x.runId));
-      }
       if (["missing_role_marker","wrong_role_marker","malformed_role_marker"].includes(defect)) {
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
         const profile = run!.runnerProfileJson as Record<string,unknown>;
@@ -159,6 +150,26 @@ suite("pending independent document review through real dispatch", () => {
       const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id,x.interactionId));
       expect(card!.status).toBe("pending");
     });
+  it.each(["none", "wake_assignee"] as const)("preserves existing %s verdict workflow and finishes the review only", async continuationPolicy => {
+    const x = await nativeReviewFixture();
+    await db.update(issues).set({status:"in_review"}).where(eq(issues.id,x.issueId));
+    await db.update(issueThreadInteractions).set({continuationPolicy}).where(eq(issueThreadInteractions.id,x.interactionId));
+    // Use the existing decision service. A verdict may apply its stored workflow;
+    // the reviewer's final report cannot reinterpret that decision as worker completion.
+    await issueThreadInteractionService(db).rejectInteraction(
+      {id:x.issueId,companyId:x.companyId,projectId:null,goalId:null},x.interactionId,{reason:"Synthetic required changes"},
+      {agentId:x.reviewerId,runId:x.runId});
+    const [task] = await db.select().from(issues).where(eq(issues.id,x.issueId));
+    expect(task).toMatchObject({status:continuationPolicy==="none"?"in_review":"todo",assigneeAgentId:x.ownerId});
+    expect(await getNativeDocumentReviewAssignment(db,{...x.binding,allowResolved:true}))
+      .toMatchObject({interaction:{status:"rejected",resolvedByRunId:x.runId}});
+    expect(await nativeCompletionFeedback(db,x.runId,{reportedWorkDisposition:"done"} as PrpStructuredRunResult))
+      .toContain("report cannot override");
+    const decision = resolveNativeFinalizerStatus({assessment:{reportedDisposition:"done"} as Parameters<typeof resolveNativeFinalizerStatus>[0]["assessment"],
+      terminalState:"succeeded",workspaceFinalizeStatus:"succeeded",documentReviewOutcome:"resolved",agentId:x.reviewerId,
+      priorIssueStatus:task!.status as "todo"|"in_review"});
+    expect(decision).toMatchObject({statusAction:"preserve",toStatus:task!.status,reasonCode:"native_document_review_resolved"});
+  });
   it.each(["wrong_resolver_run","wrong_resolver_agent","changed_revision"] as const)(
     "does not allow post-verdict finishing with %s", async defect => {
       const x = await nativeReviewFixture();

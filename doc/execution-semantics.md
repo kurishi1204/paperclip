@@ -1709,10 +1709,12 @@ resolving run may finish while the current document binding remains unchanged.
 Finalization preserves task status and assignment and releases the review lock;
 a missing or stale review never falls through to worker completion.
 
-This standalone native document-review role accepts only requests with no task
-continuation and excludes plan confirmations, whose existing workflow can change
-task state. Those requests retain their own review/plan workflow; they do not
-receive standalone inspection authority. Missing or inconsistent saved role
-markers are refused. At finalization, resolved, unresolved and stale fixed
-document reviews receive distinct reason codes. Unresolved/stale reviews record
-explicit recovery without retrying the old run or claiming business QA success.
+The verdict still follows the confirmation request's existing stored continuation
+and plan workflow. For example, rejecting a `wake_assignee` confirmation may
+return work to its worker; the reviewer's final report preserves that resulting
+state and cannot turn it into worker completion. This review role does not grant
+an independent task mutation or assignment capability. Missing or inconsistent
+saved role markers are refused. Resolved, unresolved and stale fixed document
+reviews receive distinct finalization reason codes. Unresolved/stale reviews
+record explicit recovery without replaying the old run or claiming business QA
+success.

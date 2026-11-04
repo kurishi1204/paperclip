@@ -82,7 +82,7 @@ export async function nativeCompletionFeedback(
     if (review.interaction.status === "pending" && result.reportedWorkDisposition !== "blocked") {
       throw new Error("Resolve your assigned document review with resolve_review before finishing, or report the concrete blocker.");
     }
-    return "Document review report accepted. The fixed review decision is recorded separately; task assignment and status remain unchanged.";
+    return "Document review report accepted. The fixed review decision follows its stored confirmation workflow; this report cannot override task state or assignment.";
   }
   const reviewContext = readNativeReviewAssignmentContext(run.contextSnapshot);
   if (reviewContext) {
