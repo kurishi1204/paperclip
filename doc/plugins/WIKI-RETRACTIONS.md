@@ -28,6 +28,32 @@ the server-resolved same-version human decision and separate independent QA.
 This code is not deployed. A reviewed immutable republication entry is connected locally; its real PostgreSQL/HTTP acceptance and production acceptance remain incomplete. Existing `freeze-wiki` ledger events are unchanged and remain
 strict; never activate the policy by rewriting an event or configuration.
 
+## Retaining existing unregistered bytes for inspection
+
+An operator may supply `preservePaths` to keep existing unregistered pages
+viewable without pretending their arbitrary legacy source metadata is verified.
+Their physical paths, byte hashes and complete source-reference hashes are
+pinned in `fence.preservedPages`. The preview also enumerates every current
+metadata row in `existingPages` with a reference hash and its actual read
+control, including unselected legacy pages that will be refused. This full
+census uses the same strongest-prior-fence precedence as live reads and is rebuilt at execution. Read control describes withdrawal fences; authorization and current publication proofs are still mandatory; partial or unfamiliar references cannot hide
+a known page from the impact proposal. Filesystem-only/unindexed paths remain
+explicitly refused by `unindexedPathPolicy`. Each selected page is also a `blocked_by_retraction`
+entry with the citation-holds policy; it is never put into `readable`.
+
+The structured reader retains the original body and an explicit unverified-source
+warning. Plain/string reading and verified citation reuse remain refused. This
+is deliberately not an automatic related/unrelated classifier: unknown reference
+formats cannot silently grant verified use. Normalization, independent QA and
+any new publication remain separate operations.
+
+Selection receives the same exact-proposal independent QA and human-only
+consent. Execution rebuilds every pin, and the common reader rechecks metadata
+and bytes. Previously citation-held bytes may be selected again only after their old metadata and byte proofs pass the same live structured-read checks. Earlier strict refusals cannot be revived. Missing metadata, byte
+changes and physical aliases are rejected. Unselected/future pages, direct
+withdrawals, old strict fences and the ordinary Wiki write hold keep their
+existing controls. Existing event records are never rewritten.
+
 ## Operator path
 
 All three routes require authenticated board access and company authorization.

@@ -1303,7 +1303,10 @@ export function pluginRoutes(
     const { wikiId, spaceSlug, path: pagePath, reason } = req.body;
     if (![wikiId, spaceSlug, pagePath, reason].every(v => typeof v === "string" && v.length > 0 && v === v.trim()))
       throw badRequest("Canonical wikiId, spaceSlug, path and reason are required");
-    res.json(await wikiRetractionRuntime(db, plugin.id).preview({ companyId, wikiId, spaceSlug }, pagePath, reason));
+    const preservePaths = req.body.preservePaths === undefined ? [] : req.body.preservePaths;
+    if (!Array.isArray(preservePaths) || preservePaths.some(p => typeof p !== "string" || !p.startsWith("wiki/") || p !== p.trim()) ||
+      new Set(preservePaths).size !== preservePaths.length) throw badRequest("Unique canonical preservePaths are required");
+    res.json(await wikiRetractionRuntime(db, plugin.id).preview({ companyId, wikiId, spaceSlug }, pagePath, reason, preservePaths));
   });
   router.post("/plugins/:pluginId/wiki-retractions/execute", async (req, res) => {
     assertBoard(req);

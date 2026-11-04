@@ -1,4 +1,5 @@
-import type { RetractionEvent, RetractionBlock } from "./wiki-retraction-ledger.js";
+import type { RetractionEvent, RetractionBlock, RetractionFence } from "./wiki-retraction-ledger.js";
+import { retractionFenceReadControl, strongestRetractionReadBlock } from "./wiki-retraction-gate.js";
 import { retractionBlock } from "./wiki-retraction-ledger.js";
 import { publicationCanonical, publicationHash, publicationNeed,
   type JsonObject, type PublicationRegistry } from "./wiki-publication-readback.js";
@@ -67,4 +68,54 @@ export function assertNoUnregisteredRetractionDependants(
       publicationNeed(!docKeys.has(key), "retraction_unregistered_dependant");
     }
   }
+}
+
+
+/** Retain existing bytes for inspection, never as verified unrelated sources.
+ * Arbitrary legacy references stay unverified. All selected pages become
+ * citation holds; no guessed reference classification can grant citation use. */
+export async function preserveExistingRetractionPages(
+  pins: PublicationRegistry["entries"],
+  rows: Array<{path:string;source_refs:unknown;content_hash:string}>,
+  held: ReadonlySet<string>, preservePaths: string[],
+  read: (path:string) => Promise<{path:string;contents:string}>,
+  priorRead: {assertCitationRead(path:string,contents?:string):void},
+): Promise<NonNullable<RetractionFence["preservedPages"]>> {
+  publicationNeed(Array.isArray(preservePaths) && new Set(preservePaths).size === preservePaths.length,
+    "retraction_preserve_paths");
+  const preserved: NonNullable<RetractionFence["preservedPages"]> = [];
+  for (const p of [...preservePaths].sort()) {
+    publicationNeed(typeof p === "string" && p.startsWith("wiki/") && !held.has(p) &&
+      !pins.some(pin => pin.path === p), "retraction_preserve_path");
+    const matches = rows.filter(row => row.path === p);
+    publicationNeed(matches.length === 1 && Array.isArray(matches[0]!.source_refs), "retraction_preserve_metadata");
+    const current = await read(p), hash = publicationHash(current.contents);
+    priorRead.assertCitationRead(current.path,current.contents);
+    publicationNeed(matches[0]!.content_hash === hash, "retraction_preserve_content_changed");
+    preserved.push({path:current.path,contentHash:hash,
+      sourceRefsSHA256:publicationHash(publicationCanonical(matches[0]!.source_refs))});
+  }
+  return preserved;
+}
+
+/** Full metadata census before classification. Legacy reference syntax is not
+ * used to infer independence. Unknown filesystem-only paths remain refused. */
+export function inventoryRetractionPages(
+  rows: Array<{path:string;source_refs:unknown;content_hash:string}>,
+  fence: RetractionFence,
+  priorRead: {block(path:string):RetractionBlock|null},
+) {
+  publicationNeed(new Set(rows.map(r=>r.path)).size===rows.length,"retraction_inventory_duplicate");
+  return [...rows].sort((a,b)=>a.path.localeCompare(b.path)).map(row=>{
+    publicationNeed(Array.isArray(row.source_refs),"retraction_reference_shape");
+    const physicalPath=(fence.pathPrefix?fence.pathPrefix+"/":"")+row.path;
+    const block=fence.blocks.find(p=>p.path===physicalPath),current=retractionFenceReadControl(fence,physicalPath);
+    const previous=priorRead.block(physicalPath);
+    const effective=strongestRetractionReadBlock([previous,current].filter((b):b is NonNullable<typeof b>=>b!==null));
+    return {path:row.path,physicalPath,storedContentHash:row.content_hash,
+      sourceRefsSHA256:publicationHash(publicationCanonical(row.source_refs)),
+      referenceStatus:fence.registeredPaths?.includes(physicalPath)?"pinned_registry" as const:"unverified_legacy" as const,
+      readControl:!block&&!fence.readable.some(p=>p.path===physicalPath)&&effective===current?"blocked_unselected" as const:effective?.state??"readable" as const,
+      readPolicy:effective?(effective.state==="blocked_by_retraction"&&effective.readPolicy==="citation-holds"?"citation-holds" as const:"strict" as const):"normal" as const};
+  });
 }
