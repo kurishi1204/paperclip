@@ -620,7 +620,7 @@ import {
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
-import { isCurrentPendingDocumentReviewWake, hasServerRecordedNonAssigneeWake } from "./pending-document-review-wake.js";
+import { isCurrentPendingDocumentReviewWake, hasServerRecordedNonAssigneeWake, pendingDocumentReviewRetryProfile } from "./pending-document-review-wake.js";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
 import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
@@ -15697,6 +15697,13 @@ export function heartbeatService(
       delayMs?: number;
     },
   ) {
+    const reviewRetryProfile = pendingDocumentReviewRetryProfile(run.runnerProfileJson);
+    if (reviewRetryProfile === null || (Object.keys(reviewRetryProfile).length > 0 &&
+        parseObject(run.resultJson?.executionRecovery).providerWorkStarted !== false)) {
+      return { outcome: "not_scheduled" as const, errorCode: "document_review_retry_authority_unreceived",
+        reason: "Preserve the document review until its source receipt and pre-provider stop are confirmed.",
+        issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
+    }
     if (hasSelfTaskDocumentSetupRetryHold(run)) {
       return { outcome: "not_scheduled" as const,
         reason: "Reconcile task document receipts before an explicit new episode; automatic replay is disabled.",
@@ -16347,6 +16354,7 @@ export function heartbeatService(
             status: "scheduled_retry",
             wakeupRequestId: wakeupRequest.id,
             contextSnapshot: retryContextSnapshot,
+            ...(Object.keys(reviewRetryProfile).length ? { runnerProfileJson: reviewRetryProfile } : {}),
             ...(hasConversationContinuationPolicy(run.resultJson)
               ? { resultJson: { conversationContinuation: CONVERSATION_CONTINUATION_POLICY } } : {}),
             responsibleUserId,

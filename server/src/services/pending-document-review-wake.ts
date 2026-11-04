@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, documents, issueDocuments, issueThreadInteractions, type Db } from "@paperclipai/db";
-import type { PendingDocumentReviewBinding } from "../modules/run-dispatch/domain/policy.js";
+import type { PendingDocumentReviewBinding, PendingDocumentReviewOrigin } from "../modules/run-dispatch/index.js";
 import { parseObject } from "../adapters/utils.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
 
@@ -10,9 +10,10 @@ import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-inte
 export async function readCurrentPendingDocumentReviewWake(db: Db, input: {
   companyId: string; issueId: string; agentId: string;
   runId?: string; contextSnapshot: Record<string, unknown>; lock?: boolean;
-}): Promise<PendingDocumentReviewBinding | null> {
+}): Promise<{ binding: PendingDocumentReviewBinding; origin: PendingDocumentReviewOrigin | null } | null> {
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const id = typeof input.contextSnapshot.interactionId === "string" ? input.contextSnapshot.interactionId.trim() : null;
-  if (!id || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) return null;
+  if (!id || !uuid.test(id)) return null;
   const cards = db.select().from(issueThreadInteractions).where(and(
     eq(issueThreadInteractions.id, id), eq(issueThreadInteractions.companyId, input.companyId),
     eq(issueThreadInteractions.issueId, input.issueId),
@@ -24,31 +25,64 @@ export async function readCurrentPendingDocumentReviewWake(db: Db, input: {
   const payload = parseObject(card.payload);
   if (Object.hasOwn(payload, "toolAction") || Object.hasOwn(payload, "secretProposal") ||
       !issueThreadInteractionAttentionAgentAllowed({ agentId: input.agentId, interaction: card })) return null;
-  let admitted: Record<string, unknown> | null = null;
+  const profiles: Record<string, unknown>[] = [];
+  let origin: PendingDocumentReviewOrigin | null = null;
   if (input.runId) {
-    const [run] = await db.select({ wakeupRequestId: heartbeatRuns.wakeupRequestId,
-      status: heartbeatRuns.status, nativeIssueId: heartbeatRuns.nativeIssueId,
-      contextSnapshot: heartbeatRuns.contextSnapshot, runnerProfileJson: heartbeatRuns.runnerProfileJson,
-    }).from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.runId),
-      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId)));
-    if (!run?.wakeupRequestId || !["queued", "running"].includes(run.status) ||
+    const readRun = async (id: string) => db.select({ id: heartbeatRuns.id,
+      wakeupRequestId: heartbeatRuns.wakeupRequestId, retryOfRunId: heartbeatRuns.retryOfRunId,
+      status: heartbeatRuns.status, finishedAt: heartbeatRuns.finishedAt, resultJson: heartbeatRuns.resultJson,
+      nativeIssueId: heartbeatRuns.nativeIssueId, contextSnapshot: heartbeatRuns.contextSnapshot,
+      runnerProfileJson: heartbeatRuns.runnerProfileJson,
+    }).from(heartbeatRuns).where(and(eq(heartbeatRuns.id, id),
+      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId)))
+      .then(rows => rows[0]);
+    const readReceipt = async (id: string, runId: string) => {
+      const rows = db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.id, id),
+        eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.agentId, input.agentId),
+        eq(agentWakeupRequests.runId, runId)));
+      return (input.lock ? rows.for("share") : rows).then(rows => rows[0]);
+    };
+    const run = await readRun(input.runId);
+    if (!run?.wakeupRequestId || !["queued", "running", "scheduled_retry"].includes(run.status) ||
         (run.nativeIssueId && run.nativeIssueId !== input.issueId) ||
         parseObject(run.contextSnapshot).interactionId !== card.id ||
         parseObject(run.contextSnapshot).issueId !== input.issueId) return null;
-    const receipts = db.select().from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, input.companyId),
-      eq(agentWakeupRequests.agentId, input.agentId), eq(agentWakeupRequests.runId, input.runId),
-    ));
-    const [wake] = await (input.lock ? receipts.for("share") : receipts);
-    const request = parseObject(wake?.payload);
-    const creatorMatches = wake?.requestedByActorType === "user"
-      ? Boolean(card.createdByUserId && wake.requestedByActorId === card.createdByUserId)
-      : wake?.requestedByActorType === "agent" && Boolean(card.createdByAgentId && wake.requestedByActorId === card.createdByAgentId);
-    if (!wake || !["queued", "claimed"].includes(wake.status) || !creatorMatches ||
-        wake.idempotencyKey !== `interaction-pending:${card.id}` ||
-        request.issueId !== input.issueId || request.interactionId !== card.id ||
-        request.interactionKind !== card.kind) return null;
-    admitted = parseObject(run.runnerProfileJson);
+    const wake = await readReceipt(run.wakeupRequestId, run.id);
+    if (!wake || !["queued", "claimed"].includes(wake.status)) return null;
+    const request = parseObject(wake.payload), profile = parseObject(run.runnerProfileJson);
+    let sourceRun = run, sourceWake = wake;
+    if (run.retryOfRunId) {
+      // Resource deferral creates a new system receipt. Its authority is the
+      // saved original request, not another list of accepted retry labels.
+      const saved = parseObject(profile.pendingDocumentReviewOrigin);
+      if (typeof saved.runId !== "string" || typeof saved.wakeupRequestId !== "string" ||
+          !uuid.test(saved.runId) || !uuid.test(saved.wakeupRequestId) ||
+          saved.runId === run.id || run.retryOfRunId === run.id ||
+          wake.requestedByActorType !== "system" || request.issueId !== input.issueId ||
+          request.retryOfRunId !== run.retryOfRunId) return null;
+      const parent = await readRun(run.retryOfRunId), source = await readRun(saved.runId);
+      if (!parent?.finishedAt || !["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(parent.status) ||
+          parseObject(parent.resultJson?.executionRecovery).providerWorkStarted !== false ||
+          parseObject(parent.contextSnapshot).issueId !== input.issueId ||
+          parseObject(parent.contextSnapshot).interactionId !== card.id ||
+          !source || source.retryOfRunId || source.wakeupRequestId !== saved.wakeupRequestId ||
+          parseObject(source.contextSnapshot).issueId !== input.issueId ||
+          parseObject(source.contextSnapshot).interactionId !== card.id) return null;
+      const receipt = await readReceipt(saved.wakeupRequestId, source.id);
+      if (!receipt) return null;
+      sourceRun = source; sourceWake = receipt;
+      profiles.push(profile, parseObject(parent.runnerProfileJson), parseObject(source.runnerProfileJson));
+    } else if (Object.hasOwn(profile, "pendingDocumentReviewInteractionId")) {
+      profiles.push(profile);
+    }
+    const sourceRequest = parseObject(sourceWake.payload);
+    const creatorMatches = sourceWake.requestedByActorType === "user"
+      ? Boolean(card.createdByUserId && sourceWake.requestedByActorId === card.createdByUserId)
+      : sourceWake.requestedByActorType === "agent" && Boolean(card.createdByAgentId && sourceWake.requestedByActorId === card.createdByAgentId);
+    if (!creatorMatches || sourceWake.idempotencyKey !== `interaction-pending:${card.id}` ||
+        sourceRequest.issueId !== input.issueId || sourceRequest.interactionId !== card.id ||
+        sourceRequest.interactionKind !== card.kind) return null;
+    origin = { runId: sourceRun.id, wakeupRequestId: sourceWake.id };
   }
   const target = parseObject(payload.target);
   if (target.type !== "issue_document" ||
@@ -72,12 +106,13 @@ export async function readCurrentPendingDocumentReviewWake(db: Db, input: {
   const binding: PendingDocumentReviewBinding = { companyId: input.companyId, issueId: input.issueId,
     agentId: input.agentId, interactionId: card.id, documentId: doc.id,
     key: target.key, revisionId: doc.latestRevisionId, revisionNumber: doc.latestRevisionNumber };
-  if (admitted && Object.hasOwn(admitted, "pendingDocumentReviewInteractionId")) {
-    const previous = parseObject(admitted.pendingDocumentReviewBinding);
-    if (admitted.pendingDocumentReviewInteractionId !== card.id ||
-        Object.entries(binding).some(([key, value]) => previous[key] !== value)) return null;
+  for (const profile of profiles) {
+    const previous = parseObject(profile.pendingDocumentReviewBinding), previousOrigin = parseObject(profile.pendingDocumentReviewOrigin);
+    if (profile.pendingDocumentReviewInteractionId !== card.id || !origin ||
+        Object.entries(binding).some(([key, value]) => previous[key] !== value) ||
+        previousOrigin.runId !== origin.runId || previousOrigin.wakeupRequestId !== origin.wakeupRequestId) return null;
   }
-  return binding;
+  return { binding, origin };
 }
 
 export async function isCurrentPendingDocumentReviewWake(
@@ -91,4 +126,18 @@ export async function isCurrentPendingDocumentReviewWake(
 export function hasServerRecordedNonAssigneeWake(profile: unknown): boolean {
   const value = parseObject(profile);
   return value.aiConnectionNonAssigneeWake === true || value.aiConnectionNonAssigneeCommentWake === true;
+}
+
+/** Copy only the server-recorded review authority, never runtime preparation
+ * state. The reader checks the original receipt and stopped predecessor again. */
+export function pendingDocumentReviewRetryProfile(profile: unknown): Record<string, unknown> | null {
+  const value = parseObject(profile);
+  if (!Object.hasOwn(value, "pendingDocumentReviewInteractionId")) return {};
+  const origin = parseObject(value.pendingDocumentReviewOrigin), binding = parseObject(value.pendingDocumentReviewBinding);
+  if (typeof value.pendingDocumentReviewInteractionId !== "string" ||
+      typeof origin.runId !== "string" || typeof origin.wakeupRequestId !== "string" ||
+      binding.interactionId !== value.pendingDocumentReviewInteractionId) return null;
+  return { aiConnectionNonAssigneeWake: value.aiConnectionNonAssigneeWake === true,
+    pendingDocumentReviewInteractionId: value.pendingDocumentReviewInteractionId,
+    pendingDocumentReviewBinding: binding, pendingDocumentReviewOrigin: origin };
 }

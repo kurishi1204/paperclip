@@ -529,11 +529,11 @@ export function createPostgresRunDispatchAdapter(
     );
 
     const wakeCommentId = deriveCommentId(context);
-    const pendingDocumentReviewBinding = await readCurrentPendingDocumentReviewWake(dbOrTx, {
+    const pendingDocumentReviewAuthority = await readCurrentPendingDocumentReviewWake(dbOrTx, {
       companyId: input.companyId, issueId, agentId: input.agentId, runId: input.runId,
       contextSnapshot: context, lock: Boolean(tx),
     });
-    const pendingDocumentReview = Boolean(pendingDocumentReviewBinding);
+    const pendingDocumentReview = Boolean(pendingDocumentReviewAuthority);
     const isInteractionWake = pendingDocumentReview || allowsIssueInteractionWake(
       context,
       ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
@@ -612,7 +612,8 @@ export function createPostgresRunDispatchAdapter(
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
       pendingDocumentReview,
-      pendingDocumentReviewBinding,
+      pendingDocumentReviewBinding: pendingDocumentReviewAuthority?.binding ?? null,
+      pendingDocumentReviewOrigin: pendingDocumentReviewAuthority?.origin ?? null,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
@@ -1030,6 +1031,7 @@ export function createPostgresRunDispatchAdapter(
               ...(facts.pendingDocumentReview ? {
                 pendingDocumentReviewInteractionId: facts.pendingDocumentReviewBinding!.interactionId,
                 pendingDocumentReviewBinding: facts.pendingDocumentReviewBinding,
+                pendingDocumentReviewOrigin: facts.pendingDocumentReviewOrigin,
               } : {}),
             },
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));

@@ -37,6 +37,8 @@ export type {
   QueuedRunStalenessErrorCode,
   StalenessDecision,
   QueuedRunFacts,
+  PendingDocumentReviewBinding,
+  PendingDocumentReviewOrigin,
 } from "./domain/policy.js";
 export type {
   PostCommitEffect,

@@ -833,6 +833,13 @@ not change the Task assignee. A separate worker wake must not cancel a queued
 review while its saved card and document binding remain current. Previously
 recorded non-assignee comment wakes retain their compatibility reader.
 
+A pre-provider resource wait can create a normal scheduled successor. The
+successor carries only the admitted review binding and original wake identity.
+Admission checks the system receipt, stopped predecessor, original request
+creator, and unchanged current card/document. A new retry label does not grant
+review authority, and unknown or started provider work does not permit this
+review retry path.
+
 ## 11. Task Watchdog for Issue Trees
 
 A task watchdog watches a configured issue subtree after that subtree has stopped moving. It is a product-level verification and recovery mechanism for selected work, not a process monitor.

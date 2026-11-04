@@ -5,7 +5,7 @@ import { agents, agentWakeupRequests, companies, createDb, documents, documentRe
   heartbeatRuns, issueDocuments, issueThreadInteractions, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
-import { hasServerRecordedNonAssigneeWake, isCurrentPendingDocumentReviewWake } from "../services/pending-document-review-wake.js";
+import { hasServerRecordedNonAssigneeWake, isCurrentPendingDocumentReviewWake, pendingDocumentReviewRetryProfile } from "../services/pending-document-review-wake.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { runningProcesses } from "../adapters/index.js";
 
@@ -172,6 +172,46 @@ suite("pending independent document review through real dispatch", () => {
     const [review]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
     expect(review).toMatchObject({status:"queued",errorCode:null});
     expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+  async function deferBeforeProvider(x:Awaited<ReturnType<typeof seed>>) {
+    expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({companyId:x.companyId,runId:x.runId,expectedStatus:"queued",now:new Date()}))
+      .toMatchObject({outcome:"not_stale"});
+    await db.update(issues).set({executionRunId:x.runId}).where(eq(issues.id,x.issueId));
+    await db.update(heartbeatRuns).set({status:"cancelled",finishedAt:new Date(),errorCode:"workspace_busy",
+      resultJson:{executionRecovery:{kind:"workspace_wait",providerWorkStarted:false}},
+      contextSnapshot:{...x.contextSnapshot,workspaceBusyDeferredWhileAssignee:false}}).where(eq(heartbeatRuns.id,x.runId));
+    heartbeat=heartbeatService(db,{runtimeEnv:{...process.env,PAPERCLIP_IN_WORKTREE:"false"}});
+    const result=await heartbeat.scheduleBoundedRetry(x.runId,{retryReason:"workspace_busy",wakeReason:"workspace_busy_retry",delayMs:0,maxAttempts:2});
+    expect(result.outcome).toBe("scheduled");
+    if(result.outcome!=="scheduled") throw new Error("Synthetic review did not schedule its resource wait");
+    return result.run;
+  }
+  it("preserves the original review through real resource-wait scheduling, promotion and provider handoff",async()=>{
+    const x=await seed(),retry=await deferBeforeProvider(x);
+    expect(retry.runnerProfileJson).toMatchObject({pendingDocumentReviewInteractionId:x.interactionId,
+      pendingDocumentReviewOrigin:{runId:x.runId,wakeupRequestId:x.wakeupRequestId}});
+    expect(await isCurrentPendingDocumentReviewWake(db,{...x,runId:retry.id})).toBe(true);
+    expect(await heartbeat!.promoteDueScheduledRetries(new Date(Date.now()+1000))).toMatchObject({promoted:1});
+    await heartbeat!.resumeQueuedRuns(); await heartbeat!.drainActiveRunExecutions();
+    expect(mockAdapterExecute).toHaveBeenCalledOnce();
+    const [run]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,retry.id));
+    expect(run).toMatchObject({status:"succeeded",errorCode:null});
+  });
+  it.each(["changed_origin","changed_document","unknown_predecessor"] as const)("refuses a resource successor with %s",async defect=>{
+    const x=await seed(),retry=await deferBeforeProvider(x);
+    if(defect==="changed_origin") await db.update(heartbeatRuns).set({runnerProfileJson:{...retry.runnerProfileJson,
+      pendingDocumentReviewOrigin:{runId:randomUUID(),wakeupRequestId:x.wakeupRequestId}}}).where(eq(heartbeatRuns.id,retry.id));
+    if(defect==="changed_document") await db.update(documents).set({latestRevisionId:randomUUID()}).where(eq(documents.id,x.documentId));
+    if(defect==="unknown_predecessor") await db.update(heartbeatRuns).set({resultJson:{}}).where(eq(heartbeatRuns.id,x.runId));
+    expect(await isCurrentPendingDocumentReviewWake(db,{...x,runId:retry.id})).toBe(false);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+  it("copies only review authority, retaining no adapter preparation state",()=>{
+    expect(pendingDocumentReviewRetryProfile({pendingDocumentReviewInteractionId:"i",pendingDocumentReviewBinding:{interactionId:"i"},
+      pendingDocumentReviewOrigin:{runId:"r",wakeupRequestId:"w"},adapterDispatch:{type:"old"},controllerBootId:"old"}))
+      .toEqual({aiConnectionNonAssigneeWake:false,pendingDocumentReviewInteractionId:"i",pendingDocumentReviewBinding:{interactionId:"i"},pendingDocumentReviewOrigin:{runId:"r",wakeupRequestId:"w"}});
+    expect(pendingDocumentReviewRetryProfile({pendingDocumentReviewInteractionId:"i"})).toBeNull();
+    expect(pendingDocumentReviewRetryProfile({adapterDispatch:{type:"normal"}})).toEqual({});
   });
   it("keeps server-recorded non-assignee authority from the prior version",()=>{
     expect(hasServerRecordedNonAssigneeWake({aiConnectionNonAssigneeCommentWake:true})).toBe(true);

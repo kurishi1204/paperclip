@@ -134,6 +134,8 @@ export type PendingDocumentReviewBinding = {
   documentId: string; key: string; revisionId: string; revisionNumber: number;
 };
 
+export type PendingDocumentReviewOrigin = { runId: string; wakeupRequestId: string };
+
 export type QueuedRunFacts = {
   /** Rechecked for automatic native replacements immediately before dispatch. */
   dependenciesBlocked?: DependencyBlockFacts | null;
@@ -155,6 +157,7 @@ export type QueuedRunFacts = {
   /** Server-loaded pending card and current independent document, not a wake label. */
   pendingDocumentReview?: boolean;
   pendingDocumentReviewBinding?: PendingDocumentReviewBinding | null;
+  pendingDocumentReviewOrigin?: PendingDocumentReviewOrigin | null;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
 
