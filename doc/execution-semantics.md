@@ -1693,3 +1693,7 @@ use the same activity projection. Board-owned repairs stay actionable until a
 verified native retry actually starts. Once an explicit board retry is running,
 its live activity takes precedence over the prior owner and exhausted budget.
 Resolved and cancelled actions remain resolved.
+
+### Pending review requests in runner inputs
+
+A named issue-document review is an unresolved request for the addressed reviewer. The runner response bridge does not require a verdict before that reviewer can start. It excludes only a current document review bound to the same run, source wake receipt, creator and fixed revision from the resolved-response envelope. The request itself remains pending for the reviewer to inspect and decide through normal tools. Other unresolved interactions, stale revisions, invalid receipts and missing response IDs keep their existing refusal behavior.
