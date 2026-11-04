@@ -341,6 +341,36 @@ suite("pending independent document review through real dispatch", () => {
     expect(task!.executionLockedAt).toEqual(ownership==="same_run"?null:lockedAt);
     expect(task!.assigneeAgentId).toBe(x.ownerId);
   });
+  it.each(["succeeded","failed","cancelled","timed_out","interrupted"] as const)(
+    "observes this run's committed verdict for terminal finalization only (%s)", async status => {
+      const x=await nativeReviewFixture();
+      await db.update(issueThreadInteractions).set({status:"accepted",resolvedByAgentId:x.reviewerId,resolvedByRunId:x.runId})
+        .where(eq(issueThreadInteractions.id,x.interactionId));
+      await db.update(heartbeatRuns).set({status,finishedAt:new Date()}).where(eq(heartbeatRuns.id,x.runId));
+      await db.update(agentWakeupRequests).set({status:status==="succeeded"?"completed":"failed",finishedAt:new Date()})
+        .where(eq(agentWakeupRequests.id,x.wakeupRequestId));
+      expect(await getNativeDocumentReviewAssignment(db,{...x.binding,allowResolved:true})).toBeNull();
+      const observed=await getNativeDocumentReviewAssignment(db,{...x.binding,allowResolved:true,finalizationOnly:true});
+      expect(observed).toMatchObject({interaction:{status:"accepted",resolvedByRunId:x.runId}});
+      const decision=resolveNativeFinalizerStatus({assessment:{reportedDisposition:"done"} as Parameters<typeof resolveNativeFinalizerStatus>[0]["assessment"],
+        terminalState:"succeeded",workspaceFinalizeStatus:"succeeded",documentReviewOutcome:observed?"resolved":"stale",
+        agentId:x.reviewerId,priorIssueStatus:"blocked"});
+      expect(decision).toMatchObject({statusAction:"preserve",toStatus:"blocked",reasonCode:"native_document_review_resolved"});
+      await expect(x.authority.execute({tool:"read_document",callId:"terminal-no-grant",arguments:{key:"fixed-proposal"}})).rejects.toThrow();
+    });
+  it("denies connection-intent creation by an already-resolved review run even if it becomes assignee",async()=>{
+    const x=await nativeReviewFixture();
+    await db.update(issueThreadInteractions).set({status:"accepted",resolvedByAgentId:x.reviewerId,resolvedByRunId:x.runId})
+      .where(eq(issueThreadInteractions.id,x.interactionId));
+    await db.update(issues).set({assigneeAgentId:x.reviewerId}).where(eq(issues.id,x.issueId));
+    await expect(issueThreadInteractionService(db).createConnectionIntent({id:x.issueId,companyId:x.companyId},{
+      payload:{version:1,serviceSlug:"synthetic",serviceName:"Synthetic connection",serviceLogoUrl:null,
+        requestingAgentId:x.reviewerId,requestingAgentName:"Reviewer",phase:"requested"},sourceRunId:x.runId,
+      addresseeUserId:x.responsibleUserId,idempotencyKey:`synthetic-connection:${x.runId}`,
+    })).rejects.toThrow("document-review run may only resolve its fixed review");
+    const cards=await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId,x.issueId));
+    expect(cards).toHaveLength(1);expect(cards[0]!.status).toBe("accepted");
+  });
   it.each(["wrong_resolver_run","wrong_resolver_agent","changed_revision"] as const)(
     "does not allow post-verdict finishing with %s", async defect => {
       const x = await nativeReviewFixture();

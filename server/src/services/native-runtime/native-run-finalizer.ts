@@ -1276,7 +1276,7 @@ export async function finalizeNativeRun(input: {
     ]);
     const isDocumentReview = await isNativeDocumentReviewRun(input.db, {...run,runId:run.id});
     const documentReview = isDocumentReview ? await getNativeDocumentReviewAssignment(input.db, {
-      companyId:run.companyId, issueId:authoritativeIssue.id, agentId:run.agentId, runId:run.id, allowResolved:true,
+      companyId:run.companyId, issueId:authoritativeIssue.id, agentId:run.agentId, runId:run.id, allowResolved:true, finalizationOnly:true,
     }) : null;
     const reviewContext = readNativeReviewAssignmentContext(run.contextSnapshot);
     const nativeReview = reviewContext ? await getNativeReviewAssignment(input.db, {

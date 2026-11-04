@@ -7,6 +7,8 @@ import { hasPendingDocumentReviewAdmission, readCurrentPendingDocumentReviewWake
 export async function getNativeDocumentReviewAssignment(db: Db, input: {
   companyId: string; issueId: string; agentId: string; runId: string;
   allowResolved?: boolean; lock?: boolean;
+  /** Finalizer-only observation; never pass this from tool/runtime authorization. */
+  finalizationOnly?: boolean;
 }) {
   const query = db.select({ run: heartbeatRuns, issue: issues, agent: agents })
     .from(heartbeatRuns)
@@ -15,15 +17,17 @@ export async function getNativeDocumentReviewAssignment(db: Db, input: {
     .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
       eq(heartbeatRuns.agentId, input.agentId))).limit(1);
   const [row] = await (input.lock ? query.for("share", {of:[heartbeatRuns,issues,agents]}) : query);
+  const finalizationOnly = Boolean(input.finalizationOnly && input.allowResolved);
   if (!row || !hasPendingDocumentReviewAdmission(row.run.runnerProfileJson) ||
       row.run.runtimeMode !== "native" || row.run.nativeIssueId !== input.issueId ||
-      !["queued", "running"].includes(row.run.status) ||
-      ["paused", "terminated", "pending_approval", "error"].includes(row.agent.status)) return null;
+      (!finalizationOnly && !["queued", "running"].includes(row.run.status)) ||
+      (!finalizationOnly && ["paused", "terminated", "pending_approval", "error"].includes(row.agent.status))) return null;
   const review = await readCurrentPendingDocumentReviewWake(db, {
-    ...input, contextSnapshot: row.run.contextSnapshot ?? {}, lock:input.lock,
+    ...input, contextSnapshot: row.run.contextSnapshot ?? {}, lock:input.lock, finalizationOnly,
     ...(input.allowResolved ? { allowResolvedByRunId: input.runId } : {}),
   });
-  if (!review) return null;
+  if (!review || (finalizationOnly && !["queued", "running"].includes(row.run.status) &&
+      review.interaction.status === "pending")) return null;
   const admission = parseObject(parseObject(row.run.runnerProfileJson).pendingDocumentReviewAdmission);
   if (typeof admission.nonAssignee !== "boolean" ||
       (review.interaction.status === "pending" && admission.nonAssignee !== (row.issue.assigneeAgentId !== input.agentId)) ||

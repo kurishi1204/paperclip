@@ -2667,6 +2667,9 @@ export function issueThreadInteractionService(
 
       let inserted = false;
       const created = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db,issue,{
+          agentId:payload.requestingAgentId,runId:input.sourceRunId,
+        });
         const issueRow = await tx
           .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
           .from(issues)
@@ -2693,7 +2696,8 @@ export function issueThreadInteractionService(
         if (reusable) return reusable;
 
         const [sourceRun] = await tx.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
-          .where(and(eq(heartbeatRuns.id, input.sourceRunId), eq(heartbeatRuns.companyId, issue.companyId)));
+          .where(and(eq(heartbeatRuns.id, input.sourceRunId), eq(heartbeatRuns.companyId, issue.companyId),
+            eq(heartbeatRuns.agentId,payload.requestingAgentId)));
         if (!sourceRun) throw unprocessable("Interaction source run is unavailable");
         const originCommentIds = await currentContinuationOrigins(tx as unknown as Db, issue.companyId, issue.id, sourceRun.context);
         const [row] = await tx
