@@ -10878,7 +10878,8 @@ async function createRunnerdBackendWithinSessionClaim(
       eq(heartbeatRuns.id, input.execution.binding.runId),
       eq(heartbeatRuns.companyId, input.execution.binding.companyId),
     )).limit(1).then((rows) => rows[0]);
-  const documentReview = await getNativeDocumentReviewAssignment(input.db, input.execution.binding);
+  const documentReview = hasPendingDocumentReviewAdmission(reviewRun?.runnerProfileJson)
+    ? await getNativeDocumentReviewAssignment(input.db, input.execution.binding) : null;
   if (hasPendingDocumentReviewAdmission(reviewRun?.runnerProfileJson) && !documentReview) {
     throw new Error("native_document_review_assignment_no_longer_available");
   }

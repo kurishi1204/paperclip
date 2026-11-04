@@ -162,7 +162,9 @@ suite("pending independent document review through real dispatch", () => {
   it.each(["wrong_resolver_run","wrong_resolver_agent","changed_revision"] as const)(
     "does not allow post-verdict finishing with %s", async defect => {
       const x = await nativeReviewFixture();
-      await db.update(issueThreadInteractions).set({status:"accepted",resolvedByRunId:defect==="wrong_resolver_run"?randomUUID():x.runId,
+      const otherRunId = randomUUID();
+      if (defect === "wrong_resolver_run") await db.insert(heartbeatRuns).values({id:otherRunId,companyId:x.companyId,agentId:x.reviewerId,invocationSource:"automation",status:"succeeded"});
+      await db.update(issueThreadInteractions).set({status:"accepted",resolvedByRunId:defect==="wrong_resolver_run"?otherRunId:x.runId,
         resolvedByAgentId:defect==="wrong_resolver_agent"?x.ownerId:x.reviewerId}).where(eq(issueThreadInteractions.id,x.interactionId));
       if (defect === "changed_revision") await db.update(documents).set({latestRevisionId:randomUUID()}).where(eq(documents.id,x.documentId));
       expect(await getNativeDocumentReviewAssignment(db,{...x.binding,allowResolved:true})).toBeNull();
