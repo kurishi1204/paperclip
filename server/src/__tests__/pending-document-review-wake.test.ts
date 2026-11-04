@@ -29,7 +29,10 @@ suite("pending independent document review through real dispatch", () => {
   afterEach(async () => {
     await heartbeat?.drainActiveRunExecutions(); heartbeat = undefined;
     mockAdapterExecute.mockClear(); runningProcesses.clear();
-    await db.execute(sql`truncate table ${companies} cascade`);
+    await db.transaction(async tx=>{
+      await tx.execute(sql`set local client_min_messages = 'warning'`);
+      await tx.execute(sql`truncate table ${companies} cascade`);
+    });
   });
   afterAll(async () => { await temp?.cleanup(); });
   async function seed() {
@@ -153,13 +156,13 @@ suite("pending independent document review through real dispatch", () => {
         expect(task!.executionRunId).toBe(runId); expect(task!.assigneeAgentId).toBe(x.ownerId);
       }});
     const queued=await heartbeat.wakeup(x.reviewerId,{source:"automation",triggerDetail:"system",reason:"interaction_pending",
-      payload:{issueId:x.issueId,interactionId:x.interactionId,interactionKind:"request_confirmation"},
+      payload:{issueId:x.issueId,interactionId:x.interactionId,interactionKind:"request_confirmation",mutation:"interaction"},
       idempotencyKey:`interaction-pending:${x.interactionId}`,requestedByActorType:"agent",requestedByActorId:x.ownerId,
       contextSnapshot:{...x.contextSnapshot,taskId:x.issueId}});
     expect(queued).not.toBeNull(); await heartbeat.drainActiveRunExecutions();
-    expect(observedRunId).toBe(queued!.id); expect(mockAdapterExecute).toHaveBeenCalledOnce();
     const [run]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,queued!.id));
     expect(run).toMatchObject({status:"succeeded",errorCode:null});
+    expect(observedRunId).toBe(queued!.id); expect(mockAdapterExecute).toHaveBeenCalledOnce();
     const [task]=await db.select().from(issues).where(eq(issues.id,x.issueId));
     expect(task!.assigneeAgentId).toBe(x.ownerId);
   });
