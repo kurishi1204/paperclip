@@ -41,7 +41,7 @@ or claim their content has publication QA.
 The host rejects missing metadata, byte mismatches, aliases, target/dependent
 references, and body links outside the retained registered or selected pages.
 Execution rebuilds those pins; changed references invalidate the proposal. The
-common reader checks the retained metadata and bytes again after execution.
+common reader checks the retained metadata and bytes again after execution. Preservation also requires the current read to pass every earlier durable fence; it cannot revive an existing refusal. Partial references containing the affected immutable issue, document or revision identity are refused without depending on a reference-kind or key-name list.
 Pages not selected in the proposal, future pages, direct withdrawals and old
 strict fences retain their existing refusal behavior. Ordinary Wiki writes
 remain held. Existing event records are never rewritten.

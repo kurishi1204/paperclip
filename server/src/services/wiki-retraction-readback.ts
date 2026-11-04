@@ -79,12 +79,13 @@ export async function preserveUnrelatedRetractionPages(
   rows: Array<{path:string;source_refs:unknown;content_hash:string}>,
   held: ReadonlySet<string>, preservePaths: string[],
   read: (path:string) => Promise<{path:string;contents:string}>,
+  priorRead: {assertRead(path:string,contents?:string):void},
 ): Promise<NonNullable<RetractionFence["preservedPages"]>> {
   publicationNeed(Array.isArray(preservePaths) && new Set(preservePaths).size === preservePaths.length,
     "retraction_preserve_paths");
   const preserved: NonNullable<RetractionFence["preservedPages"]> = [];
   const allowedLinks = new Set([...pins.filter(p => !held.has(p.path)).map(p => p.path), ...preservePaths]);
-  const heldIdentities = new Set([...held, ...pins.filter(p => held.has(p.path)).map(p => p.documentId)]);
+  const heldIdentities = new Set([...held, ...pins.filter(p => held.has(p.path)).flatMap(p => [p.issueId,p.documentId,p.revisionId])]);
   // Check nested values without depending on a source-kind or field-name list.
   // A conservative identity collision needs review, rather than auto-admission.
   const mentionsHeld = (value: unknown): boolean => typeof value === "string" ? heldIdentities.has(value)
@@ -97,6 +98,8 @@ export async function preserveUnrelatedRetractionPages(
     publicationNeed(matches.length === 1 && Array.isArray(matches[0]!.source_refs), "retraction_preserve_metadata");
     publicationNeed(!mentionsHeld(matches[0]!.source_refs), "retraction_preserve_dependency");
     const current = await read(p), hash = publicationHash(current.contents);
+    // Retention cannot revive a refusal from any earlier durable fence.
+    priorRead.assertRead(current.path,current.contents);
     publicationNeed(matches[0]!.content_hash === hash, "retraction_preserve_content_changed");
     publicationNeed(extractWikiLinks(current.contents, p, {strictInvalidReferences:true})
       .every(link => allowedLinks.has(link)), "retraction_preserve_body_dependency");

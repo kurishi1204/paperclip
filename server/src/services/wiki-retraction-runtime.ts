@@ -69,7 +69,8 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
       `SELECT path, source_refs, content_hash FROM ${ns}.wiki_pages WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 FOR SHARE`,
       [companyId, scope.wikiId, space.id]);
     const rootPath = await root(companyId, connection);
-    retractionFolderGate(currentEvents,companyId,"wiki-root").assertRoot(rootPath);
+    const currentGate = retractionFolderGate(currentEvents,companyId,"wiki-root");
+    currentGate.assertRoot(rootPath);
     await assertWikiRootOwnership(connection,pluginId,companyId,rootPath);
     const toPhysical = (p: string) => space.path_prefix ? `${space.path_prefix}/${p}` : p;
     const page = async (p: string): Promise<JsonObject> => {
@@ -99,7 +100,7 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
       const rel = toPhysical(p), canonical = await physical(rootPath, rel);
       publicationNeed(canonical === rel, "retraction_alias");
       return {path:canonical,contents:await readPluginLocalFolderText(rootPath, rel)};
-    });
+    },currentGate);
     return { schema: "paperclip.wiki-retraction-request/v1", pluginId,
       target: { ...scope, path: targetPath, contentHash: targetPin.wikiSHA256 }, reason,
       publicationRegistrySHA256: publicationHash(publicationCanonical(pins)),
