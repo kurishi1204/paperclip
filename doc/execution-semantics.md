@@ -1725,3 +1725,5 @@ fall through to ordinary attachment staging. Finalization releases only lease
 fields still owned by the finishing run, preserving any successor's lease.
 Pending/stale document-review recovery records have no resume-run wake policy;
 provider failures cannot skip that explicit non-replay disposition.
+
+Document-review purpose is identified separately from current authority: the original run-bound interaction receipts (including resource-deferral ancestry) retain that purpose if serialized admission/context is lost. Every native startup, staging, completion and verdict path rejects missing current admission rather than converting it into a worker. All interaction kinds share the fixed-review verdict authorization, including direct run-JWT HTTP requests.

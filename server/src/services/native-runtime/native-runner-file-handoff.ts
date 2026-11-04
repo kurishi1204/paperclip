@@ -35,8 +35,7 @@ import type { StorageService } from "../../storage/types.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import { issueService } from "../issues.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
-import { getNativeDocumentReviewAssignment } from "./native-document-review-participant.js";
-import { hasPendingDocumentReviewAdmission } from "../pending-document-review-wake.js";
+import { getNativeDocumentReviewAssignment, isNativeDocumentReviewRun } from "./native-document-review-participant.js";
 
 export type RemoteWorkspaceFileReader = (input: Pick<NativeRunnerFileHandoffInput, "contentRef" | "byteSize" | "sha256">) => Promise<Buffer>;
 
@@ -819,6 +818,7 @@ export async function stageNativeRunnerWakeAttachments(input: {
     .select({
       contextSnapshot: heartbeatRuns.contextSnapshot,
       runnerProfileJson: heartbeatRuns.runnerProfileJson,
+      retryOfRunId: heartbeatRuns.retryOfRunId,
       agentStatus: agents.status,
       assigneeAgentId: issues.assigneeAgentId,
     })
@@ -870,9 +870,10 @@ export async function stageNativeRunnerWakeAttachments(input: {
         contextSnapshot: reviewContext,
       })
     : null;
-  const documentReview = hasPendingDocumentReviewAdmission(run.runnerProfileJson)
+  const isDocumentReview = await isNativeDocumentReviewRun(input.db, {...input.binding,...run});
+  const documentReview = isDocumentReview
     ? await getNativeDocumentReviewAssignment(input.db, input.binding) : null;
-  if ((hasPendingDocumentReviewAdmission(run.runnerProfileJson) && !documentReview) ||
+  if ((isDocumentReview && !documentReview) ||
       (run.assigneeAgentId !== input.binding.agentId && !nativeReview && !documentReview)) {
     throw new Error("paperclip_runner_attachment_staging_not_authorized");
   }

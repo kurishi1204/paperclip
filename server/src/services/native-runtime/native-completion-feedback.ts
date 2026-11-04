@@ -7,8 +7,7 @@ import { isConversation } from "../agent-conversations.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { resolveExternalChatResponseWaitAuthorization } from "./chat-attachment-reuse.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
-import { getNativeDocumentReviewAssignment } from "./native-document-review-participant.js";
-import { hasPendingDocumentReviewAdmission } from "../pending-document-review-wake.js";
+import { getNativeDocumentReviewAssignment, isNativeDocumentReviewRun } from "./native-document-review-participant.js";
 import { and, eq, inArray, notInArray } from "drizzle-orm";
 import {
   approvals,
@@ -76,7 +75,7 @@ export async function nativeCompletionFeedback(
     )
     .then((rows) => rows[0]);
   if (!issue) throw new Error("Completion task no longer exists.");
-  if (hasPendingDocumentReviewAdmission(run.runnerProfileJson)) {
+  if (await isNativeDocumentReviewRun(db, {...run,runId:run.id})) {
     const review = await getNativeDocumentReviewAssignment(db, { companyId:run.companyId, issueId:issue.id, agentId:run.agentId, runId:run.id, allowResolved:true });
     if (!review) throw new Error("The fixed document review is no longer available to this run.");
     if (review.interaction.status === "pending" && result.reportedWorkDisposition !== "blocked") {

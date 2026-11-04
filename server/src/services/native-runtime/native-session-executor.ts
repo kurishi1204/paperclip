@@ -139,8 +139,7 @@ import { nativeSha256 } from "./canonical.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { createAssignedMcpTools, getAssignedMcpGateway } from "./assigned-mcp-tools.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
-import { getNativeDocumentReviewAssignment } from "./native-document-review-participant.js";
-import { hasPendingDocumentReviewAdmission } from "../pending-document-review-wake.js";
+import { getNativeDocumentReviewAssignment, isNativeDocumentReviewRun } from "./native-document-review-participant.js";
 import { NativeChatAttachmentReadScope } from "./chat-attachment-read.js";
 import {
   assertCurrentWakeCommentsRead,
@@ -10873,14 +10872,15 @@ async function createRunnerdBackendWithinSessionClaim(
   const pinnedSkills = new Set("runtimeContext" in input.execution ? input.execution.runtimeContext.skills.map((skill) => skill.key) : []);
   const connectorAssignments = [...pinnedSkills].some(isConnectorSkill)
     ? await resolveConnectorAssignments(input.db, input.execution.binding) : [];
-  const reviewRun = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot, runnerProfileJson: heartbeatRuns.runnerProfileJson })
+  const reviewRun = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot, runnerProfileJson: heartbeatRuns.runnerProfileJson, retryOfRunId: heartbeatRuns.retryOfRunId })
     .from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, input.execution.binding.runId),
       eq(heartbeatRuns.companyId, input.execution.binding.companyId),
     )).limit(1).then((rows) => rows[0]);
-  const documentReview = hasPendingDocumentReviewAdmission(reviewRun?.runnerProfileJson)
+  const isDocumentReview = reviewRun && await isNativeDocumentReviewRun(input.db, {...input.execution.binding,...reviewRun});
+  const documentReview = isDocumentReview
     ? await getNativeDocumentReviewAssignment(input.db, input.execution.binding) : null;
-  if (hasPendingDocumentReviewAdmission(reviewRun?.runnerProfileJson) && !documentReview) {
+  if (isDocumentReview && !documentReview) {
     throw new Error("native_document_review_assignment_no_longer_available");
   }
   const nativeReview = readNativeReviewAssignmentContext(reviewRun?.contextSnapshot);

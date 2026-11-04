@@ -1,5 +1,4 @@
-import { getNativeDocumentReviewAssignment } from "./native-runtime/native-document-review-participant.js";
-import { hasPendingDocumentReviewAdmission } from "./pending-document-review-wake.js";
+import { getNativeDocumentReviewAssignment, isNativeDocumentReviewRun } from "./native-runtime/native-document-review-participant.js";
 import { activeIssueInteractionCondition, historicalQuestionCondition } from "./issue-question-context.js";
 import {
   currentContinuationOrigins,
@@ -462,10 +461,26 @@ function resolverActor(actor: InteractionActor) {
   return { type: "agent" as const, agentId: null, runId: null };
 }
 
-function assertInteractionResolutionAllowed(
+async function assertInteractionResolutionAllowed(
+  db: Db,
   current: IssueThreadInteractionRow,
   actor: InteractionActor,
 ) {
+  // Apply the fixed role to every interaction kind, including direct HTTP
+  // requests. The tool catalog is not the server authorization boundary.
+  if (actor.agentId && actor.runId) {
+    const [run] = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id,actor.runId),eq(heartbeatRuns.companyId,current.companyId),
+      eq(heartbeatRuns.agentId,actor.agentId))).limit(1);
+    if (run?.runtimeMode === "native" && await isNativeDocumentReviewRun(db,{...run,runId:run.id})) {
+      const review = await getNativeDocumentReviewAssignment(db,{
+        companyId:current.companyId,issueId:current.issueId,agentId:actor.agentId,runId:actor.runId,lock:true,
+      });
+      if (!review || review.interaction.id !== current.id) {
+        throw conflict("The fixed document review binding changed before the decision.");
+      }
+    }
+  }
   return assertIssueThreadInteractionResolverAudience({
     actor: resolverActor(actor),
     interaction: current,
@@ -511,20 +526,7 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
     isRequestConfirmationLikeKind(interaction.kind) &&
     (await isIssueReviewVerdictInteraction(tx, { issue, interaction }));
 
-  assertInteractionResolutionAllowed(interaction, actor);
-  if (actor.agentId && actor.runId && readAcceptedPlanConfirmationTarget(interaction.payload,issue.id)) {
-    const [run] = await tx.select({profile:heartbeatRuns.runnerProfileJson,contextSnapshot:heartbeatRuns.contextSnapshot,runtimeMode:heartbeatRuns.runtimeMode}).from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.id,actor.runId),eq(heartbeatRuns.companyId,issue.companyId),eq(heartbeatRuns.agentId,actor.agentId))).limit(1);
-    if (hasPendingDocumentReviewAdmission(run?.profile) ||
-        (run?.runtimeMode === "native" && run.contextSnapshot?.interactionId === interaction.id)) {
-      const review = await getNativeDocumentReviewAssignment(tx, {
-        companyId:issue.companyId,issueId:issue.id,agentId:actor.agentId,runId:actor.runId,lock:true,
-      });
-      if (!review || review.interaction.id !== interaction.id) {
-        throw conflict("The fixed document review binding changed before the decision.");
-      }
-    }
-  }
+  await assertInteractionResolutionAllowed(tx, interaction, actor);
   if (actor.agentId && isNativeCompletionReview(interaction)) {
     const target = (interaction.payload as { target?: { revisionId?: string } }).target;
     if (!actor.runId || !await getNativeReviewAssignment(tx, {
@@ -2773,7 +2775,7 @@ export function issueThreadInteractionService(
           "Only connection_intent interactions have a connection phase",
         );
       }
-      assertInteractionResolutionAllowed(current, actor);
+      await assertInteractionResolutionAllowed(db, current, actor);
       const payload = connectionIntentPayloadSchema.parse(current.payload);
       const [updated] = await db
         .update(issueThreadInteractions)
@@ -2811,7 +2813,7 @@ export function issueThreadInteractionService(
       }
       if (!actor.userId)
         throw forbidden("Connection intents require a human resolver");
-      assertInteractionResolutionAllowed(current, actor);
+      await assertInteractionResolutionAllowed(db, current, actor);
       const status =
         result.outcome === "connected"
           ? "accepted"
@@ -3846,7 +3848,7 @@ export function issueThreadInteractionService(
         issue,
         interactionId,
       });
-      assertInteractionResolutionAllowed(current, actor);
+      await assertInteractionResolutionAllowed(db, current, actor);
       switch (current.kind) {
         case "suggest_tasks":
           // Accepting suggest_tasks only creates follow-up issues; it does not
@@ -3929,7 +3931,7 @@ export function issueThreadInteractionService(
       ) {
         throw interactionNotFoundError();
       }
-      assertInteractionResolutionAllowed(current, actor);
+      await assertInteractionResolutionAllowed(db, current, actor);
       if (current.kind !== "suggest_tasks") {
         throw unprocessable("Only suggest_tasks interactions can be accepted");
       }
@@ -4117,7 +4119,7 @@ export function issueThreadInteractionService(
         issue,
         interactionId,
       });
-      assertInteractionResolutionAllowed(current, actor);
+      await assertInteractionResolutionAllowed(db, current, actor);
       switch (current.kind) {
         case "suggest_tasks":
           return issueThreadInteractionService(db).rejectSuggestedTasks(
@@ -4176,7 +4178,7 @@ export function issueThreadInteractionService(
           );
         }
 
-        assertInteractionResolutionAllowed(current, actor);
+        await assertInteractionResolutionAllowed(db, current, actor);
         const interaction = hydrateInteraction(
           current,
         ) as RequestItemVerdictsInteraction;
@@ -4952,7 +4954,7 @@ export function issueThreadInteractionService(
       ) {
         throw interactionNotFoundError();
       }
-      assertInteractionResolutionAllowed(current, actor);
+      await assertInteractionResolutionAllowed(db, current, actor);
       if (current.kind !== "ask_user_questions") {
         throw unprocessable(
           "Only ask_user_questions interactions can be answered",

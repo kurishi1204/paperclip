@@ -14,8 +14,7 @@ import type { SourceTrustMetadata } from "@paperclipai/shared";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { sanitizeQuarantinedCommentForHigherTrust } from "../source-trust.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
-import { getNativeDocumentReviewAssignment } from "./native-document-review-participant.js";
-import { hasPendingDocumentReviewAdmission } from "../pending-document-review-wake.js";
+import { getNativeDocumentReviewAssignment, isNativeDocumentReviewRun } from "./native-document-review-participant.js";
 
 export const READ_CURRENT_WAKE_COMMENTS_TOOL_NAME =
   "read_current_wake_comments";
@@ -758,6 +757,7 @@ export async function assertCurrentWakeCommentsRead(
         resultJson: heartbeatRuns.resultJson,
         contextSnapshot: heartbeatRuns.contextSnapshot,
         runnerProfileJson: heartbeatRuns.runnerProfileJson,
+        retryOfRunId: heartbeatRuns.retryOfRunId,
         issueAssigneeAgentId: issues.assigneeAgentId,
         issueExecutionRunId: issues.executionRunId,
       })
@@ -782,7 +782,7 @@ export async function assertCurrentWakeCommentsRead(
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (!locked) throw new Error("native_current_wake_comments_binding_changed");
-    if (hasPendingDocumentReviewAdmission(locked.runnerProfileJson)) {
+    if (await isNativeDocumentReviewRun(tx as unknown as Db, {...input,...locked})) {
       if (!await getNativeDocumentReviewAssignment(tx as unknown as Db, { ...input, allowResolved: true })) {
         throw new Error("native_current_wake_comments_binding_changed");
       }

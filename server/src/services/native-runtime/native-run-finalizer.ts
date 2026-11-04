@@ -6,8 +6,7 @@ import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import { readPersistedNativeProviderFailure } from "./native-provider-failure-evidence.js";
 import { dismissAutomaticCompletionReviews } from "./automatic-completion-reviews.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
-import { getNativeDocumentReviewAssignment } from "./native-document-review-participant.js";
-import { hasPendingDocumentReviewAdmission } from "../pending-document-review-wake.js";
+import { getNativeDocumentReviewAssignment, isNativeDocumentReviewRun } from "./native-document-review-participant.js";
 import { readFormalIssueApprovalDecision } from "./formal-issue-approval-decision.js";
 import { conversationNativeDecision, isConversation } from "../agent-conversations.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
@@ -1275,7 +1274,7 @@ export async function finalizeNativeRun(input: {
           )
         : Promise.resolve(null),
     ]);
-    const isDocumentReview = hasPendingDocumentReviewAdmission(run.runnerProfileJson);
+    const isDocumentReview = await isNativeDocumentReviewRun(input.db, {...run,runId:run.id});
     const documentReview = isDocumentReview ? await getNativeDocumentReviewAssignment(input.db, {
       companyId:run.companyId, issueId:authoritativeIssue.id, agentId:run.agentId, runId:run.id, allowResolved:true,
     }) : null;
