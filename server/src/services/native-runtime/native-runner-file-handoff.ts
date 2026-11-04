@@ -872,7 +872,8 @@ export async function stageNativeRunnerWakeAttachments(input: {
     : null;
   const documentReview = hasPendingDocumentReviewAdmission(run.runnerProfileJson)
     ? await getNativeDocumentReviewAssignment(input.db, input.binding) : null;
-  if (run.assigneeAgentId !== input.binding.agentId && !nativeReview && !documentReview) {
+  if ((hasPendingDocumentReviewAdmission(run.runnerProfileJson) && !documentReview) ||
+      (run.assigneeAgentId !== input.binding.agentId && !nativeReview && !documentReview)) {
     throw new Error("paperclip_runner_attachment_staging_not_authorized");
   }
   // A fixed document request grants no chat-attachment access. Still scrub

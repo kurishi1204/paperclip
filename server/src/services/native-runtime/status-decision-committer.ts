@@ -1,3 +1,4 @@
+import { releaseNativeRunCheckout } from "./native-run-checkout.js";
 import { readNativePlanWait, type NativePlanWaitSource } from "./native-plan-wait.js";
 import { readFormalIssueApprovalDecision } from "./formal-issue-approval-decision.js";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
@@ -1488,45 +1489,11 @@ async function materializeDecisionEffect(input: {
     };
   }
   if (effect.kind === "release_checkout") {
-    if (input.formalApprovalDecisionId) {
-      // The verdict may already have reassigned the issue. Release only lease
-      // fields that still name this run; never clear a successor's checkout.
-      const [released] = await input.tx.update(issues).set({
-        checkoutRunId: sql`case when ${issues.checkoutRunId} = ${input.runId}::uuid then null else ${issues.checkoutRunId} end`,
-        executionRunId: sql`case when ${issues.executionRunId} = ${input.runId}::uuid then null else ${issues.executionRunId} end`,
-        executionAgentNameKey: sql`case when ${issues.executionRunId} = ${input.runId}::uuid then null else ${issues.executionAgentNameKey} end`,
-        executionLockedAt: sql`case when ${issues.executionRunId} = ${input.runId}::uuid then null else ${issues.executionLockedAt} end`,
-        updatedAt: new Date(),
-      }).where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.companyId),
-        or(eq(issues.checkoutRunId, input.runId), eq(issues.executionRunId, input.runId))))
-        .returning({ id: issues.id, checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId });
-      return { effectKind: effect.kind, targetType: "issue_checkout", targetId: input.issue.id,
-        payload: { checkoutRunId: released ? released.checkoutRunId : input.issue.checkoutRunId,
-          executionRunId: released ? released.executionRunId : input.issue.executionRunId } };
-    }
-    const [released] = await input.tx
-      .update(issues)
-      .set({
-        checkoutRunId: null,
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(issues.id, input.issue.id),
-          eq(issues.companyId, input.companyId),
-        ),
-      )
-      .returning({ id: issues.id });
-    if (!released) throw new Error("native_checkout_not_released");
-    return {
-      effectKind: effect.kind,
-      targetType: "issue_checkout",
-      targetId: released.id,
-      payload: { checkoutRunId: null, executionRunId: null },
-    };
+    const released = await releaseNativeRunCheckout(input.tx, {
+      companyId:input.companyId,issueId:input.issue.id,runId:input.runId,
+    });
+    return {effectKind:effect.kind,targetType:"issue_checkout",targetId:released.id,
+      payload:{checkoutRunId:released.checkoutRunId,executionRunId:released.executionRunId}};
   }
   if (effect.kind === "record_recovery") {
     failAt("recovery_materialization", input.failpoint);
@@ -1546,7 +1513,7 @@ async function materializeDecisionEffect(input: {
       }),
       evidence: { runId: input.runId, decisionId: input.decisionId },
       nextAction: effect.nextAction,
-      wakePolicy: { kind: "resume_native_run", runId: input.runId },
+      wakePolicy: effect.resumeNativeRun === false ? null : { kind: "resume_native_run", runId: input.runId },
       maxAttempts: 3,
     });
     return {

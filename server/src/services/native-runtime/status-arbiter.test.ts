@@ -99,8 +99,16 @@ describe("native status authority", () => {
     const decision = arbitrate({ priorIssueStatus:"blocked", documentReviewOutcome });
     expect(decision).toMatchObject({statusAction:"preserve",toStatus:"blocked",reasonCode:`native_document_review_${documentReviewOutcome}`});
     expect(decision.effects).toContainEqual({kind:"release_checkout"});
-    if (documentReviewOutcome !== "resolved") expect(decision.effects).toContainEqual(expect.objectContaining({kind:"record_recovery",cause:`native_document_review_${documentReviewOutcome}`}));
+    if (documentReviewOutcome !== "resolved") expect(decision.effects).toContainEqual(expect.objectContaining({kind:"record_recovery",cause:`native_document_review_${documentReviewOutcome}`,resumeNativeRun:false}));
     else expect(decision.effects).not.toContainEqual(expect.objectContaining({kind:"record_recovery"}));
+    expect(decision.effects.some(effect=>["enqueue_continuation","schedule_retry"].includes(effect.kind))).toBe(false);
+  });
+
+  it.each(["resolved","pending","stale"] as const)("keeps document QA recovery explicit despite provider supersession (%s)", documentReviewOutcome => {
+    const decision = arbitrate({priorIssueStatus:"blocked",terminalState:"failed",providerFailureSuperseded:true,documentReviewOutcome});
+    expect(decision).toMatchObject({statusAction:"preserve",toStatus:"blocked",reasonCode:`native_document_review_${documentReviewOutcome}`});
+    expect(decision.effects).toContainEqual({kind:"release_checkout"});
+    if (documentReviewOutcome !== "resolved") expect(decision.effects).toContainEqual(expect.objectContaining({kind:"record_recovery",resumeNativeRun:false}));
     expect(decision.effects.some(effect=>["enqueue_continuation","schedule_retry"].includes(effect.kind))).toBe(false);
   });
 

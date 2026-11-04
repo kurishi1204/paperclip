@@ -73,6 +73,8 @@ export type NativeStatusEffect =
   | { kind: "link_canonical_request" }
   | {
       kind: "record_recovery";
+      /** False records an observation requiring a fresh authorized decision, not replay. */
+      resumeNativeRun?: boolean;
       cause: string;
       nextAction: string;
       agentId: string;
@@ -168,6 +170,22 @@ export function arbitrateNativeStatus(input: {
       ],
     };
   }
+  if (input.documentReviewOutcome) {
+    const outcome = input.documentReviewOutcome;
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve", toStatus: input.priorIssueStatus,
+      reasonCode: `native_document_review_${outcome}`, unblockDescriptor: null,
+      effects: [
+        { kind: "release_checkout" },
+        ...(outcome !== "resolved" ? [{
+          kind: "record_recovery" as const, cause: `native_document_review_${outcome}`, resumeNativeRun: false,
+          nextAction: "Inspect the saved fixed-document review and its current authority. Do not mark QA complete or replay the prior run.",
+          agentId: input.agentId,
+        }] : []),
+      ],
+    };
+  }
   if (input.providerFailureSuperseded) return {
     policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
     statusAction: "preserve", toStatus: input.priorIssueStatus,
@@ -224,22 +242,6 @@ export function arbitrateNativeStatus(input: {
       effects: [
         { kind: "schedule_retry", cause: NATIVE_PROVIDER_OVERLOADED_CODE, summary: "Retry after model capacity becomes available.", agentId: input.agentId },
         ...(input.nativeReviewOutcome === "pending" ? [{ kind: "release_checkout" as const }] : []),
-      ],
-    };
-  }
-  if (input.documentReviewOutcome) {
-    const outcome = input.documentReviewOutcome;
-    return {
-      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
-      statusAction: "preserve", toStatus: input.priorIssueStatus,
-      reasonCode: `native_document_review_${outcome}`, unblockDescriptor: null,
-      effects: [
-        { kind: "release_checkout" },
-        ...(outcome !== "resolved" ? [{
-          kind: "record_recovery" as const, cause: `native_document_review_${outcome}`,
-          nextAction: "Inspect the saved fixed-document review and its current authority. Do not mark QA complete or replay the prior run.",
-          agentId: input.agentId,
-        }] : []),
       ],
     };
   }

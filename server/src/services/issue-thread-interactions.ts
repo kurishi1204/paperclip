@@ -1,3 +1,5 @@
+import { getNativeDocumentReviewAssignment } from "./native-runtime/native-document-review-participant.js";
+import { hasPendingDocumentReviewAdmission } from "./pending-document-review-wake.js";
 import { activeIssueInteractionCondition, historicalQuestionCondition } from "./issue-question-context.js";
 import {
   currentContinuationOrigins,
@@ -510,6 +512,19 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
     (await isIssueReviewVerdictInteraction(tx, { issue, interaction }));
 
   assertInteractionResolutionAllowed(interaction, actor);
+  if (actor.agentId && actor.runId && readAcceptedPlanConfirmationTarget(interaction.payload,issue.id)) {
+    const [run] = await tx.select({profile:heartbeatRuns.runnerProfileJson,contextSnapshot:heartbeatRuns.contextSnapshot,runtimeMode:heartbeatRuns.runtimeMode}).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id,actor.runId),eq(heartbeatRuns.companyId,issue.companyId),eq(heartbeatRuns.agentId,actor.agentId))).limit(1);
+    if (hasPendingDocumentReviewAdmission(run?.profile) ||
+        (run?.runtimeMode === "native" && run.contextSnapshot?.interactionId === interaction.id)) {
+      const review = await getNativeDocumentReviewAssignment(tx, {
+        companyId:issue.companyId,issueId:issue.id,agentId:actor.agentId,runId:actor.runId,lock:true,
+      });
+      if (!review || review.interaction.id !== interaction.id) {
+        throw conflict("The fixed document review binding changed before the decision.");
+      }
+    }
+  }
   if (actor.agentId && isNativeCompletionReview(interaction)) {
     const target = (interaction.payload as { target?: { revisionId?: string } }).target;
     if (!actor.runId || !await getNativeReviewAssignment(tx, {

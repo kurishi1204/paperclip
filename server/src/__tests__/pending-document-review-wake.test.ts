@@ -1,8 +1,16 @@
+import express from "express";
+import request from "supertest";
+import { actorMiddleware } from "../middleware/auth.js";
+import { errorHandler } from "../middleware/index.js";
+import { issueRoutes } from "../routes/issues.js";
+import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
+import { createStorageService } from "../storage/service.js";
+import { releaseNativeRunCheckout } from "../services/native-runtime/native-run-checkout.js";
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, companies, createDb, documents, documentRevisions,
-  heartbeatRuns, issueDocuments, issueThreadInteractions, issues } from "@paperclipai/db";
+  heartbeatRuns, issueDocuments, issueThreadInteractions, issues, authUsers, companyMemberships } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
 import { hasServerRecordedNonAssigneeWake, isCurrentPendingDocumentReviewWake, pendingDocumentReviewRetryProfile, pendingDocumentReviewProfileFields } from "../services/pending-document-review-wake.js";
@@ -44,6 +52,7 @@ suite("pending independent document review through real dispatch", () => {
     await db.transaction(async tx=>{
       await tx.execute(sql`set local client_min_messages = 'warning'`);
       await tx.execute(sql`truncate table ${companies} cascade`);
+      await tx.delete(authUsers);
     });
   });
   afterAll(async () => { await temp?.cleanup(); });
@@ -80,9 +89,14 @@ suite("pending independent document review through real dispatch", () => {
     await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId:x.companyId, runId:x.runId, expectedStatus:"queued", now:new Date() });
     await db.update(issues).set({ executionRunId:x.runId }).where(eq(issues.id,x.issueId));
     await db.update(heartbeatRuns).set({ status:"running", runtimeMode:"native", nativeIssueId:x.issueId }).where(eq(heartbeatRuns.id,x.runId));
+    const responsibleUserId = randomUUID();
+    await db.insert(authUsers).values({id:responsibleUserId,name:"Synthetic responsible owner",email:`${responsibleUserId}@example.test`,createdAt:new Date(),updatedAt:new Date()});
+    await db.insert(companyMemberships).values({companyId:x.companyId,principalType:"user",principalId:responsibleUserId,membershipRole:"owner",status:"active"});
+    await db.update(heartbeatRuns).set({responsibleUserId}).where(eq(heartbeatRuns.id,x.runId));
+    await db.update(agents).set({adapterType:"paperclip_runner"}).where(eq(agents.id,x.reviewerId));
     const binding = { companyId:x.companyId, issueId:x.issueId, agentId:x.reviewerId, runId:x.runId,
       documentReviewInteractionId:x.interactionId, apiUrl:"http://synthetic.invalid" };
-    return { ...x, binding, authority:new PaperclipRunnerToolAuthority(db,binding) };
+    return { ...x, responsibleUserId, binding, authority:new PaperclipRunnerToolAuthority(db,binding) };
   }
   it("carries one fixed native document review through staging, read, actual decision and finish", async () => {
     const x = await nativeReviewFixture(), workspaceRoot = await mkdtemp(path.join(tmpdir(),"paperclip-document-review-"));
@@ -105,10 +119,17 @@ suite("pending independent document review through real dispatch", () => {
       vi.stubGlobal("fetch",vi.fn(async (url: string, options: RequestInit) => {
         expect(url).toBe(`http://synthetic.invalid/api/issues/${x.issueId}/interactions/${x.interactionId}/accept`);
         expect(options.method).toBe("POST");
-        const result = await issueThreadInteractionService(db).acceptInteraction(
-          {id:x.issueId,companyId:x.companyId,projectId:null,goalId:null},x.interactionId,{},
-          {agentId:x.reviewerId,runId:x.runId});
-        return new Response(JSON.stringify(result.interaction),{status:200});
+        // Keep the real JWT actor middleware, HTTP route authorization and
+        // verdict transaction; only transport is redirected into this test app.
+        const app = express(); app.use(express.json());
+        app.use(actorMiddleware(db,{deploymentMode:"authenticated"}));
+        app.use("/api",issueRoutes(db,createStorageService(createLocalDiskStorageProvider(path.join(workspaceRoot,"storage")))));
+        app.use(errorHandler);
+        const response = await request(app).post(new URL(url).pathname)
+          .set(Object.fromEntries(new Headers(options.headers).entries()))
+          .send(JSON.parse(String(options.body)));
+        expect(response.status,JSON.stringify(response.body)).toBe(200);
+        return new Response(JSON.stringify(response.body),{status:response.status});
       }));
       expect(await x.authority.execute({ tool:"resolve_review", callId:"verdict", arguments:{decision:"accept"} }))
         .toMatchObject({interactionId:x.interactionId,status:"accepted"});
@@ -128,13 +149,17 @@ suite("pending independent document review through real dispatch", () => {
       await rm(workspaceRoot,{recursive:true,force:true});
     }
   });
-  it.each(["wrong_receipt","lost_lock","stale_revision","wrong_addressee","missing_role_marker","wrong_role_marker","malformed_role_marker"] as const)(
+  it.each(["wrong_receipt","lost_lock","stale_revision","wrong_addressee","stale_then_assigned","missing_role_marker","wrong_role_marker","malformed_role_marker"] as const)(
     "refuses %s across native staging and tool reads", async defect => {
       const x = await nativeReviewFixture();
       if (defect === "wrong_receipt") await db.update(agentWakeupRequests).set({requestedByActorId:x.reviewerId}).where(eq(agentWakeupRequests.id,x.wakeupRequestId));
       if (defect === "lost_lock") await db.update(issues).set({executionRunId:null}).where(eq(issues.id,x.issueId));
       if (defect === "stale_revision") await db.update(documents).set({latestRevisionId:randomUUID()}).where(eq(documents.id,x.documentId));
       if (defect === "wrong_addressee") await db.update(issueThreadInteractions).set({addresseeAgentId:x.ownerId}).where(eq(issueThreadInteractions.id,x.interactionId));
+      if (defect === "stale_then_assigned") {
+        await db.update(documents).set({latestRevisionId:randomUUID()}).where(eq(documents.id,x.documentId));
+        await db.update(issues).set({assigneeAgentId:x.reviewerId}).where(eq(issues.id,x.issueId));
+      }
       if (["missing_role_marker","wrong_role_marker","malformed_role_marker"].includes(defect)) {
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
         const profile = run!.runnerProfileJson as Record<string,unknown>;
@@ -172,14 +197,53 @@ suite("pending independent document review through real dispatch", () => {
   });
   it("keeps a human task owner when rejecting a continuing document confirmation", async () => {
     const x = await nativeReviewFixture();
-    await db.update(issues).set({status:"in_review",assigneeAgentId:null,assigneeUserId:"synthetic-human-owner"}).where(eq(issues.id,x.issueId));
+    await db.update(issues).set({status:"in_review",assigneeAgentId:null,assigneeUserId:x.responsibleUserId}).where(eq(issues.id,x.issueId));
     await db.update(issueThreadInteractions).set({continuationPolicy:"wake_assignee"}).where(eq(issueThreadInteractions.id,x.interactionId));
     await issueThreadInteractionService(db).rejectInteraction({id:x.issueId,companyId:x.companyId},x.interactionId,
       {reason:"Synthetic required changes"},{agentId:x.reviewerId,runId:x.runId});
     const [task] = await db.select().from(issues).where(eq(issues.id,x.issueId));
-    expect(task).toMatchObject({status:"todo",assigneeAgentId:null,assigneeUserId:"synthetic-human-owner"});
+    expect(task).toMatchObject({status:"todo",assigneeAgentId:null,assigneeUserId:x.responsibleUserId});
     expect(await getNativeDocumentReviewAssignment(db,{...x.binding,allowResolved:true}))
       .toMatchObject({interaction:{status:"rejected",resolvedByRunId:x.runId}});
+  });
+  it.each(["revision","receipt","saved_binding","removed_admission"] as const)("refuses a %s change inside the verdict transaction", async defect => {
+    const x = await nativeReviewFixture();
+    expect(await getNativeDocumentReviewAssignment(db,x.binding)).not.toBeNull();
+    await expect(issueThreadInteractionService(db).acceptInteraction(
+      {id:x.issueId,companyId:x.companyId,projectId:null,goalId:null},x.interactionId,{},
+      {agentId:x.reviewerId,runId:x.runId},{beforeResolveInTransaction:async tx=>{
+        if (defect === "revision") await tx.update(documents).set({latestRevisionId:randomUUID()}).where(eq(documents.id,x.documentId));
+        if (defect === "receipt") await tx.update(agentWakeupRequests).set({requestedByActorId:x.reviewerId}).where(eq(agentWakeupRequests.id,x.wakeupRequestId));
+        if (defect === "removed_admission") {
+          const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
+          const profile = {...run!.runnerProfileJson as Record<string,unknown>};
+          delete profile.pendingDocumentReviewAdmission;
+          await tx.update(heartbeatRuns).set({runnerProfileJson:profile}).where(eq(heartbeatRuns.id,x.runId));
+        }
+        if (defect === "saved_binding") {
+          const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
+          const profile = run!.runnerProfileJson as Record<string,unknown>;
+          const admission = profile.pendingDocumentReviewAdmission as Record<string,unknown>;
+          await tx.update(heartbeatRuns).set({runnerProfileJson:{...profile,pendingDocumentReviewAdmission:{...admission,binding:{...(admission.binding as Record<string,unknown>),revisionId:randomUUID()}}}}).where(eq(heartbeatRuns.id,x.runId));
+        }
+      }})).rejects.toThrow("fixed document review binding changed");
+    const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id,x.interactionId));
+    expect(card!.status).toBe("pending");
+    expect(await getNativeDocumentReviewAssignment(db,x.binding)).not.toBeNull();
+  });
+  it.each(["same_run","successor","mixed"] as const)("releases only its own checkout fields (%s)", async ownership => {
+    const x = await nativeReviewFixture(), successorId = randomUUID();
+    await db.insert(heartbeatRuns).values({id:successorId,companyId:x.companyId,agentId:x.ownerId,invocationSource:"automation",status:"running"});
+    const lockedAt = new Date("2026-01-01T00:00:00Z");
+    await db.update(issues).set({executionRunId:ownership==="same_run"?x.runId:successorId,
+      checkoutRunId:ownership==="successor"?successorId:x.runId,executionAgentNameKey:"successor-owner",executionLockedAt:lockedAt}).where(eq(issues.id,x.issueId));
+    await releaseNativeRunCheckout(db,x.binding);
+    const [task] = await db.select().from(issues).where(eq(issues.id,x.issueId));
+    expect(task!.checkoutRunId).toBe(ownership==="successor"?successorId:null);
+    expect(task!.executionRunId).toBe(ownership==="same_run"?null:successorId);
+    expect(task!.executionAgentNameKey).toBe(ownership==="same_run"?null:"successor-owner");
+    expect(task!.executionLockedAt).toEqual(ownership==="same_run"?null:lockedAt);
+    expect(task!.assigneeAgentId).toBe(x.ownerId);
   });
   it.each(["wrong_resolver_run","wrong_resolver_agent","changed_revision"] as const)(
     "does not allow post-verdict finishing with %s", async defect => {

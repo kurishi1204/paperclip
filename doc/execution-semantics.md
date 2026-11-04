@@ -1718,3 +1718,10 @@ saved role markers are refused. Resolved, unresolved and stale fixed document
 reviews receive distinct finalization reason codes. Unresolved/stale reviews
 record explicit recovery without replaying the old run or claiming business QA
 success.
+
+Document-review decisions recheck the saved run role, wake receipt and fixed
+revision under the decision transaction's locks. Losing that binding cannot
+fall through to ordinary attachment staging. Finalization releases only lease
+fields still owned by the finishing run, preserving any successor's lease.
+Pending/stale document-review recovery records have no resume-run wake policy;
+provider failures cannot skip that explicit non-replay disposition.
