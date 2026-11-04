@@ -169,7 +169,9 @@ export function documentService(db: Db) {
       return row ? mapIssueDocumentRow(row, true) : null;
     },
 
-    listIssueDocumentRevisions: async (issueId: string, rawKey: string) => {
+    listIssueDocumentRevisions: async (issueId: string, rawKey: string,
+      revisionScope?: { companyId: string; documentId: string; revisionId: string },
+    ) => {
       const key = normalizeDocumentKey(rawKey);
       return db
         .select({
@@ -190,7 +192,13 @@ export function documentService(db: Db) {
         .from(issueDocuments)
         .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
         .innerJoin(documentRevisions, eq(documentRevisions.documentId, documents.id))
-        .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, key)))
+        .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, key),
+          revisionScope ? eq(issueDocuments.companyId, revisionScope.companyId) : undefined,
+          revisionScope ? eq(documents.companyId, revisionScope.companyId) : undefined,
+          revisionScope ? eq(documentRevisions.companyId, revisionScope.companyId) : undefined,
+          revisionScope ? eq(documents.id, revisionScope.documentId) : undefined,
+          revisionScope ? eq(documentRevisions.id, revisionScope.revisionId) : undefined,
+        ))
         .orderBy(desc(documentRevisions.revisionNumber));
     },
 

@@ -600,9 +600,23 @@ export class PaperclipRunnerToolAuthority {
         }
         return { document };
       }
-      case "list_document_revisions":
-        await this.#assertDocumentReviewKey(input.key);
-        return { revisions: await documentService(this.db).listIssueDocumentRevisions(this.binding.issueId, requiredString(input.key)) };
+      case "list_document_revisions": {
+        const review=await this.#assertDocumentReviewKey(input.key);
+        const service=documentService(this.db), key=requiredString(input.key);
+        // Bound the query itself: a newer revision can arrive after admission
+        // was read, but this request must never fetch/return its body.
+        const revisions=review
+          ? await service.listIssueDocumentRevisions(this.binding.issueId,key,{
+              companyId:review.binding.companyId,documentId:review.binding.documentId,revisionId:review.binding.revisionId,
+            })
+          : await service.listIssueDocumentRevisions(this.binding.issueId,key);
+        if(review && (revisions.length!==1 || revisions[0]!.documentId!==review.binding.documentId ||
+            revisions[0]!.id!==review.binding.revisionId)) {
+          throw forbidden("The fixed document revision is no longer available.");
+        }
+        return {revisions,...(review?{scope:{mode:"assigned_revision",documentId:review.binding.documentId,
+          revisionId:review.binding.revisionId}}:{})};
+      }
       case "write_document": return this.#writeDocument(input);
       case "list_agents":
         return { actors: (await agentService(this.db).list(this.binding.companyId)).map(redactedActor) };

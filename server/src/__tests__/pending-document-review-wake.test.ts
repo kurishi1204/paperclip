@@ -1,4 +1,5 @@
 import express from "express";
+import * as documentsModule from "../services/documents.js";
 import {commitNativeStatusDecision,NativeStatusRaceError} from "../services/native-runtime/status-decision-committer.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import request from "supertest";
@@ -195,6 +196,30 @@ suite("pending independent document review through real dispatch", () => {
       else process.env.PAPERCLIP_AGENT_JWT_SECRET = previousSecret;
       await rm(workspaceRoot,{recursive:true,force:true});
     }
+  });
+  it("returns only the assigned revision when the real document writer advances during the history read",async()=>{
+    const x=await nativeReviewFixture(),originalFactory=documentsModule.documentService;
+    const newBody="Synthetic newer revision must not cross the fixed review boundary";
+    let advanced=false,readScope:unknown;
+    const spy=vi.spyOn(documentsModule,"documentService").mockImplementation(currentDb=>{
+      const service=originalFactory(currentDb);
+      return {...service,listIssueDocumentRevisions:async(issueId,key,scope)=>{
+        readScope=scope;
+        if(!advanced){advanced=true;await service.upsertIssueDocument({issueId:x.issueId,key:"fixed-proposal",
+          title:"New synthetic revision",format:"markdown",body:newBody,baseRevisionId:x.revisionId,createdByAgentId:x.ownerId});}
+        return service.listIssueDocumentRevisions(issueId,key,scope);
+      }};
+    });
+    try {
+      const result=await x.authority.execute({tool:"list_document_revisions",callId:"fixed-history",arguments:{key:"fixed-proposal"}}) as {revisions:Array<{id:string;body:string}>;scope:Record<string,unknown>};
+      expect(JSON.stringify(result)).not.toContain(newBody);
+      expect(result.revisions).toHaveLength(1);expect(result.revisions[0]).toMatchObject({id:x.revisionId,body:"Synthetic proposal only"});
+      expect(result.scope).toMatchObject({mode:"assigned_revision",documentId:x.documentId,revisionId:x.revisionId});
+      expect(readScope).toEqual({companyId:x.companyId,documentId:x.documentId,revisionId:x.revisionId});
+      const ordinary=await originalFactory(db).listIssueDocumentRevisions(x.issueId,"fixed-proposal");
+      expect(ordinary).toHaveLength(2);expect(ordinary[0]!.body).toBe(newBody);
+      expect(await getNativeDocumentReviewAssignment(db,x.binding)).toBeNull();
+    } finally {spy.mockRestore();}
   });
   it.each(["wrong_receipt","lost_lock","stale_revision","wrong_addressee","stale_then_assigned","missing_role_marker","wrong_role_marker","malformed_role_marker"] as const)(
     "refuses %s across native staging and tool reads", async defect => {
