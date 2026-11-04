@@ -157,7 +157,7 @@ suite("pending independent document review through real dispatch", () => {
     // Use the existing decision service. A verdict may apply its stored workflow;
     // the reviewer's final report cannot reinterpret that decision as worker completion.
     await issueThreadInteractionService(db).rejectInteraction(
-      {id:x.issueId,companyId:x.companyId,projectId:null,goalId:null},x.interactionId,{reason:"Synthetic required changes"},
+      {id:x.issueId,companyId:x.companyId},x.interactionId,{reason:"Synthetic required changes"},
       {agentId:x.reviewerId,runId:x.runId});
     const [task] = await db.select().from(issues).where(eq(issues.id,x.issueId));
     expect(task).toMatchObject({status:continuationPolicy==="none"?"in_review":"todo",assigneeAgentId:x.ownerId});
