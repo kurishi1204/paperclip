@@ -1,11 +1,22 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { activityLog, agents, companies, createDb, documents, documentRevisions, heartbeatRunEvents,
+import { eq, sql } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { agents, companies, createDb, documents, documentRevisions,
   heartbeatRuns, issueDocuments, issueThreadInteractions, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
 import { hasServerRecordedNonAssigneeWake, isCurrentPendingDocumentReviewWake } from "../services/pending-document-review-wake.js";
+import { heartbeatService } from "../services/heartbeat.js";
+import { runningProcesses } from "../adapters/index.js";
+
+const mockAdapterExecute = vi.hoisted(() => vi.fn(async (_input?: unknown) => ({
+  exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+  summary: "Synthetic independent review dispatch.", provider: "test", model: "test-model",
+})));
+vi.mock("../adapters/index.js", async () => {
+  const actual = await vi.importActual<typeof import("../adapters/index.js")>("../adapters/index.js");
+  return { ...actual, getServerAdapter: vi.fn(() => ({ supportsLocalAgentJwt: false, execute: mockAdapterExecute })) };
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -14,10 +25,11 @@ suite("pending independent document review through real dispatch", () => {
   let db: ReturnType<typeof createDb>;
   let temp: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | undefined;
   beforeAll(async () => { temp = await startEmbeddedPostgresTestDatabase("paperclip-pending-review-"); db = createDb(temp.connectionString); }, 20000);
+  let heartbeat: ReturnType<typeof heartbeatService> | undefined;
   afterEach(async () => {
-    await db.delete(activityLog); await db.delete(issueThreadInteractions); await db.delete(issueDocuments);
-    await db.delete(documentRevisions); await db.delete(documents); await db.delete(issues);
-    await db.delete(heartbeatRunEvents); await db.delete(heartbeatRuns); await db.delete(agents); await db.delete(companies);
+    await heartbeat?.drainActiveRunExecutions(); heartbeat = undefined;
+    mockAdapterExecute.mockClear(); runningProcesses.clear();
+    await db.execute(sql`truncate table ${companies} cascade`);
   });
   afterAll(async () => { await temp?.cleanup(); });
   async function seed() {
@@ -25,8 +37,8 @@ suite("pending independent document review through real dispatch", () => {
     const documentId=randomUUID(), revisionId=randomUUID(), interactionId=randomUUID(), runId=randomUUID();
     await db.insert(companies).values({ id:companyId, name:"Synthetic review company", issuePrefix:"Q"+companyId.slice(0,6), defaultResponsibleUserId:"owner" });
     for (const id of [ownerId,reviewerId]) await db.insert(agents).values({
-      id,companyId,name:id===ownerId?"Owner":"Reviewer",role:"engineer",status:"active",adapterType:"codex_local",
-      adapterConfig:{},runtimeConfig:{heartbeat:{wakeOnDemand:true,maxConcurrentRuns:1}},permissions:{},
+      id,companyId,name:id===ownerId?"Owner":"Reviewer",role:"engineer",status:"idle",adapterType:"codex_local",
+      adapterConfig:{},runtimeConfig:{heartbeat:{enabled:true,wakeOnDemand:true,maxConcurrentRuns:1}},permissions:{},
     });
     await db.insert(issues).values({ id:issueId,companyId,title:"Synthetic independent proposal",status:"blocked",priority:"medium",assigneeAgentId:ownerId });
     await db.insert(documents).values({ id:documentId,companyId,title:"Fixed proposal",format:"markdown",
@@ -98,6 +110,31 @@ suite("pending independent document review through real dispatch", () => {
     expect(await adapter.dispatchResolvedInteractionIfCurrent({companyId:x.companyId,runId:x.runId,expectedStatus:"running",now:new Date(),dispatch:async()=>{calls++;}}))
       .toMatchObject({dispatched:false,cancellation:{outcome:"cancelled",errorCode:"issue_execution_lock_changed"}});
     expect(calls).toBe(0);
+  });
+  it("claims the real heartbeat execution lock for the current reviewer and reaches the adapter", async () => {
+    const x=await seed();
+    heartbeat=heartbeatService(db,{runtimeEnv:{...process.env,PAPERCLIP_IN_WORKTREE:"false"},
+      beforeResolvedInteractionContinuationDispatchCheck:async ({runId})=>{
+        expect(runId).toBe(x.runId);
+        const [task]=await db.select().from(issues).where(eq(issues.id,x.issueId));
+        expect(task!.executionRunId).toBe(x.runId); expect(task!.assigneeAgentId).toBe(x.ownerId);
+      }});
+    await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions();
+    expect(mockAdapterExecute).toHaveBeenCalledOnce();
+    const [run]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
+    expect(run).toMatchObject({status:"succeeded",errorCode:null});
+    const [task]=await db.select().from(issues).where(eq(issues.id,x.issueId));
+    expect(task!.assigneeAgentId).toBe(x.ownerId);
+  });
+  it("keeps a current queued review when the worker receives a separate wake", async () => {
+    const x=await seed();
+    await db.update(issues).set({executionRunId:x.runId}).where(eq(issues.id,x.issueId));
+    heartbeat=heartbeatService(db,{runtimeEnv:{...process.env,PAPERCLIP_IN_WORKTREE:"false"}});
+    await heartbeat.wakeup(x.ownerId,{source:"automation",reason:"issue_assigned",requestedByActorType:"system",
+      contextSnapshot:{issueId:x.issueId},payload:{issueId:x.issueId}});
+    const [review]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
+    expect(review).toMatchObject({status:"queued",errorCode:null});
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
   it("keeps server-recorded non-assignee authority from the prior version",()=>{
     expect(hasServerRecordedNonAssigneeWake({aiConnectionNonAssigneeCommentWake:true})).toBe(true);

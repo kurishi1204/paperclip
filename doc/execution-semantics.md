@@ -826,8 +826,10 @@ Admission records the accepted review binding under the issue/run locks and
 checks it again immediately before provider handoff. A resolved request,
 changed document, detached link, or mismatched scope cancels dispatch. Human-only
 resolution, issue holds, budget and provider gates, tool permissions, and the
-existing serialized execution lock remain in force. Previously recorded
-non-assignee comment wakes retain their compatibility reader.
+existing serialized execution lock remain in force. Claiming that lock does
+not change the Task assignee. A separate worker wake must not cancel a queued
+review while its saved card and document binding remain current. Previously
+recorded non-assignee comment wakes retain their compatibility reader.
 
 ## 11. Task Watchdog for Issue Trees
 

@@ -17952,10 +17952,16 @@ export function heartbeatService(
           eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.runId, run.id),
           sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' = 'qa_predecessor_ownership_active'`));
       }
-      const ownsIssue = owner?.assigneeAgentId === run.agentId &&
+      // A named current document reviewer may hold the serialized execution
+      // lock, but the document worker remains the Task assignee.
+      const pendingDocumentReview = issueId && owner && await isCurrentPendingDocumentReviewWake(tx, {
+        companyId: run.companyId, issueId, agentId: run.agentId, runId: run.id,
+        contextSnapshot: context, lock: true,
+      });
+      const ownsIssue = Boolean(owner && (owner.assigneeAgentId === run.agentId || pendingDocumentReview)) &&
         context.wakeReason !== "source_scoped_recovery_action";
       if (ownsIssue && ["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? "") &&
-          owner.checkoutRunId && owner.checkoutRunId !== run.id) {
+          owner?.checkoutRunId && owner.checkoutRunId !== run.id) {
         return { ownsIssue, blocked: true };
       }
       if (run.scheduledRetryReason === "native_provider_overloaded" && owner?.executionRunId &&
@@ -29609,7 +29615,11 @@ export function heartbeatService(
             activeExecutionRun &&
             activeExecutionRun.status !== "running" &&
             issue.assigneeAgentId &&
-            activeExecutionRun.agentId !== issue.assigneeAgentId
+            activeExecutionRun.agentId !== issue.assigneeAgentId &&
+            !await isCurrentPendingDocumentReviewWake(tx as unknown as Db, {
+              companyId: issue.companyId, issueId: issue.id, agentId: activeExecutionRun.agentId,
+              runId: activeExecutionRun.id, contextSnapshot: parseObject(activeExecutionRun.contextSnapshot), lock: true,
+            })
           ) {
             const cancelled = await tx
               .update(heartbeatRuns)
