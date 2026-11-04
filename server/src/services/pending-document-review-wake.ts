@@ -10,7 +10,9 @@ import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-inte
 export async function readCurrentPendingDocumentReviewWake(db: Db, input: {
   companyId: string; issueId: string; agentId: string;
   runId?: string; contextSnapshot: Record<string, unknown>; lock?: boolean;
-}): Promise<{ binding: PendingDocumentReviewBinding; origin: PendingDocumentReviewOrigin | null } | null> {
+  /** Only the exact resolving run may finish after its own verdict. */
+  allowResolvedByRunId?: string;
+}): Promise<{ binding: PendingDocumentReviewBinding; origin: PendingDocumentReviewOrigin | null; interaction: typeof issueThreadInteractions.$inferSelect } | null> {
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const id = typeof input.contextSnapshot.interactionId === "string" ? input.contextSnapshot.interactionId.trim() : null;
   if (!id || !uuid.test(id)) return null;
@@ -19,7 +21,10 @@ export async function readCurrentPendingDocumentReviewWake(db: Db, input: {
     eq(issueThreadInteractions.issueId, input.issueId),
   ));
   const [card] = await (input.lock ? cards.for("share") : cards);
-  if (!card || card.status !== "pending" || card.kind !== "request_confirmation" ||
+  const resolvedByThisRun = Boolean(input.runId && input.allowResolvedByRunId === input.runId &&
+    card && ["accepted", "rejected"].includes(card.status) &&
+    card.resolvedByRunId === input.runId && card.resolvedByAgentId === input.agentId);
+  if (!card || (card.status !== "pending" && !resolvedByThisRun) || card.kind !== "request_confirmation" ||
       card.addresseeAgentId !== input.agentId || card.addresseeUserId ||
       (input.runId && card.sourceRunId === input.runId)) return null;
   const payload = parseObject(card.payload);
@@ -112,7 +117,7 @@ export async function readCurrentPendingDocumentReviewWake(db: Db, input: {
         Object.entries(binding).some(([key, value]) => previous[key] !== value) ||
         previousOrigin.runId !== origin.runId || previousOrigin.wakeupRequestId !== origin.wakeupRequestId) return null;
   }
-  return { binding, origin };
+  return { binding, origin, interaction: card };
 }
 
 export async function isCurrentPendingDocumentReviewWake(

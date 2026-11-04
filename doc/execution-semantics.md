@@ -1697,3 +1697,14 @@ Resolved and cancelled actions remain resolved.
 ### Pending review requests in runner inputs
 
 A named issue-document review is an unresolved request for the addressed reviewer. The runner response bridge does not require a verdict before that reviewer can start. It excludes only a current document review bound to the same run, source wake receipt, creator and fixed revision from the resolved-response envelope. The request itself remains pending for the reviewer to inspect and decide through normal tools. Other unresolved interactions, stale revisions, invalid receipts and missing response IDs keep their existing refusal behavior.
+
+
+A native named document-review run uses that same receipt-bound role throughout
+startup, its restricted tool session, and finalization. It receives the fixed
+review request instead of the worker objective, stages no chat attachments, and
+can inspect the task and fixed document and resolve only its own review. It
+cannot use worker mutations, connection tools or assigned MCP tools. Ordinary
+provider file/shell policy remains unchanged. After a verdict, only the exact
+resolving run may finish while the current document binding remains unchanged.
+Finalization preserves task status and assignment and releases the review lock;
+a missing or stale review never falls through to worker completion.

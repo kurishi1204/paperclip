@@ -6,6 +6,8 @@ import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import { readPersistedNativeProviderFailure } from "./native-provider-failure-evidence.js";
 import { dismissAutomaticCompletionReviews } from "./automatic-completion-reviews.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
+import { getNativeDocumentReviewAssignment } from "./native-document-review-participant.js";
+import { hasPendingDocumentReviewAdmission } from "../pending-document-review-wake.js";
 import { readFormalIssueApprovalDecision } from "./formal-issue-approval-decision.js";
 import { conversationNativeDecision, isConversation } from "../agent-conversations.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
@@ -1273,6 +1275,10 @@ export async function finalizeNativeRun(input: {
           )
         : Promise.resolve(null),
     ]);
+    const isDocumentReview = hasPendingDocumentReviewAdmission(run.runnerProfileJson);
+    const documentReview = isDocumentReview ? await getNativeDocumentReviewAssignment(input.db, {
+      companyId:run.companyId, issueId:authoritativeIssue.id, agentId:run.agentId, runId:run.id, allowResolved:true,
+    }) : null;
     const reviewContext = readNativeReviewAssignmentContext(run.contextSnapshot);
     const nativeReview = reviewContext ? await getNativeReviewAssignment(input.db, {
       companyId: run.companyId, issueId: authoritativeIssue.id, agentId: run.agentId,
@@ -1291,6 +1297,7 @@ export async function finalizeNativeRun(input: {
       input.db, run, resultRow.turnId, envelope.terminal as PrpTerminalState,
     );
     const ownsProviderFailureDecision =
+      !isDocumentReview &&
       (!authoritativeIssue.executionRunId || authoritativeIssue.executionRunId === run.id) &&
       (reviewContext ? nativeReview?.interaction.status === "pending"
         : authoritativeIssue.assigneeAgentId === run.agentId && !authoritativeIssue.assigneeUserId);
@@ -1299,7 +1306,7 @@ export async function finalizeNativeRun(input: {
       sourceIntentId: typeof record(run.contextSnapshot).nativeStatusWakeIntentId === "string"
         ? record(run.contextSnapshot).nativeStatusWakeIntentId as string : null,
     };
-    const hasPendingChildCompletion = !reviewContext &&
+    const hasPendingChildCompletion = !reviewContext && !isDocumentReview &&
       await hasPendingNativeChildCompletion(input.db, childCompletionRecipient);
     const proposedDecision = resolveNativeFinalizerStatus({
       planWaitAuthorized: planWait !== null,
@@ -1309,7 +1316,9 @@ export async function finalizeNativeRun(input: {
       providerFailureSuperseded: providerFailure?.errorCode === "native_provider_overloaded" && !ownsProviderFailureDecision,
       formalApprovalDecisionId: formalApprovalDecision?.id ?? null,
       failureRetryCount: executionFailureRetryCount(run),
-      ...(reviewContext ? { nativeReviewOutcome: nativeReview
+      ...(isDocumentReview ? { nativeReviewOutcome: documentReview
+        ? documentReview.interaction.status === "pending" ? "pending" as const : "resolved" as const
+        : "stale" as const } : reviewContext ? { nativeReviewOutcome: nativeReview
         ? nativeReview.interaction.status === "pending" ? "pending" as const : "resolved" as const
         : "stale" as const } : {}),
       assessment,
@@ -1396,7 +1405,7 @@ export async function finalizeNativeRun(input: {
         requirePlanWaitSource:
           decision.reasonCode === "native_plan_accepted_waiting_for_continuation"
             ? planWait?.source : undefined,
-        requireNoPendingChildCompletion: decision.statusAction === "done" && !reviewContext
+        requireNoPendingChildCompletion: decision.statusAction === "done" && !reviewContext && !isDocumentReview
           ? childCompletionRecipient : undefined,
         requireModelRejectionOwner: decision.reasonCode === "native_provider_model_rejected"
           ? { agentId: run.agentId, reviewContext }

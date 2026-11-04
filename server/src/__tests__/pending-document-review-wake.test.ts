@@ -10,6 +10,16 @@ import { heartbeatService } from "../services/heartbeat.js";
 import { materializeNativeInteractionResponses } from "../services/native-runtime/native-interaction-bridge.js";
 import { runningProcesses } from "../adapters/index.js";
 
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { getNativeDocumentReviewAssignment } from "../services/native-runtime/native-document-review-participant.js";
+import { stageNativeRunnerWakeAttachments } from "../services/native-runtime/native-runner-file-handoff.js";
+import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
+import { nativeCompletionFeedback } from "../services/native-runtime/native-completion-feedback.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import type { PrpStructuredRunResult } from "../vendor/paperclip-runner/index.js";
+
 const mockAdapterExecute = vi.hoisted(() => vi.fn(async (_input?: unknown) => ({
   exitCode: 0, signal: null, timedOut: false, errorMessage: null,
   summary: "Synthetic independent review dispatch.", provider: "test", model: "test-model",
@@ -64,6 +74,77 @@ suite("pending independent document review through real dispatch", () => {
     const input={ companyId,issueId,agentId:reviewerId,runId,contextSnapshot:context };
     return { ...input,ownerId,reviewerId,documentId,revisionId,interactionId,target,wakeupRequestId };
   }
+  async function nativeReviewFixture() {
+    const x = await seed();
+    await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId:x.companyId, runId:x.runId, expectedStatus:"queued", now:new Date() });
+    await db.update(issues).set({ executionRunId:x.runId }).where(eq(issues.id,x.issueId));
+    await db.update(heartbeatRuns).set({ status:"running", runtimeMode:"native", nativeIssueId:x.issueId }).where(eq(heartbeatRuns.id,x.runId));
+    const binding = { companyId:x.companyId, issueId:x.issueId, agentId:x.reviewerId, runId:x.runId,
+      documentReviewInteractionId:x.interactionId, apiUrl:"http://synthetic.invalid" };
+    return { ...x, binding, authority:new PaperclipRunnerToolAuthority(db,binding) };
+  }
+  it("carries one fixed native document review through staging, read, actual decision and finish", async () => {
+    const x = await nativeReviewFixture(), workspaceRoot = await mkdtemp(path.join(tmpdir(),"paperclip-document-review-"));
+    const previousSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "synthetic-document-review-secret";
+    try {
+      const stage = await stageNativeRunnerWakeAttachments({ db, binding:{ ...x.binding, workspaceRoot, executionTargetKind:"local" } });
+      expect(stage.attachments).toEqual([]); await stage.cleanup();
+      expect(x.authority.definitions().map(tool=>tool.name).sort()).toEqual([
+        "get_task_context","get_task_history","list_document_revisions","list_documents","read_document","resolve_review",
+      ].sort());
+      expect(await x.authority.execute({ tool:"get_task_context", callId:"context", arguments:{} }))
+        .toMatchObject({ assignedReview:{ id:x.interactionId, status:"pending" }, activeTask:{ assigneeAgentId:x.ownerId } });
+      expect(await x.authority.execute({ tool:"read_document", callId:"document", arguments:{key:"fixed-proposal"} }))
+        .toMatchObject({ document:{ id:x.documentId, latestRevisionId:x.revisionId, body:"Synthetic proposal only" } });
+      await expect(x.authority.execute({ tool:"write_document", callId:"write", arguments:{} })).rejects.toThrow("may only inspect");
+      await expect(x.authority.execute({ tool:"read_document", callId:"other-document", arguments:{key:"other-proposal"} })).rejects.toThrow("Read only the fixed document");
+      const report = { reportedWorkDisposition:"done" } as PrpStructuredRunResult;
+      await expect(nativeCompletionFeedback(db,x.runId,report)).rejects.toThrow("Resolve your assigned document review");
+      vi.stubGlobal("fetch",vi.fn(async (url: string, options: RequestInit) => {
+        expect(url).toBe(`http://synthetic.invalid/api/issues/${x.issueId}/interactions/${x.interactionId}/accept`);
+        expect(options.method).toBe("POST");
+        const result = await issueThreadInteractionService(db).acceptInteraction(
+          {id:x.issueId,companyId:x.companyId,projectId:null,goalId:null},x.interactionId,{},
+          {agentId:x.reviewerId,runId:x.runId});
+        return new Response(JSON.stringify(result.interaction),{status:200});
+      }));
+      expect(await x.authority.execute({ tool:"resolve_review", callId:"verdict", arguments:{decision:"accept"} }))
+        .toMatchObject({interactionId:x.interactionId,status:"accepted"});
+      expect(await nativeCompletionFeedback(db,x.runId,report)).toContain("task assignment and status remain unchanged");
+      expect(await getNativeDocumentReviewAssignment(db,{...x.binding,allowResolved:true}))
+        .toMatchObject({interaction:{status:"accepted",resolvedByRunId:x.runId,resolvedByAgentId:x.reviewerId}});
+      const [task] = await db.select().from(issues).where(eq(issues.id,x.issueId));
+      expect(task).toMatchObject({assigneeAgentId:x.ownerId,status:"blocked"});
+    } finally {
+      vi.unstubAllGlobals();
+      if (previousSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      else process.env.PAPERCLIP_AGENT_JWT_SECRET = previousSecret;
+      await rm(workspaceRoot,{recursive:true,force:true});
+    }
+  });
+  it.each(["wrong_receipt","lost_lock","stale_revision","wrong_addressee"] as const)(
+    "refuses %s across native staging and tool reads", async defect => {
+      const x = await nativeReviewFixture();
+      if (defect === "wrong_receipt") await db.update(agentWakeupRequests).set({requestedByActorId:x.reviewerId}).where(eq(agentWakeupRequests.id,x.wakeupRequestId));
+      if (defect === "lost_lock") await db.update(issues).set({executionRunId:null}).where(eq(issues.id,x.issueId));
+      if (defect === "stale_revision") await db.update(documents).set({latestRevisionId:randomUUID()}).where(eq(documents.id,x.documentId));
+      if (defect === "wrong_addressee") await db.update(issueThreadInteractions).set({addresseeAgentId:x.ownerId}).where(eq(issueThreadInteractions.id,x.interactionId));
+      expect(await getNativeDocumentReviewAssignment(db,x.binding)).toBeNull();
+      await expect(stageNativeRunnerWakeAttachments({db,binding:{...x.binding,workspaceRoot:"/unused-synthetic-workspace",executionTargetKind:"local"}}))
+        .rejects.toThrow("paperclip_runner_attachment_staging_not_authorized");
+      await expect(x.authority.execute({tool:"read_document",callId:"denied",arguments:{key:"fixed-proposal"}})).rejects.toThrow();
+      const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id,x.interactionId));
+      expect(card!.status).toBe("pending");
+    });
+  it.each(["wrong_resolver_run","wrong_resolver_agent","changed_revision"] as const)(
+    "does not allow post-verdict finishing with %s", async defect => {
+      const x = await nativeReviewFixture();
+      await db.update(issueThreadInteractions).set({status:"accepted",resolvedByRunId:defect==="wrong_resolver_run"?randomUUID():x.runId,
+        resolvedByAgentId:defect==="wrong_resolver_agent"?x.ownerId:x.reviewerId}).where(eq(issueThreadInteractions.id,x.interactionId));
+      if (defect === "changed_revision") await db.update(documents).set({latestRevisionId:randomUUID()}).where(eq(documents.id,x.documentId));
+      expect(await getNativeDocumentReviewAssignment(db,{...x.binding,allowResolved:true})).toBeNull();
+    });
   it("admits the current independent reviewer without changing task assignment and hands off to the provider", async () => {
     const x=await seed(), adapter=createPostgresRunDispatchAdapter(db);
     expect(await adapter.cancelStaleQueuedRun({companyId:x.companyId,runId:x.runId,expectedStatus:"queued",now:new Date()})).toMatchObject({outcome:"not_stale"});
