@@ -839,6 +839,10 @@ Admission checks the system receipt, stopped predecessor, original request
 creator, and unchanged current card/document. A new retry label does not grant
 review authority, and unknown or started provider work does not permit this
 review retry path.
+The server records this authority in one `pendingDocumentReviewAdmission`
+envelope. Native and legacy profile preparation retain that same-run envelope,
+including malformed evidence so the final gate can refuse it. Runtime profile
+preparation and the retry writer must not discard or rebuild its identity.
 
 ## 11. Task Watchdog for Issue Trees
 

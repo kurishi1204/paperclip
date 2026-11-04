@@ -620,7 +620,7 @@ import {
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
-import { isCurrentPendingDocumentReviewWake, hasServerRecordedNonAssigneeWake, pendingDocumentReviewRetryProfile } from "./pending-document-review-wake.js";
+import { isCurrentPendingDocumentReviewWake, hasServerRecordedNonAssigneeWake, pendingDocumentReviewRetryProfile, hasPendingDocumentReviewAdmission } from "./pending-document-review-wake.js";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
 import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
@@ -23801,7 +23801,7 @@ export function heartbeatService(
         if (
           !issueId ||
           (!readNonEmptyString(context.qaDecisionId) &&
-            !readNonEmptyString(parseObject(run.runnerProfileJson).pendingDocumentReviewInteractionId) &&
+            !hasPendingDocumentReviewAdmission(run.runnerProfileJson) &&
             !isResolvedInteractionContinuationWakeContext(context) &&
             !["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? ""))
         ) {
@@ -25463,6 +25463,15 @@ export function heartbeatService(
                 else '{}'::jsonb end)
               || (case when ${heartbeatRuns.runnerProfileJson} ? 'adapterDispatch'
                 then jsonb_build_object('adapterDispatch', ${heartbeatRuns.runnerProfileJson}->'adapterDispatch')
+                else '{}'::jsonb end)
+              || (case when ${heartbeatRuns.runnerProfileJson} ? 'pendingDocumentReviewAdmission'
+                then jsonb_build_object('pendingDocumentReviewAdmission', ${heartbeatRuns.runnerProfileJson}->'pendingDocumentReviewAdmission')
+                else '{}'::jsonb end)
+              || (case when ${heartbeatRuns.runnerProfileJson} ? 'aiConnectionNonAssigneeWake'
+                then jsonb_build_object('aiConnectionNonAssigneeWake', ${heartbeatRuns.runnerProfileJson}->'aiConnectionNonAssigneeWake')
+                else '{}'::jsonb end)
+              || (case when ${heartbeatRuns.runnerProfileJson} ? 'aiConnectionNonAssigneeCommentWake'
+                then jsonb_build_object('aiConnectionNonAssigneeCommentWake', ${heartbeatRuns.runnerProfileJson}->'aiConnectionNonAssigneeCommentWake')
                 else '{}'::jsonb end)
               || (case when ${heartbeatRuns.runnerProfileJson} ? 'qaClaimPreparation'
                 then jsonb_build_object('qaClaimPreparation', ${heartbeatRuns.runnerProfileJson}->'qaClaimPreparation')

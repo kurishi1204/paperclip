@@ -1,3 +1,4 @@
+import { pendingDocumentReviewProfileFields } from "../pending-document-review-wake.js";
 import { randomUUID } from "node:crypto";
 
 import { and, eq } from "drizzle-orm";
@@ -131,6 +132,7 @@ export async function prepareNativeHeartbeatRun(input: {
         runtimeModeReason: locked.runtimeModeReason ?? "explicit_paperclip_runner",
         runtimeModeResolvedAt: locked.runtimeModeResolvedAt ?? new Date(),
         runnerProfileJson: {
+          ...pendingDocumentReviewProfileFields(locked.runnerProfileJson),
           schema: "paperclip.runner.profile.v1",
           provider: "codex",
           turnId,

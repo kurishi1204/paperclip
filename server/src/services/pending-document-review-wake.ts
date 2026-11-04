@@ -49,12 +49,12 @@ export async function readCurrentPendingDocumentReviewWake(db: Db, input: {
         parseObject(run.contextSnapshot).issueId !== input.issueId) return null;
     const wake = await readReceipt(run.wakeupRequestId, run.id);
     if (!wake || !["queued", "claimed"].includes(wake.status)) return null;
-    const request = parseObject(wake.payload), profile = parseObject(run.runnerProfileJson);
+    const request = parseObject(wake.payload), profile = parseObject(parseObject(run.runnerProfileJson).pendingDocumentReviewAdmission);
     let sourceRun = run, sourceWake = wake;
     if (run.retryOfRunId) {
       // Resource deferral creates a new system receipt. Its authority is the
       // saved original request, not another list of accepted retry labels.
-      const saved = parseObject(profile.pendingDocumentReviewOrigin);
+      const saved = parseObject(profile.origin);
       if (typeof saved.runId !== "string" || typeof saved.wakeupRequestId !== "string" ||
           !uuid.test(saved.runId) || !uuid.test(saved.wakeupRequestId) ||
           saved.runId === run.id || run.retryOfRunId === run.id ||
@@ -71,8 +71,8 @@ export async function readCurrentPendingDocumentReviewWake(db: Db, input: {
       const receipt = await readReceipt(saved.wakeupRequestId, source.id);
       if (!receipt) return null;
       sourceRun = source; sourceWake = receipt;
-      profiles.push(profile, parseObject(parent.runnerProfileJson), parseObject(source.runnerProfileJson));
-    } else if (Object.hasOwn(profile, "pendingDocumentReviewInteractionId")) {
+      profiles.push(profile, parseObject(parseObject(parent.runnerProfileJson).pendingDocumentReviewAdmission), parseObject(parseObject(source.runnerProfileJson).pendingDocumentReviewAdmission));
+    } else if (hasPendingDocumentReviewAdmission(run.runnerProfileJson)) {
       profiles.push(profile);
     }
     const sourceRequest = parseObject(sourceWake.payload);
@@ -107,8 +107,8 @@ export async function readCurrentPendingDocumentReviewWake(db: Db, input: {
     agentId: input.agentId, interactionId: card.id, documentId: doc.id,
     key: target.key, revisionId: doc.latestRevisionId, revisionNumber: doc.latestRevisionNumber };
   for (const profile of profiles) {
-    const previous = parseObject(profile.pendingDocumentReviewBinding), previousOrigin = parseObject(profile.pendingDocumentReviewOrigin);
-    if (profile.pendingDocumentReviewInteractionId !== card.id || !origin ||
+    const previous = parseObject(profile.binding), previousOrigin = parseObject(profile.origin);
+    if (profile.interactionId !== card.id || !origin ||
         Object.entries(binding).some(([key, value]) => previous[key] !== value) ||
         previousOrigin.runId !== origin.runId || previousOrigin.wakeupRequestId !== origin.wakeupRequestId) return null;
   }
@@ -125,19 +125,29 @@ export async function isCurrentPendingDocumentReviewWake(
  * a comment-specific name; retain those already-accepted runs. */
 export function hasServerRecordedNonAssigneeWake(profile: unknown): boolean {
   const value = parseObject(profile);
-  return value.aiConnectionNonAssigneeWake === true || value.aiConnectionNonAssigneeCommentWake === true;
+  return parseObject(value.pendingDocumentReviewAdmission).nonAssignee === true ||
+    value.aiConnectionNonAssigneeWake === true || value.aiConnectionNonAssigneeCommentWake === true;
 }
 
-/** Copy only the server-recorded review authority, never runtime preparation
- * state. The reader checks the original receipt and stopped predecessor again. */
+/** One envelope crosses profile serialization boundaries. Preserve malformed
+ * evidence too, so the admission reader can reject it instead of forgetting it. */
+export function hasPendingDocumentReviewAdmission(profile: unknown): boolean {
+  return Object.hasOwn(parseObject(profile), "pendingDocumentReviewAdmission");
+}
+
+export function pendingDocumentReviewProfileFields(profile: unknown): Record<string, unknown> {
+  const value = parseObject(profile);
+  return hasPendingDocumentReviewAdmission(value)
+    ? { pendingDocumentReviewAdmission: value.pendingDocumentReviewAdmission } : {};
+}
+
+/** Retries carry authority only; they never copy adapter preparation state. */
 export function pendingDocumentReviewRetryProfile(profile: unknown): Record<string, unknown> | null {
   const value = parseObject(profile);
-  if (!Object.hasOwn(value, "pendingDocumentReviewInteractionId")) return {};
-  const origin = parseObject(value.pendingDocumentReviewOrigin), binding = parseObject(value.pendingDocumentReviewBinding);
-  if (typeof value.pendingDocumentReviewInteractionId !== "string" ||
-      typeof origin.runId !== "string" || typeof origin.wakeupRequestId !== "string" ||
-      binding.interactionId !== value.pendingDocumentReviewInteractionId) return null;
-  return { aiConnectionNonAssigneeWake: value.aiConnectionNonAssigneeWake === true,
-    pendingDocumentReviewInteractionId: value.pendingDocumentReviewInteractionId,
-    pendingDocumentReviewBinding: binding, pendingDocumentReviewOrigin: origin };
+  if (!hasPendingDocumentReviewAdmission(value)) return {};
+  const admission = parseObject(value.pendingDocumentReviewAdmission);
+  const origin = parseObject(admission.origin), binding = parseObject(admission.binding);
+  if (typeof admission.interactionId !== "string" || typeof origin.runId !== "string" ||
+      typeof origin.wakeupRequestId !== "string" || binding.interactionId !== admission.interactionId) return null;
+  return pendingDocumentReviewProfileFields(value);
 }

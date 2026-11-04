@@ -5,7 +5,7 @@ import { agents, agentWakeupRequests, companies, createDb, documents, documentRe
   heartbeatRuns, issueDocuments, issueThreadInteractions, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
-import { hasServerRecordedNonAssigneeWake, isCurrentPendingDocumentReviewWake, pendingDocumentReviewRetryProfile } from "../services/pending-document-review-wake.js";
+import { hasServerRecordedNonAssigneeWake, isCurrentPendingDocumentReviewWake, pendingDocumentReviewRetryProfile, pendingDocumentReviewProfileFields } from "../services/pending-document-review-wake.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { runningProcesses } from "../adapters/index.js";
 
@@ -68,7 +68,7 @@ suite("pending independent document review through real dispatch", () => {
     expect(await adapter.cancelStaleQueuedRun({companyId:x.companyId,runId:x.runId,expectedStatus:"queued",now:new Date()})).toMatchObject({outcome:"not_stale"});
     const [record]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
     expect(hasServerRecordedNonAssigneeWake(record!.runnerProfileJson)).toBe(true);
-    expect(record!.runnerProfileJson).toMatchObject({ pendingDocumentReviewInteractionId:x.interactionId });
+    expect(record!.runnerProfileJson).toMatchObject({ pendingDocumentReviewAdmission:{interactionId:x.interactionId} });
     // The existing serialized execution lock is still mandatory at the final handoff.
     await db.update(issues).set({executionRunId:x.runId}).where(eq(issues.id,x.issueId));
     await db.update(heartbeatRuns).set({status:"running"}).where(eq(heartbeatRuns.id,x.runId));
@@ -161,7 +161,8 @@ suite("pending independent document review through real dispatch", () => {
       contextSnapshot:{...x.contextSnapshot,taskId:x.issueId}});
     expect(queued).not.toBeNull(); await heartbeat.drainActiveRunExecutions();
     const [run]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,queued!.id));
-    expect(run).toMatchObject({status:"succeeded",errorCode:null});
+    expect(run).toMatchObject({status:"succeeded",errorCode:null,
+      runnerProfileJson:{pendingDocumentReviewAdmission:{interactionId:x.interactionId,binding:{documentId:x.documentId,revisionId:x.revisionId}}}});
     expect(observedRunId).toBe(queued!.id); expect(mockAdapterExecute).toHaveBeenCalledOnce();
     const [task]=await db.select().from(issues).where(eq(issues.id,x.issueId));
     expect(task!.assigneeAgentId).toBe(x.ownerId);
@@ -191,8 +192,8 @@ suite("pending independent document review through real dispatch", () => {
   }
   it("preserves the original review through real resource-wait scheduling, promotion and provider handoff",async()=>{
     const x=await seed(),retry=await deferBeforeProvider(x);
-    expect(retry.runnerProfileJson).toMatchObject({pendingDocumentReviewInteractionId:x.interactionId,
-      pendingDocumentReviewOrigin:{runId:x.runId,wakeupRequestId:x.wakeupRequestId}});
+    expect(retry.runnerProfileJson).toMatchObject({pendingDocumentReviewAdmission:{interactionId:x.interactionId,
+      origin:{runId:x.runId,wakeupRequestId:x.wakeupRequestId}}});
     expect(await isCurrentPendingDocumentReviewWake(db,{...x,runId:retry.id})).toBe(true);
     expect(await heartbeat!.promoteDueScheduledRetries(new Date(Date.now()+1000))).toMatchObject({promoted:1});
     await heartbeat!.resumeQueuedRuns(); await heartbeat!.drainActiveRunExecutions();
@@ -203,17 +204,20 @@ suite("pending independent document review through real dispatch", () => {
   it.each(["changed_origin","changed_document","unknown_predecessor"] as const)("refuses a resource successor with %s",async defect=>{
     const x=await seed(),retry=await deferBeforeProvider(x);
     if(defect==="changed_origin") await db.update(heartbeatRuns).set({runnerProfileJson:{...retry.runnerProfileJson,
-      pendingDocumentReviewOrigin:{runId:randomUUID(),wakeupRequestId:x.wakeupRequestId}}}).where(eq(heartbeatRuns.id,retry.id));
+      pendingDocumentReviewAdmission:{...(retry.runnerProfileJson?.pendingDocumentReviewAdmission as Record<string,unknown>),
+        origin:{runId:randomUUID(),wakeupRequestId:x.wakeupRequestId}}}}).where(eq(heartbeatRuns.id,retry.id));
     if(defect==="changed_document") await db.update(documents).set({latestRevisionId:randomUUID()}).where(eq(documents.id,x.documentId));
     if(defect==="unknown_predecessor") await db.update(heartbeatRuns).set({resultJson:{}}).where(eq(heartbeatRuns.id,x.runId));
     expect(await isCurrentPendingDocumentReviewWake(db,{...x,runId:retry.id})).toBe(false);
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
   it("copies only review authority, retaining no adapter preparation state",()=>{
-    expect(pendingDocumentReviewRetryProfile({pendingDocumentReviewInteractionId:"i",pendingDocumentReviewBinding:{interactionId:"i"},
-      pendingDocumentReviewOrigin:{runId:"r",wakeupRequestId:"w"},adapterDispatch:{type:"old"},controllerBootId:"old"}))
-      .toEqual({aiConnectionNonAssigneeWake:false,pendingDocumentReviewInteractionId:"i",pendingDocumentReviewBinding:{interactionId:"i"},pendingDocumentReviewOrigin:{runId:"r",wakeupRequestId:"w"}});
-    expect(pendingDocumentReviewRetryProfile({pendingDocumentReviewInteractionId:"i"})).toBeNull();
+    const admission={interactionId:"i",binding:{interactionId:"i"},origin:{runId:"r",wakeupRequestId:"w"},nonAssignee:true};
+    expect(pendingDocumentReviewRetryProfile({pendingDocumentReviewAdmission:admission,adapterDispatch:{type:"old"},controllerBootId:"old"}))
+      .toEqual({pendingDocumentReviewAdmission:admission});
+    expect(pendingDocumentReviewRetryProfile({pendingDocumentReviewAdmission:{interactionId:"i"}})).toBeNull();
+    expect(pendingDocumentReviewProfileFields({pendingDocumentReviewAdmission:null,adapterDispatch:{type:"old"}}))
+      .toEqual({pendingDocumentReviewAdmission:null});
     expect(pendingDocumentReviewRetryProfile({adapterDispatch:{type:"normal"}})).toEqual({});
   });
   it("keeps server-recorded non-assignee authority from the prior version",()=>{

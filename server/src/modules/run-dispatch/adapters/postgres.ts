@@ -1,5 +1,5 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
-import { readCurrentPendingDocumentReviewWake } from "../../../services/pending-document-review-wake.js";
+import { readCurrentPendingDocumentReviewWake, hasPendingDocumentReviewAdmission } from "../../../services/pending-document-review-wake.js";
 import { getExecutionBlocker, isIndependentQaDocumentEpisode } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
@@ -1001,8 +1001,8 @@ export function createPostgresRunDispatchAdapter(
       now,
       tx,
     );
-    const recordedReview = readNonEmptyString(parseObject(run.runnerProfileJson).pendingDocumentReviewInteractionId);
-    if (recordedReview && (!facts.pendingDocumentReview ||
+    const recordedReview = readNonEmptyString(parseObject(parseObject(run.runnerProfileJson).pendingDocumentReviewAdmission).interactionId);
+    if (hasPendingDocumentReviewAdmission(run.runnerProfileJson) && (!facts.pendingDocumentReview ||
         recordedReview !== readNonEmptyString(contextSnapshot.interactionId))) {
       return { issueId, facts, decision: { stale: true as const,
         errorCode: "interaction_review_stale" as const,
@@ -1027,12 +1027,13 @@ export function createPostgresRunDispatchAdapter(
           await tx.update(heartbeatRuns).set({
             runnerProfileJson: {
               ...parseObject(run.runnerProfileJson),
-              aiConnectionNonAssigneeWake: facts.issueAssigneeAgentId !== run.agentId,
               ...(facts.pendingDocumentReview ? {
-                pendingDocumentReviewInteractionId: facts.pendingDocumentReviewBinding!.interactionId,
-                pendingDocumentReviewBinding: facts.pendingDocumentReviewBinding,
-                pendingDocumentReviewOrigin: facts.pendingDocumentReviewOrigin,
-              } : {}),
+                pendingDocumentReviewAdmission: {
+                  interactionId: facts.pendingDocumentReviewBinding!.interactionId,
+                  binding: facts.pendingDocumentReviewBinding, origin: facts.pendingDocumentReviewOrigin,
+                  nonAssignee: facts.issueAssigneeAgentId !== run.agentId,
+                },
+              } : { aiConnectionNonAssigneeWake: facts.issueAssigneeAgentId !== run.agentId }),
             },
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
         }
