@@ -811,6 +811,39 @@ the outcome commits. Resolution records an answer; every continuation, task
 creation, tool/provider call, execution-policy transition, spend, deployment, or
 other effect independently re-runs its own authorization and approval gates.
 
+### Named independent document-review wakes
+
+A pending `request_confirmation` addressed to an agent can request an independent
+review of a current issue document without transferring the issue's assignee.
+Dispatch reads the current company-scoped interaction and linked document. The
+card must still be pending, address that agent, permit that agent under its
+stored resolver audience, and target the exact current document/key/revision.
+The reviewer must not be the document's creator or latest agent editor.
+Tool-action and secret confirmations do not use this review entry.
+
+A wake reason or caller-supplied interaction ID is not sufficient authority.
+Run admission also requires the durable wake receipt to bind that run, company,
+reviewer, interaction and request creator. The fixed key, document ID and revision
+are recorded under the issue/run locks and checked again before provider handoff.
+Changing a card to another valid document does not change that admitted target. A resolved request,
+changed document, detached link, or mismatched scope cancels dispatch. Human-only
+resolution, issue holds, budget and provider gates, tool permissions, and the
+existing serialized execution lock remain in force. Claiming that lock does
+not change the Task assignee. A separate worker wake must not cancel a queued
+review while its saved card and document binding remain current. Previously
+recorded non-assignee comment wakes retain their compatibility reader.
+
+A pre-provider resource wait can create a normal scheduled successor. The
+successor carries only the admitted review binding and original wake identity.
+Admission checks the system receipt, stopped predecessor, original request
+creator, and unchanged current card/document. A new retry label does not grant
+review authority, and unknown or started provider work does not permit this
+review retry path.
+The server records this authority in one `pendingDocumentReviewAdmission`
+envelope. Native and legacy profile preparation retain that same-run envelope,
+including malformed evidence so the final gate can refuse it. Runtime profile
+preparation and the retry writer must not discard or rebuild its identity.
+
 ## 11. Task Watchdog for Issue Trees
 
 A task watchdog watches a configured issue subtree after that subtree has stopped moving. It is a product-level verification and recovery mechanism for selected work, not a process monitor.

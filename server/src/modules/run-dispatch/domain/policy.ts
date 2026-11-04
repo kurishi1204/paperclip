@@ -112,6 +112,7 @@ export type QueuedRunStalenessErrorCode =
   | "issue_dependencies_blocked"
   | "issue_not_found"
   | "issue_assignee_changed"
+  | "interaction_review_stale"
   | "issue_terminal_status"
   | "issue_not_in_progress"
   | "issue_execution_lock_changed"
@@ -127,6 +128,13 @@ export type StalenessDecision =
       errorCode: QueuedRunStalenessErrorCode;
       details: Record<string, unknown>;
     };
+
+export type PendingDocumentReviewBinding = {
+  companyId: string; issueId: string; agentId: string; interactionId: string;
+  documentId: string; key: string; revisionId: string; revisionNumber: number;
+};
+
+export type PendingDocumentReviewOrigin = { runId: string; wakeupRequestId: string };
 
 export type QueuedRunFacts = {
   /** Rechecked for automatic native replacements immediately before dispatch. */
@@ -146,6 +154,10 @@ export type QueuedRunFacts = {
   /** A connection resolution or tool refresh can resume an agent waiting in review. */
   isConnectionContinuation?: boolean;
   isInteractionWake: boolean;
+  /** Server-loaded pending card and current independent document, not a wake label. */
+  pendingDocumentReview?: boolean;
+  pendingDocumentReviewBinding?: PendingDocumentReviewBinding | null;
+  pendingDocumentReviewOrigin?: PendingDocumentReviewOrigin | null;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
 
