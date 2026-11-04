@@ -129,6 +129,11 @@ export type StalenessDecision =
       details: Record<string, unknown>;
     };
 
+export type PendingDocumentReviewBinding = {
+  companyId: string; issueId: string; agentId: string; interactionId: string;
+  documentId: string; key: string; revisionId: string; revisionNumber: number;
+};
+
 export type QueuedRunFacts = {
   /** Rechecked for automatic native replacements immediately before dispatch. */
   dependenciesBlocked?: DependencyBlockFacts | null;
@@ -149,6 +154,7 @@ export type QueuedRunFacts = {
   isInteractionWake: boolean;
   /** Server-loaded pending card and current independent document, not a wake label. */
   pendingDocumentReview?: boolean;
+  pendingDocumentReviewBinding?: PendingDocumentReviewBinding | null;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
 

@@ -822,8 +822,10 @@ The reviewer must not be the document's creator or latest agent editor.
 Tool-action and secret confirmations do not use this review entry.
 
 A wake reason or caller-supplied interaction ID is not sufficient authority.
-Admission records the accepted review binding under the issue/run locks and
-checks it again immediately before provider handoff. A resolved request,
+Run admission also requires the durable wake receipt to bind that run, company,
+reviewer, interaction and request creator. The fixed key, document ID and revision
+are recorded under the issue/run locks and checked again before provider handoff.
+Changing a card to another valid document does not change that admitted target. A resolved request,
 changed document, detached link, or mismatched scope cancels dispatch. Human-only
 resolution, issue holds, budget and provider gates, tool permissions, and the
 existing serialized execution lock remain in force. Claiming that lock does

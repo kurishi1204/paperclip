@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, documents, documentRevisions,
+import { agents, agentWakeupRequests, companies, createDb, documents, documentRevisions,
   heartbeatRuns, issueDocuments, issueThreadInteractions, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
@@ -51,9 +51,14 @@ suite("pending independent document review through real dispatch", () => {
       status:"pending",continuationPolicy:"none",requestedResolverPolicy:"not_creator",effectiveResolverPolicy:"not_creator",
       createdByAgentId:ownerId,addresseeAgentId:reviewerId,payload:{version:1,prompt:"Review this fixed synthetic proposal",target} });
     const context={ issueId,interactionId,interactionKind:"request_confirmation",source:"issue.interaction.created",wakeReason:"interaction_pending" };
-    await db.insert(heartbeatRuns).values({ id:runId,companyId,agentId:reviewerId,invocationSource:"automation",status:"queued",contextSnapshot:context });
+    const wakeupRequestId=randomUUID();
+    await db.insert(agentWakeupRequests).values({id:wakeupRequestId,companyId,agentId:reviewerId,runId,
+      source:"automation",triggerDetail:"system",reason:"interaction_pending",status:"queued",
+      requestedByActorType:"agent",requestedByActorId:ownerId,idempotencyKey:`interaction-pending:${interactionId}`,
+      payload:{issueId,interactionId,interactionKind:"request_confirmation"}});
+    await db.insert(heartbeatRuns).values({ id:runId,companyId,agentId:reviewerId,invocationSource:"automation",status:"queued",wakeupRequestId,contextSnapshot:context });
     const input={ companyId,issueId,agentId:reviewerId,runId,contextSnapshot:context };
-    return { ...input,ownerId,reviewerId,documentId,revisionId,interactionId,target };
+    return { ...input,ownerId,reviewerId,documentId,revisionId,interactionId,target,wakeupRequestId };
   }
   it("admits the current independent reviewer without changing task assignment and hands off to the provider", async () => {
     const x=await seed(), adapter=createPostgresRunDispatchAdapter(db);
@@ -90,13 +95,24 @@ suite("pending independent document review through real dispatch", () => {
         expect(run!.startedAt).toBeNull();
       }
     });
-  it.each(["revision_changed","resolved_then_reassigned"] as const)("rechecks %s after admission and before provider dispatch",async defect=>{
+  it.each(["revision_changed","revision_and_card_changed","target_replaced","resolved_then_reassigned"] as const)("rechecks %s after admission and before provider dispatch",async defect=>{
     const x=await seed(),adapter=createPostgresRunDispatchAdapter(db);
     expect(await adapter.cancelStaleQueuedRun({companyId:x.companyId,runId:x.runId,expectedStatus:"queued",now:new Date()})).toMatchObject({outcome:"not_stale"});
     await db.update(heartbeatRuns).set({status:"running"}).where(eq(heartbeatRuns.id,x.runId));
     await db.update(issues).set({executionRunId:x.runId,...(defect==="resolved_then_reassigned"?{assigneeAgentId:x.reviewerId}:{})}).where(eq(issues.id,x.issueId));
-    if(defect==="revision_changed") await db.update(documents).set({latestRevisionId:randomUUID()}).where(eq(documents.id,x.documentId));
-    else await db.update(issueThreadInteractions).set({status:"accepted"}).where(eq(issueThreadInteractions.id,x.interactionId));
+    if(defect==="revision_changed" || defect==="revision_and_card_changed") {
+      const revisionId=randomUUID();
+      await db.update(documents).set({latestRevisionId:revisionId}).where(eq(documents.id,x.documentId));
+      if(defect==="revision_and_card_changed") await db.update(issueThreadInteractions)
+        .set({payload:{version:1,prompt:"Changed review",target:{...x.target,revisionId}}}).where(eq(issueThreadInteractions.id,x.interactionId));
+    } else if(defect==="target_replaced") {
+      const documentId=randomUUID(),revisionId=randomUUID();
+      await db.insert(documents).values({id:documentId,companyId:x.companyId,title:"Other synthetic document",format:"markdown",
+        latestBody:"Other synthetic text",latestRevisionId:revisionId,latestRevisionNumber:1,createdByAgentId:x.ownerId,updatedByAgentId:x.ownerId});
+      await db.insert(documentRevisions).values({id:revisionId,companyId:x.companyId,documentId,revisionNumber:1,title:"Other synthetic document",format:"markdown",body:"Other synthetic text",createdByAgentId:x.ownerId});
+      await db.insert(issueDocuments).values({companyId:x.companyId,issueId:x.issueId,documentId,key:"other-proposal"});
+      await db.update(issueThreadInteractions).set({payload:{version:1,prompt:"Retargeted review",target:{...x.target,key:"other-proposal",documentId,revisionId}}}).where(eq(issueThreadInteractions.id,x.interactionId));
+    } else await db.update(issueThreadInteractions).set({status:"accepted"}).where(eq(issueThreadInteractions.id,x.interactionId));
     let calls=0;
     expect(await adapter.dispatchResolvedInteractionIfCurrent({companyId:x.companyId,runId:x.runId,expectedStatus:"running",now:new Date(),dispatch:async()=>{calls++;}}))
       .toMatchObject({dispatched:false,cancellation:{outcome:"cancelled",errorCode:"interaction_review_stale"}});
@@ -111,22 +127,43 @@ suite("pending independent document review through real dispatch", () => {
       .toMatchObject({dispatched:false,cancellation:{outcome:"cancelled",errorCode:"issue_execution_lock_changed"}});
     expect(calls).toBe(0);
   });
-  it("claims the real heartbeat execution lock for the current reviewer and reaches the adapter", async () => {
+  it.each(["missing_receipt","wrong_run","wrong_card","wrong_creator","settled_receipt"] as const)(
+    "refuses a borrowed interaction ID with %s before provider work",async defect=>{
+      const x=await seed();
+      if(defect==="missing_receipt") await db.update(heartbeatRuns).set({wakeupRequestId:null}).where(eq(heartbeatRuns.id,x.runId));
+      if(defect==="wrong_run") await db.update(agentWakeupRequests).set({runId:randomUUID()}).where(eq(agentWakeupRequests.id,x.wakeupRequestId));
+      if(defect==="wrong_card") await db.update(agentWakeupRequests).set({payload:{issueId:x.issueId,interactionId:randomUUID(),interactionKind:"request_confirmation"}}).where(eq(agentWakeupRequests.id,x.wakeupRequestId));
+      if(defect==="wrong_creator") await db.update(agentWakeupRequests).set({requestedByActorId:x.reviewerId}).where(eq(agentWakeupRequests.id,x.wakeupRequestId));
+      if(defect==="settled_receipt") await db.update(agentWakeupRequests).set({status:"skipped"}).where(eq(agentWakeupRequests.id,x.wakeupRequestId));
+      expect(await isCurrentPendingDocumentReviewWake(db,x)).toBe(false);
+      expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({companyId:x.companyId,runId:x.runId,expectedStatus:"queued",now:new Date()}))
+        .toMatchObject({outcome:"cancelled",errorCode:"issue_assignee_changed"});
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+    });
+  it("creates the normal review wake, claims its execution lock, and reaches the adapter", async () => {
     const x=await seed();
+    // Exercise the same wake options as the route, rather than a manually inserted Run.
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id,x.wakeupRequestId));
+    let observedRunId:string|undefined;
     heartbeat=heartbeatService(db,{runtimeEnv:{...process.env,PAPERCLIP_IN_WORKTREE:"false"},
       beforeResolvedInteractionContinuationDispatchCheck:async ({runId})=>{
-        expect(runId).toBe(x.runId);
+        observedRunId=runId;
         const [task]=await db.select().from(issues).where(eq(issues.id,x.issueId));
-        expect(task!.executionRunId).toBe(x.runId); expect(task!.assigneeAgentId).toBe(x.ownerId);
+        expect(task!.executionRunId).toBe(runId); expect(task!.assigneeAgentId).toBe(x.ownerId);
       }});
-    await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions();
-    expect(mockAdapterExecute).toHaveBeenCalledOnce();
-    const [run]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
+    const queued=await heartbeat.wakeup(x.reviewerId,{source:"automation",triggerDetail:"system",reason:"interaction_pending",
+      payload:{issueId:x.issueId,interactionId:x.interactionId,interactionKind:"request_confirmation"},
+      idempotencyKey:`interaction-pending:${x.interactionId}`,requestedByActorType:"agent",requestedByActorId:x.ownerId,
+      contextSnapshot:{...x.contextSnapshot,taskId:x.issueId}});
+    expect(queued).not.toBeNull(); await heartbeat.drainActiveRunExecutions();
+    expect(observedRunId).toBe(queued!.id); expect(mockAdapterExecute).toHaveBeenCalledOnce();
+    const [run]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,queued!.id));
     expect(run).toMatchObject({status:"succeeded",errorCode:null});
     const [task]=await db.select().from(issues).where(eq(issues.id,x.issueId));
     expect(task!.assigneeAgentId).toBe(x.ownerId);
   });
-  it("keeps a current queued review when the worker receives a separate wake", async () => {
+  it("keeps a restored current queued review lock when the worker receives a separate wake", async () => {
     const x=await seed();
     await db.update(issues).set({executionRunId:x.runId}).where(eq(issues.id,x.issueId));
     heartbeat=heartbeatService(db,{runtimeEnv:{...process.env,PAPERCLIP_IN_WORKTREE:"false"}});

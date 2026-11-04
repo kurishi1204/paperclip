@@ -1,5 +1,5 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
-import { isCurrentPendingDocumentReviewWake } from "../../../services/pending-document-review-wake.js";
+import { readCurrentPendingDocumentReviewWake } from "../../../services/pending-document-review-wake.js";
 import { getExecutionBlocker, isIndependentQaDocumentEpisode } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
@@ -529,10 +529,11 @@ export function createPostgresRunDispatchAdapter(
     );
 
     const wakeCommentId = deriveCommentId(context);
-    const pendingDocumentReview = await isCurrentPendingDocumentReviewWake(dbOrTx, {
+    const pendingDocumentReviewBinding = await readCurrentPendingDocumentReviewWake(dbOrTx, {
       companyId: input.companyId, issueId, agentId: input.agentId, runId: input.runId,
       contextSnapshot: context, lock: Boolean(tx),
     });
+    const pendingDocumentReview = Boolean(pendingDocumentReviewBinding);
     const isInteractionWake = pendingDocumentReview || allowsIssueInteractionWake(
       context,
       ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
@@ -611,6 +612,7 @@ export function createPostgresRunDispatchAdapter(
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
       pendingDocumentReview,
+      pendingDocumentReviewBinding,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
@@ -1026,7 +1028,8 @@ export function createPostgresRunDispatchAdapter(
               ...parseObject(run.runnerProfileJson),
               aiConnectionNonAssigneeWake: facts.issueAssigneeAgentId !== run.agentId,
               ...(facts.pendingDocumentReview ? {
-                pendingDocumentReviewInteractionId: readNonEmptyString(parseObject(run.contextSnapshot).interactionId),
+                pendingDocumentReviewInteractionId: facts.pendingDocumentReviewBinding!.interactionId,
+                pendingDocumentReviewBinding: facts.pendingDocumentReviewBinding,
               } : {}),
             },
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
