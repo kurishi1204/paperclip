@@ -50,15 +50,16 @@ export async function readCurrentPendingDocumentReviewWake(db: Db, input: {
       return (input.lock ? rows.for("share") : rows).then(rows => rows[0]);
     };
     const run = await readRun(input.runId);
-    const terminalVerdictRead = Boolean(input.finalizationOnly && resolvedByThisRun && run?.finishedAt &&
-      ["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status));
-    if (!run?.wakeupRequestId || (!terminalVerdictRead && !["queued", "running", "scheduled_retry"].includes(run.status)) ||
+    // A committed exact verdict is historical evidence, not renewed execution
+    // authority. The finalizer already requires its persisted terminal result;
+    // changing controller run/wake labels must not invalidate that evidence.
+    const finalizationVerdictRead = Boolean(input.finalizationOnly && resolvedByThisRun);
+    if (!run?.wakeupRequestId || (!finalizationVerdictRead && !["queued", "running", "scheduled_retry"].includes(run.status)) ||
         (run.nativeIssueId && run.nativeIssueId !== input.issueId) ||
         parseObject(run.contextSnapshot).interactionId !== card.id ||
         parseObject(run.contextSnapshot).issueId !== input.issueId) return null;
     const wake = await readReceipt(run.wakeupRequestId, run.id);
-    if (!wake || (!["queued", "claimed"].includes(wake.status) &&
-        !(terminalVerdictRead && ["completed", "failed"].includes(wake.status)))) return null;
+    if (!wake || (!finalizationVerdictRead && !["queued", "claimed"].includes(wake.status))) return null;
     const request = parseObject(wake.payload), profile = parseObject(parseObject(run.runnerProfileJson).pendingDocumentReviewAdmission);
     let sourceRun = run, sourceWake = wake;
     if (run.retryOfRunId) {

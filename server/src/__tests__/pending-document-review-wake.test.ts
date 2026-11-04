@@ -341,13 +341,14 @@ suite("pending independent document review through real dispatch", () => {
     expect(task!.executionLockedAt).toEqual(ownership==="same_run"?null:lockedAt);
     expect(task!.assigneeAgentId).toBe(x.ownerId);
   });
-  it.each(["succeeded","failed","cancelled","timed_out","interrupted"] as const)(
-    "observes this run's committed verdict for terminal finalization only (%s)", async status => {
+  it.each([["succeeded","completed"],["failed","failed"],["cancelled","cancelled"],
+    ["timed_out","failed"],["interrupted","completed"],["cancelled","skipped"]] as const)(
+    "observes this run's committed verdict for finalization only (%s / %s)", async (status,wakeStatus) => {
       const x=await nativeReviewFixture();
       await db.update(issueThreadInteractions).set({status:"accepted",resolvedByAgentId:x.reviewerId,resolvedByRunId:x.runId})
         .where(eq(issueThreadInteractions.id,x.interactionId));
       await db.update(heartbeatRuns).set({status,finishedAt:new Date()}).where(eq(heartbeatRuns.id,x.runId));
-      await db.update(agentWakeupRequests).set({status:status==="succeeded"?"completed":"failed",finishedAt:new Date()})
+      await db.update(agentWakeupRequests).set({status:wakeStatus,finishedAt:new Date()})
         .where(eq(agentWakeupRequests.id,x.wakeupRequestId));
       expect(await getNativeDocumentReviewAssignment(db,{...x.binding,allowResolved:true})).toBeNull();
       const observed=await getNativeDocumentReviewAssignment(db,{...x.binding,allowResolved:true,finalizationOnly:true});
