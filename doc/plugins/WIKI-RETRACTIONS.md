@@ -36,7 +36,7 @@ Their physical paths, byte hashes and complete source-reference hashes are
 pinned in `fence.preservedPages`. The preview also enumerates every current
 metadata row in `existingPages` with a reference hash and its actual read
 control, including unselected legacy pages that will be refused. This full
-census is rebuilt at execution; partial or unfamiliar references cannot hide
+census uses the same strongest-prior-fence precedence as live reads and is rebuilt at execution. Read control describes withdrawal fences; authorization and current publication proofs are still mandatory; partial or unfamiliar references cannot hide
 a known page from the impact proposal. Filesystem-only/unindexed paths remain
 explicitly refused by `unindexedPathPolicy`. Each selected page is also a `blocked_by_retraction`
 entry with the citation-holds policy; it is never put into `readable`.
@@ -49,7 +49,7 @@ any new publication remain separate operations.
 
 Selection receives the same exact-proposal independent QA and human-only
 consent. Execution rebuilds every pin, and the common reader rechecks metadata
-and bytes. Earlier durable refusals cannot be revived. Missing metadata, byte
+and bytes. Previously citation-held bytes may be selected again only after their old metadata and byte proofs pass the same live structured-read checks. Earlier strict refusals cannot be revived. Missing metadata, byte
 changes and physical aliases are rejected. Unselected/future pages, direct
 withdrawals, old strict fences and the ordinary Wiki write hold keep their
 existing controls. Existing event records are never rewritten.

@@ -283,9 +283,16 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
       [randomUUID(),kept.companyId,notPreviouslyKept,publicationHash(unrelatedBody)]);
     await expect(wikiRetractionRuntime(db,pluginId).preview({companyId:kept.companyId,wikiId:"default",spaceSlug:"default"},
       "wiki/upstream.md","Second synthetic withdrawal",[notPreviouslyKept])).rejects.toThrow(/E_SOURCE_RETRACTED/);
+    const secondPreview=()=>wikiRetractionRuntime(db,pluginId).preview({companyId:kept.companyId,wikiId:"default",spaceSlug:"default"},
+      "wiki/upstream.md","Second preserved inspection",[keptPath]);
+    const second=await secondPreview();
+    expect(second.fence.preservedPages).toEqual(keptEvents[0]!.fence!.preservedPages);
+    expect(second.existingPages?.find(p=>p.path==="wiki/p7.md")).toMatchObject({readControl:"retracted",readPolicy:"strict"});
+    expect(second.existingPages?.find(p=>p.path===keptPath)).toMatchObject({readControl:"blocked_by_retraction",readPolicy:"citation-holds"});
     const keptRows=await db.$client.unsafe(`SELECT source_refs FROM ${ns}.wiki_pages WHERE company_id=$1 AND path=$2`,[kept.companyId,keptPath]);
     await db.$client.unsafe(`UPDATE ${ns}.wiki_pages SET source_refs='[]'::jsonb WHERE company_id=$1 AND path=$2`,[kept.companyId,keptPath]);
     await expect(readKept()).rejects.toThrow(/preserved_page_changed/);
+    await expect(secondPreview()).rejects.toThrow(/preserved_page_changed/);
     await db.$client.unsafe(`UPDATE ${ns}.wiki_pages SET source_refs=$3::jsonb WHERE company_id=$1 AND path=$2`,[kept.companyId,keptPath,JSON.stringify(keptRows[0]!.source_refs)]);
     await writeFile(join(kept.dir,keptPath),"changed retained body");
     await expect(readKept()).rejects.toThrow(/readable_content_changed/);

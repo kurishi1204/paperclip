@@ -47,6 +47,22 @@ describe("explicit existing-page preservation",()=>{
       await expect(readRetractionFolderText(dir,target.path,gate)).rejects.toThrow(/E_SOURCE_RETRACTED/);
       await writeFile(join(dir,"wiki/future.md"),"Not selected");
       await expect(readRetractionFolderText(dir,"wiki/future.md",gate)).rejects.toThrow(/E_SOURCE_RETRACTED/);
+      const retainedAgain=await preserveExistingRetractionPages(pins,[row],held,[kept],read,gate);
+      expect(retainedAgain).toEqual(measured);
+      const nextFence={folderKey:"wiki-root" as const,rootPath:dir,pathPrefix:"",mode:"citation-holds" as const,
+        registeredPaths:[target.path,"wiki/upstream.md"],blocks:[{path:"wiki/upstream.md",contentHash:hash,state:"retracted" as const},
+          ...retainedAgain.map(({path,contentHash})=>({path,contentHash,state:"blocked_by_retraction" as const}))],
+        readable:[{path:target.path,contentHash:hash}],preservedPages:retainedAgain};
+      const nextRows=[row,{path:target.path,content_hash:hash,source_refs:[]}];
+      expect(inventoryRetractionPages(nextRows,nextFence,gate).find(p=>p.path===target.path)).toMatchObject({readControl:"retracted",readPolicy:"strict"});
+      const nextTarget={...target,path:"wiki/upstream.md"};
+      await executeRetraction(store,{target:nextTarget,retractionId:"second-operation",eventId:"second-event",reason:"Second synthetic withdrawal",
+        actorId:"synthetic-owner",runId:null,at:new Date().toISOString(),fence:nextFence,readCurrent:async()=>nextTarget,
+        approval:{id:"second-review",companyId:target.companyId,target:nextTarget,reason:"Second synthetic withdrawal",reviewerId:"synthetic-qa",reviewRunId:"second-run",ownerDecisionId:"second-human"}});
+      const combined=retractionFolderGate(events,target.companyId,"wiki-root");
+      expect((await readRetractionFolderTextWithStatus(dir,kept,combined)).citationHolds).toHaveLength(2);
+      await expect(readRetractionFolderText(dir,kept,combined)).rejects.toThrow(/E_SOURCE_RETRACTED/);
+      await expect(readRetractionFolderTextWithStatus(dir,target.path,combined)).rejects.toThrow(/E_SOURCE_RETRACTED/);
       const invalid=structuredClone(event);invalid.fence!.preservedPages![0]!.sourceRefsSHA256="invalid";
       const {eventHash:_old,...basis}=invalid;invalid.eventHash=retractionEventHash(basis);
       expect(()=>validateRetractionEvents(target,[invalid])).toThrow(/fence_preserved_page/);
@@ -55,7 +71,7 @@ describe("explicit existing-page preservation",()=>{
       expect(()=>validateRetractionEvents(target,[registered])).toThrow(/fence_preserved_page/);
       // A later proposal cannot claim to preserve a page that an earlier
       // durable fence still refuses. The prior event remains immutable.
-      const prior=structuredClone(event);prior.fence!.readable=[];delete prior.fence!.preservedPages;
+      const prior=structuredClone(event);prior.fence!.readable=[];prior.fence!.mode="freeze-wiki";delete prior.fence!.preservedPages;
       const {eventHash:_prior,...priorBasis}=prior;prior.eventHash=retractionEventHash(priorBasis);
       const priorGate=retractionFolderGate([prior],target.companyId,"wiki-root");
       expect(()=>priorGate.assertRead(kept,body)).toThrow(/E_SOURCE_RETRACTED/);
@@ -100,12 +116,18 @@ describe("explicit existing-page preservation",()=>{
       registeredPaths:["scope/wiki/p7.md"],readable:[],blocks:[{path:"scope/wiki/p7.md",contentHash:hash,state:"retracted" as const},
         {path:"scope/"+kept,contentHash:row.content_hash,state:"blocked_by_retraction" as const}]};
     const rows=[row,{path:other,content_hash:hash,source_refs:partial},{path:"wiki/p7.md",content_hash:hash,source_refs:[]}];
-    const inventory=inventoryRetractionPages(rows,fence);expect(inventory).toHaveLength(rows.length);
+    const inventory=inventoryRetractionPages(rows,fence,noPriorHold);expect(inventory).toHaveLength(rows.length);
     expect(new Set(inventory.map(p=>p.path))).toEqual(new Set(rows.map(p=>p.path)));
     expect(inventory.find(p=>p.path===other)).toMatchObject({readControl:"blocked_unselected",referenceStatus:"unverified_legacy",sourceRefsSHA256:publicationHash(publicationCanonical(partial))});
     expect(inventory.find(p=>p.path===kept)).toMatchObject({readControl:"blocked_by_retraction",referenceStatus:"unverified_legacy"});
     expect(inventory.find(p=>p.path==="wiki/p7.md")).toMatchObject({readControl:"retracted",referenceStatus:"pinned_registry"});
-    expect(()=>inventoryRetractionPages([...rows,row],fence)).toThrow(/inventory_duplicate/);
+    expect(()=>inventoryRetractionPages([...rows,row],fence,noPriorHold)).toThrow(/inventory_duplicate/);
+  });
+  it("reports the prior strict hold even when the next fence marks that page readable",()=>{
+    const p="wiki/p7.md",fence={folderKey:"wiki-root" as const,rootPath:"/synthetic",pathPrefix:"",mode:"citation-holds" as const,
+      registeredPaths:[p],readable:[{path:p,contentHash:hash}],blocks:[]};
+    const prior={block:(path:string)=>({path,state:"retracted" as const,retractionId:"old",retractedPath:p,reason:"Prior withdrawal",eventHash:hash})};
+    expect(inventoryRetractionPages([{path:p,source_refs:[],content_hash:hash}],fence,prior)[0]).toMatchObject({readControl:"retracted",readPolicy:"strict"});
   });
   it("pins reference changes and refuses a changed file or missing reference array",async()=>{
     await expect(preserveExistingRetractionPages(pins,[{...row,content_hash:hash}],held,[kept],read,noPriorHold)).rejects.toThrow(/preserve_content_changed/);

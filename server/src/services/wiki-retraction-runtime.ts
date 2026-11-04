@@ -10,6 +10,7 @@ import { assertConfiguredLocalFolder, getStoredLocalFolders, inspectPluginLocalF
 import { executeRetraction, withRetractionMaintenanceLog, retainedRetractionFile, RetractionError, type RetractionFence, type RetractionScope, type RetractionStore, type RetractionTarget } from "./wiki-retraction-ledger.js";
 import { loadAllWikiRetractions, loadCurrentWikiRetractions, withWikiRetractionLock, inspectWikiLocalFolder, assertWikiRootOwnership, appendCommittedWikiMaintenance, readWikiMaintenanceState } from "./wiki-retraction-store.js";
 import { resolveReviewedWikiRetraction } from "./wiki-retraction-approval.js";
+import { assertCurrentWikiRepublication } from "./wiki-republication-runtime.js";
 import { retractionFolderGate } from "./wiki-retraction-gate.js";
 import { buildRetractionGraph, assertNoUnregisteredRetractionDependants, preserveExistingRetractionPages, inventoryRetractionPages } from "./wiki-retraction-readback.js";
 import { parsePublicationRegistry, publicationCanonical, publicationHash, publicationNeed, type JsonObject } from "./wiki-publication-readback.js";
@@ -102,6 +103,7 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
     const preservedPages = await preserveExistingRetractionPages(pins.entries, rows, held, preservePaths, async p => {
       const rel = toPhysical(p), canonical = await physical(rootPath, rel);
       publicationNeed(canonical === rel, "retraction_alias");
+      await assertCurrentWikiRepublication(connection,pluginId,companyId,currentEvents,canonical);
       return {path:canonical,contents:await readPluginLocalFolderText(rootPath, rel)};
     },currentGate);
     // Every removed row is now represented by an explicit, hash-bound hold.
@@ -116,7 +118,7 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
     return {schema:"paperclip.wiki-retraction-request/v1",pluginId,
       target:{...scope,path:targetPath,contentHash:targetPin.wikiSHA256},reason,
       publicationRegistrySHA256:publicationHash(publicationCanonical(pins)),fence,
-      existingPages:inventoryRetractionPages(rows,fence),unindexedPathPolicy:"read_blocked"};
+      existingPages:inventoryRetractionPages(rows,fence,currentGate),unindexedPathPolicy:"read_blocked"};
   }
   return {
     preview: (scope: RetractionScope, targetPath: string, reason: string, preservePaths: string[] = []) =>

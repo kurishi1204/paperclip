@@ -2,7 +2,7 @@ import path from "node:path";
 import { realpath } from "node:fs/promises";
 import { resolvePluginLocalFolderPath, readPluginLocalFolderText } from "./plugin-local-folders.js";
 import { publicationHash } from "./wiki-publication-readback.js";
-import type { RetractionEvent, RetractionBlock } from "./wiki-retraction-ledger.js";
+import type { RetractionEvent, RetractionBlock, RetractionFence } from "./wiki-retraction-ledger.js";
 import { RetractionError, validateRetractionEvents, retainedRetractionFile, retractionCitationReason } from "./wiki-retraction-ledger.js";
 
 /** The persisted physical-path fence does not depend on publication config.
@@ -34,7 +34,7 @@ export function retractionFolderGate(events: RetractionEvent[], companyId: strin
   }
   function block(path: string): RetractionBlock | null {
     const blocks = relevant.map(event => newlyPublished(event,path)?null:retractionFolderGateSingle(event, path)).filter((b): b is RetractionBlock => b !== null);
-    return blocks.find(b => b.state === "retracted" || b.readPolicy !== "citation-holds") ?? blocks[0] ?? null;
+    return strongestRetractionReadBlock(blocks);
   }
   function citationHolds(filePath: string) {
     return relevant.flatMap(event => {
@@ -81,14 +81,21 @@ export function retractionFolderGate(events: RetractionEvent[], companyId: strin
   };
 }
 
-function retractionFolderGateSingle(event: RetractionEvent, filePath: string): RetractionBlock | null {
-  const match=event.fence!.blocks.find(b => b.path === filePath);
-  const prefix=event.fence!.pathPrefix ? event.fence!.pathPrefix + "/wiki/" : "wiki/";
-  if (!match && !(filePath.startsWith(prefix) && !event.fence!.readable.some(p => p.path === filePath))) return null;
-  // Unknown pages are never treated as reviewed downstream citations.
-  return { state: match?.state ?? "retracted", path: filePath, retractedPath: event.path,
-    retractionId: event.retractionId, reason: retractionCitationReason(event,filePath), eventHash: event.eventHash,
-    ...(match && event.fence!.mode === "citation-holds" ? { readPolicy: "citation-holds" as const } : {}) };
+/** Shared by active reads and proposed full-scope readback. Strict refusal
+ * dominates citation-only inspection across every prior and proposed fence. */
+export function strongestRetractionReadBlock<T extends Pick<RetractionBlock,"state"|"readPolicy">>(blocks:T[]):T|null {
+  return blocks.find(b=>b.state==="retracted"||b.readPolicy!=="citation-holds")??blocks[0]??null;
+}
+export function retractionFenceReadControl(fence:RetractionFence,filePath:string):Pick<RetractionBlock,"state"|"readPolicy">|null {
+  const match=fence.blocks.find(b=>b.path===filePath);
+  const prefix=fence.pathPrefix?fence.pathPrefix+"/wiki/":"wiki/";
+  if(!match&&!(filePath.startsWith(prefix)&&!fence.readable.some(p=>p.path===filePath)))return null;
+  return {state:match?.state??"retracted",...(match&&fence.mode==="citation-holds"?{readPolicy:"citation-holds" as const}:{})};
+}
+function retractionFolderGateSingle(event:RetractionEvent,filePath:string):RetractionBlock|null {
+  const control=retractionFenceReadControl(event.fence!,filePath);
+  return control?{...control,path:filePath,retractedPath:event.path,retractionId:event.retractionId,
+    reason:retractionCitationReason(event,filePath),eventHash:event.eventHash}:null;
 }
 
 /** Resolve the existing parent even when a new leaf does not exist.
