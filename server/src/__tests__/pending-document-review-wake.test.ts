@@ -7,6 +7,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
 import { hasServerRecordedNonAssigneeWake, isCurrentPendingDocumentReviewWake, pendingDocumentReviewRetryProfile, pendingDocumentReviewProfileFields } from "../services/pending-document-review-wake.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { materializeNativeInteractionResponses } from "../services/native-runtime/native-interaction-bridge.js";
 import { runningProcesses } from "../adapters/index.js";
 
 const mockAdapterExecute = vi.hoisted(() => vi.fn(async (_input?: unknown) => ({
@@ -143,6 +144,31 @@ suite("pending independent document review through real dispatch", () => {
         .toMatchObject({outcome:"cancelled",errorCode:"issue_assignee_changed"});
       expect(mockAdapterExecute).not.toHaveBeenCalled();
     });
+  it("keeps a receipt-bound pending document review out of resolved response inputs", async () => {
+    const x = await seed();
+    await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId:x.companyId, runId:x.runId, expectedStatus:"queued", now:new Date() });
+    await expect(materializeNativeInteractionResponses({ db, companyId:x.companyId, issueId:x.issueId,
+      runId:x.runId, agentId:x.reviewerId, interactionIds:[x.interactionId] })).resolves.toEqual([]);
+    const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id,x.interactionId));
+    expect(card).toMatchObject({ status:"pending", result:null, resolvedByAgentId:null, resolvedByUserId:null });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
+    expect(run!.runnerProfileJson).toMatchObject({ pendingDocumentReviewAdmission:{ interactionId:x.interactionId } });
+  });
+  it.each(["wrong_receipt", "stale_revision", "wrong_addressee"] as const)("still refuses %s instead of dropping an unresolved input", async defect => {
+    const x = await seed();
+    await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId:x.companyId, runId:x.runId, expectedStatus:"queued", now:new Date() });
+    if (defect === "wrong_receipt") await db.update(agentWakeupRequests).set({ requestedByActorId:x.reviewerId }).where(eq(agentWakeupRequests.id,x.wakeupRequestId));
+    if (defect === "stale_revision") await db.update(documents).set({ latestRevisionId:randomUUID() }).where(eq(documents.id,x.documentId));
+    if (defect === "wrong_addressee") await db.update(issueThreadInteractions).set({ addresseeAgentId:x.ownerId }).where(eq(issueThreadInteractions.id,x.interactionId));
+    await expect(materializeNativeInteractionResponses({ db, companyId:x.companyId, issueId:x.issueId,
+      runId:x.runId, agentId:x.reviewerId, interactionIds:[x.interactionId] })).rejects.toMatchObject({ code:"native_interaction_unresolved" });
+  });
+  it("does not hide a missing response beside a valid pending review request", async () => {
+    const x = await seed();
+    await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId:x.companyId, runId:x.runId, expectedStatus:"queued", now:new Date() });
+    await expect(materializeNativeInteractionResponses({ db, companyId:x.companyId, issueId:x.issueId,
+      runId:x.runId, agentId:x.reviewerId, interactionIds:[x.interactionId,randomUUID()] })).rejects.toMatchObject({ code:"native_interaction_missing" });
+  });
   it("creates the normal review wake, claims its execution lock, and reaches the adapter", async () => {
     const x=await seed();
     // Exercise the same wake options as the route, rather than a manually inserted Run.

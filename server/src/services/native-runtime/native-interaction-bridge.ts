@@ -15,6 +15,7 @@ import {
 } from "@paperclipai/db";
 import { getAgentWorkEligibility } from "@paperclipai/shared";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
+import { isCurrentPendingDocumentReviewWake } from "../pending-document-review-wake.js";
 import { commitNativeStatusDecision } from "./status-decision-committer.js";
 import { nativeSha256 } from "./canonical.js";
 import { recordNativeAttentionAssessment } from "./work-assessments.js";
@@ -170,6 +171,7 @@ export async function materializeNativeInteractionResponses(input: {
   ]);
   if (!issue) throw new NativeInteractionBridgeError("native_interaction_binding_mismatch", "Issue binding not found");
   const responses: NativeInteractionResponseEnvelope[] = [];
+  const pendingReviewRequests = new Set<string>();
 
   for (const interaction of interactions) {
     if (!requestedIds.has(interaction.id)) continue;
@@ -178,6 +180,20 @@ export async function materializeNativeInteractionResponses(input: {
         "native_interaction_binding_mismatch",
         `Interaction ${interaction.id} is not bound to the native company and issue`,
       );
+    }
+    // A named review wake carries a request to resolve, not a response
+    // already resolved by someone else. Only the current receipt-bound
+    // document review may remain pending here; other unresolved inputs
+    // retain the existing refusal below.
+    if (interaction.status === "pending" && await isCurrentPendingDocumentReviewWake(input.db, {
+      companyId: input.companyId,
+      issueId: input.issueId,
+      agentId: input.agentId,
+      runId: input.runId,
+      contextSnapshot: { interactionId: interaction.id },
+    })) {
+      pendingReviewRequests.add(interaction.id);
+      continue;
     }
     if (interaction.kind === "request_confirmation" && interaction.payload.toolAction) {
       const action = interaction.payload.toolAction;
@@ -395,7 +411,7 @@ export async function materializeNativeInteractionResponses(input: {
     );
   }
 
-  const missing = [...requestedIds].filter((id) => !responses.some((response) => response.interactionId === id));
+  const missing = [...requestedIds].filter((id) => !pendingReviewRequests.has(id) && !responses.some((response) => response.interactionId === id));
   if (missing.length > 0) {
     throw new NativeInteractionBridgeError(
       "native_interaction_missing",
