@@ -11,13 +11,16 @@ import { executeRetraction, withRetractionMaintenanceLog, retainedRetractionFile
 import { loadAllWikiRetractions, loadCurrentWikiRetractions, withWikiRetractionLock, inspectWikiLocalFolder, assertWikiRootOwnership, appendCommittedWikiMaintenance, readWikiMaintenanceState } from "./wiki-retraction-store.js";
 import { resolveReviewedWikiRetraction } from "./wiki-retraction-approval.js";
 import { retractionFolderGate } from "./wiki-retraction-gate.js";
-import { buildRetractionGraph, assertNoUnregisteredRetractionDependants, preserveExistingRetractionPages } from "./wiki-retraction-readback.js";
+import { buildRetractionGraph, assertNoUnregisteredRetractionDependants, preserveExistingRetractionPages, inventoryRetractionPages } from "./wiki-retraction-readback.js";
 import { parsePublicationRegistry, publicationCanonical, publicationHash, publicationNeed, type JsonObject } from "./wiki-publication-readback.js";
 
 export interface WikiRetractionProposal {
   schema: "paperclip.wiki-retraction-request/v1";
   pluginId: string; target: RetractionTarget; reason: string;
   publicationRegistrySHA256: string; fence: RetractionFence;
+  /** Present in current previews; exact fresh comparison rejects omissions. */
+  existingPages?: ReturnType<typeof inventoryRetractionPages>;
+  unindexedPathPolicy?: "read_blocked";
 }
 const WIKI_PLUGIN = "paperclipai.plugin-llm-wiki";
 
@@ -106,13 +109,14 @@ export function wikiRetractionRuntime(db: Db, pluginId: string) {
     const selected = new Set(preservePaths);
     assertNoUnregisteredRetractionDependants(pins.entries, rows.filter(row => !selected.has(row.path)), held);
     blocks.push(...preservedPages.map(({path,contentHash}) => ({path,contentHash,state:"blocked_by_retraction" as const})));
-    return { schema: "paperclip.wiki-retraction-request/v1", pluginId,
-      target: { ...scope, path: targetPath, contentHash: targetPin.wikiSHA256 }, reason,
-      publicationRegistrySHA256: publicationHash(publicationCanonical(pins)),
-      fence: { folderKey: "wiki-root", rootPath, pathPrefix: space.path_prefix ?? "", mode: "citation-holds", blocks,
-        registeredPaths: pins.entries.map(p=>toPhysical(p.path)).sort(),
-        ...(preservedPages.length ? {preservedPages} : {}),
-        readable: pins.entries.filter(p => !held.has(p.path)).map(p => ({ path: toPhysical(p.path), contentHash: p.wikiSHA256 })).sort((a,b)=>a.path.localeCompare(b.path)) } };
+    const fence: RetractionFence = {folderKey:"wiki-root",rootPath,pathPrefix:space.path_prefix??"",mode:"citation-holds",blocks,
+      registeredPaths:pins.entries.map(p=>toPhysical(p.path)).sort(),
+      ...(preservedPages.length?{preservedPages}:{}),
+      readable:pins.entries.filter(p=>!held.has(p.path)).map(p=>({path:toPhysical(p.path),contentHash:p.wikiSHA256})).sort((a,b)=>a.path.localeCompare(b.path))};
+    return {schema:"paperclip.wiki-retraction-request/v1",pluginId,
+      target:{...scope,path:targetPath,contentHash:targetPin.wikiSHA256},reason,
+      publicationRegistrySHA256:publicationHash(publicationCanonical(pins)),fence,
+      existingPages:inventoryRetractionPages(rows,fence),unindexedPathPolicy:"read_blocked"};
   }
   return {
     preview: (scope: RetractionScope, targetPath: string, reason: string, preservePaths: string[] = []) =>

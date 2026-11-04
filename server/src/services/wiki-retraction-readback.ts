@@ -96,3 +96,21 @@ export async function preserveExistingRetractionPages(
   }
   return preserved;
 }
+
+/** Full metadata census before classification. Legacy reference syntax is not
+ * used to infer independence. Unknown filesystem-only paths remain refused. */
+export function inventoryRetractionPages(
+  rows: Array<{path:string;source_refs:unknown;content_hash:string}>,
+  fence: RetractionFence,
+) {
+  publicationNeed(new Set(rows.map(r=>r.path)).size===rows.length,"retraction_inventory_duplicate");
+  return [...rows].sort((a,b)=>a.path.localeCompare(b.path)).map(row=>{
+    publicationNeed(Array.isArray(row.source_refs),"retraction_reference_shape");
+    const physicalPath=(fence.pathPrefix?fence.pathPrefix+"/":"")+row.path;
+    const block=fence.blocks.find(p=>p.path===physicalPath);
+    return {path:row.path,physicalPath,storedContentHash:row.content_hash,
+      sourceRefsSHA256:publicationHash(publicationCanonical(row.source_refs)),
+      referenceStatus:fence.registeredPaths?.includes(physicalPath)?"pinned_registry" as const:"unverified_legacy" as const,
+      readControl:block?.state??(fence.readable.some(p=>p.path===physicalPath)?"readable" as const:"blocked_unselected" as const)};
+  });
+}

@@ -229,6 +229,21 @@ describeDatabase("durable Wiki withdrawal SQL and file boundary", () => {
       const opaquePreview=await preview([preserved]);
       expect(opaquePreview.fence.readable.some(p=>p.path===preserved)).toBe(false);
       expect(opaquePreview.fence.preservedPages).toHaveLength(1);
+      // Unselected partial references are explicit impact rows, never silently
+      // classified unrelated; adding one also invalidates the saved proposal.
+      await db.$client.unsafe(`UPDATE ${ns}.wiki_pages SET source_refs=$2::jsonb WHERE company_id=$1 AND path=$3`,
+        [company,JSON.stringify([{kind:"historical_reference",note:"existing input"}]),preserved]);
+      const unselected="wiki/unselected-partial.md",partial=[{kind:"document",documentId:affectedDocument}];
+      await db.$client.unsafe(`INSERT INTO ${ns}.wiki_pages(id,company_id,wiki_id,space_id,path,page_type,source_refs,content_hash)
+        SELECT $1,$2,'default',id,$3,'source',$4::jsonb,$5 FROM ${ns}.wiki_spaces WHERE company_id=$2 AND wiki_id='default' AND slug='default'`,
+        [randomUUID(),company,unselected,JSON.stringify(partial),publicationHash("Synthetic unselected bytes")]);
+      const complete=await preview([preserved]);
+      expect(complete.existingPages?.find(p=>p.path===unselected)).toMatchObject({readControl:"blocked_unselected",referenceStatus:"unverified_legacy"});
+      const [{count:allRows}]=await db.$client.unsafe(`SELECT count(*)::integer AS count FROM ${ns}.wiki_pages WHERE company_id=$1`,[company]);
+      expect(complete.existingPages).toHaveLength(allRows);expect(complete.unindexedPathPolicy).toBe("read_blocked");
+      await expect(service.execute(input)).rejects.toThrow(/Withdrawal proposal changed/);
+      expect(await loadAllWikiRetractions(db,pluginId,company)).toHaveLength(0);
+      await db.$client.unsafe(`DELETE FROM ${ns}.wiki_pages WHERE company_id=$1 AND path=$2`,[company,unselected]);
       const changed=[{kind:"historical_reference",note:"different input"}];
       await db.$client.unsafe(`UPDATE ${ns}.wiki_pages SET source_refs=$2::jsonb WHERE company_id=$1 AND path=$3`,[company,JSON.stringify(changed),preserved]);
       await expect(service.execute(input)).rejects.toThrow(/Withdrawal proposal changed/);

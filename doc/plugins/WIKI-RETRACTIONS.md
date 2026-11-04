@@ -33,7 +33,12 @@ strict; never activate the policy by rewriting an event or configuration.
 An operator may supply `preservePaths` to keep existing unregistered pages
 viewable without pretending their arbitrary legacy source metadata is verified.
 Their physical paths, byte hashes and complete source-reference hashes are
-pinned in `fence.preservedPages`. Each page is also a `blocked_by_retraction`
+pinned in `fence.preservedPages`. The preview also enumerates every current
+metadata row in `existingPages` with a reference hash and its actual read
+control, including unselected legacy pages that will be refused. This full
+census is rebuilt at execution; partial or unfamiliar references cannot hide
+a known page from the impact proposal. Filesystem-only/unindexed paths remain
+explicitly refused by `unindexedPathPolicy`. Each selected page is also a `blocked_by_retraction`
 entry with the citation-holds policy; it is never put into `readable`.
 
 The structured reader retains the original body and an explicit unverified-source

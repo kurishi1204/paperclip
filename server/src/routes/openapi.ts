@@ -9001,7 +9001,7 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/wiki-retractions/preview",
   tags: ["plugins"],
   summary: "Preview a Wiki withdrawal proposal",
-  description: "Board sessions only. Returns the current publication and dependent-page snapshot. Optional preservePaths retain existing unregistered bytes for citation-aware inspection with unverified-source warnings; citation reuse stays held and no publication is registered. Does not withdraw content.",
+  description: "Board sessions only. Returns the current publication and dependent-page snapshot. Optional preservePaths retain existing unregistered bytes for citation-aware inspection with unverified-source warnings; citation reuse stays held and no publication is registered. Every current metadata row and its read control is included in existingPages; unindexed paths remain refused. Does not withdraw content.",
   request: {
     params: z.object({ pluginId: z.string() }),
     body: jsonBody(z.object({

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { describe,it,expect } from "vitest";
 import { executeRetraction,validateRetractionEvents,retractionEventHash,type RetractionEvent,type RetractionStore } from "../services/wiki-retraction-ledger.js";
 import { retractionFolderGate,readRetractionFolderText,readRetractionFolderTextWithStatus } from "../services/wiki-retraction-gate.js";
-import { preserveExistingRetractionPages } from "../services/wiki-retraction-readback.js";
+import { preserveExistingRetractionPages, inventoryRetractionPages } from "../services/wiki-retraction-readback.js";
 import { publicationCanonical,publicationHash,type PublicationRegistry } from "../services/wiki-publication-readback.js";
 
 const hash=publicationHash("synthetic");
@@ -93,6 +93,19 @@ describe("explicit existing-page preservation",()=>{
       const measured=await preserveExistingRetractionPages(pins,rows,held,[kept],async path=>({path,contents}),noPriorHold);
       expect(measured[0]!.contentHash).toBe(publicationHash(contents));
     }
+  });
+  it("enumerates every metadata row before classifying even partial unselected references",()=>{
+    const other="wiki/not-selected.md",partial=[{kind:"document",documentId:"doc-p7"}];
+    const fence={folderKey:"wiki-root" as const,rootPath:"/synthetic",pathPrefix:"scope",mode:"citation-holds" as const,
+      registeredPaths:["scope/wiki/p7.md"],readable:[],blocks:[{path:"scope/wiki/p7.md",contentHash:hash,state:"retracted" as const},
+        {path:"scope/"+kept,contentHash:row.content_hash,state:"blocked_by_retraction" as const}]};
+    const rows=[row,{path:other,content_hash:hash,source_refs:partial},{path:"wiki/p7.md",content_hash:hash,source_refs:[]}];
+    const inventory=inventoryRetractionPages(rows,fence);expect(inventory).toHaveLength(rows.length);
+    expect(new Set(inventory.map(p=>p.path))).toEqual(new Set(rows.map(p=>p.path)));
+    expect(inventory.find(p=>p.path===other)).toMatchObject({readControl:"blocked_unselected",referenceStatus:"unverified_legacy",sourceRefsSHA256:publicationHash(publicationCanonical(partial))});
+    expect(inventory.find(p=>p.path===kept)).toMatchObject({readControl:"blocked_by_retraction",referenceStatus:"unverified_legacy"});
+    expect(inventory.find(p=>p.path==="wiki/p7.md")).toMatchObject({readControl:"retracted",referenceStatus:"pinned_registry"});
+    expect(()=>inventoryRetractionPages([...rows,row],fence)).toThrow(/inventory_duplicate/);
   });
   it("pins reference changes and refuses a changed file or missing reference array",async()=>{
     await expect(preserveExistingRetractionPages(pins,[{...row,content_hash:hash}],held,[kept],read,noPriorHold)).rejects.toThrow(/preserve_content_changed/);
