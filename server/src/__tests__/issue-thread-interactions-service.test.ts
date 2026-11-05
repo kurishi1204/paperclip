@@ -37,6 +37,8 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { agentService } from "../services/agents.js";
+import { hasPendingNativeChildCompletion } from "../services/native-runtime/native-child-completion-delivery.js";
+import { findExistingIssueBlockersResolvedWakeForReadyState } from "../services/issue-dependency-wakeups.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -5017,7 +5019,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
           target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } } },
         { userId: "local-board" });
       await recordReviewTransition({ companyId, issueId: childId, interactionId: review.id });
-      return { companyId, parentId, childId, child, review };
+      return { companyId, parentId, childId, child, review, agentId };
     }
 
     it.each([false, true])("persists one parent handoff with final acceptance (explicit blocker: %s)", async explicitBlocker => {
@@ -5027,17 +5029,27 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
       expect(wakes).toHaveLength(1);
       expect(wakes[0]).toMatchObject({ requestedByActorType: "system", requestedByActorId: "native-status-committer",
-        reason: explicitBlocker ? "issue_blockers_resolved" : "issue_children_completed",
+        reason: "issue_children_completed",
         payload: expect.objectContaining({ issueId: f.parentId,
           _paperclipWakeContext: expect.objectContaining({ nativeCompletionReviewInteractionId: f.review.id,
             nativeChildCompletionDecisionId: (f.review.payload as { target: { revisionId: string } }).target.revisionId,
             statusDecisionSource: "native_status_decision" }) }) });
       expect((wakes[0].payload as any)._paperclipWakeContext).not.toHaveProperty("interactionId");
       expect(wakes[0].runId).toBeNull(); // intent, not a provider run
+      expect(await hasPendingNativeChildCompletion(db, { companyId: f.companyId, issueId: f.parentId,
+        agentId: f.agentId, runId: randomUUID(), sourceIntentId: null })).toBe(true);
+      if (explicitBlocker) {
+        const [ready] = await issuesSvc.listWakeableBlockedDependents(f.childId);
+        expect(ready?.id).toBe(f.parentId);
+        expect((await findExistingIssueBlockersResolvedWakeForReadyState(db, { companyId: f.companyId,
+          dependentIssueId: ready.id, blockerIssueIds: ready.blockerIssueIds,
+          blockedTransitionAt: ready.blockedTransitionAt }))?.id).toBe(wakes[0].id);
+      }
+
     });
 
-    it("hands off the saved source result rather than a later QA comment", async () => {
-      const f = await fixture(false, true);
+    it.each([false, true])("hands off the saved source result rather than a later QA comment (explicit blocker: %s)", async explicitBlocker => {
+      const f = await fixture(explicitBlocker, true);
       await issuesSvc.addComment(f.childId, "Later QA bookkeeping", { userId: "local-board" });
       await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
       const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));

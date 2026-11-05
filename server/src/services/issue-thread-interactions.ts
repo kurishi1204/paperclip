@@ -2369,14 +2369,22 @@ export function issueThreadInteractionService(
             const readyState = { companyId: issueContext.companyId, dependentIssueId: dependent.id,
               blockerIssueIds: dependent.blockerIssueIds, blockedTransitionAt: dependent.blockedTransitionAt };
             if (await findExistingIssueBlockersResolvedWakeForReadyState(tx as unknown as Db, readyState)) continue;
+            const isCompletedChildParent = parent?.id === dependent.id;
+            const context = { ...reviewContext, resolvedBlockerIssueId: completedIssue.id,
+              blockerIssueIds: dependent.blockerIssueIds,
+              ...(isCompletedChildParent && parent ? {
+                completedChildIssueId: completedIssue.id, childIssueIds: parent.childIssueIds,
+                childIssueSummaries: parent.childIssueSummaries, onboardingCompletion: parent.onboardingCompletion,
+                childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+              } : {}) };
             await enqueueNativeStatusWakeIntent({
               tx: tx as unknown as Db, companyId: issueContext.companyId,
               issueId: dependent.id, agentId: dependent.assigneeAgentId,
-              reason: "issue_blockers_resolved", idempotencyKey: buildIssueBlockersResolvedWakeStateKey(readyState),
-              payload: { resolvedBlockerIssueId: completedIssue.id, blockerIssueIds: dependent.blockerIssueIds,
-                ...reviewContext },
-              contextSnapshot: { ...reviewContext, resolvedBlockerIssueId: completedIssue.id,
-                blockerIssueIds: dependent.blockerIssueIds },
+              // Keep dependency readiness and its state key, but parent results
+              // must be visible to the finalizer's pending-child delivery guard.
+              reason: isCompletedChildParent ? "issue_children_completed" : "issue_blockers_resolved",
+              idempotencyKey: buildIssueBlockersResolvedWakeStateKey(readyState),
+              payload: context, contextSnapshot: context,
             });
           }
           // Explicit blockers use only their readiness/state-key path. A parent
