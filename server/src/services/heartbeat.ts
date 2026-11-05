@@ -30760,7 +30760,9 @@ export function heartbeatService(
         readNonEmptyString(wakeContext.issueId) ??
         null;
       const scopeKey = issueId
-        ? `${candidate.companyId}:${candidate.agentId}:${issueId}:${readNativeReviewAssignmentContext(wakeContext)?.nativeReviewInteractionId ?? ""}`
+        ? JSON.stringify([candidate.companyId, candidate.agentId, issueId,
+            readNativeReviewAssignmentContext(wakeContext)?.nativeReviewInteractionId ?? null,
+            readNonEmptyString(wakeContext.nativeChildCompletionDecisionId) ?? null])
         : null;
       const priorDelivery = scopeKey
         ? deliveredByIssueScope.get(scopeKey)

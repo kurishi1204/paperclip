@@ -226,8 +226,12 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
         eq(agentWakeupRequests.companyId, input.companyId),
         or(inArray(agentWakeupRequests.idempotencyKey, lookupKeys), and(
           eq(agentWakeupRequests.requestedByActorType, "system"),
-          eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
-          eq(agentWakeupRequests.reason, "issue_children_completed"),
+          or(eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+            sql`${agentWakeupRequests.requestedByActorId} like 'native-status-wake-dispatch:%'`),
+          or(eq(agentWakeupRequests.reason, "issue_children_completed"), and(
+            eq(agentWakeupRequests.reason, "issue_execution_deferred"),
+            sql`${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'wakeReason' = 'issue_children_completed'`,
+          )),
           sql`${agentWakeupRequests.payload}->>'nativeDependencyReadyStateKey' = ${cycleKey}`,
         )),
       ),
