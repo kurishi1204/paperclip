@@ -38,7 +38,7 @@ import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { agentService } from "../services/agents.js";
 import { hasPendingNativeChildCompletion } from "../services/native-runtime/native-child-completion-delivery.js";
-import { findExistingIssueBlockersResolvedWakeForReadyState } from "../services/issue-dependency-wakeups.js";
+import { buildIssueBlockersResolvedWakeIdempotencyKey, buildIssueBlockersResolvedWakeStateKey, findExistingIssueBlockersResolvedWakeForReadyState } from "../services/issue-dependency-wakeups.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -5046,6 +5046,18 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
           blockedTransitionAt: ready.blockedTransitionAt }))?.id).toBe(wakes[0].id);
       }
 
+    });
+
+    it("does not trust a native ready-state alias on an unrelated completed legacy wake", async () => {
+      const f = await fixture(true);
+      const ready = { companyId: f.companyId, dependentIssueId: f.parentId,
+        blockerIssueIds: [f.childId], blockedTransitionAt: (await issuesSvc.getById(f.parentId))!.blockedTransitionAt };
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+        source: "automation", triggerDetail: "system", status: "completed", reason: "issue_blockers_resolved",
+        requestedByActorType: "user", requestedByActorId: "local-board",
+        idempotencyKey: buildIssueBlockersResolvedWakeIdempotencyKey({ dependentIssueId: f.parentId, resolvedBlockerIssueId: f.childId }),
+        payload: { nativeDependencyReadyStateKey: buildIssueBlockersResolvedWakeStateKey(ready) } });
+      expect(await findExistingIssueBlockersResolvedWakeForReadyState(db, ready)).toBeNull();
     });
 
     it.each([false, true])("hands off the saved source result rather than a later QA comment (explicit blocker: %s)", async explicitBlocker => {

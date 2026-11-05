@@ -212,28 +212,30 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
   const lookupKeys = [...new Set([cycleKey, oldStateKey, ...legacyKeyList])];
   const blockedTransitionAt = parseWakeCycleDate(input.blockedTransitionAt);
 
+  const trustedNativeReadyStateAlias = and(
+    eq(agentWakeupRequests.requestedByActorType, "system"),
+    or(eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+      sql`${agentWakeupRequests.requestedByActorId} like 'native-status-wake-dispatch:%'`),
+    or(eq(agentWakeupRequests.reason, "issue_children_completed"), and(
+      eq(agentWakeupRequests.reason, "issue_execution_deferred"),
+      sql`${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'wakeReason' = 'issue_children_completed'`,
+    )),
+    sql`${agentWakeupRequests.payload}->>'nativeDependencyReadyStateKey' = ${cycleKey}`,
+  );
+
   const rows = await db
     .select({
       id: agentWakeupRequests.id,
       status: agentWakeupRequests.status,
       idempotencyKey: agentWakeupRequests.idempotencyKey,
-      readyStateAlias: sql<string | null>`${agentWakeupRequests.payload}->>'nativeDependencyReadyStateKey'`,
+      readyStateAlias: sql<string | null>`case when ${trustedNativeReadyStateAlias} then ${cycleKey} else null end`,
       requestedAt: agentWakeupRequests.requestedAt,
     })
     .from(agentWakeupRequests)
     .where(
       and(
         eq(agentWakeupRequests.companyId, input.companyId),
-        or(inArray(agentWakeupRequests.idempotencyKey, lookupKeys), and(
-          eq(agentWakeupRequests.requestedByActorType, "system"),
-          or(eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
-            sql`${agentWakeupRequests.requestedByActorId} like 'native-status-wake-dispatch:%'`),
-          or(eq(agentWakeupRequests.reason, "issue_children_completed"), and(
-            eq(agentWakeupRequests.reason, "issue_execution_deferred"),
-            sql`${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'wakeReason' = 'issue_children_completed'`,
-          )),
-          sql`${agentWakeupRequests.payload}->>'nativeDependencyReadyStateKey' = ${cycleKey}`,
-        )),
+        or(inArray(agentWakeupRequests.idempotencyKey, lookupKeys), trustedNativeReadyStateAlias),
       ),
     );
 
