@@ -10,7 +10,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   agents,
   agentWakeupRequests,
@@ -2373,6 +2373,50 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
       await reconcileNativeFinalizations(db, [seeded.runId]);
       expect((await issueService(db).getById(seeded.issueId))!.status).toBe("in_progress");
     } finally {
+      check.mockRestore();
+    }
+  }, 30_000);
+
+  it("serializes a Done claim against an uncommitted child result", async () => {
+    const seeded = await seedAutomaticReview();
+    let releaseWriter!: () => void;
+    let writerReady!: () => void;
+    const held = new Promise<void>(resolve => { releaseWriter = resolve; });
+    const ready = new Promise<void>(resolve => { writerReady = resolve; });
+    const writer = db.transaction(async tx => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`native-completion-parent:${companyId}:${seeded.issueId}`}, 0))`);
+      await tx.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", triggerDetail: "system",
+        reason: "issue_children_completed", requestedByActorType: "system", requestedByActorId: "native-status-committer",
+        status: "queued", payload: { issueId: seeded.issueId, _paperclipWakeContext: { nativeChildCompletionDecisionId: randomUUID() } } });
+      writerReady();
+      await held;
+    });
+    await ready;
+    let initialRead!: () => void;
+    const read = new Promise<void>(resolve => { initialRead = resolve; });
+    const original = childCompletionDelivery.hasPendingNativeChildCompletion;
+    const check = vi.spyOn(childCompletionDelivery, "hasPendingNativeChildCompletion").mockImplementation(async (...args) => {
+      const pending = await original(...args);
+      initialRead();
+      return pending;
+    });
+    let completed = false;
+    const reconcile = reconcileNativeFinalizations(db, [seeded.runId]).then(value => { completed = true; return value; });
+    try {
+      await read;
+      await new Promise(resolve => setTimeout(resolve, 200));
+      expect(completed).toBe(false);
+      releaseWriter();
+      await writer;
+      await reconcile;
+      expect((await issueService(db).getById(seeded.issueId))!.status).toBe("in_review");
+      expect(await db.select().from(statusDecisions).where(eq(statusDecisions.issueId, seeded.issueId))).toHaveLength(1);
+      await reconcileNativeFinalizations(db, [seeded.runId]);
+      expect((await issueService(db).getById(seeded.issueId))!.status).toBe("in_progress");
+    } finally {
+      releaseWriter();
+      await writer;
+      await reconcile;
       check.mockRestore();
     }
   }, 30_000);

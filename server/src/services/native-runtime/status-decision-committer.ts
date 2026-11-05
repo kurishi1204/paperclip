@@ -1,4 +1,4 @@
-import { enqueueNativeStatusWakeIntent as enqueueWake, lockNativeCompletionParent } from "./status-wake-intent.js";
+import { enqueueNativeStatusWakeIntent as enqueueWake, lockNativeCompletionParent, lockNativeCompletionRecipient } from "./status-wake-intent.js";
 import { getNativeDocumentReviewAssignment } from "./native-document-review-participant.js";
 import type { PendingDocumentReviewBinding } from "../../modules/run-dispatch/index.js";
 import { releaseNativeRunCheckout } from "./native-run-checkout.js";
@@ -1546,6 +1546,11 @@ export async function commitNativeStatusDecision(input: {
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (!issue) throw new NativeStatusRaceError();
+    // A child may have an uncommitted result after the finalizer's first read.
+    // Serialize the final Done check with that child's handoff transaction.
+    if (input.requireNoPendingChildCompletion) {
+      await lockNativeCompletionRecipient(tx as unknown as Db, input.companyId, input.issueId);
+    }
     if (input.decision.statusAction === "done" && issue.status !== "done") {
       await lockNativeCompletionParent(tx as unknown as Db, input.companyId, input.issueId);
     }

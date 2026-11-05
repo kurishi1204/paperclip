@@ -65,11 +65,15 @@ export async function enqueueNativeStatusWakeIntent(input: {
   return inserted.id;
 }
 
-// Call with the source issue row already locked. All native completion producers
-// share this short parent group lock, so the last concurrent sibling observes
-// committed earlier completions before it decides whether the parent is ready.
+// Completion writers and the recipient's Done commit use the same group lock.
+// The caller already holds its own issue row. Parent readiness reads do not
+// acquire another issue row, so they cannot invert the issue/group lock order.
+export async function lockNativeCompletionRecipient(tx: Db, companyId: string, recipientIssueId: string) {
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`native-completion-parent:${companyId}:${recipientIssueId}`}, 0))`);
+}
+
 export async function lockNativeCompletionParent(tx: Db, companyId: string, issueId: string) {
   const [source] = await tx.select({ parentId: issues.parentId }).from(issues)
     .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId))).limit(1);
-  if (source?.parentId) await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`native-completion-parent:${companyId}:${source.parentId}`}, 0))`);
+  if (source?.parentId) await lockNativeCompletionRecipient(tx, companyId, source.parentId);
 }
