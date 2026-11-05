@@ -5059,6 +5059,57 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       ]));
     });
 
+    it("delivers a new reviewed result within the same parent blocked cycle", async () => {
+      const f = await fixture(true);
+      const before = (await issuesSvc.getById(f.parentId))!.blockedTransitionAt;
+      await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
+      const [first] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, first.id));
+      await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, f.childId));
+      const revision = randomUUID();
+      const next = await interactionsSvc.create(f.child, { kind: "request_confirmation", resolverPolicy: "anyone",
+        continuationPolicy: "none", payload: { version: 1, prompt: "Review revised work",
+          target: { type: "custom", key: "native_completion_review", revisionId: revision } } }, { userId: "local-board" });
+      await recordReviewTransition({ companyId: f.companyId, issueId: f.childId, interactionId: next.id });
+      await interactionsSvc.acceptInteraction(f.child, next.id, {}, { userId: "local-board" });
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(wakes).toHaveLength(2);
+      expect(new Set(wakes.map(wake => wake.idempotencyKey)).size).toBe(2);
+      expect(wakes.find(wake => wake.id !== first.id)?.payload).toMatchObject({
+        _paperclipWakeContext: { nativeChildCompletionDecisionId: revision } });
+      expect((await issuesSvc.getById(f.parentId))!.blockedTransitionAt).toEqual(before);
+    });
+
+    it.each([0, 1, 2])("does not lose the last concurrent sibling acceptance (%s)", async () => {
+      const f = await fixture(false); const siblingId = randomUUID();
+      await db.insert(issues).values({ id: siblingId, companyId: f.companyId, goalId: f.child.goalId,
+        parentId: f.parentId, title: "Other saved work", status: "in_review", priority: "medium" });
+      const sibling = (await issuesSvc.getById(siblingId))!;
+      const review = await interactionsSvc.create(sibling, { kind: "request_confirmation", resolverPolicy: "anyone",
+        continuationPolicy: "none", payload: { version: 1, prompt: "Review other work",
+          target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } } }, { userId: "local-board" });
+      await recordReviewTransition({ companyId: f.companyId, issueId: siblingId, interactionId: review.id });
+      let arrivals = 0; let release!: () => void;
+      const barrier = new Promise<void>(resolve => { release = resolve; });
+      const simultaneous = { afterResolveInTransaction: async () => { if (++arrivals === 2) release(); await barrier; } };
+      await db.execute(sql.raw(`CREATE FUNCTION test_m7_overlap() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.parent_id='${f.parentId}' AND NEW.status='done' THEN PERFORM pg_sleep(0.25); END IF; RETURN NEW; END $$`));
+      await db.execute(sql.raw(`CREATE TRIGGER test_m7_overlap AFTER UPDATE ON issues FOR EACH ROW EXECUTE FUNCTION test_m7_overlap()`));
+      try {
+        await Promise.all([
+          interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" }, simultaneous),
+          interactionsSvc.acceptInteraction(sibling, review.id, {}, { userId: "local-board" }, simultaneous),
+        ]);
+      } finally {
+        await db.execute(sql.raw(`DROP TRIGGER test_m7_overlap ON issues`));
+        await db.execute(sql.raw(`DROP FUNCTION test_m7_overlap()`));
+      }
+      expect((await issuesSvc.getById(f.childId))!.status).toBe("done");
+      expect((await issuesSvc.getById(siblingId))!.status).toBe("done");
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(wakes).toHaveLength(1);
+      expect((wakes[0].payload as any)._paperclipWakeContext.childIssueIds.sort()).toEqual([f.childId, siblingId].sort());
+    });
+
     it("does not bypass another unfinished explicit blocker with a parent wake", async () => {
       const f = await fixture(true);
       const blockerId = randomUUID();

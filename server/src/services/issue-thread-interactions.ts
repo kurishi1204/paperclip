@@ -1,4 +1,4 @@
-import { enqueueNativeStatusWakeIntent } from "./native-runtime/status-wake-intent.js";
+import { enqueueNativeStatusWakeIntent, lockNativeCompletionParent } from "./native-runtime/status-wake-intent.js";
 import { buildIssueBlockersResolvedWakeStateKey, findExistingIssueBlockersResolvedWakeForReadyState } from "./issue-dependency-wakeups.js";
 import { getNativeDocumentReviewAssignment, isNativeDocumentReviewRun } from "./native-runtime/native-document-review-participant.js";
 import { activeIssueInteractionCondition, historicalQuestionCondition } from "./issue-question-context.js";
@@ -2313,6 +2313,7 @@ export function issueThreadInteractionService(
         acceptedPlanTarget.key === "plan" &&
         issueContext.workMode === "planning";
       if (isNativeCompletionReview(lockedCurrent)) {
+        await lockNativeCompletionParent(tx as unknown as Db, issueContext.companyId, issueContext.id);
         const otherPending = await tx.select({ id: issueThreadInteractions.id })
           .from(issueThreadInteractions).where(and(
             eq(issueThreadInteractions.companyId, issueContext.companyId),
@@ -2368,10 +2369,12 @@ export function issueThreadInteractionService(
           for (const dependent of dependents) {
             const readyState = { companyId: issueContext.companyId, dependentIssueId: dependent.id,
               blockerIssueIds: dependent.blockerIssueIds, blockedTransitionAt: dependent.blockedTransitionAt };
-            if (await findExistingIssueBlockersResolvedWakeForReadyState(tx as unknown as Db, readyState)) continue;
             const isCompletedChildParent = parent?.id === dependent.id;
+            if (!isCompletedChildParent && await findExistingIssueBlockersResolvedWakeForReadyState(tx as unknown as Db, readyState)) continue;
+            const stateKey = buildIssueBlockersResolvedWakeStateKey(readyState);
             const context = { ...reviewContext, resolvedBlockerIssueId: completedIssue.id,
               blockerIssueIds: dependent.blockerIssueIds,
+              ...(isCompletedChildParent ? { nativeDependencyReadyStateKey: stateKey } : {}),
               ...(isCompletedChildParent && parent ? {
                 completedChildIssueId: completedIssue.id, childIssueIds: parent.childIssueIds,
                 childIssueSummaries: parent.childIssueSummaries, onboardingCompletion: parent.onboardingCompletion,
@@ -2383,7 +2386,9 @@ export function issueThreadInteractionService(
               // Keep dependency readiness and its state key, but parent results
               // must be visible to the finalizer's pending-child delivery guard.
               reason: isCompletedChildParent ? "issue_children_completed" : "issue_blockers_resolved",
-              idempotencyKey: buildIssueBlockersResolvedWakeStateKey(readyState),
+              idempotencyKey: isCompletedChildParent
+                ? `issue_children_completed:${dependent.id}:${completedIssue.id}:review:${lockedCurrent.id}`
+                : stateKey,
               payload: context, contextSnapshot: context,
             });
           }

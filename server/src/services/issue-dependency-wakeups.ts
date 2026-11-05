@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests } from "@paperclipai/db";
@@ -217,18 +217,26 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
       id: agentWakeupRequests.id,
       status: agentWakeupRequests.status,
       idempotencyKey: agentWakeupRequests.idempotencyKey,
+      readyStateAlias: sql<string | null>`${agentWakeupRequests.payload}->>'nativeDependencyReadyStateKey'`,
       requestedAt: agentWakeupRequests.requestedAt,
     })
     .from(agentWakeupRequests)
     .where(
       and(
         eq(agentWakeupRequests.companyId, input.companyId),
-        inArray(agentWakeupRequests.idempotencyKey, lookupKeys),
+        or(inArray(agentWakeupRequests.idempotencyKey, lookupKeys), and(
+          eq(agentWakeupRequests.requestedByActorType, "system"),
+          eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+          eq(agentWakeupRequests.reason, "issue_children_completed"),
+          sql`${agentWakeupRequests.payload}->>'nativeDependencyReadyStateKey' = ${cycleKey}`,
+        )),
       ),
     );
 
   const covering = rows.find((row) =>
-    wakeCoversIssueBlockersResolvedReadyState(row, {
+    wakeCoversIssueBlockersResolvedReadyState({ ...row,
+      idempotencyKey: row.readyStateAlias === cycleKey ? cycleKey : row.idempotencyKey,
+    }, {
       cycleKey,
       oldStateKey,
       legacyKeys: new Set(legacyKeyList),

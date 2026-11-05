@@ -1,4 +1,4 @@
-import { enqueueNativeStatusWakeIntent as enqueueWake } from "./status-wake-intent.js";
+import { enqueueNativeStatusWakeIntent as enqueueWake, lockNativeCompletionParent } from "./status-wake-intent.js";
 import { getNativeDocumentReviewAssignment } from "./native-document-review-participant.js";
 import type { PendingDocumentReviewBinding } from "../../modules/run-dispatch/index.js";
 import { releaseNativeRunCheckout } from "./native-run-checkout.js";
@@ -51,7 +51,7 @@ import {
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
-import { buildIssueBlockersResolvedWakeIdempotencyKey } from "../issue-dependency-wakeups.js";
+import { buildIssueBlockersResolvedWakeIdempotencyKey, buildIssueBlockersResolvedWakeStateKey } from "../issue-dependency-wakeups.js";
 import {
   persistActivity,
   publishActivity,
@@ -1546,6 +1546,9 @@ export async function commitNativeStatusDecision(input: {
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (!issue) throw new NativeStatusRaceError();
+    if (input.decision.statusAction === "done" && issue.status !== "done") {
+      await lockNativeCompletionParent(tx as unknown as Db, input.companyId, input.issueId);
+    }
     if (input.requireFormalApprovalDecision) {
       const original = await readFormalIssueApprovalDecision({ db: tx as unknown as Db,
         issue, runId: input.runId, agentId: input.requireFormalApprovalDecision.agentId });
@@ -2058,6 +2061,10 @@ export async function commitNativeStatusDecision(input: {
             resolvedBlockerIssueId: input.issueId,
             blockerIssueIds: dependent.blockerIssueIds,
             ...(childCompletionContext ?? {}),
+            ...(isCompletedChildParent ? { nativeDependencyReadyStateKey: buildIssueBlockersResolvedWakeStateKey({
+              dependentIssueId: dependent.id, blockerIssueIds: dependent.blockerIssueIds,
+              blockedTransitionAt: dependent.blockedTransitionAt,
+            }) } : {}),
           },
           contextSnapshot: childCompletionContext ?? undefined,
         });
