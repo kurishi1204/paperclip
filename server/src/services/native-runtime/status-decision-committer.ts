@@ -1,3 +1,4 @@
+import { enqueueNativeStatusWakeIntent as enqueueWake } from "./status-wake-intent.js";
 import { getNativeDocumentReviewAssignment } from "./native-document-review-participant.js";
 import type { PendingDocumentReviewBinding } from "../../modules/run-dispatch/index.js";
 import { releaseNativeRunCheckout } from "./native-run-checkout.js";
@@ -408,64 +409,6 @@ function failAt(
     throw new Error(`native_status_failpoint:${actual}`);
 }
 
-async function enqueueWake(input: {
-  tx: Db;
-  companyId: string;
-  issueId: string;
-  agentId: string;
-  reason: string;
-  idempotencyKey: string;
-  payload: Record<string, unknown>;
-  contextSnapshot?: Record<string, unknown>;
-}) {
-  const existing = await input.tx
-    .select({ id: agentWakeupRequests.id })
-    .from(agentWakeupRequests)
-    .where(
-      and(
-        eq(agentWakeupRequests.companyId, input.companyId),
-        eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
-        inArray(agentWakeupRequests.status, [
-          "queued",
-          "deferred_issue_execution",
-          "claimed",
-          "completed",
-        ]),
-      ),
-    )
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  if (existing) return existing.id;
-  const inserted = await input.tx
-    .insert(agentWakeupRequests)
-    .values({
-      companyId: input.companyId,
-      agentId: input.agentId,
-      source: "automation",
-      triggerDetail: "system",
-      reason: input.reason,
-      payload: {
-        issueId: input.issueId,
-        taskId: input.issueId,
-        ...input.payload,
-        _paperclipWakeContext: {
-          issueId: input.issueId,
-          taskId: input.issueId,
-          ...(input.contextSnapshot ?? {}),
-          wakeReason: input.reason,
-          source: "native_status_decision",
-          statusDecisionSource: "native_status_decision",
-        },
-      },
-      requestedByActorType: "system",
-      requestedByActorId: "native-status-committer",
-      idempotencyKey: input.idempotencyKey,
-    })
-    .returning({ id: agentWakeupRequests.id })
-    .then((rows) => rows[0] ?? null);
-  if (!inserted) throw new Error("native_status_wake_not_persisted");
-  return inserted.id;
-}
 
 async function validateGovernanceGate(
   tx: Db,

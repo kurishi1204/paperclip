@@ -3,12 +3,15 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   authUsers,
   companyMemberships,
   instanceUserRoles,
   issueQuestionResponseDeliveries,
   companies,
+  completionContracts,
+  nativeRunResults,
   createDb,
   documentRevisions,
   documents,
@@ -60,7 +63,10 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     await db.delete(documentRevisions);
     await db.delete(documents);
     await db.delete(issueRelations);
+    await db.delete(agentWakeupRequests);
+    await db.delete(nativeRunResults);
     await db.delete(heartbeatRuns);
+    await db.delete(completionContracts);
     await db.delete(workspaceOperations);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
@@ -4979,4 +4985,108 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       });
     });
   });
+  describe("native completion review handoff", () => {
+    async function fixture(explicitBlocker: boolean, withSourceResult = false) {
+      const { companyId, goalId, issueId: parentId } = await seedConfirmationIssue("Return reviewed work");
+      const agentId = randomUUID();
+      await db.insert(agents).values({ id: agentId, companyId, name: "Coordinator", role: "ceo",
+        status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+      await db.update(issues).set({ status: "blocked", assigneeAgentId: agentId }).where(eq(issues.id, parentId));
+      const childId = randomUUID();
+      await db.insert(issues).values({ id: childId, companyId, goalId, parentId, title: "Saved work",
+        status: "in_review", priority: "medium" });
+      if (explicitBlocker) await db.insert(issueRelations).values({ companyId, issueId: childId,
+        relatedIssueId: parentId, type: "blocks" });
+      const child = (await issuesSvc.getById(childId))!;
+      let sourceRunId: string | undefined;
+      if (withSourceResult) {
+        const contractId = randomUUID(); sourceRunId = randomUUID();
+        await db.insert(completionContracts).values({ id: contractId, companyId, issueId: childId,
+          revision: 1, schemaVersion: "v1", policyVersion: "v1", risk: "low", completionAuthority: "review",
+          incompleteCriteriaPolicy: "block", contractJson: {}, canonicalSha256: "a".repeat(64),
+          createdByActorType: "user", createdByActorId: "local-board" });
+        await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId, invocationSource: "assignment",
+          status: "succeeded", nativeIssueId: childId, completionContractId: contractId });
+        await db.insert(nativeRunResults).values({ companyId, issueId: childId, runId: sourceRunId,
+          completionContractId: contractId, serverFingerprint: "source-result", schemaStatus: "accepted",
+          resultJson: { result: { summary: "Saved source-run result" } }, canonicalSha256: "b".repeat(64) });
+      }
+      const review = await interactionsSvc.create(child, { kind: "request_confirmation", resolverPolicy: "anyone",
+        ...(sourceRunId ? { sourceRunId } : {}),
+        continuationPolicy: "none", payload: { version: 1, prompt: "Review saved work",
+          target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } } },
+        { userId: "local-board" });
+      await recordReviewTransition({ companyId, issueId: childId, interactionId: review.id });
+      return { companyId, parentId, childId, child, review };
+    }
+
+    it.each([false, true])("persists one parent handoff with final acceptance (explicit blocker: %s)", async explicitBlocker => {
+      const f = await fixture(explicitBlocker);
+      await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
+      expect((await issuesSvc.getById(f.childId))?.status).toBe("done");
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]).toMatchObject({ requestedByActorType: "system", requestedByActorId: "native-status-committer",
+        reason: explicitBlocker ? "issue_blockers_resolved" : "issue_children_completed",
+        payload: expect.objectContaining({ issueId: f.parentId,
+          _paperclipWakeContext: expect.objectContaining({ nativeCompletionReviewInteractionId: f.review.id,
+            nativeChildCompletionDecisionId: (f.review.payload as { target: { revisionId: string } }).target.revisionId,
+            statusDecisionSource: "native_status_decision" }) }) });
+      expect((wakes[0].payload as any)._paperclipWakeContext).not.toHaveProperty("interactionId");
+      expect(wakes[0].runId).toBeNull(); // intent, not a provider run
+    });
+
+    it("hands off the saved source result rather than a later QA comment", async () => {
+      const f = await fixture(false, true);
+      await issuesSvc.addComment(f.childId, "Later QA bookkeeping", { userId: "local-board" });
+      await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      const context = (wake.payload as any)._paperclipWakeContext;
+      expect(context.childIssueSummaries).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: f.childId, summary: "Saved source-run result" }),
+      ]));
+    });
+
+    it("does not bypass another unfinished explicit blocker with a parent wake", async () => {
+      const f = await fixture(true);
+      const blockerId = randomUUID();
+      await db.insert(issues).values({ id: blockerId, companyId: f.companyId, title: "Other dependency",
+        status: "in_progress", priority: "medium" });
+      await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blockerId,
+        relatedIssueId: f.parentId, type: "blocks" });
+      await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
+      expect((await issuesSvc.getById(f.childId))?.status).toBe("done");
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerId));
+      expect((await issuesSvc.listWakeableBlockedDependents(blockerId)).map(v => v.id)).toContain(f.parentId);
+    });
+
+    it("does not complete or hand off while another review remains pending", async () => {
+      const f = await fixture(false);
+      await interactionsSvc.create(f.child, { kind: "request_confirmation", resolverPolicy: "anyone",
+        continuationPolicy: "none", payload: { version: 1, prompt: "Second independent reviewer",
+          target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } } },
+        { userId: "local-board" });
+      await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
+      expect((await issuesSvc.getById(f.childId))?.status).toBe("in_review");
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+    });
+
+    it("rolls acceptance and completion back when the handoff cannot be saved", async () => {
+      const f = await fixture(false);
+      await db.execute(sql.raw(`CREATE FUNCTION test_m7_reject_wake() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'm7 wake persistence failure'; END $$`));
+      await db.execute(sql.raw(`CREATE TRIGGER test_m7_reject_wake BEFORE INSERT ON agent_wakeup_requests FOR EACH ROW EXECUTE FUNCTION test_m7_reject_wake()`));
+      try {
+        await expect(interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" }))
+          .rejects.toThrow();
+      } finally {
+        await db.execute(sql.raw(`DROP TRIGGER test_m7_reject_wake ON agent_wakeup_requests`));
+        await db.execute(sql.raw(`DROP FUNCTION test_m7_reject_wake()`));
+      }
+      expect((await issuesSvc.getById(f.childId))?.status).toBe("in_review");
+      expect((await interactionsSvc.getById(f.review.id))?.status).toBe("pending");
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+    });
+  });
+
 });
