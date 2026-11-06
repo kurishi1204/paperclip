@@ -30737,30 +30737,27 @@ export function heartbeatService(
         }
       }
       if (existingDispatch && !isNativeDailyCapRefusal(existingDispatch)) {
-        const recoveredStatus = existingDispatch.runId
-          ? "coalesced"
-          : existingDispatch.status === "deferred_issue_execution"
-            ? "coalesced"
-            : existingDispatch.status;
-        await db
-          .update(agentWakeupRequests)
-          .set({
-            status: recoveredStatus,
-            runId: existingDispatch.runId,
-            finishedAt:
-              (existingDispatch.runId ?? existingDispatch.finishedAt)
-                ? (existingDispatch.finishedAt ?? now)
-                : null,
-            error: existingDispatch.error,
-            updatedAt: now,
-          })
-          .where(
-            and(
-              eq(agentWakeupRequests.id, candidate.id),
-              isNull(agentWakeupRequests.runId),
-            ),
-          );
-        recovered += 1;
+        // Share receipt -> source ordering with pre-provider cancellation. A
+        // stale recovery observation cannot overwrite a newly committed hold.
+        const linked = await db.transaction(async tx => {
+          const [current] = await tx.select().from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.id, existingDispatch.id),
+            eq(agentWakeupRequests.companyId, candidate.companyId),
+          )).for("update").limit(1);
+          if (!current || isNativeDailyCapRefusal(current)) return false;
+          const recoveredStatus = current.runId || current.status === "deferred_issue_execution"
+            ? "coalesced" : current.status;
+          const rows = await tx.update(agentWakeupRequests).set({
+            status: recoveredStatus, runId: current.runId,
+            finishedAt: (current.runId ?? current.finishedAt) ? (current.finishedAt ?? now) : null,
+            error: current.error, updatedAt: now,
+          }).where(and(eq(agentWakeupRequests.id, candidate.id), isNull(agentWakeupRequests.runId),
+            inArray(agentWakeupRequests.status, ["queued", "claimed"]),
+          )).returning({ id: agentWakeupRequests.id });
+          return rows.length > 0;
+        });
+        if (linked) recovered += 1;
+        else deferred += 1;
         continue;
       }
 
