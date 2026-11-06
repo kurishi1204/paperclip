@@ -1,5 +1,11 @@
 # Cloud build readiness
 
+> Fork scope: the release, Docker, lockfile-refresh, and cloud-migrator workflow
+> definitions described here are retained as upstream reference files in
+> [upstream-workflows](upstream-workflows/README.md). They are not registered
+> Actions workflows in the COLO fork. COLO uses `colo-source-artifact.yml`.
+
+
 The `Cloud readiness` workflow starts for every master push and retains the
 versioned `Cloud source verified v1` job. It calls the full `Release Verify`
 workflow for that exact commit, including typecheck, builds, general and

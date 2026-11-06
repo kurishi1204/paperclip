@@ -1,5 +1,11 @@
 # Preview deployment artifacts
 
+> Fork scope: the release, Docker, lockfile-refresh, and cloud-migrator workflow
+> definitions described here are retained as upstream reference files in
+> [upstream-workflows](upstream-workflows/README.md). They are not registered
+> Actions workflows in the COLO fork. COLO uses `colo-source-artifact.yml`.
+
+
 The `preview` channel in `.github/workflows/release.yml` builds deployment
 artifacts for one immutable source commit. It does not create a GitHub release,
 move a source branch, or advance any stable, beta, nightly, or canary alias.

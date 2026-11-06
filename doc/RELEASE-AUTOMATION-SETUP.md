@@ -1,5 +1,11 @@
 # Release Automation Setup
 
+> Fork scope: the release, Docker, lockfile-refresh, and cloud-migrator workflow
+> definitions described here are retained as upstream reference files in
+> [upstream-workflows](upstream-workflows/README.md). They are not registered
+> Actions workflows in the COLO fork. COLO uses `colo-source-artifact.yml`.
+
+
 This document covers the GitHub and npm setup required for the current Paperclip release model:
 
 - automatic canaries from `master`

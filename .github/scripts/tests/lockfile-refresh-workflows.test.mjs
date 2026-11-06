@@ -3,9 +3,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const workflows = [
-  '.github/workflows/refresh-lockfile.yml',
+  'doc/upstream-workflows/refresh-lockfile.yml',
   '.github/workflows/pr-trusted.yml',
-  '.github/workflows/docker.yml',
+  'doc/upstream-workflows/docker.yml',
 ];
 
 test('lockfile repair workflows resolve dependencies instead of updating metadata only', async () => {

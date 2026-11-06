@@ -19,12 +19,12 @@ test("retirement preserves exact-source verification without issuing legacy depl
 });
 
 test("standard image provenance and independent exact-source migrators remain available", () => {
-  const docker = readFileSync(new URL("../../workflows/docker.yml", import.meta.url), "utf8");
+  const docker = readFileSync(new URL("../../../doc/upstream-workflows/docker.yml", import.meta.url), "utf8");
   assert.match(docker, /target: production/);
   assert.match(docker, /type=raw,value=sha-\$\{\{ github.sha \}\}/);
   assert.match(docker, /run: node scripts\/standard-image-contract.mjs --resolve "\$GITHUB_SHA"/);
   assert.match(docker, /subject-digest: \$\{\{ steps.standard.outputs.digest \}\}/);
-  const migrator = readFileSync(new URL("../../workflows/cloud-migrator-artifacts.yml", import.meta.url), "utf8");
+  const migrator = readFileSync(new URL("../../../doc/upstream-workflows/cloud-migrator-artifacts.yml", import.meta.url), "utf8");
   assert.match(migrator, /push:\s*\n\s*branches: \[master\]/);
   assert.match(migrator, /uses: actions\/attest@/);
   assert.doesNotMatch(docker, /build-and-push-cloud|docker-cloud.yml|canary-cloud/);

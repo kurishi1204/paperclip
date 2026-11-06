@@ -36,7 +36,7 @@ const ecsTaskDefinition = JSON.parse(read("docker", "ecs-task-definition.json"))
 };
 const reapingProbe = read("scripts", "assert-orphan-reaping.sh");
 const buildTest = read("scripts", "docker-build-test.sh");
-const dockerWorkflow = read(".github", "workflows", "docker.yml");
+const dockerWorkflow = read("doc", "upstream-workflows", "docker.yml");
 
 /** Every `ENTRYPOINT [...]` line in a Dockerfile, in order. */
 function entrypoints(source: string): string[] {

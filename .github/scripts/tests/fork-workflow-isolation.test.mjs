@@ -7,6 +7,10 @@ import { test } from 'node:test';
 // complete workflow, so a new job or a changed dependency cannot bypass the
 // reviewed entry-job inventory by using a different YAML spelling.
 const workflowDir = new URL('../../workflows/', import.meta.url);
+const archivedWorkflowDir = new URL('../../../doc/upstream-workflows/', import.meta.url);
+const archivedFiles = [
+  'cloud-migrator-artifacts.yml', 'docker.yml', 'refresh-lockfile.yml', 'release.yml',
+];
 const sourcePins = {
   'agent-runtime-images.yml': 'f5545e5026b260939a60d84a7362487123bd5196aecd09edbba8aed7c91614e8',
   'cloud-migrator-artifacts.yml': 'e3f8b842e6bccc9e037417d1c1028161aa6974cfa1994bd041e07bfe98d8e672',
@@ -64,7 +68,7 @@ const reviewedFiles = [
 ];
 
 function source(file) {
-  return readFileSync(new URL(file, workflowDir));
+  return readFileSync(new URL(file, archivedFiles.includes(file) ? archivedWorkflowDir : workflowDir));
 }
 
 function jobBody(file, name) {
@@ -81,7 +85,10 @@ function jobBody(file, name) {
 
 test('the complete pinned workflow inventory has no undeclared workflow', () => {
   const actual = readdirSync(workflowDir).filter((name) => /\.ya?ml$/.test(name)).sort();
-  assert.deepEqual(actual, reviewedFiles.toSorted());
+  const archived = readdirSync(archivedWorkflowDir).filter((name) => /\.ya?ml$/.test(name)).sort();
+  assert.deepEqual(actual, reviewedFiles.filter((name) => !archivedFiles.includes(name)).toSorted());
+  assert.deepEqual(archived, archivedFiles.toSorted());
+  assert.deepEqual([...actual, ...archived].sort(), reviewedFiles.toSorted());
 });
 
 test('the pinned reusable PR workflow is the adopted 489b blob', () => {

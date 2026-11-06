@@ -12,7 +12,7 @@ const repoRoot = path.resolve(
 );
 
 function readWorkflow(name) {
-  return readFileSync(path.join(repoRoot, ".github/workflows", name), "utf8");
+  return readFileSync(path.join(repoRoot, name === "release.yml" ? "doc/upstream-workflows" : ".github/workflows", name), "utf8");
 }
 
 test("chaos verification isolates callers that verify the same source commit", () => {

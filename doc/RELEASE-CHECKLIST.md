@@ -1,5 +1,11 @@
 # Release Checklist
 
+> Fork scope: the release, Docker, lockfile-refresh, and cloud-migrator workflow
+> definitions described here are retained as upstream reference files in
+> [upstream-workflows](upstream-workflows/README.md). They are not registered
+> Actions workflows in the COLO fork. COLO uses `colo-source-artifact.yml`.
+
+
 The release captain's checklist for every lane. The mechanics live in
 [`RELEASING.md`](RELEASING.md); the user-facing channel guide is
 [`CHANNELS.md`](CHANNELS.md).
