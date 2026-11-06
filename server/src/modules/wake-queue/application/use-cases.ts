@@ -819,6 +819,14 @@ function isApprovalReturnReceipt(context: Record<string, unknown>): boolean {
     stage.stageType === "approval" && stage.wakeRole === "executor";
 }
 
+// Native child results carry a distinct completion identity. They are dedicated
+// continuations: neither a later result nor an unrelated wake may absorb them.
+function isNativeChildCompletionContext(context: Record<string, unknown>) {
+  return context.statusDecisionSource === "native_status_decision" &&
+    context.wakeReason === "issue_children_completed" &&
+    readNonEmptyString(context.nativeChildCompletionDecisionId) !== null;
+}
+
 export function createAdmitWakeBehindIssueExecution(deps: {
   reader: WakeAdmissionReader;
   writer: WakeAdmissionWriter;
@@ -881,9 +889,11 @@ export function createAdmitWakeBehindIssueExecution(deps: {
       input.idempotencyKey?.startsWith("qa-decision:"),
     );
     const approvalReturnReceipt = isApprovalReturnReceipt(input.contextSnapshot);
+    const childCompletionReceipt = isNativeChildCompletionContext(input.contextSnapshot);
     const activeContext = parseObject(input.activeExecutionRun.contextSnapshot);
     const decision = decideWakeAdmission({
-      allowRunCoalescing: interactionReceipt || qaReceipt || approvalReturnReceipt ||
+      allowRunCoalescing: interactionReceipt || qaReceipt || approvalReturnReceipt || childCompletionReceipt ||
+        isNativeChildCompletionContext(activeContext) ||
         isApprovalReturnReceipt(activeContext) || activeContext.interactionId ||
         readNonEmptyString(activeContext.qaDecisionId)
         ? false : input.allowRunCoalescing,
@@ -928,7 +938,7 @@ export function createAdmitWakeBehindIssueExecution(deps: {
     // existing deferred wake, so the coalesce path (the common path) never
     // pays for this query.
     const existingDeferred =
-      (interactionReceipt || qaReceipt || approvalReturnReceipt || input.allowRunCoalescing === false)
+      (interactionReceipt || qaReceipt || approvalReturnReceipt || childCompletionReceipt || input.allowRunCoalescing === false)
         ? null
         : await deps.reader.findExistingDeferredWake(scope, {
             companyId: input.companyId,
@@ -945,6 +955,7 @@ export function createAdmitWakeBehindIssueExecution(deps: {
           });
 
     if (existingDeferred &&
+        !isNativeChildCompletionContext(existingDeferred.deferredContext) &&
         !existingDeferred.payload?.interactionId && !existingDeferred.deferredContext.interactionId &&
         !readNonEmptyString(existingDeferred.payload?.qaDecisionId) &&
         !readNonEmptyString(existingDeferred.deferredContext.qaDecisionId) &&

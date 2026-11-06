@@ -3,12 +3,15 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   authUsers,
   companyMemberships,
   instanceUserRoles,
   issueQuestionResponseDeliveries,
   companies,
+  completionContracts,
+  nativeRunResults,
   createDb,
   documentRevisions,
   documents,
@@ -34,6 +37,8 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { agentService } from "../services/agents.js";
+import { hasPendingNativeChildCompletion } from "../services/native-runtime/native-child-completion-delivery.js";
+import { buildIssueBlockersResolvedWakeIdempotencyKey, buildIssueBlockersResolvedWakeStateKey, findExistingIssueBlockersResolvedWakeForReadyState } from "../services/issue-dependency-wakeups.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -60,7 +65,10 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     await db.delete(documentRevisions);
     await db.delete(documents);
     await db.delete(issueRelations);
+    await db.delete(agentWakeupRequests);
+    await db.delete(nativeRunResults);
     await db.delete(heartbeatRuns);
+    await db.delete(completionContracts);
     await db.delete(workspaceOperations);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
@@ -4979,4 +4987,230 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       });
     });
   });
+  describe("native completion review handoff", () => {
+    async function fixture(explicitBlocker: boolean, withSourceResult = false) {
+      const { companyId, goalId, issueId: parentId } = await seedConfirmationIssue("Return reviewed work");
+      const agentId = randomUUID();
+      await db.insert(agents).values({ id: agentId, companyId, name: "Coordinator", role: "ceo",
+        status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+      await db.update(issues).set({ status: "blocked", assigneeAgentId: agentId }).where(eq(issues.id, parentId));
+      const childId = randomUUID();
+      await db.insert(issues).values({ id: childId, companyId, goalId, parentId, title: "Saved work",
+        status: "in_review", priority: "medium" });
+      if (explicitBlocker) await db.insert(issueRelations).values({ companyId, issueId: childId,
+        relatedIssueId: parentId, type: "blocks" });
+      const child = (await issuesSvc.getById(childId))!;
+      let sourceRunId: string | undefined;
+      if (withSourceResult) {
+        const contractId = randomUUID(); sourceRunId = randomUUID();
+        await db.insert(completionContracts).values({ id: contractId, companyId, issueId: childId,
+          revision: 1, schemaVersion: "v1", policyVersion: "v1", risk: "low", completionAuthority: "review",
+          incompleteCriteriaPolicy: "block", contractJson: {}, canonicalSha256: "a".repeat(64),
+          createdByActorType: "user", createdByActorId: "local-board" });
+        await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId, invocationSource: "assignment",
+          status: "succeeded", nativeIssueId: childId, completionContractId: contractId });
+        await db.insert(nativeRunResults).values({ companyId, issueId: childId, runId: sourceRunId,
+          completionContractId: contractId, serverFingerprint: "earlier-turn", schemaStatus: "accepted",
+          resultJson: { result: { summary: "Earlier plan wait" } }, canonicalSha256: "c".repeat(64), createdAt: new Date(Date.now() - 10_000) });
+        await db.insert(nativeRunResults).values({ companyId, issueId: childId, runId: sourceRunId,
+          completionContractId: contractId, serverFingerprint: "source-result", schemaStatus: "accepted",
+          resultJson: { result: { summary: "Saved source-run result" } }, canonicalSha256: "b".repeat(64) });
+      }
+      const review = await interactionsSvc.create(child, { kind: "request_confirmation", resolverPolicy: "anyone",
+        ...(sourceRunId ? { sourceRunId } : {}),
+        continuationPolicy: "none", payload: { version: 1, prompt: "Review saved work",
+          target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } } },
+        { userId: "local-board" });
+      await recordReviewTransition({ companyId, issueId: childId, interactionId: review.id });
+      return { companyId, parentId, childId, child, review, agentId };
+    }
+
+    it.each([false, true])("persists one parent handoff with final acceptance (explicit blocker: %s)", async explicitBlocker => {
+      const f = await fixture(explicitBlocker);
+      await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
+      expect((await issuesSvc.getById(f.childId))?.status).toBe("done");
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]).toMatchObject({ requestedByActorType: "system", requestedByActorId: "native-status-committer",
+        reason: "issue_children_completed",
+        payload: expect.objectContaining({ issueId: f.parentId,
+          _paperclipWakeContext: expect.objectContaining({ nativeCompletionReviewInteractionId: f.review.id,
+            nativeChildCompletionDecisionId: (f.review.payload as { target: { revisionId: string } }).target.revisionId,
+            statusDecisionSource: "native_status_decision" }) }) });
+      expect((wakes[0].payload as any)._paperclipWakeContext).not.toHaveProperty("interactionId");
+      expect(wakes[0].runId).toBeNull(); // intent, not a provider run
+      expect(await hasPendingNativeChildCompletion(db, { companyId: f.companyId, issueId: f.parentId,
+        agentId: f.agentId, runId: randomUUID(), sourceIntentId: null })).toBe(true);
+      if (explicitBlocker) {
+        const [ready] = await issuesSvc.listWakeableBlockedDependents(f.childId);
+        expect(ready?.id).toBe(f.parentId);
+        expect((await findExistingIssueBlockersResolvedWakeForReadyState(db, { companyId: f.companyId,
+          dependentIssueId: ready.id, blockerIssueIds: ready.blockerIssueIds,
+          blockedTransitionAt: ready.blockedTransitionAt }))?.id).toBe(wakes[0].id);
+      }
+
+    });
+
+    it("does not trust a native ready-state alias on an unrelated completed legacy wake", async () => {
+      const f = await fixture(true);
+      const ready = { companyId: f.companyId, dependentIssueId: f.parentId,
+        blockerIssueIds: [f.childId], blockedTransitionAt: (await issuesSvc.getById(f.parentId))!.blockedTransitionAt };
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+        source: "automation", triggerDetail: "system", status: "completed", reason: "issue_blockers_resolved",
+        requestedByActorType: "user", requestedByActorId: "local-board",
+        idempotencyKey: buildIssueBlockersResolvedWakeIdempotencyKey({ dependentIssueId: f.parentId, resolvedBlockerIssueId: f.childId }),
+        payload: { nativeDependencyReadyStateKey: buildIssueBlockersResolvedWakeStateKey(ready) } });
+      expect(await findExistingIssueBlockersResolvedWakeForReadyState(db, ready)).toBeNull();
+    });
+
+    it.each([false, true])("hands off the saved source result rather than a later QA comment (explicit blocker: %s)", async explicitBlocker => {
+      const f = await fixture(explicitBlocker, true);
+      await issuesSvc.addComment(f.childId, "Later QA bookkeeping", { userId: "local-board" });
+      await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      const context = (wake.payload as any)._paperclipWakeContext;
+      expect(context.childIssueSummaries).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: f.childId, summary: "Saved source-run result" }),
+      ]));
+    });
+
+    it("delivers a new reviewed result within the same parent blocked cycle", async () => {
+      const f = await fixture(true);
+      const before = (await issuesSvc.getById(f.parentId))!.blockedTransitionAt;
+      await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
+      const [first] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, first.id));
+      await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, f.childId));
+      const revision = randomUUID();
+      const next = await interactionsSvc.create(f.child, { kind: "request_confirmation", resolverPolicy: "anyone",
+        continuationPolicy: "none", payload: { version: 1, prompt: "Review revised work",
+          target: { type: "custom", key: "native_completion_review", revisionId: revision } } }, { userId: "local-board" });
+      await recordReviewTransition({ companyId: f.companyId, issueId: f.childId, interactionId: next.id });
+      await interactionsSvc.acceptInteraction(f.child, next.id, {}, { userId: "local-board" });
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(wakes).toHaveLength(2);
+      expect(new Set(wakes.map(wake => wake.idempotencyKey)).size).toBe(2);
+      expect(wakes.find(wake => wake.id !== first.id)?.payload).toMatchObject({
+        _paperclipWakeContext: { nativeChildCompletionDecisionId: revision } });
+      expect((await issuesSvc.getById(f.parentId))!.blockedTransitionAt).toEqual(before);
+    });
+
+    it.each([0, 1, 2])("preserves each concurrent sibling acceptance (%s)", async () => {
+      const f = await fixture(false); const siblingId = randomUUID();
+      await db.insert(issues).values({ id: siblingId, companyId: f.companyId, goalId: f.child.goalId,
+        parentId: f.parentId, title: "Other saved work", status: "in_review", priority: "medium" });
+      const sibling = (await issuesSvc.getById(siblingId))!;
+      const review = await interactionsSvc.create(sibling, { kind: "request_confirmation", resolverPolicy: "anyone",
+        continuationPolicy: "none", payload: { version: 1, prompt: "Review other work",
+          target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } } }, { userId: "local-board" });
+      await recordReviewTransition({ companyId: f.companyId, issueId: siblingId, interactionId: review.id });
+      let arrivals = 0; let release!: () => void;
+      const barrier = new Promise<void>(resolve => { release = resolve; });
+      const simultaneous = { afterResolveInTransaction: async () => { if (++arrivals === 2) release(); await barrier; } };
+      await db.execute(sql.raw(`CREATE FUNCTION test_m7_overlap() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.parent_id='${f.parentId}' AND NEW.status='done' THEN PERFORM pg_sleep(0.25); END IF; RETURN NEW; END $$`));
+      await db.execute(sql.raw(`CREATE TRIGGER test_m7_overlap AFTER UPDATE ON issues FOR EACH ROW EXECUTE FUNCTION test_m7_overlap()`));
+      try {
+        await Promise.all([
+          interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" }, simultaneous),
+          interactionsSvc.acceptInteraction(sibling, review.id, {}, { userId: "local-board" }, simultaneous),
+        ]);
+      } finally {
+        await db.execute(sql.raw(`DROP TRIGGER test_m7_overlap ON issues`));
+        await db.execute(sql.raw(`DROP FUNCTION test_m7_overlap()`));
+      }
+      expect((await issuesSvc.getById(f.childId))!.status).toBe("done");
+      expect((await issuesSvc.getById(siblingId))!.status).toBe("done");
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(wakes).toHaveLength(2);
+      expect(wakes.flatMap(w => (w.payload as any)._paperclipWakeContext.childIssueIds).sort()).toEqual([f.childId, siblingId].sort());
+    });
+
+    it("keeps earlier siblings' accepted source summaries when the last review completes", async () => {
+      const f = await fixture(false, true);
+      const siblingId = randomUUID();
+      await db.insert(issues).values({ id: siblingId, companyId: f.companyId, goalId: f.child.goalId,
+        parentId: f.parentId, title: "Second saved result", status: "in_review", priority: "medium" });
+      const sibling = (await issuesSvc.getById(siblingId))!;
+      const review = await interactionsSvc.create(sibling, { kind: "request_confirmation", resolverPolicy: "anyone",
+        continuationPolicy: "none", payload: { version: 1, prompt: "Review second result",
+          target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } } }, { userId: "local-board" });
+      await recordReviewTransition({ companyId: f.companyId, issueId: siblingId, interactionId: review.id });
+      await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(1);
+      await issuesSvc.addComment(f.childId, "Later QA bookkeeping", { userId: "local-board" });
+      await interactionsSvc.acceptInteraction(sibling, review.id, {}, { userId: "local-board" });
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(wakes).toHaveLength(2);
+      const wake = wakes.find(w => (w.payload as any).completedChildIssueId === f.childId)!;
+      expect((wake!.payload as any)._paperclipWakeContext.childIssueSummaries).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: f.childId, summary: "Saved source-run result" }),
+      ]));
+    });
+
+    it.each([false, true])("retains the current result with a separate historical blocker (ready: %s)", async ready => {
+      const f = await fixture(false, true); const blockerId = randomUUID();
+      await db.insert(issues).values({ id: blockerId, companyId: f.companyId, title: "Separate dependency",
+        status: ready ? "done" : "in_progress", priority: "medium" });
+      await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blockerId,
+        relatedIssueId: f.parentId, type: "blocks" });
+      if (ready) await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+        source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved", status: "completed",
+        requestedByActorType: "system", requestedByActorId: "dependency-observer",
+        idempotencyKey: buildIssueBlockersResolvedWakeStateKey({ dependentIssueId: f.parentId,
+          blockerIssueIds: [blockerId], blockedTransitionAt: (await issuesSvc.getById(f.parentId))!.blockedTransitionAt }), payload: { issueId: f.parentId } });
+      await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      const results = wakes.filter(w => w.reason === "issue_children_completed");
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({ status: "queued", runId: null,
+        payload: { issueId: f.parentId, completedChildIssueId: f.childId,
+          _paperclipWakeContext: { childIssueSummaries: [expect.objectContaining({ id: f.childId, summary: "Saved source-run result" })] } } });
+      expect((await issuesSvc.getDependencyReadiness(f.parentId)).isDependencyReady).toBe(ready);
+    });
+
+    it("does not bypass another unfinished explicit blocker with a parent wake", async () => {
+      const f = await fixture(true);
+      const blockerId = randomUUID();
+      await db.insert(issues).values({ id: blockerId, companyId: f.companyId, title: "Other dependency",
+        status: "in_progress", priority: "medium" });
+      await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blockerId,
+        relatedIssueId: f.parentId, type: "blocks" });
+      await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
+      expect((await issuesSvc.getById(f.childId))?.status).toBe("done");
+      const pending = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(pending).toHaveLength(1);
+      expect(pending[0]!.status).toBe("queued");
+      expect((await issuesSvc.getDependencyReadiness(f.parentId)).isDependencyReady).toBe(false);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerId));
+      expect((await issuesSvc.listWakeableBlockedDependents(blockerId)).map(v => v.id)).toContain(f.parentId);
+    });
+
+    it("does not complete or hand off while another review remains pending", async () => {
+      const f = await fixture(false);
+      await interactionsSvc.create(f.child, { kind: "request_confirmation", resolverPolicy: "anyone",
+        continuationPolicy: "none", payload: { version: 1, prompt: "Second independent reviewer",
+          target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } } },
+        { userId: "local-board" });
+      await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
+      expect((await issuesSvc.getById(f.childId))?.status).toBe("in_review");
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+    });
+
+    it("rolls acceptance and completion back when the handoff cannot be saved", async () => {
+      const f = await fixture(false);
+      await db.execute(sql.raw(`CREATE FUNCTION test_m7_reject_wake() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'm7 wake persistence failure'; END $$`));
+      await db.execute(sql.raw(`CREATE TRIGGER test_m7_reject_wake BEFORE INSERT ON agent_wakeup_requests FOR EACH ROW EXECUTE FUNCTION test_m7_reject_wake()`));
+      try {
+        await expect(interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" }))
+          .rejects.toThrow();
+      } finally {
+        await db.execute(sql.raw(`DROP TRIGGER test_m7_reject_wake ON agent_wakeup_requests`));
+        await db.execute(sql.raw(`DROP FUNCTION test_m7_reject_wake()`));
+      }
+      expect((await issuesSvc.getById(f.childId))?.status).toBe("in_review");
+      expect((await interactionsSvc.getById(f.review.id))?.status).toBe("pending");
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+    });
+  });
+
 });

@@ -1,3 +1,5 @@
+import { enqueueNativeStatusWakeIntent, lockNativeCompletionParent } from "./native-runtime/status-wake-intent.js";
+import { buildIssueBlockersResolvedWakeStateKey, findExistingIssueBlockersResolvedWakeForReadyState } from "./issue-dependency-wakeups.js";
 import { getNativeDocumentReviewAssignment, isNativeDocumentReviewRun } from "./native-runtime/native-document-review-participant.js";
 import { activeIssueInteractionCondition, historicalQuestionCondition } from "./issue-question-context.js";
 import {
@@ -30,6 +32,8 @@ import {
   companies,
   documents,
   heartbeatRuns,
+  nativeRunResults,
+  nativeRunFinalizations,
   runIdentityContexts,
   issueComments,
   issueDocuments,
@@ -2310,6 +2314,7 @@ export function issueThreadInteractionService(
         acceptedPlanTarget.key === "plan" &&
         issueContext.workMode === "planning";
       if (isNativeCompletionReview(lockedCurrent)) {
+        await lockNativeCompletionParent(tx as unknown as Db, issueContext.companyId, issueContext.id);
         const otherPending = await tx.select({ id: issueThreadInteractions.id })
           .from(issueThreadInteractions).where(and(
             eq(issueThreadInteractions.companyId, issueContext.companyId),
@@ -2337,6 +2342,78 @@ export function issueThreadInteractionService(
           postCommitActivityPublications,
         );
         if (completedIssue) {
+          // Acceptance completes the source issue before the reviewer finishes.
+          // Persist its consumer handoffs with that completion; a later finish
+          // sees an already-done issue and cannot repair a lost post-commit wake.
+          const completedSvc = issueService(tx as unknown as Db);
+          const dependents = await completedSvc.listWakeableBlockedDependents(completedIssue.id);
+          const sourceResult = lockedCurrent.sourceRunId ? await tx
+            .select({ resultJson: nativeRunResults.resultJson })
+            .from(nativeRunResults).leftJoin(nativeRunFinalizations, and(
+              eq(nativeRunFinalizations.companyId, nativeRunResults.companyId),
+              eq(nativeRunFinalizations.issueId, nativeRunResults.issueId),
+              eq(nativeRunFinalizations.runId, nativeRunResults.runId),
+            )).where(and(
+              eq(nativeRunResults.companyId, issueContext.companyId),
+              eq(nativeRunResults.issueId, completedIssue.id),
+              eq(nativeRunResults.runId, lockedCurrent.sourceRunId),
+              eq(nativeRunResults.schemaStatus, "accepted"),
+              or(isNull(nativeRunFinalizations.resultId), eq(nativeRunResults.id, nativeRunFinalizations.resultId)),
+            )).orderBy(desc(nativeRunResults.createdAt), desc(nativeRunResults.id))
+            .limit(1).then(rows => rows[0] ?? null) : null;
+          const sourceSummary = (sourceResult?.resultJson as { result?: { summary?: unknown } } | undefined)?.result?.summary;
+          const summary = typeof sourceSummary === "string" && sourceSummary.trim() ? sourceSummary.trim() : null;
+          const parent = completedIssue.parentId
+            ? await completedSvc.getWakeableParentAfterChildCompletion(completedIssue.parentId, {
+                issueId: completedIssue.id, summary, notifyAcceptedChild: true,
+              }) : null;
+          const completionTarget = (lockedCurrent.payload as { target?: { revisionId?: unknown } }).target;
+          const reviewContext = { nativeCompletionReviewInteractionId: lockedCurrent.id,
+            ...(typeof completionTarget?.revisionId === "string"
+              ? { nativeChildCompletionDecisionId: completionTarget.revisionId } : {}) };
+          // interactionId belongs to the completed child. Do not put it on the
+          // parent's wake: native input would resolve it in the wrong issue.
+
+          for (const dependent of dependents) {
+            const readyState = { companyId: issueContext.companyId, dependentIssueId: dependent.id,
+              blockerIssueIds: dependent.blockerIssueIds, blockedTransitionAt: dependent.blockedTransitionAt };
+            const isCompletedChildParent = parent?.id === dependent.id;
+            if (!isCompletedChildParent && await findExistingIssueBlockersResolvedWakeForReadyState(tx as unknown as Db, readyState)) continue;
+            const stateKey = buildIssueBlockersResolvedWakeStateKey(readyState);
+            const context = { ...reviewContext, resolvedBlockerIssueId: completedIssue.id,
+              blockerIssueIds: dependent.blockerIssueIds,
+              ...(isCompletedChildParent ? { nativeDependencyReadyStateKey: stateKey } : {}),
+              ...(isCompletedChildParent && parent ? {
+                completedChildIssueId: completedIssue.id, childIssueIds: parent.childIssueIds,
+                childIssueSummaries: parent.childIssueSummaries, onboardingCompletion: parent.onboardingCompletion,
+                childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+              } : {}) };
+            await enqueueNativeStatusWakeIntent({
+              tx: tx as unknown as Db, companyId: issueContext.companyId,
+              issueId: dependent.id, agentId: dependent.assigneeAgentId,
+              // Keep dependency readiness and its state key, but parent results
+              // must be visible to the finalizer's pending-child delivery guard.
+              reason: isCompletedChildParent ? "issue_children_completed" : "issue_blockers_resolved",
+              idempotencyKey: isCompletedChildParent
+                ? `issue_children_completed:${dependent.id}:${completedIssue.id}:review:${lockedCurrent.id}`
+                : stateKey,
+              payload: context, contextSnapshot: context,
+            });
+          }
+          // Persist this result even when another dependency is unfinished.
+          // The normal dispatcher/admission gate delays delivery until ready.
+          if (parent && !dependents.some(dependent => dependent.id === parent.id)) {
+            const context = { ...reviewContext, completedChildIssueId: completedIssue.id,
+              childIssueIds: parent.childIssueIds, childIssueSummaries: parent.childIssueSummaries,
+              onboardingCompletion: parent.onboardingCompletion,
+              childIssueSummaryTruncated: parent.childIssueSummaryTruncated };
+            await enqueueNativeStatusWakeIntent({
+              tx: tx as unknown as Db, companyId: issueContext.companyId,
+              issueId: parent.id, agentId: parent.assigneeAgentId, reason: "issue_children_completed",
+              idempotencyKey: `issue_children_completed:${parent.id}:${completedIssue.id}:review:${lockedCurrent.id}`,
+              payload: context, contextSnapshot: context,
+            });
+          }
           continuationIssue = {
             id: completedIssue.id,
             assigneeAgentId: completedIssue.assigneeAgentId ?? null,

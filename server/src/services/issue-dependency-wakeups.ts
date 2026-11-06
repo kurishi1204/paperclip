@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests } from "@paperclipai/db";
@@ -212,23 +212,37 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
   const lookupKeys = [...new Set([cycleKey, oldStateKey, ...legacyKeyList])];
   const blockedTransitionAt = parseWakeCycleDate(input.blockedTransitionAt);
 
+  const trustedNativeReadyStateAlias = and(
+    eq(agentWakeupRequests.requestedByActorType, "system"),
+    or(eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+      sql`${agentWakeupRequests.requestedByActorId} like 'native-status-wake-dispatch:%'`),
+    or(eq(agentWakeupRequests.reason, "issue_children_completed"), and(
+      eq(agentWakeupRequests.reason, "issue_execution_deferred"),
+      sql`${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'wakeReason' = 'issue_children_completed'`,
+    )),
+    sql`${agentWakeupRequests.payload}->>'nativeDependencyReadyStateKey' = ${cycleKey}`,
+  );
+
   const rows = await db
     .select({
       id: agentWakeupRequests.id,
       status: agentWakeupRequests.status,
       idempotencyKey: agentWakeupRequests.idempotencyKey,
+      readyStateAlias: sql<string | null>`case when ${trustedNativeReadyStateAlias} then ${cycleKey} else null end`,
       requestedAt: agentWakeupRequests.requestedAt,
     })
     .from(agentWakeupRequests)
     .where(
       and(
         eq(agentWakeupRequests.companyId, input.companyId),
-        inArray(agentWakeupRequests.idempotencyKey, lookupKeys),
+        or(inArray(agentWakeupRequests.idempotencyKey, lookupKeys), trustedNativeReadyStateAlias),
       ),
     );
 
   const covering = rows.find((row) =>
-    wakeCoversIssueBlockersResolvedReadyState(row, {
+    wakeCoversIssueBlockersResolvedReadyState({ ...row,
+      idempotencyKey: row.readyStateAlias === cycleKey ? cycleKey : row.idempotencyKey,
+    }, {
       cycleKey,
       oldStateKey,
       legacyKeys: new Set(legacyKeyList),

@@ -13157,6 +13157,7 @@ export function heartbeatService(
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    atomicAfterWrite?: (client: Db, updated: typeof heartbeatRuns.$inferSelect) => Promise<void>,
   ) {
     const previousStatus = await db
       .select()
@@ -13186,20 +13187,20 @@ export function heartbeatService(
       };
     }
     patch = reconcileQaProviderEvidence(previousStatus, patch, status);
-    const updated =
+    const persist = async (client: Db) =>
       previousStatus &&
-      await legacyExecutionNeedsReconciliationWithEvidence(db, {
+      await legacyExecutionNeedsReconciliationWithEvidence(client, {
         ...previousStatus,
         status,
         ...patch,
       })
         ? await terminalizeLegacyExecution({
-            db,
+            db: client,
             run: previousStatus,
             status,
             patch,
           })
-        : await db
+        : await client
             .update(heartbeatRuns)
             .set({
               status,
@@ -13211,6 +13212,14 @@ export function heartbeatService(
             .where(eq(heartbeatRuns.id, runId))
             .returning()
             .then((rows) => rows[0] ?? null);
+
+    const updated = atomicAfterWrite
+      ? await db.transaction(async tx => {
+          const result = await persist(tx as unknown as Db);
+          if (result) await atomicAfterWrite(tx as unknown as Db, result);
+          return result;
+        })
+      : await persist(db);
 
     if (updated) {
       publishLiveEvent({
@@ -17228,6 +17237,12 @@ export function heartbeatService(
     return null;
   }
 
+  function isNativeDailyCapRefusal(receipt: typeof agentWakeupRequests.$inferSelect | null) {
+    if (!receipt || receipt.status !== "skipped" || receipt.runId && !parseObject(receipt.payload).nativeStatusAdmissionHold) return false;
+    const reason = readNonEmptyString(parseObject(receipt.payload).nativeStatusAdmissionHold) ?? receipt.reason;
+    return reason === "heartbeat.daily_run_limit" || reason === "heartbeat.daily_cost_limit";
+  }
+
   async function cancelQueuedRunForHeartbeatDailyCap(
     run: typeof heartbeatRuns.$inferSelect,
     dailyCapBlock: NonNullable<
@@ -17251,13 +17266,32 @@ export function heartbeatService(
         timeoutSource: "heartbeat_daily_cap_gate",
         timeoutFired: false,
       },
+    }, async client => {
+      if (run.wakeupRequestId) await client.update(agentWakeupRequests).set({ status: "skipped",
+        finishedAt: now, error: reason, updatedAt: now }).where(and(
+        eq(agentWakeupRequests.id, run.wakeupRequestId), ne(agentWakeupRequests.status, "cancelled")));
+      // This gate runs before any adapter/provider invocation. Preserve the source
+      // result for normal admission later; never replay a failed/unknown provider run.
+      const intentId = readNonEmptyString(parseObject(run.contextSnapshot).nativeStatusWakeIntentId);
+      if (intentId && run.wakeupRequestId) {
+        const [held] = await client.update(agentWakeupRequests).set({
+          payload: sql`coalesce(${agentWakeupRequests.payload}, '{}'::jsonb) || ${JSON.stringify({ nativeStatusAdmissionHold: dailyCapBlock.reason })}::jsonb`,
+        }).where(and(eq(agentWakeupRequests.id, run.wakeupRequestId),
+          eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+          eq(agentWakeupRequests.requestedByActorType, "system"),
+          eq(agentWakeupRequests.requestedByActorId, `native-status-wake-dispatch:${intentId}`),
+        )).returning({ id: agentWakeupRequests.id });
+        if (held) await client.update(agentWakeupRequests).set({ status: "queued", runId: null, claimedAt: null,
+          finishedAt: null, error: dailyCapBlock.reason, updatedAt: now }).where(and(
+          eq(agentWakeupRequests.id, intentId), eq(agentWakeupRequests.companyId, run.companyId),
+          eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.requestedByActorType, "system"),
+          eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+          inArray(agentWakeupRequests.status, ["claimed", "coalesced"]),
+          or(eq(agentWakeupRequests.runId, run.id), isNull(agentWakeupRequests.runId)),
+        ));
+      }
     });
     if (!cancelled) return null;
-
-    await setWakeupStatus(run.wakeupRequestId, "skipped", {
-      finishedAt: now,
-      error: reason,
-    });
 
     await appendRunEvent(cancelled, {
       eventType: "lifecycle",
@@ -30668,7 +30702,7 @@ export function heartbeatService(
           isNull(agentWakeupRequests.runId),
         ),
       )
-      .orderBy(asc(agentWakeupRequests.requestedAt))
+      .orderBy(asc(agentWakeupRequests.updatedAt), asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id))
       .limit(Math.max(1, Math.min(input.limit ?? 100, 500)));
 
     let dispatched = 0;
@@ -30680,6 +30714,12 @@ export function heartbeatService(
     >();
 
     for (const candidate of candidates) {
+      // Fairly rotate inspected entries, including dependency/cap/fresh-claim
+      // holds. Keep requestedAt as the immutable receipt time.
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+        eq(agentWakeupRequests.id, candidate.id), isNull(agentWakeupRequests.runId),
+        inArray(agentWakeupRequests.status, ["queued", "claimed"]),
+      ));
       const dispatchActorId = `native-status-wake-dispatch:${candidate.id}`;
       const existingDispatch = await db
         .select()
@@ -30695,31 +30735,35 @@ export function heartbeatService(
         .limit(1)
         .then((rows) => rows[0] ?? null);
 
-      if (existingDispatch) {
-        const recoveredStatus = existingDispatch.runId
-          ? "coalesced"
-          : existingDispatch.status === "deferred_issue_execution"
-            ? "coalesced"
-            : existingDispatch.status;
-        await db
-          .update(agentWakeupRequests)
-          .set({
-            status: recoveredStatus,
-            runId: existingDispatch.runId,
-            finishedAt:
-              (existingDispatch.runId ?? existingDispatch.finishedAt)
-                ? (existingDispatch.finishedAt ?? now)
-                : null,
-            error: existingDispatch.error,
-            updatedAt: now,
-          })
-          .where(
-            and(
-              eq(agentWakeupRequests.id, candidate.id),
-              isNull(agentWakeupRequests.runId),
-            ),
-          );
-        recovered += 1;
+      if (isNativeDailyCapRefusal(existingDispatch)) {
+        const recipient = await getAgent(candidate.agentId);
+        if (recipient && await getHeartbeatDailyCapBlock(recipient, parseHeartbeatPolicy(recipient))) {
+          deferred += 1;
+          continue; // same pending intent; no repeated skipped receipts or model calls
+        }
+      }
+      if (existingDispatch && !isNativeDailyCapRefusal(existingDispatch)) {
+        // Share receipt -> source ordering with pre-provider cancellation. A
+        // stale recovery observation cannot overwrite a newly committed hold.
+        const linked = await db.transaction(async tx => {
+          const [current] = await tx.select().from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.id, existingDispatch.id),
+            eq(agentWakeupRequests.companyId, candidate.companyId),
+          )).for("update").limit(1);
+          if (!current || isNativeDailyCapRefusal(current)) return false;
+          const recoveredStatus = current.runId || current.status === "deferred_issue_execution"
+            ? "coalesced" : current.status;
+          const rows = await tx.update(agentWakeupRequests).set({
+            status: recoveredStatus, runId: current.runId,
+            finishedAt: (current.runId ?? current.finishedAt) ? (current.finishedAt ?? now) : null,
+            error: current.error, updatedAt: now,
+          }).where(and(eq(agentWakeupRequests.id, candidate.id), isNull(agentWakeupRequests.runId),
+            inArray(agentWakeupRequests.status, ["queued", "claimed"]),
+          )).returning({ id: agentWakeupRequests.id });
+          return rows.length > 0;
+        });
+        if (linked) recovered += 1;
+        else deferred += 1;
         continue;
       }
 
@@ -30760,7 +30804,10 @@ export function heartbeatService(
         readNonEmptyString(wakeContext.issueId) ??
         null;
       const scopeKey = issueId
-        ? `${candidate.companyId}:${candidate.agentId}:${issueId}:${readNativeReviewAssignmentContext(wakeContext)?.nativeReviewInteractionId ?? ""}`
+        ? JSON.stringify([candidate.companyId, candidate.agentId, issueId,
+            readNativeReviewAssignmentContext(wakeContext)?.nativeReviewInteractionId ?? null,
+            readNonEmptyString(wakeContext.nativeChildCompletionDecisionId) ?? null,
+            readNonEmptyString(wakeContext.nativeCompletionReviewInteractionId) ?? null])
         : null;
       const priorDelivery = scopeKey
         ? deliveredByIssueScope.get(scopeKey)
@@ -30832,6 +30879,18 @@ export function heartbeatService(
         }
       }
 
+      if (issueId && ["issue_children_completed", "issue_blockers_resolved"].includes(candidate.reason ?? "")) {
+        const readiness = await issuesSvc.getDependencyReadiness(issueId);
+        if (!readiness.isDependencyReady) {
+          await db.update(agentWakeupRequests).set({ status: "queued", claimedAt: null,
+            error: "native_result_waiting_for_dependencies", updatedAt: new Date() })
+            .where(and(eq(agentWakeupRequests.id, candidate.id),
+              eq(agentWakeupRequests.status, "claimed"), isNull(agentWakeupRequests.runId)));
+          deferred += 1;
+          continue;
+        }
+      }
+
       try {
         const wakeRun = await enqueueWakeup(candidate.agentId, {
           source: candidate.source as WakeupOptions["source"],
@@ -30873,30 +30932,33 @@ export function heartbeatService(
         // promote both rows (the original has no nativeStatusWakeIntentId
         // provenance and would otherwise run once before the dispatch receipt).
         const deliveredStatus = delivered?.status ?? "queued";
+        const admissionHeld = isNativeDailyCapRefusal(delivered);
         await db
           .update(agentWakeupRequests)
           .set({
-            status: wakeRun || deliveredStatus === "deferred_issue_execution"
+            status: admissionHeld ? "queued" : wakeRun || deliveredStatus === "deferred_issue_execution"
               ? "coalesced"
               : deliveredStatus,
-            runId: wakeRun?.id ?? delivered?.runId ?? null,
-            finishedAt:
+            runId: admissionHeld ? null : wakeRun?.id ?? delivered?.runId ?? null,
+            claimedAt: admissionHeld ? null : undefined,
+            finishedAt: admissionHeld ? null :
               wakeRun || delivered?.finishedAt
                 ? (delivered?.finishedAt ?? new Date())
                 : null,
-            error: delivered?.error ?? null,
+            error: admissionHeld ? (readNonEmptyString(parseObject(delivered?.payload).nativeStatusAdmissionHold) ?? delivered?.reason ?? "native_admission_held") : delivered?.error ?? null,
             updatedAt: new Date(),
           })
-          .where(eq(agentWakeupRequests.id, candidate.id));
+          .where(and(eq(agentWakeupRequests.id, candidate.id),
+            eq(agentWakeupRequests.status, "claimed"), isNull(agentWakeupRequests.runId)));
 
-        if (scopeKey) {
+        if (scopeKey && !admissionHeld) {
           deliveredByIssueScope.set(scopeKey, {
             runId: wakeRun?.id ?? delivered?.runId ?? null,
             status: wakeRun ? "coalesced" : (delivered?.status ?? "queued"),
           });
         }
 
-        if (wakeRun) dispatched += 1;
+        if (wakeRun && !admissionHeld) dispatched += 1;
         else deferred += 1;
       } catch (error) {
         await db

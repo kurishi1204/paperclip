@@ -1,3 +1,4 @@
+import { enqueueNativeStatusWakeIntent as enqueueWake, lockNativeCompletionParent, lockNativeCompletionRecipient } from "./status-wake-intent.js";
 import { getNativeDocumentReviewAssignment } from "./native-document-review-participant.js";
 import type { PendingDocumentReviewBinding } from "../../modules/run-dispatch/index.js";
 import { releaseNativeRunCheckout } from "./native-run-checkout.js";
@@ -50,7 +51,7 @@ import {
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
-import { buildIssueBlockersResolvedWakeIdempotencyKey } from "../issue-dependency-wakeups.js";
+import { buildIssueBlockersResolvedWakeIdempotencyKey, buildIssueBlockersResolvedWakeStateKey } from "../issue-dependency-wakeups.js";
 import {
   persistActivity,
   publishActivity,
@@ -408,64 +409,6 @@ function failAt(
     throw new Error(`native_status_failpoint:${actual}`);
 }
 
-async function enqueueWake(input: {
-  tx: Db;
-  companyId: string;
-  issueId: string;
-  agentId: string;
-  reason: string;
-  idempotencyKey: string;
-  payload: Record<string, unknown>;
-  contextSnapshot?: Record<string, unknown>;
-}) {
-  const existing = await input.tx
-    .select({ id: agentWakeupRequests.id })
-    .from(agentWakeupRequests)
-    .where(
-      and(
-        eq(agentWakeupRequests.companyId, input.companyId),
-        eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
-        inArray(agentWakeupRequests.status, [
-          "queued",
-          "deferred_issue_execution",
-          "claimed",
-          "completed",
-        ]),
-      ),
-    )
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  if (existing) return existing.id;
-  const inserted = await input.tx
-    .insert(agentWakeupRequests)
-    .values({
-      companyId: input.companyId,
-      agentId: input.agentId,
-      source: "automation",
-      triggerDetail: "system",
-      reason: input.reason,
-      payload: {
-        issueId: input.issueId,
-        taskId: input.issueId,
-        ...input.payload,
-        _paperclipWakeContext: {
-          issueId: input.issueId,
-          taskId: input.issueId,
-          ...(input.contextSnapshot ?? {}),
-          wakeReason: input.reason,
-          source: "native_status_decision",
-          statusDecisionSource: "native_status_decision",
-        },
-      },
-      requestedByActorType: "system",
-      requestedByActorId: "native-status-committer",
-      idempotencyKey: input.idempotencyKey,
-    })
-    .returning({ id: agentWakeupRequests.id })
-    .then((rows) => rows[0] ?? null);
-  if (!inserted) throw new Error("native_status_wake_not_persisted");
-  return inserted.id;
-}
 
 async function validateGovernanceGate(
   tx: Db,
@@ -1603,6 +1546,14 @@ export async function commitNativeStatusDecision(input: {
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (!issue) throw new NativeStatusRaceError();
+    // A child may have an uncommitted result after the finalizer's first read.
+    // Serialize the final Done check with that child's handoff transaction.
+    if (input.requireNoPendingChildCompletion) {
+      await lockNativeCompletionRecipient(tx as unknown as Db, input.companyId, input.issueId);
+    }
+    if (input.decision.statusAction === "done" && issue.status !== "done") {
+      await lockNativeCompletionParent(tx as unknown as Db, input.companyId, input.issueId);
+    }
     if (input.requireFormalApprovalDecision) {
       const original = await readFormalIssueApprovalDecision({ db: tx as unknown as Db,
         issue, runId: input.runId, agentId: input.requireFormalApprovalDecision.agentId });
@@ -2050,24 +2001,23 @@ export async function commitNativeStatusDecision(input: {
       );
       const completedResultSummary = await tx
         .select({ resultJson: nativeRunResults.resultJson })
-        .from(nativeRunResults)
-        .where(
-          and(
-            eq(nativeRunResults.companyId, input.companyId),
-            eq(nativeRunResults.runId, input.runId),
-          ),
-        )
-        .limit(1)
-        .then((rows) => {
+        .from(nativeRunResults).innerJoin(workAssessments, and(
+          eq(workAssessments.id, input.assessmentId),
+          eq(workAssessments.companyId, nativeRunResults.companyId),
+          eq(workAssessments.issueId, nativeRunResults.issueId),
+          eq(workAssessments.runId, nativeRunResults.runId),
+          eq(workAssessments.resultId, nativeRunResults.id),
+        )).where(and(eq(nativeRunResults.companyId, input.companyId),
+          eq(nativeRunResults.issueId, input.issueId), eq(nativeRunResults.runId, input.runId),
+          eq(nativeRunResults.schemaStatus, "accepted"),
+        )).limit(1).then(rows => {
           const summary = record(record(rows[0]?.resultJson).result).summary;
-          return typeof summary === "string" && summary.trim().length > 0
-            ? summary.trim()
-            : null;
+          return typeof summary === "string" && summary.trim() ? summary.trim() : null;
         });
       const parent = issue.parentId
         ? await issueSvc.getWakeableParentAfterChildCompletion(issue.parentId, {
             issueId: input.issueId,
-            summary: completedResultSummary,
+            summary: completedResultSummary, notifyAcceptedChild: true,
           })
         : null;
       const parentIsDependent = parent
@@ -2115,6 +2065,10 @@ export async function commitNativeStatusDecision(input: {
             resolvedBlockerIssueId: input.issueId,
             blockerIssueIds: dependent.blockerIssueIds,
             ...(childCompletionContext ?? {}),
+            ...(isCompletedChildParent ? { nativeDependencyReadyStateKey: buildIssueBlockersResolvedWakeStateKey({
+              dependentIssueId: dependent.id, blockerIssueIds: dependent.blockerIssueIds,
+              blockedTransitionAt: dependent.blockedTransitionAt,
+            }) } : {}),
           },
           contextSnapshot: childCompletionContext ?? undefined,
         });

@@ -53,6 +53,8 @@ import {
   documents,
   goals,
   heartbeatRuns,
+  nativeRunResults,
+  nativeRunFinalizations,
   routineRuns,
   executionWorkspaces,
   issueApprovals,
@@ -9179,7 +9181,7 @@ export function issueService(db: Db) {
 
     getWakeableParentAfterChildCompletion: async (
       parentIssueId: string,
-      completedChildResult?: { issueId: string; summary: string | null } | null,
+      completedChildResult?: { issueId: string; summary: string | null; notifyAcceptedChild?: boolean } | null,
     ) => {
       const parent = await db
         .select({
@@ -9219,14 +9221,19 @@ export function issueService(db: Db) {
         .orderBy(asc(issues.issueNumber), asc(issues.createdAt));
       if (children.length === 0) return null;
       if (
-        !children.every(
+        !completedChildResult?.notifyAcceptedChild && !children.every(
           (child) => child.status === "done" || child.status === "cancelled",
         )
       ) {
         return null;
       }
 
-      const childIdsForSummaries = children
+      // A saved result is an event for this child, not an assertion that all
+      // historical children are complete. Queue admission owns dependency waits.
+      const summaryChildren = completedChildResult?.notifyAcceptedChild
+        ? children.filter(child => child.id === completedChildResult.issueId) : children;
+      if (summaryChildren.length === 0) return null;
+      const childIdsForSummaries = summaryChildren
         .slice(0, MAX_CHILD_COMPLETION_SUMMARIES)
         .map((child) => child.id);
       const commentRows =
@@ -9247,13 +9254,39 @@ export function issueService(db: Db) {
               )
               .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
           : [];
+      // Use the latest accepted source binding for EACH reviewed child. The
+      // last child's finish summary cannot stand in for an earlier sibling,
+      // and a later QA bookkeeping comment must not replace its saved result.
+      const acceptedSources = childIdsForSummaries.length > 0 ? await db.select({
+        issueId: issueThreadInteractions.issueId, resultJson: nativeRunResults.resultJson,
+      }).from(issueThreadInteractions).leftJoin(nativeRunFinalizations, and(
+        eq(nativeRunFinalizations.companyId, issueThreadInteractions.companyId),
+        eq(nativeRunFinalizations.issueId, issueThreadInteractions.issueId),
+        eq(nativeRunFinalizations.runId, issueThreadInteractions.sourceRunId),
+      )).leftJoin(nativeRunResults, and(
+        eq(nativeRunResults.companyId, issueThreadInteractions.companyId),
+        eq(nativeRunResults.issueId, issueThreadInteractions.issueId),
+        eq(nativeRunResults.runId, issueThreadInteractions.sourceRunId),
+        eq(nativeRunResults.schemaStatus, "accepted"),
+        or(isNull(nativeRunFinalizations.resultId), eq(nativeRunResults.id, nativeRunFinalizations.resultId)),
+      )).where(and(eq(issueThreadInteractions.companyId, parent.companyId),
+        inArray(issueThreadInteractions.issueId, childIdsForSummaries),
+        eq(issueThreadInteractions.status, "accepted"),
+        sql`${issueThreadInteractions.payload}->'target'->>'key' = 'native_completion_review'`,
+      )).orderBy(desc(issueThreadInteractions.resolvedAt), desc(issueThreadInteractions.createdAt), desc(issueThreadInteractions.id), desc(nativeRunResults.createdAt), desc(nativeRunResults.id)) : [];
+      const acceptedSummaryByIssueId = new Map<string, string | null>();
+      for (const row of acceptedSources) {
+        if (acceptedSummaryByIssueId.has(row.issueId)) continue;
+        const summary = (row.resultJson as { result?: { summary?: unknown } } | null)?.result?.summary;
+        acceptedSummaryByIssueId.set(row.issueId, typeof summary === "string" && summary.trim() ? summary.trim() : null);
+      }
       const latestCommentByIssueId = new Map<string, string>();
       for (const comment of commentRows) {
         if (!latestCommentByIssueId.has(comment.issueId)) {
           latestCommentByIssueId.set(comment.issueId, comment.body);
         }
       }
-      const childIssueSummaries: ChildIssueCompletionSummary[] = children
+      const childIssueSummaries: ChildIssueCompletionSummary[] = summaryChildren
         .slice(0, MAX_CHILD_COMPLETION_SUMMARIES)
         .map((child) => ({
           ...child,
@@ -9261,7 +9294,7 @@ export function issueService(db: Db) {
             child.id === completedChildResult?.issueId
               ? (completedChildResult.summary ??
                   latestCommentByIssueId.get(child.id))
-              : latestCommentByIssueId.get(child.id),
+              : (acceptedSummaryByIssueId.get(child.id) ?? latestCommentByIssueId.get(child.id)),
           ),
         }));
 
@@ -9269,10 +9302,10 @@ export function issueService(db: Db) {
         onboardingCompletion: parent.originKind === "onboarding_first_task",
         id: parent.id,
         assigneeAgentId: parent.assigneeAgentId,
-        childIssueIds: children.map((child) => child.id),
+        childIssueIds: summaryChildren.map((child) => child.id),
         childIssueSummaries,
         childIssueSummaryTruncated:
-          children.length > childIssueSummaries.length,
+          summaryChildren.length > childIssueSummaries.length,
       };
     },
 
