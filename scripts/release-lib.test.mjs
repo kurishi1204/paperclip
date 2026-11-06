@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
-const releaseWorkflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
+const releaseWorkflow = readFileSync(new URL("../doc/upstream-workflows/release.yml", import.meta.url), "utf8");
 
 function workflowVerifyBudget() {
   return {
