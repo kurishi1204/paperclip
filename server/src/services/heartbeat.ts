@@ -13157,6 +13157,7 @@ export function heartbeatService(
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    atomicAfterWrite?: (client: Db, updated: typeof heartbeatRuns.$inferSelect) => Promise<void>,
   ) {
     const previousStatus = await db
       .select()
@@ -13186,20 +13187,20 @@ export function heartbeatService(
       };
     }
     patch = reconcileQaProviderEvidence(previousStatus, patch, status);
-    const updated =
+    const persist = async (client: Db) =>
       previousStatus &&
-      await legacyExecutionNeedsReconciliationWithEvidence(db, {
+      await legacyExecutionNeedsReconciliationWithEvidence(client, {
         ...previousStatus,
         status,
         ...patch,
       })
         ? await terminalizeLegacyExecution({
-            db,
+            db: client,
             run: previousStatus,
             status,
             patch,
           })
-        : await db
+        : await client
             .update(heartbeatRuns)
             .set({
               status,
@@ -13211,6 +13212,14 @@ export function heartbeatService(
             .where(eq(heartbeatRuns.id, runId))
             .returning()
             .then((rows) => rows[0] ?? null);
+
+    const updated = atomicAfterWrite
+      ? await db.transaction(async tx => {
+          const result = await persist(tx as unknown as Db);
+          if (result) await atomicAfterWrite(tx as unknown as Db, result);
+          return result;
+        })
+      : await persist(db);
 
     if (updated) {
       publishLiveEvent({
@@ -17257,34 +17266,32 @@ export function heartbeatService(
         timeoutSource: "heartbeat_daily_cap_gate",
         timeoutFired: false,
       },
+    }, async client => {
+      if (run.wakeupRequestId) await client.update(agentWakeupRequests).set({ status: "skipped",
+        finishedAt: now, error: reason, updatedAt: now }).where(and(
+        eq(agentWakeupRequests.id, run.wakeupRequestId), ne(agentWakeupRequests.status, "cancelled")));
+      // This gate runs before any adapter/provider invocation. Preserve the source
+      // result for normal admission later; never replay a failed/unknown provider run.
+      const intentId = readNonEmptyString(parseObject(run.contextSnapshot).nativeStatusWakeIntentId);
+      if (intentId && run.wakeupRequestId) {
+        const [held] = await client.update(agentWakeupRequests).set({
+          payload: sql`coalesce(${agentWakeupRequests.payload}, '{}'::jsonb) || ${JSON.stringify({ nativeStatusAdmissionHold: dailyCapBlock.reason })}::jsonb`,
+        }).where(and(eq(agentWakeupRequests.id, run.wakeupRequestId),
+          eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+          eq(agentWakeupRequests.requestedByActorType, "system"),
+          eq(agentWakeupRequests.requestedByActorId, `native-status-wake-dispatch:${intentId}`),
+        )).returning({ id: agentWakeupRequests.id });
+        if (held) await client.update(agentWakeupRequests).set({ status: "queued", runId: null, claimedAt: null,
+          finishedAt: null, error: dailyCapBlock.reason, updatedAt: now }).where(and(
+          eq(agentWakeupRequests.id, intentId), eq(agentWakeupRequests.companyId, run.companyId),
+          eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.requestedByActorType, "system"),
+          eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+          inArray(agentWakeupRequests.status, ["claimed", "coalesced"]),
+          or(eq(agentWakeupRequests.runId, run.id), isNull(agentWakeupRequests.runId)),
+        ));
+      }
     });
     if (!cancelled) return null;
-
-    await setWakeupStatus(run.wakeupRequestId, "skipped", {
-      finishedAt: now,
-      error: reason,
-    });
-
-    // This gate runs before any adapter/provider invocation. Preserve the source
-    // result for normal admission later; never replay a failed/unknown provider run.
-    const intentId = readNonEmptyString(parseObject(run.contextSnapshot).nativeStatusWakeIntentId);
-    if (intentId && run.wakeupRequestId) {
-      const [held] = await db.update(agentWakeupRequests).set({
-        payload: sql`coalesce(${agentWakeupRequests.payload}, '{}'::jsonb) || ${JSON.stringify({ nativeStatusAdmissionHold: dailyCapBlock.reason })}::jsonb`,
-      }).where(and(eq(agentWakeupRequests.id, run.wakeupRequestId),
-        eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
-        eq(agentWakeupRequests.requestedByActorType, "system"),
-        eq(agentWakeupRequests.requestedByActorId, `native-status-wake-dispatch:${intentId}`),
-      )).returning({ id: agentWakeupRequests.id });
-      if (held) await db.update(agentWakeupRequests).set({ status: "queued", runId: null, claimedAt: null,
-        finishedAt: null, error: dailyCapBlock.reason, updatedAt: now }).where(and(
-        eq(agentWakeupRequests.id, intentId), eq(agentWakeupRequests.companyId, run.companyId),
-        eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.requestedByActorType, "system"),
-        eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
-        inArray(agentWakeupRequests.status, ["claimed", "coalesced"]),
-        or(eq(agentWakeupRequests.runId, run.id), isNull(agentWakeupRequests.runId)),
-      ));
-    }
 
     await appendRunEvent(cancelled, {
       eventType: "lifecycle",
