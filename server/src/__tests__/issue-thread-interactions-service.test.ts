@@ -5122,6 +5122,26 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       expect((wakes[0].payload as any)._paperclipWakeContext.childIssueIds.sort()).toEqual([f.childId, siblingId].sort());
     });
 
+    it("keeps earlier siblings' accepted source summaries when the last review completes", async () => {
+      const f = await fixture(false, true);
+      const siblingId = randomUUID();
+      await db.insert(issues).values({ id: siblingId, companyId: f.companyId, goalId: f.child.goalId,
+        parentId: f.parentId, title: "Second saved result", status: "in_review", priority: "medium" });
+      const sibling = (await issuesSvc.getById(siblingId))!;
+      const review = await interactionsSvc.create(sibling, { kind: "request_confirmation", resolverPolicy: "anyone",
+        continuationPolicy: "none", payload: { version: 1, prompt: "Review second result",
+          target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } } }, { userId: "local-board" });
+      await recordReviewTransition({ companyId: f.companyId, issueId: siblingId, interactionId: review.id });
+      await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+      await issuesSvc.addComment(f.childId, "Later QA bookkeeping", { userId: "local-board" });
+      await interactionsSvc.acceptInteraction(sibling, review.id, {}, { userId: "local-board" });
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect((wake!.payload as any)._paperclipWakeContext.childIssueSummaries).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: f.childId, summary: "Saved source-run result" }),
+      ]));
+    });
+
     it("does not bypass another unfinished explicit blocker with a parent wake", async () => {
       const f = await fixture(true);
       const blockerId = randomUUID();

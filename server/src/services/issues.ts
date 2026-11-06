@@ -53,6 +53,7 @@ import {
   documents,
   goals,
   heartbeatRuns,
+  nativeRunResults,
   routineRuns,
   executionWorkspaces,
   issueApprovals,
@@ -9247,6 +9248,27 @@ export function issueService(db: Db) {
               )
               .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
           : [];
+      // Use the latest accepted source binding for EACH reviewed child. The
+      // last child's finish summary cannot stand in for an earlier sibling,
+      // and a later QA bookkeeping comment must not replace its saved result.
+      const acceptedSources = childIdsForSummaries.length > 0 ? await db.select({
+        issueId: issueThreadInteractions.issueId, resultJson: nativeRunResults.resultJson,
+      }).from(issueThreadInteractions).leftJoin(nativeRunResults, and(
+        eq(nativeRunResults.companyId, issueThreadInteractions.companyId),
+        eq(nativeRunResults.issueId, issueThreadInteractions.issueId),
+        eq(nativeRunResults.runId, issueThreadInteractions.sourceRunId),
+        eq(nativeRunResults.schemaStatus, "accepted"),
+      )).where(and(eq(issueThreadInteractions.companyId, parent.companyId),
+        inArray(issueThreadInteractions.issueId, childIdsForSummaries),
+        eq(issueThreadInteractions.status, "accepted"),
+        sql`${issueThreadInteractions.payload}->'target'->>'key' = 'native_completion_review'`,
+      )).orderBy(desc(issueThreadInteractions.resolvedAt), desc(issueThreadInteractions.createdAt), desc(issueThreadInteractions.id)) : [];
+      const acceptedSummaryByIssueId = new Map<string, string | null>();
+      for (const row of acceptedSources) {
+        if (acceptedSummaryByIssueId.has(row.issueId)) continue;
+        const summary = (row.resultJson as { result?: { summary?: unknown } } | null)?.result?.summary;
+        acceptedSummaryByIssueId.set(row.issueId, typeof summary === "string" && summary.trim() ? summary.trim() : null);
+      }
       const latestCommentByIssueId = new Map<string, string>();
       for (const comment of commentRows) {
         if (!latestCommentByIssueId.has(comment.issueId)) {
@@ -9261,7 +9283,7 @@ export function issueService(db: Db) {
             child.id === completedChildResult?.issueId
               ? (completedChildResult.summary ??
                   latestCommentByIssueId.get(child.id))
-              : latestCommentByIssueId.get(child.id),
+              : (acceptedSummaryByIssueId.get(child.id) ?? latestCommentByIssueId.get(child.id)),
           ),
         }));
 
