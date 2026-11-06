@@ -174,12 +174,14 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await tempDb?.cleanup();
   });
 
-  it.each([1, 2])("delivers %s reviewed child revisions after the running parent blocks", async revisionCount => {
+  it.each([1, 2])("delivers %s accepted child results after the running parent blocks", async revisionCount => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
     const childId = randomUUID();
-    const decisionIds = Array.from({ length: revisionCount }, () => randomUUID());
+    const decisionId = randomUUID();
+    const decisionIds = Array.from({ length: revisionCount }, () => decisionId);
+    const reviewIds = Array.from({ length: revisionCount }, () => randomUUID());
     const readyState = { companyId, dependentIssueId: issueId, blockerIssueIds: [childId], blockedTransitionAt: null };
     const readyKey = buildIssueBlockersResolvedWakeStateKey(readyState);
     let finishParent!: () => void;
@@ -224,10 +226,10 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         const [intent] = await db.insert(agentWakeupRequests).values({ companyId, agentId,
           source: "automation", triggerDetail: "system", reason: "issue_children_completed",
           requestedByActorType: "system", requestedByActorId: "native-status-committer",
-          idempotencyKey: `issue_children_completed:${issueId}:${childId}:${decisionId}`,
+          idempotencyKey: `issue_children_completed:${issueId}:${childId}:${decisionId}:review:${reviewIds[revision]}`,
           payload: { issueId, taskId: issueId, nativeDependencyReadyStateKey: readyKey, _paperclipWakeContext: {
             issueId, taskId: issueId, source: "native_status_decision",
-            nativeChildCompletionDecisionId: decisionId, completedChildIssueId: childId,
+            nativeChildCompletionDecisionId: decisionId, nativeCompletionReviewInteractionId: reviewIds[revision], completedChildIssueId: childId,
             childIssueIds: [childId], childIssueSummaries: [{ id: childId, summary: `Saved revision ${revision + 1}` }],
           } },
         }).returning();
@@ -249,7 +251,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       expect(runs.map((run) => ({ id: run.id, status: run.status, context: run.contextSnapshot, error: run.error }))).toHaveLength(revisionCount + 1);
       const continuations = runs.filter(run => run.id !== parentRun!.id);
       for (const [revision, decisionId] of decisionIds.entries()) {
-        const continuation = continuations.find(run => (run.contextSnapshot as any).nativeChildCompletionDecisionId === decisionId)!;
+        const continuation = continuations.find(run => (run.contextSnapshot as any).nativeCompletionReviewInteractionId === reviewIds[revision])!;
         expect(continuation).toBeDefined();
         expect(continuation.contextSnapshot).toMatchObject({
           wakeReason: "issue_children_completed", nativeChildCompletionDecisionId: decisionId,

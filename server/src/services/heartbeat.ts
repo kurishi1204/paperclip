@@ -30800,7 +30800,8 @@ export function heartbeatService(
       const scopeKey = issueId
         ? JSON.stringify([candidate.companyId, candidate.agentId, issueId,
             readNativeReviewAssignmentContext(wakeContext)?.nativeReviewInteractionId ?? null,
-            readNonEmptyString(wakeContext.nativeChildCompletionDecisionId) ?? null])
+            readNonEmptyString(wakeContext.nativeChildCompletionDecisionId) ?? null,
+            readNonEmptyString(wakeContext.nativeCompletionReviewInteractionId) ?? null])
         : null;
       const priorDelivery = scopeKey
         ? deliveredByIssueScope.get(scopeKey)
