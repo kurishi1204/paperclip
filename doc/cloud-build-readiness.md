@@ -6,6 +6,23 @@
 > Actions workflows in the COLO fork. COLO uses `colo-source-artifact.yml`.
 
 
+## COLO fork distribution
+
+This fork distributes source only through
+[COLO source artifact](../.github/workflows/colo-source-artifact.yml).
+Use that workflow's source package and receipt for the selected commit. Do not
+dispatch `release.yml`, `docker.yml`, `refresh-lockfile.yml`, or
+`cloud-migrator-artifacts.yml` in this fork: none is registered here. Their
+retained definitions do not provide npm, image-registry, or AWS publication.
+
+## Upstream reference contract
+
+Everything below describes the canonical `paperclipai/paperclip` infrastructure,
+not a current COLO fork operation. Dispatches and publication instructions apply
+only to an upstream repository where those workflows and publisher identities
+are registered. Tests that read the retained files check source contracts; they
+do not prove that a fork job ran or that an artifact was published.
+
 The `Cloud readiness` workflow starts for every master push and retains the
 versioned `Cloud source verified v1` job. It calls the full `Release Verify`
 workflow for that exact commit, including typecheck, builds, general and
@@ -17,9 +34,10 @@ retired. The workflow no longer builds a legacy image or waits for one.
 Keep its filename and source-proof job name stable: npm canary publication and
 downstream image composers consume that exact contract.
 
-Standard images still publish independently through `docker.yml`. The
-`cloud-migrator-artifacts.yml` workflow still publishes signed exact-source
-migrators independently. A downstream composer must verify those artifacts,
+In the canonical upstream repository, standard images publish independently
+through `docker.yml`. Its `cloud-migrator-artifacts.yml` workflow publishes
+signed exact-source migrators independently. These producers are retained
+reference files in the COLO fork and do not publish here. A downstream composer must verify those artifacts,
 build and test its own image, and record separate deployment readiness.
 
 Verification runs outside the full npm release's concurrency group. Different

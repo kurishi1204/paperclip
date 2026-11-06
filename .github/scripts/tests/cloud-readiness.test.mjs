@@ -18,7 +18,7 @@ test("retirement preserves exact-source verification without issuing legacy depl
   assert.equal(existsSync(new URL("../../workflows/docker-cloud.yml", import.meta.url)), false);
 });
 
-test("standard image provenance and independent exact-source migrators remain available", () => {
+test("retained upstream definitions preserve image provenance and exact-source migrator contracts", () => {
   const docker = readFileSync(new URL("../../../doc/upstream-workflows/docker.yml", import.meta.url), "utf8");
   assert.match(docker, /target: production/);
   assert.match(docker, /type=raw,value=sha-\$\{\{ github.sha \}\}/);

@@ -6,6 +6,23 @@
 > Actions workflows in the COLO fork. COLO uses `colo-source-artifact.yml`.
 
 
+## COLO fork distribution
+
+This fork distributes source only through
+[COLO source artifact](../.github/workflows/colo-source-artifact.yml).
+Use that workflow's source package and receipt for the selected commit. Do not
+dispatch `release.yml`, `docker.yml`, `refresh-lockfile.yml`, or
+`cloud-migrator-artifacts.yml` in this fork: none is registered here. Their
+retained definitions do not provide npm, image-registry, or AWS publication.
+
+## Upstream reference contract
+
+Everything below describes the canonical `paperclipai/paperclip` infrastructure,
+not a current COLO fork operation. Dispatches and publication instructions apply
+only to an upstream repository where those workflows and publisher identities
+are registered. Tests that read the retained files check source contracts; they
+do not prove that a fork job ran or that an artifact was published.
+
 The release captain's checklist for every lane. The mechanics live in
 [`RELEASING.md`](RELEASING.md); the user-facing channel guide is
 [`CHANNELS.md`](CHANNELS.md).

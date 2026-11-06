@@ -128,10 +128,10 @@ describe("deployment manifest parity", () => {
 describe("orphan-reaping probe", () => {
   it.each([
     ["the docker build test", buildTest],
-    ["the Docker publish workflow", dockerWorkflow],
-  ])("is exercised against a real image by %s", (_name, source) => {
-    // A probe nothing runs proves nothing. The static assertions above only
-    // check configuration; this is what keeps the behavioural check wired up.
+    ["the retained upstream Docker publish definition", dockerWorkflow],
+  ])("declares the real-image probe in %s", (_name, source) => {
+    // This checks source wiring only. The retained definition is not a runnable
+    // fork workflow, and this assertion does not prove image execution.
     expect(source).toContain("scripts/assert-orphan-reaping.sh");
   });
 
