@@ -5010,6 +5010,9 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId, invocationSource: "assignment",
           status: "succeeded", nativeIssueId: childId, completionContractId: contractId });
         await db.insert(nativeRunResults).values({ companyId, issueId: childId, runId: sourceRunId,
+          completionContractId: contractId, serverFingerprint: "earlier-turn", schemaStatus: "accepted",
+          resultJson: { result: { summary: "Earlier plan wait" } }, canonicalSha256: "c".repeat(64), createdAt: new Date(Date.now() - 10_000) });
+        await db.insert(nativeRunResults).values({ companyId, issueId: childId, runId: sourceRunId,
           completionContractId: contractId, serverFingerprint: "source-result", schemaStatus: "accepted",
           resultJson: { result: { summary: "Saved source-run result" } }, canonicalSha256: "b".repeat(64) });
       }

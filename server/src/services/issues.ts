@@ -54,6 +54,7 @@ import {
   goals,
   heartbeatRuns,
   nativeRunResults,
+  nativeRunFinalizations,
   routineRuns,
   executionWorkspaces,
   issueApprovals,
@@ -9253,16 +9254,21 @@ export function issueService(db: Db) {
       // and a later QA bookkeeping comment must not replace its saved result.
       const acceptedSources = childIdsForSummaries.length > 0 ? await db.select({
         issueId: issueThreadInteractions.issueId, resultJson: nativeRunResults.resultJson,
-      }).from(issueThreadInteractions).leftJoin(nativeRunResults, and(
+      }).from(issueThreadInteractions).leftJoin(nativeRunFinalizations, and(
+        eq(nativeRunFinalizations.companyId, issueThreadInteractions.companyId),
+        eq(nativeRunFinalizations.issueId, issueThreadInteractions.issueId),
+        eq(nativeRunFinalizations.runId, issueThreadInteractions.sourceRunId),
+      )).leftJoin(nativeRunResults, and(
         eq(nativeRunResults.companyId, issueThreadInteractions.companyId),
         eq(nativeRunResults.issueId, issueThreadInteractions.issueId),
         eq(nativeRunResults.runId, issueThreadInteractions.sourceRunId),
         eq(nativeRunResults.schemaStatus, "accepted"),
+        or(isNull(nativeRunFinalizations.resultId), eq(nativeRunResults.id, nativeRunFinalizations.resultId)),
       )).where(and(eq(issueThreadInteractions.companyId, parent.companyId),
         inArray(issueThreadInteractions.issueId, childIdsForSummaries),
         eq(issueThreadInteractions.status, "accepted"),
         sql`${issueThreadInteractions.payload}->'target'->>'key' = 'native_completion_review'`,
-      )).orderBy(desc(issueThreadInteractions.resolvedAt), desc(issueThreadInteractions.createdAt), desc(issueThreadInteractions.id)) : [];
+      )).orderBy(desc(issueThreadInteractions.resolvedAt), desc(issueThreadInteractions.createdAt), desc(issueThreadInteractions.id), desc(nativeRunResults.createdAt), desc(nativeRunResults.id)) : [];
       const acceptedSummaryByIssueId = new Map<string, string | null>();
       for (const row of acceptedSources) {
         if (acceptedSummaryByIssueId.has(row.issueId)) continue;

@@ -33,6 +33,7 @@ import {
   documents,
   heartbeatRuns,
   nativeRunResults,
+  nativeRunFinalizations,
   runIdentityContexts,
   issueComments,
   issueDocuments,
@@ -2348,11 +2349,18 @@ export function issueThreadInteractionService(
           const dependents = await completedSvc.listWakeableBlockedDependents(completedIssue.id);
           const sourceResult = lockedCurrent.sourceRunId ? await tx
             .select({ resultJson: nativeRunResults.resultJson })
-            .from(nativeRunResults).where(and(
+            .from(nativeRunResults).leftJoin(nativeRunFinalizations, and(
+              eq(nativeRunFinalizations.companyId, nativeRunResults.companyId),
+              eq(nativeRunFinalizations.issueId, nativeRunResults.issueId),
+              eq(nativeRunFinalizations.runId, nativeRunResults.runId),
+            )).where(and(
               eq(nativeRunResults.companyId, issueContext.companyId),
               eq(nativeRunResults.issueId, completedIssue.id),
               eq(nativeRunResults.runId, lockedCurrent.sourceRunId),
-            )).limit(1).then(rows => rows[0] ?? null) : null;
+              eq(nativeRunResults.schemaStatus, "accepted"),
+              or(isNull(nativeRunFinalizations.resultId), eq(nativeRunResults.id, nativeRunFinalizations.resultId)),
+            )).orderBy(desc(nativeRunResults.createdAt), desc(nativeRunResults.id))
+            .limit(1).then(rows => rows[0] ?? null) : null;
           const sourceSummary = (sourceResult?.resultJson as { result?: { summary?: unknown } } | undefined)?.result?.summary;
           const summary = typeof sourceSummary === "string" && sourceSummary.trim() ? sourceSummary.trim() : null;
           const parent = completedIssue.parentId
