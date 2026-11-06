@@ -16,7 +16,7 @@ import { BUNDLED_PLUGIN_CATALOG } from "../services/bundled-plugins.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const dockerfile = readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
-const workflow = readFileSync(path.join(repoRoot, ".github", "workflows", "docker.yml"), "utf8");
+const workflow = readFileSync(path.join(repoRoot, "doc", "upstream-workflows", "docker.yml"), "utf8");
 
 function parseList(source: string, pattern: RegExp, label: string): string[] {
   const match = source.match(pattern);

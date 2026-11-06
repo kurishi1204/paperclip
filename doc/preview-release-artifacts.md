@@ -1,10 +1,35 @@
 # Preview deployment artifacts
 
-The `preview` channel in `.github/workflows/release.yml` builds deployment
+> Fork scope: the release, Docker, lockfile-refresh, and cloud-migrator workflow
+> definitions described here are retained as upstream reference files in
+> [upstream-workflows](upstream-workflows/README.md). They are not registered
+> Actions workflows in the COLO fork. COLO uses `colo-source-artifact.yml`.
+
+
+## COLO fork distribution
+
+This fork distributes source only through
+[COLO source artifact](../.github/workflows/colo-source-artifact.yml).
+Use that workflow's source package and receipt for the selected commit. Do not
+dispatch `release.yml`, `docker.yml`, `refresh-lockfile.yml`, or
+`cloud-migrator-artifacts.yml` in this fork: none is registered here. Their
+retained definitions do not provide npm, image-registry, or AWS publication.
+
+## Upstream reference contract
+
+Everything below describes the canonical `paperclipai/paperclip` infrastructure,
+not a current COLO fork operation. Dispatches and publication instructions apply
+only to an upstream repository where those workflows and publisher identities
+are registered. Tests that read the retained files check source contracts; they
+do not prove that a fork job ran or that an artifact was published.
+
+The upstream `preview` channel in the retained
+[`release.yml`](upstream-workflows/release.yml) definition builds deployment
 artifacts for one immutable source commit. It does not create a GitHub release,
 move a source branch, or advance any stable, beta, nightly, or canary alias.
 
-Dispatch `release.yml` on `master` with these inputs:
+In the canonical upstream repository only, dispatch its registered `release.yml`
+on `master` with these inputs:
 
 | Input | Value |
 | --- | --- |
@@ -54,12 +79,14 @@ version 1, request ID, SHA, stage `build`, and status `ready`. It expires after
 
 ### Migrator publication on merge
 
-`cloud-migrator-artifacts.yml` publishes a signed exact-source DB/shared bundle
-on each canonical master push, independently of image publication and npm.
+The canonical upstream `cloud-migrator-artifacts.yml` publishes a signed
+exact-source DB/shared bundle on each upstream master push, independently of
+image publication and npm. This fork keeps its definition as reference only.
 See [Direct cloud migrator artifacts](#direct-cloud-migrator-artifacts) below.
 Downstream deployment tooling must verify source, image, and migrator separately.
 
-The manual npm compatibility path remains available: dispatch `release.yml` on
+The upstream manual npm compatibility path remains available: dispatch its
+registered `release.yml` on
 `master` with `channel=cloud-migrator`, the full SHA as `source_ref`, a new UUID v4
 as `request_id`, and `dry_run=false`. `preview_migrator` is not required for this
 channel. Existing packages are verified and reused. Preview and migrator-only

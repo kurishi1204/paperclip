@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-const workflow = readFileSync(new URL("../../workflows/refresh-lockfile.yml", import.meta.url), "utf8");
+const workflow = readFileSync(new URL("../../../doc/upstream-workflows/refresh-lockfile.yml", import.meta.url), "utf8");
 const nodeStep = workflow.split("      - name: Setup Node.js\n")[1]?.split("      - name:")[0];
 assert.ok(nodeStep, "the refresh workflow must set up Node");
 const input = (name) => nodeStep.match(new RegExp(`^          ${name}: (.+)$`, "m"))?.[1].trim();

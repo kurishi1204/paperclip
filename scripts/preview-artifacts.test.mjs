@@ -149,7 +149,7 @@ test("invalid DB package metadata prevents publication of either package", async
 });
 
 test("preview workflow separates branch compilation from trusted publishing", () => {
-  const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
+  const workflow = readFileSync(new URL("../doc/upstream-workflows/release.yml", import.meta.url), "utf8");
   const builder = workflow.split("  package_preview:")[1].split("  publish_preview:")[0];
   const publisher = workflow.split("  publish_preview:")[1].split("  image_preview:")[0];
   const image = workflow.split("  image_preview:")[1].split("  publish_image_preview:")[0];
@@ -169,7 +169,7 @@ test("preview workflow separates branch compilation from trusted publishing", ()
 });
 
 test("manual migrator and branch preview retain their npm publisher and concurrency", () => {
-  const release = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
+  const release = readFileSync(new URL("../doc/upstream-workflows/release.yml", import.meta.url), "utf8");
   assert.match(release, /\(inputs.channel == 'preview' \|\| inputs.channel == 'cloud-migrator'\) && format\('\{0\}-\{1\}', inputs.channel, inputs.source_ref\)/);
   const publisher = release.split("  publish_preview:")[1].split("  image_preview:")[0];
   assert.match(publisher, /group: preview-package-publish-\$\{\{ inputs.source_ref \}\}/);

@@ -13,7 +13,7 @@ const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const scriptPath = join(repoRoot, "scripts", "service-onboard-smoke.sh");
 const script = readFileSync(scriptPath, "utf8");
 const smokeWorkflow = readFileSync(join(repoRoot, ".github", "workflows", "release-smoke.yml"), "utf8");
-const releaseWorkflow = readFileSync(join(repoRoot, ".github", "workflows", "release.yml"), "utf8");
+const releaseWorkflow = readFileSync(join(repoRoot, "doc", "upstream-workflows", "release.yml"), "utf8");
 
 test("smoke script is executable and parses", () => {
   accessSync(scriptPath, constants.X_OK);

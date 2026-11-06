@@ -1,5 +1,28 @@
 # Releasing Paperclip
 
+> Fork scope: the release, Docker, lockfile-refresh, and cloud-migrator workflow
+> definitions described here are retained as upstream reference files in
+> [upstream-workflows](upstream-workflows/README.md). They are not registered
+> Actions workflows in the COLO fork. COLO uses `colo-source-artifact.yml`.
+
+
+## COLO fork distribution
+
+This fork distributes source only through
+[COLO source artifact](../.github/workflows/colo-source-artifact.yml).
+Use that workflow's source package and receipt for the selected commit. Do not
+dispatch `release.yml`, `docker.yml`, `refresh-lockfile.yml`, or
+`cloud-migrator-artifacts.yml` in this fork: none is registered here. Their
+retained definitions do not provide npm, image-registry, or AWS publication.
+
+## Upstream reference contract
+
+Everything below describes the canonical `paperclipai/paperclip` infrastructure,
+not a current COLO fork operation. Dispatches and publication instructions apply
+only to an upstream repository where those workflows and publisher identities
+are registered. Tests that read the retained files check source contracts; they
+do not prove that a fork job ran or that an artifact was published.
+
 Maintainer runbook for shipping Paperclip across npm, GitHub, and the website-facing changelog surface.
 
 The release model is now commit-driven:
@@ -89,7 +112,7 @@ internal traceability tag.
 
 ### Canary
 
-Every push to `master` runs the canary path inside [`.github/workflows/release.yml`](../.github/workflows/release.yml).
+Every push to `master` runs the canary path inside [`.github/workflows/release.yml`](upstream-workflows/release.yml).
 
 It:
 
@@ -113,7 +136,7 @@ npx paperclipai@canary onboard --data-dir "$(mktemp -d /tmp/paperclip-canary.XXX
 
 ### Nightly
 
-A scheduled job in [`.github/workflows/release.yml`](../.github/workflows/release.yml)
+A scheduled job in [`.github/workflows/release.yml`](upstream-workflows/release.yml)
 runs once a night at 09:00 UTC.
 
 It:
@@ -130,7 +153,7 @@ It:
   dist-tag `nightly` (the commit was already verified by its canary run, so
   verification is not repeated)
 - creates and pushes the git tag `nightly/vYYYY.MDD.P-nightly.N`
-- dispatches [`docker.yml`](../.github/workflows/docker.yml) at that tag to
+- dispatches [`docker.yml`](upstream-workflows/docker.yml) at that tag to
   publish the `:nightly` images
 
 To force a nightly outside the schedule (recovery, or promoting a specific
@@ -148,7 +171,7 @@ npx paperclipai@nightly onboard
 ### Beta
 
 Betas are manual promotions. Dispatch
-[`release.yml`](../.github/workflows/release.yml) with `channel: beta`.
+[`release.yml`](upstream-workflows/release.yml) with `channel: beta`.
 
 - leave `source_version` empty to promote the newest nightly, or set it to an
   exact nightly version such as `2026.807.0-nightly.0`
@@ -205,7 +228,7 @@ was cut from.
 
 ### Stable
 
-Use [`.github/workflows/release.yml`](../.github/workflows/release.yml) from the Actions tab with the manual `workflow_dispatch` inputs.
+Use [`.github/workflows/release.yml`](upstream-workflows/release.yml) from the Actions tab with the manual `workflow_dispatch` inputs.
 
 [Run the action here](https://github.com/paperclipai/paperclip/actions/workflows/release.yml)
 
@@ -267,7 +290,7 @@ The workflow:
   the missing path named
 - publishes `YYYY.MDD.P` under npm dist-tag `latest`
 - creates git tag `vYYYY.MDD.P`
-- dispatches [`docker.yml`](../.github/workflows/docker.yml) at that tag to
+- dispatches [`docker.yml`](upstream-workflows/docker.yml) at that tag to
   publish `:latest` and the versioned stable images
 - creates or updates the GitHub Release from the resolved notes file
 - for master-side beta notes, pushes a `release-notes/v<version>-canonicalize`
@@ -276,7 +299,7 @@ The workflow:
 
 ## Docker Image Tags
 
-[`docker.yml`](../.github/workflows/docker.yml) publishes both the self-hosted
+[`docker.yml`](upstream-workflows/docker.yml) publishes both the self-hosted
 image and the `-cloud` variant with the same lane mapping:
 
 | Build ref | Tags |
