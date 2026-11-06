@@ -2365,7 +2365,7 @@ export function issueThreadInteractionService(
           const summary = typeof sourceSummary === "string" && sourceSummary.trim() ? sourceSummary.trim() : null;
           const parent = completedIssue.parentId
             ? await completedSvc.getWakeableParentAfterChildCompletion(completedIssue.parentId, {
-                issueId: completedIssue.id, summary,
+                issueId: completedIssue.id, summary, notifyAcceptedChild: true,
               }) : null;
           const completionTarget = (lockedCurrent.payload as { target?: { revisionId?: unknown } }).target;
           const reviewContext = { nativeCompletionReviewInteractionId: lockedCurrent.id,
@@ -2400,23 +2400,19 @@ export function issueThreadInteractionService(
               payload: context, contextSnapshot: context,
             });
           }
-          // Explicit blockers use only their readiness/state-key path. A parent
-          // with an unfinished workspace barrier is left to normal finalize or
-          // reconciliation; do not bypass it with a differently keyed parent wake.
+          // Persist this result even when another dependency is unfinished.
+          // The normal dispatcher/admission gate delays delivery until ready.
           if (parent && !dependents.some(dependent => dependent.id === parent.id)) {
-            const readiness = await completedSvc.getDependencyReadiness(parent.id);
-            if (readiness.blockerIssueIds.length === 0) {
-              const context = { ...reviewContext, completedChildIssueId: completedIssue.id,
-                childIssueIds: parent.childIssueIds, childIssueSummaries: parent.childIssueSummaries,
-                onboardingCompletion: parent.onboardingCompletion,
-                childIssueSummaryTruncated: parent.childIssueSummaryTruncated };
-              await enqueueNativeStatusWakeIntent({
-                tx: tx as unknown as Db, companyId: issueContext.companyId,
-                issueId: parent.id, agentId: parent.assigneeAgentId, reason: "issue_children_completed",
-                idempotencyKey: `issue_children_completed:${parent.id}:${completedIssue.id}:review:${lockedCurrent.id}`,
-                payload: context, contextSnapshot: context,
-              });
-            }
+            const context = { ...reviewContext, completedChildIssueId: completedIssue.id,
+              childIssueIds: parent.childIssueIds, childIssueSummaries: parent.childIssueSummaries,
+              onboardingCompletion: parent.onboardingCompletion,
+              childIssueSummaryTruncated: parent.childIssueSummaryTruncated };
+            await enqueueNativeStatusWakeIntent({
+              tx: tx as unknown as Db, companyId: issueContext.companyId,
+              issueId: parent.id, agentId: parent.assigneeAgentId, reason: "issue_children_completed",
+              idempotencyKey: `issue_children_completed:${parent.id}:${completedIssue.id}:review:${lockedCurrent.id}`,
+              payload: context, contextSnapshot: context,
+            });
           }
           continuationIssue = {
             id: completedIssue.id,

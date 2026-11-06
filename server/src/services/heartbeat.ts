@@ -30872,6 +30872,18 @@ export function heartbeatService(
         }
       }
 
+      if (issueId && ["issue_children_completed", "issue_blockers_resolved"].includes(candidate.reason ?? "")) {
+        const readiness = await issuesSvc.getDependencyReadiness(issueId);
+        if (!readiness.isDependencyReady) {
+          await db.update(agentWakeupRequests).set({ status: "queued", claimedAt: null,
+            error: "native_result_waiting_for_dependencies", updatedAt: new Date() })
+            .where(and(eq(agentWakeupRequests.id, candidate.id),
+              eq(agentWakeupRequests.status, "claimed"), isNull(agentWakeupRequests.runId)));
+          deferred += 1;
+          continue;
+        }
+      }
+
       try {
         const wakeRun = await enqueueWakeup(candidate.agentId, {
           source: candidate.source as WakeupOptions["source"],

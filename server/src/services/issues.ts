@@ -9181,7 +9181,7 @@ export function issueService(db: Db) {
 
     getWakeableParentAfterChildCompletion: async (
       parentIssueId: string,
-      completedChildResult?: { issueId: string; summary: string | null } | null,
+      completedChildResult?: { issueId: string; summary: string | null; notifyAcceptedChild?: boolean } | null,
     ) => {
       const parent = await db
         .select({
@@ -9221,14 +9221,19 @@ export function issueService(db: Db) {
         .orderBy(asc(issues.issueNumber), asc(issues.createdAt));
       if (children.length === 0) return null;
       if (
-        !children.every(
+        !completedChildResult?.notifyAcceptedChild && !children.every(
           (child) => child.status === "done" || child.status === "cancelled",
         )
       ) {
         return null;
       }
 
-      const childIdsForSummaries = children
+      // A saved result is an event for this child, not an assertion that all
+      // historical children are complete. Queue admission owns dependency waits.
+      const summaryChildren = completedChildResult?.notifyAcceptedChild
+        ? children.filter(child => child.id === completedChildResult.issueId) : children;
+      if (summaryChildren.length === 0) return null;
+      const childIdsForSummaries = summaryChildren
         .slice(0, MAX_CHILD_COMPLETION_SUMMARIES)
         .map((child) => child.id);
       const commentRows =
@@ -9281,7 +9286,7 @@ export function issueService(db: Db) {
           latestCommentByIssueId.set(comment.issueId, comment.body);
         }
       }
-      const childIssueSummaries: ChildIssueCompletionSummary[] = children
+      const childIssueSummaries: ChildIssueCompletionSummary[] = summaryChildren
         .slice(0, MAX_CHILD_COMPLETION_SUMMARIES)
         .map((child) => ({
           ...child,
@@ -9297,10 +9302,10 @@ export function issueService(db: Db) {
         onboardingCompletion: parent.originKind === "onboarding_first_task",
         id: parent.id,
         assigneeAgentId: parent.assigneeAgentId,
-        childIssueIds: children.map((child) => child.id),
+        childIssueIds: summaryChildren.map((child) => child.id),
         childIssueSummaries,
         childIssueSummaryTruncated:
-          children.length > childIssueSummaries.length,
+          summaryChildren.length > childIssueSummaries.length,
       };
     },
 

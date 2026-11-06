@@ -364,6 +364,36 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(dispatchedRequests[0]).toMatchObject({ runId: dispatchedRun!.id });
   });
 
+  it("retains a child result until its explicit dependency is ready without a provider call", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), blockerId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Result admission", issuePrefix: `E${companyId.slice(0, 6).toUpperCase()}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Lead", role: "engineer", status: "active",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {} });
+    await db.insert(issues).values([{ id: issueId, companyId, title: "Parent", status: "blocked", assigneeAgentId: agentId, responsibleUserId: "responsible-user" },
+      { id: blockerId, companyId, title: "Required dependency", status: "in_progress" }]);
+    await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" });
+    const [intent] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", triggerDetail: "system",
+      reason: "issue_children_completed", requestedByActorType: "system", requestedByActorId: "native-status-committer",
+      idempotencyKey: `readiness-result:${issueId}`, payload: { issueId, _paperclipWakeContext: { nativeChildCompletionDecisionId: randomUUID() } } }).returning();
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(1);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent!.id)))[0]!.status).toBe("queued");
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerId));
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "running")));
+      await db.insert(issueComments).values({ companyId, issueId, authorAgentId: agentId, authorType: "agent", createdByRunId: run!.id, body: "Delivered the retained child result." });
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Delivered the retained child result.", provider: "test", model: "test-model" };
+    });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
+  });
+
   it.each([false, true])("retains a native result through a daily cap (already queued: %s)", async queued => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
     let releaseFirst = () => {};

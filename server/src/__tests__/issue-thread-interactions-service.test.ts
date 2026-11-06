@@ -5095,7 +5095,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       expect((await issuesSvc.getById(f.parentId))!.blockedTransitionAt).toEqual(before);
     });
 
-    it.each([0, 1, 2])("does not lose the last concurrent sibling acceptance (%s)", async () => {
+    it.each([0, 1, 2])("preserves each concurrent sibling acceptance (%s)", async () => {
       const f = await fixture(false); const siblingId = randomUUID();
       await db.insert(issues).values({ id: siblingId, companyId: f.companyId, goalId: f.child.goalId,
         parentId: f.parentId, title: "Other saved work", status: "in_review", priority: "medium" });
@@ -5121,8 +5121,8 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       expect((await issuesSvc.getById(f.childId))!.status).toBe("done");
       expect((await issuesSvc.getById(siblingId))!.status).toBe("done");
       const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
-      expect(wakes).toHaveLength(1);
-      expect((wakes[0].payload as any)._paperclipWakeContext.childIssueIds.sort()).toEqual([f.childId, siblingId].sort());
+      expect(wakes).toHaveLength(2);
+      expect(wakes.flatMap(w => (w.payload as any)._paperclipWakeContext.childIssueIds).sort()).toEqual([f.childId, siblingId].sort());
     });
 
     it("keeps earlier siblings' accepted source summaries when the last review completes", async () => {
@@ -5136,13 +5136,36 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
           target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } } }, { userId: "local-board" });
       await recordReviewTransition({ companyId: f.companyId, issueId: siblingId, interactionId: review.id });
       await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
-      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(1);
       await issuesSvc.addComment(f.childId, "Later QA bookkeeping", { userId: "local-board" });
       await interactionsSvc.acceptInteraction(sibling, review.id, {}, { userId: "local-board" });
-      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(wakes).toHaveLength(2);
+      const wake = wakes.find(w => (w.payload as any).completedChildIssueId === f.childId)!;
       expect((wake!.payload as any)._paperclipWakeContext.childIssueSummaries).toEqual(expect.arrayContaining([
         expect.objectContaining({ id: f.childId, summary: "Saved source-run result" }),
       ]));
+    });
+
+    it.each([false, true])("retains the current result with a separate historical blocker (ready: %s)", async ready => {
+      const f = await fixture(false, true); const blockerId = randomUUID();
+      await db.insert(issues).values({ id: blockerId, companyId: f.companyId, title: "Separate dependency",
+        status: ready ? "done" : "in_progress", priority: "medium" });
+      await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blockerId,
+        relatedIssueId: f.parentId, type: "blocks" });
+      if (ready) await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+        source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved", status: "completed",
+        requestedByActorType: "system", requestedByActorId: "dependency-observer",
+        idempotencyKey: buildIssueBlockersResolvedWakeStateKey({ dependentIssueId: f.parentId,
+          blockerIssueIds: [blockerId], blockedTransitionAt: (await issuesSvc.getById(f.parentId))!.blockedTransitionAt }), payload: { issueId: f.parentId } });
+      await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      const results = wakes.filter(w => w.reason === "issue_children_completed");
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({ status: "queued", runId: null,
+        payload: { issueId: f.parentId, completedChildIssueId: f.childId,
+          _paperclipWakeContext: { childIssueSummaries: [expect.objectContaining({ id: f.childId, summary: "Saved source-run result" })] } } });
+      expect((await issuesSvc.getDependencyReadiness(f.parentId)).isDependencyReady).toBe(ready);
     });
 
     it("does not bypass another unfinished explicit blocker with a parent wake", async () => {
@@ -5154,7 +5177,10 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         relatedIssueId: f.parentId, type: "blocks" });
       await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
       expect((await issuesSvc.getById(f.childId))?.status).toBe("done");
-      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+      const pending = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(pending).toHaveLength(1);
+      expect(pending[0]!.status).toBe("queued");
+      expect((await issuesSvc.getDependencyReadiness(f.parentId)).isDependencyReady).toBe(false);
       await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerId));
       expect((await issuesSvc.listWakeableBlockedDependents(blockerId)).map(v => v.id)).toContain(f.parentId);
     });

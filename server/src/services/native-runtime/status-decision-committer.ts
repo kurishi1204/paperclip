@@ -2001,24 +2001,23 @@ export async function commitNativeStatusDecision(input: {
       );
       const completedResultSummary = await tx
         .select({ resultJson: nativeRunResults.resultJson })
-        .from(nativeRunResults)
-        .where(
-          and(
-            eq(nativeRunResults.companyId, input.companyId),
-            eq(nativeRunResults.runId, input.runId),
-          ),
-        )
-        .limit(1)
-        .then((rows) => {
+        .from(nativeRunResults).innerJoin(workAssessments, and(
+          eq(workAssessments.id, input.assessmentId),
+          eq(workAssessments.companyId, nativeRunResults.companyId),
+          eq(workAssessments.issueId, nativeRunResults.issueId),
+          eq(workAssessments.runId, nativeRunResults.runId),
+          eq(workAssessments.resultId, nativeRunResults.id),
+        )).where(and(eq(nativeRunResults.companyId, input.companyId),
+          eq(nativeRunResults.issueId, input.issueId), eq(nativeRunResults.runId, input.runId),
+          eq(nativeRunResults.schemaStatus, "accepted"),
+        )).limit(1).then(rows => {
           const summary = record(record(rows[0]?.resultJson).result).summary;
-          return typeof summary === "string" && summary.trim().length > 0
-            ? summary.trim()
-            : null;
+          return typeof summary === "string" && summary.trim() ? summary.trim() : null;
         });
       const parent = issue.parentId
         ? await issueSvc.getWakeableParentAfterChildCompletion(issue.parentId, {
             issueId: input.issueId,
-            summary: completedResultSummary,
+            summary: completedResultSummary, notifyAcceptedChild: true,
           })
         : null;
       const parentIsDependent = parent
