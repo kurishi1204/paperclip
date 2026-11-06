@@ -30702,7 +30702,7 @@ export function heartbeatService(
           isNull(agentWakeupRequests.runId),
         ),
       )
-      .orderBy(asc(agentWakeupRequests.requestedAt))
+      .orderBy(asc(agentWakeupRequests.updatedAt), asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id))
       .limit(Math.max(1, Math.min(input.limit ?? 100, 500)));
 
     let dispatched = 0;
@@ -30714,6 +30714,12 @@ export function heartbeatService(
     >();
 
     for (const candidate of candidates) {
+      // Fairly rotate inspected entries, including dependency/cap/fresh-claim
+      // holds. Keep requestedAt as the immutable receipt time.
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+        eq(agentWakeupRequests.id, candidate.id), isNull(agentWakeupRequests.runId),
+        inArray(agentWakeupRequests.status, ["queued", "claimed"]),
+      ));
       const dispatchActorId = `native-status-wake-dispatch:${candidate.id}`;
       const existingDispatch = await db
         .select()
