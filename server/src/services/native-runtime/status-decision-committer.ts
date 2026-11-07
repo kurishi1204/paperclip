@@ -9,7 +9,7 @@ import { isConversation } from "../agent-conversations.js";
 import { hasPendingNativeChildCompletion, type NativeChildCompletionRecipient } from "./native-child-completion-delivery.js";
 import { and, asc, desc, eq, inArray, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import type { CreateIssueThreadInteraction } from "@paperclipai/shared";
+import type { CreateIssueThreadInteraction, RequestConfirmationBoundDocument } from "@paperclipai/shared";
 import {
   agentWakeupRequests,
   agents,
@@ -51,6 +51,7 @@ import {
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
+import { NATIVE_COMPLETION_BINDING_SYSTEM_ID, readNativeCompletionDocumentRevisions } from "./native-completion-document-binding.js";
 import { buildIssueBlockersResolvedWakeIdempotencyKey, buildIssueBlockersResolvedWakeStateKey } from "../issue-dependency-wakeups.js";
 import {
   persistActivity,
@@ -536,12 +537,32 @@ async function materializeDecisionEffect(input: {
   }
   if (effect.kind === "bind_reviewer") {
     failAt("interaction_materialization", input.failpoint);
+    const idempotencyKey = `native-review:${input.decisionId}${effect.requestKey ? `:${effect.requestKey}` : ""}`;
+    // Approval covers the documents as saved now, not whatever is latest later.
+    // A replayed effect keeps the binding its card already recorded, including
+    // a card saved before binding existed, so the idempotent create still matches.
+    const existingTarget = await input.tx
+      .select({ payload: issueThreadInteractions.payload })
+      .from(issueThreadInteractions)
+      .where(and(
+        eq(issueThreadInteractions.companyId, input.companyId),
+        eq(issueThreadInteractions.issueId, input.issue.id),
+        eq(issueThreadInteractions.idempotencyKey, idempotencyKey),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ? record(record(rows[0].payload).target) : null);
+    const boundDocuments = existingTarget
+      ? (existingTarget.boundDocuments as RequestConfirmationBoundDocument[] | null | undefined)
+      : await readNativeCompletionDocumentRevisions(input.tx, {
+          companyId: input.companyId,
+          issueId: input.issue.id,
+        });
     const reviewInput: Extract<
       CreateIssueThreadInteraction,
       { kind: "request_confirmation" }
     > = {
       kind: "request_confirmation",
-      idempotencyKey: `native-review:${input.decisionId}${effect.requestKey ? `:${effect.requestKey}` : ""}`,
+      idempotencyKey,
       sourceRunId: input.runId,
       resolverPolicy: effect.ownerAgentId ? "anyone" : "human_only",
       addresseeAgentId: effect.ownerAgentId ?? null,
@@ -564,13 +585,14 @@ async function materializeDecisionEffect(input: {
           key: "native_completion_review",
           revisionId: input.decisionId,
           label: "Completion decision",
+          ...(boundDocuments !== undefined ? { boundDocuments } : {}),
         },
       },
     };
     const interaction = await issueThreadInteractionService(input.tx).create(
       input.issue,
       reviewInput,
-      { systemId: "native-status-committer", runId: input.runId },
+      { systemId: NATIVE_COMPLETION_BINDING_SYSTEM_ID, runId: input.runId },
     );
     // The card and its next actor commit together. The post-commit dispatcher
     // revalidates this exact review before granting a scoped reviewer run.

@@ -1,6 +1,9 @@
+import { activityRoutes } from "../../routes/activity.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { asc, eq, sql } from "drizzle-orm";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { readCompletedAssistantMessageCandidate, resolveHeartbeatRunResponse, selectHeartbeatRunFinalAgentMessage } from "../heartbeat-run-summary.js";
 import {
@@ -12,8 +15,11 @@ import {
   companyMemberships,
   completionContracts,
   createDb,
+  documentRevisions,
+  documents,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueDocuments,
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
@@ -55,6 +61,11 @@ import { buildExecutionContinuation } from "../execution-continuation.js";
 import { childReviewOutcomes } from "./child-review-outcomes.js";
 import { createPostgresRunDispatchAdapter } from "../../modules/run-dispatch/adapters/postgres.js";
 import { materializeRuntimeQuestionFallback } from "./native-session-executor.js";
+import { documentService } from "../documents.js";
+import { issueRoutes } from "../../routes/issues.js";
+import { errorHandler } from "../../middleware/index.js";
+import { refreshIssueContinuationSummary } from "../issue-continuation-summary.js";
+import { createNativeCompletionReviewFixture } from "../../__tests__/helpers/native-completion-review-fixture.js";
 import {
   subscribeAllCompanyLiveEvents,
   subscribeCompanyLiveEvents,
@@ -1467,17 +1478,15 @@ describe("PaperclipControlPlanePort conformance", () => {
     await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, agentReview.id));
 
     await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, issueId));
-    const newRevision = "review-round-two";
+    const newRevision = randomUUID();
     const reviews = [];
     for (const key of ["one", "two"]) {
-      reviews.push(await issueThreadInteractionService(db).create(
-        { id: issueId, companyId: identity.companyId },
-        { kind: "request_confirmation", title: `Review ${key}`, addresseeUserId: "reviewer-24",
-          resolverPolicy: "human_only", continuationPolicy: "wake_assignee", sourceRunId: runId,
-          payload: { version: 1, prompt: `Approve ${key}`, acceptLabel: "Approve", rejectLabel: "Decline", allowDeclineReason: true,
-            target: { type: "custom", key: "native_completion_review", revisionId: newRevision } } },
-        { systemId: "test-multiple-reviewers", runId },
-      ));
+      // Both reviewers belong to the same real decision, as the committer creates them.
+      reviews.push(await createNativeCompletionReviewFixture(db, { id: issueId, companyId: identity.companyId }, {
+        prompt: `Approve ${key}`, title: `Review ${key}`, decisionId: newRevision, sourceRunId: runId,
+        addresseeUserId: "reviewer-24", resolverPolicy: "human_only", continuationPolicy: "wake_assignee",
+        acceptLabel: "Approve", rejectLabel: "Decline", allowDeclineReason: true,
+      }));
     }
     await issueThreadInteractionService(db).rejectInteraction(
       { id: issueId, companyId: identity.companyId }, reviews[0]!.id,
@@ -1493,6 +1502,399 @@ describe("PaperclipControlPlanePort conformance", () => {
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("in_review");
     await db.update(heartbeatRuns).set({ wakeupRequestId: null }).where(eq(heartbeatRuns.id, reviewRunId));
 
+  });
+
+  describe("native completion review document binding", () => {
+    const identity = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
+    const reviewerAgentId = "34000000-0000-4000-8000-000000000152";
+    const ownerUserId = "owner-152";
+    beforeAll(async () => {
+      await db.insert(agents).values({
+        id: reviewerAgentId, companyId: identity.companyId, name: "Document QA",
+        adapterType: "codex_local", status: "idle",
+      });
+      await db.insert(authUsers).values({ id: ownerUserId, name: "Task owner", email: "owner-152@example.test",
+        createdAt: new Date(), updatedAt: new Date() });
+      await db.insert(companyMemberships).values({ companyId: identity.companyId, principalType: "user",
+        principalId: ownerUserId, status: "active", membershipRole: "operator" });
+    });
+    const ownerActor = { type: "board", source: "session", userId: ownerUserId, companyIds: [identity.companyId],
+      memberships: [{ companyId: identity.companyId, status: "active", membershipRole: "operator" }], isInstanceAdmin: false };
+
+    function reviewApp(actor: Record<string, unknown>) {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => { (req as any).actor = actor; next(); });
+      app.use("/api", issueRoutes(db, {} as any));
+      app.use(errorHandler);
+      return app;
+    }
+
+    type Writer = "worker" | "reviewer_agent" | "reviewer_run_only" | "owner";
+    /** Saves documents, finishes the worker run through the native finalizer and admits the named reviewer. */
+    async function submitForReview(documentsToSave: Array<{ key: string; writers: Writer[] }>, reviewBy: "agent" | "owner" = "agent",
+      seed?: (issueId: string) => Promise<void>) {
+      const issueId = randomUUID(), contractId = randomUUID(), runId = randomUUID();
+      const reviewerOtherRunId = randomUUID(), reviewRunId = randomUUID(), runnerInstanceId = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId: identity.companyId,
+        title: "Saved deliverable", status: "in_progress", assigneeAgentId: identity.agentId, workMode: "standard",
+        ...(reviewBy === "owner" ? { responsibleUserId: ownerUserId } : {}) });
+      await db.insert(completionContracts).values({ id: contractId, companyId: identity.companyId, issueId,
+        revision: 1, schemaVersion: "paperclip.completion-contract.v1", policyVersion: "phase6-v1",
+        risk: "standard", completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+        contractJson: { revision: "phase6-v1", objective: "Deliver", criteria: [{ id: "objective", requirement: "Deliver" }] },
+        canonicalSha256: "document-binding-contract", createdByActorType: "system", createdByActorId: "test" });
+      await db.insert(heartbeatRuns).values([
+        { id: runId, companyId: identity.companyId, agentId: identity.agentId, status: "running",
+          runtimeMode: "native", nativeIssueId: issueId, nativeSessionId: identity.sessionId,
+          runnerInstanceId, completionContractId: contractId,
+          completionContractSha256: "document-binding-contract", contextSnapshot: { issueId } },
+        { id: reviewerOtherRunId, companyId: identity.companyId, agentId: reviewerAgentId,
+          status: "succeeded", contextSnapshot: {} },
+      ]);
+      const docs = documentService(db);
+      for (const entry of documentsToSave) {
+        let baseRevisionId: string | null = null;
+        for (const [index, writer] of entry.writers.entries()) {
+          const saved = await docs.upsertIssueDocument({
+            issueId, key: entry.key, format: "markdown", body: `${entry.key} ${index}`, baseRevisionId,
+            createdByAgentId: writer === "worker" ? identity.agentId : writer === "reviewer_agent" ? reviewerAgentId : null,
+            createdByRunId: writer === "worker" ? runId : writer === "reviewer_run_only" ? reviewerOtherRunId : null,
+            createdByUserId: writer === "owner" ? ownerUserId : null,
+          });
+          baseRevisionId = saved.document.latestRevisionId;
+        }
+      }
+      await seed?.(issueId);
+      const port = new PaperclipControlPlanePort(db, {
+        companyId: identity.companyId, issueId, runId, agentId: identity.agentId, sessionId: identity.sessionId,
+        completionContractId: contractId, completionContractSha256: "document-binding-contract",
+        sourceInstanceId: runnerInstanceId, controlPlaneSourceInstanceId: "document-binding-control",
+      });
+      await port.openRun({ identity: { ...identity, issueId, runId }, backendKind: "mock", sourceInstanceId: runnerInstanceId });
+      const result = { ...structuredClone(CONTROL_PLANE_CONFORMANCE_RESULT),
+        completionClaim: { ...CONTROL_PLANE_CONFORMANCE_RESULT.completionClaim, contractRevision: "phase6-v1" },
+        reportedWorkDisposition: "needs_review" as const,
+        attentionRequests: reviewBy === "owner"
+          ? [{ kind: "approval" as const, summary: "Owner decision on the saved deliverable", ownerClass: "human" as const }]
+          : [{ kind: "review" as const, summary: "QA the saved deliverable", ownerClass: "agent" as const, targetAgentId: reviewerAgentId }] };
+      await expect(nativeCompletionFeedback(db, runId, result)).resolves.toContain("Completion report accepted");
+      await port.completeRun({ result, terminal: { ...CONTROL_PLANE_CONFORMANCE_TERMINAL, reportedWorkDisposition: "needs_review" },
+        callerResultId: `document-binding-${issueId}` });
+      await finalizeNativeRun({ db, runId, workspaceFinalizeStatus: "succeeded" });
+      const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId));
+      const decisionId = (card!.payload as { target: { revisionId: string } }).target.revisionId;
+      await db.insert(heartbeatRuns).values({ id: reviewRunId, companyId: identity.companyId, agentId: reviewerAgentId,
+        status: "running", runtimeMode: "native", nativeIssueId: issueId,
+        contextSnapshot: { issueId, wakeReason: "native_completion_review", nativeReviewInteractionId: card!.id, nativeReviewDecisionId: decisionId } });
+      await db.update(issues).set({ executionRunId: reviewRunId }).where(eq(issues.id, issueId));
+      const reviewer = request(reviewApp({ type: "agent", source: "agent_key", companyId: identity.companyId, agentId: reviewerAgentId, runId: reviewRunId }));
+      const state = async () => ({
+        issue: (await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId)))[0]!.status,
+        card: (await db.select({ status: issueThreadInteractions.status }).from(issueThreadInteractions).where(eq(issueThreadInteractions.id, card!.id)))[0]!.status,
+      });
+      const owner = request(reviewApp(ownerActor));
+      return { issueId, runId, card: card!, reviewer, owner, state, docs,
+        accept: () => reviewer.post(`/api/issues/${issueId}/interactions/${card!.id}/accept`).send({}),
+        ownerAccept: () => owner.post(`/api/issues/${issueId}/interactions/${card!.id}/accept`).send({}) };
+    }
+
+    it("fixes every saved document revision and lets an independent reviewer approve that version", async () => {
+      const f = await submitForReview([{ key: "report", writers: ["worker"] }, { key: "appendix", writers: ["worker", "worker"] }]);
+      const current = await db.select({ documentId: documents.id, key: issueDocuments.key,
+        revisionId: documents.latestRevisionId, revisionNumber: documents.latestRevisionNumber })
+        .from(issueDocuments).innerJoin(documents, eq(documents.id, issueDocuments.documentId))
+        .where(eq(issueDocuments.issueId, f.issueId)).orderBy(asc(issueDocuments.key));
+      expect(current.map(entry => entry.revisionNumber)).toEqual([2, 1]);
+      expect(f.card).toMatchObject({ addresseeAgentId: reviewerAgentId, effectiveResolverPolicy: "anyone",
+        payload: { target: { type: "custom", key: "native_completion_review", boundDocuments: current } } });
+      // Server bookkeeping written after submission by its internal writer is not submitted work.
+      await refreshIssueContinuationSummary({ db, issueId: f.issueId,
+        run: { id: f.runId, status: "succeeded", error: null }, agent: { id: identity.agentId, name: "Native conformance", adapterType: "codex_local" } });
+      const accepted = await f.accept();
+      expect(accepted.status, accepted.text).toBe(200);
+      await expect(f.state()).resolves.toEqual({ issue: "done", card: "accepted" });
+    });
+
+    it("refuses to carry the approval to a revision saved after submission", async () => {
+      const f = await submitForReview([{ key: "report", writers: ["worker"] }]);
+      const revisionA = (await f.docs.getIssueDocumentByKey(f.issueId, "report"))!.latestRevisionId;
+      await f.docs.upsertIssueDocument({ issueId: f.issueId, key: "report", format: "markdown", body: "report B",
+        baseRevisionId: revisionA, createdByAgentId: identity.agentId, createdByRunId: f.runId });
+      // Reconciling the saved decision keeps the card bound to revision A.
+      await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded" });
+      const cards = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId));
+      expect(cards).toHaveLength(1);
+      expect(cards[0]!.payload).toEqual(f.card.payload);
+      const stale = await f.accept();
+      expect(stale.status).toBe(409);
+      expect(stale.body).toMatchObject({ code: "native_completion_review_documents_stale" });
+      await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+      // Sending stale work back stays available to the same reviewer.
+      const rejected = await f.reviewer.post(`/api/issues/${f.issueId}/interactions/${f.card.id}/reject`)
+        .send({ reason: "Revision B arrived after submission; resubmit it." });
+      expect(rejected.status, rejected.text).toBe(200);
+      await expect(f.state()).resolves.toMatchObject({ card: "rejected" });
+    });
+
+    it.each(["reviewer_agent", "reviewer_run_only"] as const)(
+      "excludes a reviewer who wrote a bound document history (%s)", async (writer) => {
+      const f = await submitForReview([{ key: "report", writers: [writer, "worker"] }]);
+      const denied = await f.accept();
+      expect(denied.status).toBe(403);
+      expect(denied.body).toMatchObject({ code: "native_completion_review_author_excluded" });
+      await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+    });
+
+    it("lets the human_only owner judge documents they wrote while the agent author rule stays", async () => {
+      const f = await submitForReview([{ key: "report", writers: ["worker", "owner"] }], "owner");
+      expect(f.card).toMatchObject({ addresseeUserId: ownerUserId, effectiveResolverPolicy: "human_only",
+        payload: { target: { key: "native_completion_review", boundDocuments: [expect.objectContaining({ key: "report", revisionNumber: 2 })] } } });
+      // The human_only audience still excludes agents, including the named QA agent.
+      const agentTry = await f.accept();
+      expect(agentTry.status).toBe(403);
+      await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+      const accepted = await f.ownerAccept();
+      expect(accepted.status, accepted.text).toBe(200);
+      await expect(f.state()).resolves.toEqual({ issue: "done", card: "accepted" });
+
+      // The owner's decision stays bound to the saved revision.
+      const later = await submitForReview([{ key: "report", writers: ["owner"] }], "owner");
+      const revisionA = (await later.docs.getIssueDocumentByKey(later.issueId, "report"))!.latestRevisionId;
+      await later.docs.upsertIssueDocument({ issueId: later.issueId, key: "report", format: "markdown", body: "owner B",
+        baseRevisionId: revisionA, createdByUserId: ownerUserId });
+      const stale = await later.ownerAccept();
+      expect(stale.status).toBe(409);
+      expect(stale.body).toMatchObject({ code: "native_completion_review_documents_stale" });
+      await expect(later.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+    });
+
+    const ownerResolve = (f: { issueId: string; card: { id: string } }, options?: Parameters<ReturnType<typeof issueThreadInteractionService>["acceptInteraction"]>[4]) =>
+      issueThreadInteractionService(db).acceptInteraction(
+        { id: f.issueId, companyId: identity.companyId, projectId: null, goalId: null, status: "in_review" },
+        f.card.id, {}, { userId: ownerUserId }, options);
+
+    it.each(["revision", "new_key"] as const)(
+      "serializes a %s write that arrives during approval behind the approved snapshot", async (kind) => {
+      const f = await submitForReview([{ key: "report", writers: ["worker"] }], "owner");
+      const revisionA = (await f.docs.getIssueDocumentByKey(f.issueId, "report"))!.latestRevisionId;
+      let writer!: Promise<unknown>; let writerSettled = false;
+      await ownerResolve(f, { beforeResolveInTransaction: async (tx) => {
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.issueId)).for("update");
+        writer = f.docs.upsertIssueDocument(kind === "revision"
+          ? { issueId: f.issueId, key: "report", format: "markdown", body: "report B", baseRevisionId: revisionA, createdByAgentId: identity.agentId }
+          : { issueId: f.issueId, key: "late-appendix", format: "markdown", body: "late", createdByAgentId: identity.agentId })
+          .finally(() => { writerSettled = true; });
+        writer.catch(() => undefined);
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        // The writer waits on the issue row the approval holds, past deadlock_timeout.
+        expect(writerSettled).toBe(false);
+      } });
+      await expect(writer).resolves.toBeTruthy();
+      await expect(f.state()).resolves.toEqual({ issue: "done", card: "accepted" });
+    });
+
+    it("makes approval wait for a writer that already holds the issue and then refuses the changed set", async () => {
+      const f = await submitForReview([{ key: "report", writers: ["worker"] }], "owner");
+      let approval!: Promise<unknown>; let approvalSettled = false;
+      await db.transaction(async (wtx) => {
+        await documentService(wtx as unknown as typeof db).upsertIssueDocument({ issueId: f.issueId, key: "late-appendix",
+          format: "markdown", body: "late", createdByAgentId: identity.agentId });
+        approval = ownerResolve(f).finally(() => { approvalSettled = true; });
+        approval.catch(() => undefined);
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        expect(approvalSettled).toBe(false);
+      });
+      await expect(approval).rejects.toMatchObject({ status: 409, details: { code: "native_completion_review_documents_stale" } });
+      await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+    });
+
+    it("refuses a legacy card when a linked document has no current revision instead of treating it as absent", async () => {
+      const f = await submitForReview([{ key: "report", writers: ["worker"] }]);
+      const payload = structuredClone(f.card.payload) as unknown as { target: Record<string, unknown> };
+      delete payload.target.boundDocuments;
+      await db.update(issueThreadInteractions).set({ payload: payload as any }).where(eq(issueThreadInteractions.id, f.card.id));
+      const linked = (await f.docs.getIssueDocumentByKey(f.issueId, "report"))!;
+      await db.update(documents).set({ latestRevisionId: null }).where(eq(documents.id, linked.id));
+      const denied = await f.accept();
+      expect(denied.status).toBe(409);
+      expect(denied.body).toMatchObject({ code: "native_completion_review_documents_inconsistent" });
+      await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+    });
+
+    it("does not accept a client-supplied binding through the ordinary create route", async () => {
+      const f = await submitForReview([{ key: "report", writers: ["worker"] }, { key: "appendix", writers: ["worker"] }], "owner");
+      const report = (await f.docs.getIssueDocumentByKey(f.issueId, "report"))!;
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, f.card.id));
+      const forgedEntry = { documentId: report.id, key: "report", revisionId: report.latestRevisionId!, revisionNumber: report.latestRevisionNumber };
+      const created = await f.owner.post(`/api/issues/${f.issueId}/interactions`).send({
+        kind: "request_confirmation", continuationPolicy: "none",
+        payload: { version: 1, prompt: "Approve completion", target: { type: "custom", key: "native_completion_review",
+          revisionId: randomUUID(), boundDocuments: [forgedEntry, forgedEntry] } },
+      });
+      if (created.status === 201 || created.status === 200) {
+        const accepted = await f.owner.post(`/api/issues/${f.issueId}/interactions/${created.body.id}/accept`).send({});
+        expect({ create: created.status, accept: accepted.status }).toEqual({ create: 422, accept: "not reached" });
+      }
+      expect(created.status).toBe(422);
+      expect(created.body).toMatchObject({ code: "native_completion_review_reserved" });
+      expect((await db.select({ status: issues.status }).from(issues).where(eq(issues.id, f.issueId)))[0]!.status).toBe("in_review");
+    });
+
+    it("checks the whole current set when a server-owned binding repeats an entry", async () => {
+      const f = await submitForReview([{ key: "report", writers: ["worker"] }, { key: "appendix", writers: ["worker"] }]);
+      const payload = structuredClone(f.card.payload) as unknown as { target: { boundDocuments: unknown[] } };
+      payload.target.boundDocuments = [payload.target.boundDocuments[0], payload.target.boundDocuments[0]];
+      await db.update(issueThreadInteractions).set({ payload: payload as any }).where(eq(issueThreadInteractions.id, f.card.id));
+      const denied = await f.accept();
+      expect(denied.status).toBe(409);
+      expect(denied.body).toMatchObject({ code: "native_completion_review_documents_stale" });
+      await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+    });
+
+    it("binds and approves a submission with more than 500 documents", async () => {
+      const f = await submitForReview([], "agent", async (issueId) => {
+        const ids = Array.from({ length: 501 }, () => ({ documentId: randomUUID(), revisionId: randomUUID() }));
+        await db.insert(documents).values(ids.map(({ documentId }, index) => ({ id: documentId, companyId: identity.companyId,
+          latestBody: `part ${index}`, latestRevisionNumber: 1, createdByAgentId: identity.agentId })));
+        await db.insert(documentRevisions).values(ids.map(({ documentId, revisionId }, index) => ({ id: revisionId,
+          companyId: identity.companyId, documentId, revisionNumber: 1, body: `part ${index}`, createdByAgentId: identity.agentId })));
+        for (const { documentId, revisionId } of ids) {
+          await db.update(documents).set({ latestRevisionId: revisionId }).where(eq(documents.id, documentId));
+        }
+        await db.insert(issueDocuments).values(ids.map(({ documentId }, index) => ({ companyId: identity.companyId, issueId,
+          documentId, key: `part-${String(index).padStart(3, "0")}` })));
+      });
+      expect((f.card.payload as { target: { boundDocuments: unknown[] } }).target.boundDocuments).toHaveLength(501);
+      const accepted = await f.accept();
+      expect(accepted.status, accepted.text).toBe(200);
+      await expect(f.state()).resolves.toEqual({ issue: "done", card: "accepted" });
+    }, 120_000);
+
+    it("reserves the system document keys at the ordinary document entry", async () => {
+      const f = await submitForReview([], "owner");
+      const put = await f.owner.put(`/api/issues/${f.issueId}/documents/continuation-summary`)
+        .send({ format: "markdown", body: "Deliverable saved under a system key" });
+      if (put.status === 200 || put.status === 201) {
+        // Old path: the deliverable is excluded from the binding and a later revision is approvable.
+        const saved = (await f.docs.getIssueDocumentByKey(f.issueId, "continuation-summary"))!;
+        await f.owner.put(`/api/issues/${f.issueId}/documents/continuation-summary`)
+          .send({ format: "markdown", body: "Changed after submission", baseRevisionId: saved.latestRevisionId });
+        const accepted = await f.ownerAccept();
+        expect({ put: put.status, accept: accepted.status }).toEqual({ put: 422, accept: "not reached" });
+      }
+      expect(put.status).toBe(422);
+      expect(put.body).toMatchObject({ code: "issue_document_key_reserved" });
+      const pipe = await f.owner.put(`/api/issues/${f.issueId}/documents/pipeline-case-body`)
+        .send({ format: "markdown", body: "Not a case body" });
+      expect(pipe.status).toBe(422);
+    });
+
+    it("binds a pipeline case body as authored work", async () => {
+      const f = await submitForReview([], "agent", async (issueId) => {
+        // The pipeline links its case body document into the conversation issue directly.
+        const documentId = randomUUID(), revisionId = randomUUID();
+        await db.insert(documents).values({ id: documentId, companyId: identity.companyId, latestBody: "Case body A",
+          latestRevisionNumber: 1, createdByAgentId: identity.agentId });
+        await db.insert(documentRevisions).values({ id: revisionId, companyId: identity.companyId, documentId,
+          revisionNumber: 1, body: "Case body A", createdByAgentId: identity.agentId });
+        await db.update(documents).set({ latestRevisionId: revisionId }).where(eq(documents.id, documentId));
+        await db.insert(issueDocuments).values({ companyId: identity.companyId, issueId, documentId, key: "pipeline-case-body" });
+      });
+      const body = (await f.docs.getIssueDocumentByKey(f.issueId, "pipeline-case-body"))!;
+      expect((f.card.payload as { target: { boundDocuments: unknown[] } }).target.boundDocuments)
+        .toEqual([expect.objectContaining({ key: "pipeline-case-body", documentId: body.id })]);
+      const revisionB = randomUUID();
+      await db.insert(documentRevisions).values({ id: revisionB, companyId: identity.companyId, documentId: body.id,
+        revisionNumber: 2, body: "Case body B", createdByAgentId: identity.agentId });
+      await db.update(documents).set({ latestRevisionId: revisionB, latestRevisionNumber: 2, latestBody: "Case body B" })
+        .where(eq(documents.id, body.id));
+      const stale = await f.accept();
+      expect(stale.status).toBe(409);
+      expect(stale.body).toMatchObject({ code: "native_completion_review_documents_stale" });
+      await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+    });
+
+    it("binds a continuation summary whose current revision is not a system refresh", async () => {
+      const f = await submitForReview([], "agent", async (issueId) => {
+        // An ordinary legacy writer could forge the exact text marker and its own
+        // run ID. Those client-controlled values are not server provenance.
+        const [active] = await db.select({ runId: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, issueId));
+        expect(active?.runId).toBeTruthy();
+        const documentId = randomUUID(), revisionId = randomUUID();
+        await db.insert(documents).values({ id: documentId, companyId: identity.companyId, latestBody: "Deliverable",
+          latestRevisionNumber: 1, createdByAgentId: identity.agentId });
+        await db.insert(documentRevisions).values({ id: revisionId, companyId: identity.companyId, documentId,
+          revisionNumber: 1, body: "Deliverable", changeSummary: `Refresh continuation summary after run ${active!.runId}`,
+          createdByRunId: active!.runId, createdByAgentId: identity.agentId });
+        await db.update(documents).set({ latestRevisionId: revisionId }).where(eq(documents.id, documentId));
+        await db.insert(issueDocuments).values({ companyId: identity.companyId, issueId, documentId, key: "continuation-summary" });
+      });
+      expect((f.card.payload as { target: { boundDocuments: unknown[] } }).target.boundDocuments)
+        .toEqual([expect.objectContaining({ key: "continuation-summary" })]);
+      await refreshIssueContinuationSummary({ db, issueId: f.issueId,
+        run: { id: f.runId, status: "succeeded", error: null }, agent: { id: identity.agentId, name: "Native conformance", adapterType: "codex_local" } });
+      const stale = await f.accept();
+      expect(stale.status).toBe(409);
+      expect(stale.body).toMatchObject({ code: "native_completion_review_documents_stale" });
+      await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+    });
+
+    it("does not let the ordinary activity API forge system document provenance", async () => {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => { (req as any).actor = ownerActor; next(); });
+      app.use("/api", activityRoutes(db));
+      app.use(errorHandler);
+      const response = await request(app).post(`/api/companies/${identity.companyId}/activity`).send({
+        actorType: "system", actorId: "issue-continuation-summary", action: "issue.continuation_summary.refreshed",
+        entityType: "document", entityId: randomUUID(), details: { revisionId: randomUUID() },
+      });
+      expect(response.status).toBe(422);
+      expect(response.body).toMatchObject({ code: "system_document_provenance_reserved" });
+    });
+
+    it("refuses a native completion card without status-decision provenance", async () => {
+      const f = await submitForReview([], "owner");
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, f.card.id));
+      // Ordinary create cannot make the reserved card at all.
+      const created = await f.owner.post(`/api/issues/${f.issueId}/interactions`).send({
+        kind: "request_confirmation", continuationPolicy: "none",
+        payload: { version: 1, prompt: "Approve completion", target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } },
+      });
+      if (created.status === 200 || created.status === 201) {
+        const accepted = await f.owner.post(`/api/issues/${f.issueId}/interactions/${created.body.id}/accept`).send({});
+        expect({ create: created.status, accept: accepted.status }).toEqual({ create: 422, accept: "not reached" });
+      }
+      expect(created.status).toBe(422);
+      expect(created.body).toMatchObject({ code: "native_completion_review_reserved" });
+      // A stored card that only carries the key (no committer effect) has no authority either.
+      const [stored] = await db.insert(issueThreadInteractions).values({ companyId: identity.companyId, issueId: f.issueId,
+        kind: "request_confirmation", status: "pending", continuationPolicy: "none",
+        payload: { version: 1, prompt: "Approve completion", target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } },
+      }).returning();
+      const denied = await f.owner.post(`/api/issues/${f.issueId}/interactions/${stored!.id}/accept`).send({});
+      expect(denied.status).toBe(409);
+      expect(denied.body).toMatchObject({ code: "native_completion_review_provenance_missing" });
+      expect((await db.select({ status: issues.status }).from(issues).where(eq(issues.id, f.issueId)))[0]!.status).toBe("in_review");
+    });
+
+    it("keeps a task without documents approvable and refuses an unbound card once documents exist", async () => {
+      const plain = await submitForReview([]);
+      expect((plain.card.payload as { target: { boundDocuments: unknown } }).target.boundDocuments).toEqual([]);
+      const accepted = await plain.accept();
+      expect(accepted.status, accepted.text).toBe(200);
+      await expect(plain.state()).resolves.toEqual({ issue: "done", card: "accepted" });
+
+      const legacy = await submitForReview([{ key: "report", writers: ["worker"] }]);
+      const payload = structuredClone(legacy.card.payload) as unknown as { target: Record<string, unknown> };
+      delete payload.target.boundDocuments;
+      await db.update(issueThreadInteractions).set({ payload: payload as any }).where(eq(issueThreadInteractions.id, legacy.card.id));
+      const unbound = await legacy.accept();
+      expect(unbound.status).toBe(409);
+      expect(unbound.body).toMatchObject({ code: "native_completion_review_documents_unbound" });
+      await expect(legacy.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+    });
   });
 
   it.each(["none", "queued", "claimed", "deferred_issue_execution", "coalesced", "current_run", "current_intent"])(

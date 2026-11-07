@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentWakeupRequests, companies, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, nativeRunResults, statusDecisions, workAssessments } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, nativeRunResults, statusDecisionEffects, statusDecisions, workAssessments } from "@paperclipai/db";
 import type { ControlPlanePort, NativeExecutionInputV1, PrpEvent, PrpTerminalState } from "@paperclipai/paperclip-runner";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { CONTROL_PLANE_CONFORMANCE_RESULT } from "../../vendor/paperclip-runner/testing.js";
@@ -77,12 +77,16 @@ describe("native completed failure diagnostics", () => {
         const [reviewIssue] = await db.update(issues).set({ status: "in_review", assigneeAgentId: workerId }).where(eq(issues.id, issueId)).returning();
         await db.insert(statusDecisions).values({ id: decisionId, companyId, issueId, runId: sourceRunId, assessmentId, decisionVersion: 1, policyVersion: "fixture", fromStatus: "in_progress", toStatus: "in_review", reasonCode: "explicit_review", decisionJson: { projectedStatusVersion: reviewIssue.statusVersion }, decisionDigest: decisionId, applicationState: "applied" });
         await db.update(issues).set({ lastStatusDecisionId: decisionId }).where(eq(issues.id, issueId));
-        await db.insert(issueThreadInteractions).values({ id: interactionId, companyId, issueId, kind: "request_confirmation", sourceRunId, addresseeAgentId: agentId, createdByAgentId: workerId,
+        // The status committer creates the card as a system actor and records its bind_reviewer effect.
+        await db.insert(issueThreadInteractions).values({ id: interactionId, companyId, issueId, kind: "request_confirmation", sourceRunId, addresseeAgentId: agentId,
           continuationPolicy: "wake_assignee",
           status: scenario === "resolved-review" ? "accepted" : "pending",
           ...(scenario === "resolved-review" ? { resolvedByRunId: runId, resolvedByAgentId: agentId } : {}),
           payload: { version: 1, prompt: "Review the completed work.", target: { type: "custom", key: "native_completion_review", revisionId: decisionId } },
         });
+        await db.insert(statusDecisionEffects).values({ companyId, issueId, decisionId, ordinal: 1, effectKind: "bind_reviewer",
+          targetType: "issue_thread_interaction", targetId: interactionId, idempotencyKey: `native-status:${decisionId}:1`,
+          payload: {}, deliveryState: "delivered", attemptCount: 1, deliveredAt: new Date() });
         const contextSnapshot = { issueId, wakeReason: "native_completion_review", nativeReviewInteractionId: interactionId, nativeReviewDecisionId: decisionId };
         await db.update(heartbeatRuns).set({ contextSnapshot }).where(eq(heartbeatRuns.id, runId));
         if (scenario === "superseded-review") await db.update(issues).set({ lastStatusDecisionId: null }).where(eq(issues.id, issueId));

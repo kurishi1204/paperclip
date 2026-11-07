@@ -26,12 +26,16 @@ import {
   issues,
   projectWorkspaces,
   projects,
+  statusDecisionEffects,
+  statusDecisions,
+  workAssessments,
   workspaceOperations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { createNativeCompletionReviewFixture } from "./helpers/native-completion-review-fixture.js";
 import { ONBOARDING_FIRST_TASK_ORIGIN_KIND } from "@paperclipai/shared";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
@@ -59,6 +63,8 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
   afterEach(async () => {
     vi.unstubAllEnvs();
     await db.delete(issueThreadInteractions);
+    await db.delete(statusDecisionEffects);
+    await db.delete(statusDecisions);
     await db.delete(activityLog);
     await db.delete(issueComments);
     await db.delete(issueDocuments);
@@ -66,6 +72,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     await db.delete(documents);
     await db.delete(issueRelations);
     await db.delete(agentWakeupRequests);
+    await db.delete(workAssessments);
     await db.delete(nativeRunResults);
     await db.delete(heartbeatRuns);
     await db.delete(completionContracts);
@@ -5016,11 +5023,8 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
           completionContractId: contractId, serverFingerprint: "source-result", schemaStatus: "accepted",
           resultJson: { result: { summary: "Saved source-run result" } }, canonicalSha256: "b".repeat(64) });
       }
-      const review = await interactionsSvc.create(child, { kind: "request_confirmation", resolverPolicy: "anyone",
-        ...(sourceRunId ? { sourceRunId } : {}),
-        continuationPolicy: "none", payload: { version: 1, prompt: "Review saved work",
-          target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } } },
-        { userId: "local-board" });
+      const review = await createNativeCompletionReviewFixture(db, child, { prompt: "Review saved work", agentId,
+        ...(sourceRunId ? { sourceRunId } : {}) });
       await recordReviewTransition({ companyId, issueId: childId, interactionId: review.id });
       return { companyId, parentId, childId, child, review, agentId };
     }
@@ -5082,9 +5086,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, first.id));
       await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, f.childId));
       const revision = randomUUID();
-      const next = await interactionsSvc.create(f.child, { kind: "request_confirmation", resolverPolicy: "anyone",
-        continuationPolicy: "none", payload: { version: 1, prompt: "Review revised work",
-          target: { type: "custom", key: "native_completion_review", revisionId: revision } } }, { userId: "local-board" });
+      const next = await createNativeCompletionReviewFixture(db, f.child, { prompt: "Review revised work", agentId: f.agentId, decisionId: revision });
       await recordReviewTransition({ companyId: f.companyId, issueId: f.childId, interactionId: next.id });
       await interactionsSvc.acceptInteraction(f.child, next.id, {}, { userId: "local-board" });
       const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
@@ -5100,9 +5102,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       await db.insert(issues).values({ id: siblingId, companyId: f.companyId, goalId: f.child.goalId,
         parentId: f.parentId, title: "Other saved work", status: "in_review", priority: "medium" });
       const sibling = (await issuesSvc.getById(siblingId))!;
-      const review = await interactionsSvc.create(sibling, { kind: "request_confirmation", resolverPolicy: "anyone",
-        continuationPolicy: "none", payload: { version: 1, prompt: "Review other work",
-          target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } } }, { userId: "local-board" });
+      const review = await createNativeCompletionReviewFixture(db, sibling, { prompt: "Review other work", agentId: f.agentId });
       await recordReviewTransition({ companyId: f.companyId, issueId: siblingId, interactionId: review.id });
       let arrivals = 0; let release!: () => void;
       const barrier = new Promise<void>(resolve => { release = resolve; });
@@ -5131,9 +5131,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       await db.insert(issues).values({ id: siblingId, companyId: f.companyId, goalId: f.child.goalId,
         parentId: f.parentId, title: "Second saved result", status: "in_review", priority: "medium" });
       const sibling = (await issuesSvc.getById(siblingId))!;
-      const review = await interactionsSvc.create(sibling, { kind: "request_confirmation", resolverPolicy: "anyone",
-        continuationPolicy: "none", payload: { version: 1, prompt: "Review second result",
-          target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } } }, { userId: "local-board" });
+      const review = await createNativeCompletionReviewFixture(db, sibling, { prompt: "Review second result", agentId: f.agentId });
       await recordReviewTransition({ companyId: f.companyId, issueId: siblingId, interactionId: review.id });
       await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
       expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(1);
@@ -5187,10 +5185,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
 
     it("does not complete or hand off while another review remains pending", async () => {
       const f = await fixture(false);
-      await interactionsSvc.create(f.child, { kind: "request_confirmation", resolverPolicy: "anyone",
-        continuationPolicy: "none", payload: { version: 1, prompt: "Second independent reviewer",
-          target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } } },
-        { userId: "local-board" });
+      await createNativeCompletionReviewFixture(db, f.child, { prompt: "Second independent reviewer", agentId: f.agentId });
       await interactionsSvc.acceptInteraction(f.child, f.review.id, {}, { userId: "local-board" });
       expect((await issuesSvc.getById(f.childId))?.status).toBe("in_review");
       expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);

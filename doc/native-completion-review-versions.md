@@ -81,3 +81,100 @@ when it is in the latest contract's explicit `supersedesContractId` ancestry,
 with each link owned by this company/issue and strictly decreasing revision.
 The new saved result must still belong to the latest current contract. No old
 result, assessment or contract is rewritten, and an unrelated revision is held.
+
+## Saved document revisions and authors
+
+When a completion review card is created, `bind_reviewer` records every issue
+document's `documentId`, `key`, `revisionId` and `revisionNumber` in
+`payload.target.boundDocuments`, in the same transaction as the card. A task
+without documents records an empty list.
+
+Only the server's continuation summary is bookkeeping rather than submitted
+work, and only while its current revision has the internal writer's reserved
+activity-log record for the exact company, issue, document, revision and run.
+Textual change summaries are not authority. A `continuation-summary` revision
+without that server record (including a legacy or imported marker) is bound like
+any document, so the next system refresh makes the review stale instead of the
+content passing unreviewed. The pipeline case body (`pipeline-case-body`) is
+authored case content linked into the conversation issue and is always bound.
+
+The system issue document keys are reserved at the shared document service.
+Ordinary saves, restores and removals of `continuation-summary` or
+`pipeline-case-body` (issue document routes, runner tools, plugins) return 422
+`issue_document_key_reserved`. The continuation summary writer passes an
+internal option naming its key as a separate argument, never from a request
+body. The pipeline links its case body directly, and the commander result
+writer refuses a reserved key.
+
+Acceptance, through the HTTP route, the reviewer's `resolve_review` tool or a
+system actor, re-reads the issue documents while holding the issue row
+`FOR UPDATE`, then applies these checks in order:
+
+- A linked, non-system document without a current revision makes the saved set
+  unverifiable: 409 `native_completion_review_documents_inconsistent`. It is
+  never treated as absent.
+- A native completion review is genuine only when the status committer
+  materialized it: a system-created card with a `bind_reviewer` status-decision
+  effect pointing at it for the decision named in `target.revisionId`. A card
+  that only carries the target key returns 409
+  `native_completion_review_provenance_missing`, with or without documents.
+- A genuine card saved before this binding existed carries no document set:
+  409 `native_completion_review_documents_unbound` once the issue has
+  documents. A task without documents still completes normally.
+- Each document appears once in the binding and the binding equals the whole
+  current set (same ids, keys and revisions). A repeated entry, a later
+  revision, an added document or a removed document returns 409
+  `native_completion_review_documents_stale`.
+
+The card is server-owned. The ordinary interaction create entry rejects the
+`native_completion_review` target key with 422
+`native_completion_review_reserved`, and a client-supplied `boundDocuments` on
+any custom target with 422 `native_completion_review_binding_server_owned`.
+Only the status committer's system identity creates the card and records the
+binding, and an idempotent replay reuses the recorded value. Tests that do not
+drive the real finalizer create cards through
+`server/src/__tests__/helpers/native-completion-review-fixture.ts`, which
+writes the same decision chain and effect the committer does. The binding has no count cap, because issue
+documents have none: every submitted document is recorded.
+
+The issue row is the only lock used. The `paperclip_bump_issue_revision_from_child`
+triggers (migration 0313) lock the issue `FOR UPDATE` before every
+`issue_documents` insert, update or delete and every update of a linked
+`documents` row, whichever service, route or import performs it. A writer
+therefore waits for an approval that holds the issue, and an approval waits for
+a writer that already reached the trigger and then sees its committed change.
+The reader does not lock document rows: a writer holds its document row before
+its trigger waits for the issue, so a document share lock would deadlock (40P01).
+
+An approving agent must not have written any revision up to a bound revision,
+whether the revision records it in the agent column or only through its creating
+run. That case returns 403 `native_completion_review_author_excluded`. Author
+exclusion applies to an agent's independent content QA only. A human resolver
+keeps the existing addressee and `human_only` audience rules and may decide on
+documents they wrote; the version binding still applies. System actors keep
+their existing rules.
+
+Rejection stays available in each of these cases, so the reviewer can send stale
+work back and the worker can resubmit the current revisions. The rule adds no
+database column, migration, resolver policy or reviewer tool. `human_only` cards
+remain human-only.
+
+The "native completion review document binding" cases in
+`paperclip-control-plane-port.test.ts` drive the native finalizer and the real
+HTTP create/accept/reject and document routes against PostgreSQL. They cover
+multiple documents, a revision saved after submission, both agent-authorship
+forms, a `human_only` owner deciding on their own revision (including after a
+later revision), a task without documents, an unbound card, a linked document
+without a current revision, a client-supplied duplicate binding, a repeated
+entry in a server-owned binding, 501 documents, both orders of a concurrent
+document write and approval, the reserved system document keys at the ordinary
+document route, a bound pipeline case body, a continuation summary that is not a
+system refresh (including an exact forged text marker), the reserved activity API action, and a native card without status-decision provenance.
+
+The reserved keys are `SYSTEM_ISSUE_DOCUMENT_KEYS` in
+`packages/shared/src/constants.ts` (`continuation-summary`,
+`pipeline-case-body`, checked by `isSystemIssueDocumentKey`).
+
+## Server provenance of continuation summaries
+
+A textual change summary and run ID are not provenance: an earlier ordinary writer could copy them. The internal summary refresh records its exact document/revision/run tuple in the existing activity log in the same transaction as the revision write. The ordinary activity create service rejects this reserved action for every caller. Only that recorded tuple exempts a summary revision from submitted work. Legacy/imported revisions without that record stay bound, including ones with forged text markers; they may require one normal resubmission after the first genuine server refresh. No legacy record is backfilled or silently trusted. Pipeline case bodies remain bound.

@@ -1286,6 +1286,14 @@ export interface RequestConfirmationIssueDocumentTarget {
   href?: string | null;
 }
 
+/** An issue document revision saved with a completion submission. */
+export interface RequestConfirmationBoundDocument {
+  documentId: string;
+  key: string;
+  revisionId: string;
+  revisionNumber: number;
+}
+
 export interface RequestConfirmationCustomTarget {
   type: "custom";
   key: string;
@@ -1293,6 +1301,12 @@ export interface RequestConfirmationCustomTarget {
   revisionNumber?: number | null;
   label?: string | null;
   href?: string | null;
+  /**
+   * Native completion reviews record every issue document revision present at
+   * submission. Acceptance requires the same set to still be current and an
+   * approver who authored none of those revisions.
+   */
+  boundDocuments?: RequestConfirmationBoundDocument[] | null;
 }
 
 export type RequestConfirmationTarget =

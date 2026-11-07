@@ -113,6 +113,7 @@ import {
 } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
+import { assertNativeCompletionDocumentBindingCurrent, assertNativeCompletionReviewCreateAllowed } from "./native-runtime/native-completion-document-binding.js";
 import {
   assertIssueReviewVerdictActorAllowed,
   isIssueReviewVerdictInteraction,
@@ -2256,6 +2257,14 @@ export function issueThreadInteractionService(
         lockedCurrent,
         args.actor,
       );
+      if (isNativeCompletionReview(lockedCurrent)) {
+        await assertNativeCompletionDocumentBindingCurrent(tx as unknown as Db, {
+          companyId: issueContext.companyId,
+          issueId: issueContext.id,
+          interaction: lockedCurrent,
+          actor: args.actor,
+        });
+      }
 
       const interaction = hydrateInteraction(lockedCurrent);
       const selectedOptionIds =
@@ -3489,6 +3498,7 @@ export function issueThreadInteractionService(
       const data = normalizeCreateInteractionInput(
         createIssueThreadInteractionSchema.parse(input),
       );
+      assertNativeCompletionReviewCreateAllowed(data.payload, actor);
       // Chat ownership is server-owned and immutable. Ordinary human questions
       // must not depend on a model copying an opaque user identity correctly.
       let defaultAddresseeUserId: string | null = null;
