@@ -97,6 +97,30 @@ describe.each(["approval", "review"] as const)("native issue %s stage", (stageTy
     vi.unstubAllEnvs();
   });
 
+  it.each(["approve", "request_changes"] as const)("keeps a human-only %s decision outside agent authority", async (decision) => {
+    await server.db.update(issues).set({ reviewPolicy: "human_only" }).where(eq(issues.id, fixture.issueId));
+    const current = (await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!;
+    const token = createLocalAgentJwt(fixture.agentId, fixture.companyId, "paperclip_runner", fixture.runId)!;
+    const argumentsForDecision = {
+      decision, summary: "This must remain a human decision.", expectedStageId: approvalStageId,
+      expectedStatusVersion: current.statusVersion, expectedRevision: current.revision,
+      expectedLastDecisionId: previousDecisionId,
+    };
+    const response = await fetch(`${server.apiUrl}/api/issues/${fixture.issueId}/${stageType}-stage-decisions`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(argumentsForDecision),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.text()).toContain("human_only");
+    const result = await rpc(`human-only-${decision}`, "tools/call", { name: stageTool, arguments: argumentsForDecision });
+    expect(result.result?.isError).toBe(true);
+    const updated = (await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!;
+    expect(updated).toMatchObject({ status: current.status, statusVersion: current.statusVersion, revision: current.revision, executionState: current.executionState });
+    expect(await server.db.select().from(issueExecutionDecisions).where(and(
+      eq(issueExecutionDecisions.issueId, fixture.issueId), eq(issueExecutionDecisions.stageId, approvalStageId),
+    ))).toHaveLength(0);
+  });
+
   it("control: the bound run reads its task through the real bridge", async () => {
     const listed = await rpc("control-list", "tools/list");
     expect(listed.result?.tools?.map(({ name }) => name)).toContain("get_task_context");

@@ -13071,6 +13071,14 @@ export function issueRoutes(
         state.currentParticipant?.type !== "agent" || state.currentParticipant.agentId !== actor.agentId) {
       throw conflict("Approval stage or run binding changed; read the task again before deciding");
     }
+    // Both approval and change requests are review verdicts. This helper is
+    // called before effects and again with the issue row locked, so a policy
+    // change cannot authorize an agent verdict inside the decision transaction.
+    await assertIssueReviewVerdictActorAllowed(query, {
+      issue,
+      actor: { type: "agent", id: actor.agentId },
+      reviewPolicy: issue.reviewPolicy,
+    });
     const runQuery = query.select({ id: heartbeatRuns.id, agentStatus: agents.status }).from(heartbeatRuns)
       .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, heartbeatRuns.companyId))).where(and(
       eq(heartbeatRuns.id, actor.runId), eq(heartbeatRuns.companyId, issue.companyId),
