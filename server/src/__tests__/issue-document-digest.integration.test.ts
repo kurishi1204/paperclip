@@ -50,6 +50,32 @@ if (process.env.PAPERCLIP_REQUIRE_EMBEDDED_PG === "1" && !support.supported) {
     expect(await documentService(server.db).getIssueDocumentByKey(f.issueId, "saved-report")).toEqual(document);
     expect(await documentService(server.db).listIssueDocumentRevisions(f.issueId, "saved-report")).toHaveLength(1);
   });
+  it("publishes the full digest response contract in OpenAPI", async () => {
+    const response = await fetch(`${server.apiUrl}/api/openapi.json`);
+    expect(response.status).toBe(200);
+    const spec = await response.json();
+    const schema = spec.paths["/api/issues/{id}/documents/{key}/revisions/{revisionId}/digest"]
+      .get.responses["200"].content["application/json"].schema;
+    expect(Object.keys(schema.properties).sort()).toEqual([
+      "issueId", "key", "documentId", "revisionId", "revisionNumber", "algorithm", "encoding", "bodyBytes", "bodySha256",
+    ].sort());
+    expect(schema.required.slice().sort()).toEqual(Object.keys(schema.properties).sort());
+    expect(schema.properties.bodyBytes).toMatchObject({ type: "integer", minimum: 0 });
+    expect(schema.properties.bodySha256.pattern).toBe("^[0-9a-f]{64}$");
+  });
+  it("allows an authenticated normal agent to verify its readable task", async () => {
+    const f = await server.fixture({ disableWakeOnDemand: true });
+    const document = await save(f.issueId, "report", "normal agent source\n");
+    const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId)!;
+    const response = await fetch(url(f.issueId, "report", document.latestRevisionId!), {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(response.status, await response.clone().text()).toBe(200);
+    expect(await response.json()).toMatchObject({
+      issueId: f.issueId, documentId: document.id, revisionId: document.latestRevisionId,
+      bodySha256: createHash("sha256").update("normal agent source\n").digest("hex"),
+    });
+  });
   it("keeps the requested old revision bound when the current body has advanced", async () => {
     const f = await server.fixture({ disableWakeOnDemand: true });
     const old = await save(f.issueId, "report", "original\n");
