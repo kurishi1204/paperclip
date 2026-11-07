@@ -17,6 +17,7 @@ import type {
   IssueComment,
   IssueQueuedCommentQueue,
   IssueDocument,
+  IssueDocumentRevisionDigest,
   IssueLabel,
   IssueRecoveryAction,
   IssueRetryNowResponse,
@@ -547,6 +548,10 @@ export const issuesApi = {
   getDocument: (id: string, key: string) =>
     api.get<IssueDocument>(
       `/issues/${id}/documents/${encodeURIComponent(key)}`,
+    ),
+  getDocumentRevisionDigest: (id: string, key: string, revisionId: string) =>
+    api.get<IssueDocumentRevisionDigest>(
+      `/issues/${id}/documents/${encodeURIComponent(key)}/revisions/${encodeURIComponent(revisionId)}/digest`,
     ),
   upsertDocument: (id: string, key: string, data: UpsertIssueDocument) =>
     api.put<IssueDocument>(
