@@ -9,7 +9,7 @@ import { test } from 'node:test';
 const workflowDir = new URL('../../workflows/', import.meta.url);
 const archivedWorkflowDir = new URL('../../../doc/upstream-workflows/', import.meta.url);
 const archivedFiles = [
-  'cloud-migrator-artifacts.yml', 'docker.yml', 'refresh-lockfile.yml', 'release.yml',
+  'cloud-migrator-artifacts.yml', 'docker-runner-manual.yml', 'docker.yml', 'refresh-lockfile.yml', 'release.yml',
 ];
 const sourcePins = {
   'agent-runtime-images.yml': 'f5545e5026b260939a60d84a7362487123bd5196aecd09edbba8aed7c91614e8',
@@ -17,7 +17,8 @@ const sourcePins = {
   'cloud-readiness.yml': '6fa94435fcf0524e50f4d883fa08fd3d59d8f42344cdda28718f1fa212ab84c2',
   'colo-source-artifact.yml': '7ef4a5707faf0b913fac8d53789224a76a48716af1dc8497e4decae79853e94b',
   'commitperclip-review.yml': 'a99c5dcfc4e22bc697b163a95a2121a4854636212c7757e148bdfb7f7cfeba37',
-  'docker-runner-check.yml': 'ca484e72732dc8f6417a5cdb3968238c6f74ea455a3acaa8acd07a2c76811f00',
+  'docker-runner-check.yml': '7c44c3bf724ac912b03c6c3bf520f9117ac4bb3347a1636103213d9a38d89119',
+  'docker-runner-manual.yml': 'ca484e72732dc8f6417a5cdb3968238c6f74ea455a3acaa8acd07a2c76811f00',
   'docker.yml': '27988c53e451e602a5e35fdf857aca98aac48fa120d2d94f3457467311808ca3',
   'e2e.yml': 'd8a00ab355a4e9304a9a8a28d6aa1fdb816f9130bff244c91d4d59a5453fde85',
   'pr-trusted.yml': '4591cb206275d8ffa8420045b028719e6bf066fc1f262cdde3c578b063150f27',
@@ -38,7 +39,7 @@ const guard = "github.repository == 'paperclipai/paperclip' && github.repository
 const guardedRoots = {
   'agent-runtime-images.yml': { 'build-and-sign': null },
   'commitperclip-review.yml': { review: null },
-  'docker-runner-check.yml': { authorize_manual: "github.event_name == 'workflow_dispatch'" },
+  'docker-runner-manual.yml': { authorize_manual: "github.event_name == 'workflow_dispatch'" },
   'docker.yml': { 'build-and-push': null },
   'e2e.yml': { authorize: null },
   'refresh-lockfile.yml': { refresh: null },
@@ -59,7 +60,7 @@ const guardedRoots = {
 
 const reviewedFiles = [
   'agent-runtime-images.yml', 'cloud-migrator-artifacts.yml', 'cloud-readiness.yml',
-  'colo-source-artifact.yml', 'commitperclip-review.yml', 'docker-runner-check.yml', 'docker.yml', 'e2e.yml',
+  'colo-source-artifact.yml', 'commitperclip-review.yml', 'docker-runner-check.yml', 'docker-runner-manual.yml', 'docker.yml', 'e2e.yml',
   'pr-trusted.yml', 'pr.yml', 'refresh-lockfile.yml', 'release-smoke.yml',
   'release-verify.yml', 'release.yml', 'runner-chaos-evals.yml',
   'runner-full-stack-e2e.yml', 'runner-live-evals.yml',
