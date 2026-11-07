@@ -4590,13 +4590,16 @@ it("captures exact provider frames and correlates Rust and TypeScript interpreta
   await rm(hostHome, { recursive: true, force: true });
 }, 30_000);
 
-it("steers the active provider turn through the durable PRP command path", async () => {
+it.each(["plain", "compressed"])("steers and reuses the exact %s payload through the durable PRP command path", async (mode) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-steering-"));
+  const tracePath = join(stateDirectory, "provider.ndjson");
+  const steeringText = mode === "compressed" ? 'Prioritize the mobile queue layout. 引用 "full text"\n'.repeat(8000) : "Prioritize the mobile queue layout.";
   const bundle = createCapabilityRunnerdCodexTransport({
     runnerBinary: defaultCapabilityRunnerdBinary(),
     codexCommand: fakeCodex,
     codexArgs: fakeCodexArgs(stateDirectory, "--linger-after-turn-start"),
     stateDirectory,
+    environment: { PAPERCLIP_PROVIDER_TRACE_PATH: tracePath, PAPERCLIP_PROVIDER_TRACE_MAX_BYTES: String(16 * 1024 * 1024) },
   });
   bundle.transport.setServerRequestHandler(async () => ({
     success: true,
@@ -4624,13 +4627,13 @@ it("steers the active provider turn through the durable PRP command path", async
 
     await expect(
       bundle.transport.request("turn/steer", {
-        input: [{ type: "text", text: "Prioritize the mobile queue layout." }],
+        input: [{ type: "text", text: steeringText }],
         correlationId: "queued-comment-1",
       }),
     ).resolves.toEqual({});
     await expect(
       bundle.transport.request("turn/steer", {
-        input: [{ type: "text", text: "Prioritize the mobile queue layout." }],
+        input: [{ type: "text", text: steeringText }],
         correlationId: "queued-comment-1",
       }),
     ).resolves.toEqual({});
@@ -4666,6 +4669,13 @@ it("steers the active provider turn through the durable PRP command path", async
     }
     expect(methods).toContain("turn/started");
     expect(acknowledged).toBe(true);
+    await expect(bundle.transport.request("turn/steer", {
+      input: [{ type: "text", text: steeringText + " changed" }],
+      correlationId: "queued-comment-1",
+    })).rejects.toThrow("reused with different content");
+    const steers = (await readProviderRequestFrames(tracePath)).filter(frame => frame.method === "turn/steer");
+    expect(steers).toHaveLength(1);
+    expect((steers[0]!.params as { input: Array<{ text: string }> }).input[0]!.text).toBe(steeringText);
   } finally {
     await bundle.transport.close();
     await rm(stateDirectory, { recursive: true, force: true });

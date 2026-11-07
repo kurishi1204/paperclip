@@ -2370,7 +2370,10 @@ mod tests {
         use sha2::{Digest, Sha256};
         use std::io::Write;
 
-        struct TextExecutor { calls: usize, expected: String }
+        struct TextExecutor {
+            calls: usize,
+            expected: String,
+        }
         impl CommandExecutor for TextExecutor {
             fn execute(&mut self, value: &Command) -> Result<CommandExecution, DurableRunnerError> {
                 assert_eq!(value.payload["text"], self.expected);
@@ -2380,7 +2383,10 @@ mod tests {
             }
         }
         for corrupted in [false, true] {
-            let directory = std::env::temp_dir().join(format!("paperclip-turn-text-replay-{}", uuid::Uuid::new_v4()));
+            let directory = std::env::temp_dir().join(format!(
+                "paperclip-turn-text-replay-{}",
+                uuid::Uuid::new_v4()
+            ));
             let config = config(directory.clone());
             let store = DurableStateStore::new(&directory).unwrap();
             let (mut state, _) = store.load_or_create(&config).unwrap();
@@ -2393,11 +2399,15 @@ mod tests {
                 "data":STANDARD.encode(gzip.finish().unwrap())}});
             let wire = start.clone();
             let mut executor = TextExecutor { calls: 0, expected };
-            let first = process_command(&mut state, &store, &config, &mut executor, &start).unwrap().0;
+            let first = process_command(&mut state, &store, &config, &mut executor, &start)
+                .unwrap()
+                .0;
             assert_eq!(first.status, if corrupted { "failed" } else { "completed" });
             assert_eq!(executor.calls, usize::from(!corrupted));
             let (mut restored, _) = store.load_or_create(&config).unwrap();
-            let replay = process_command(&mut restored, &store, &config, &mut executor, &wire).unwrap().0;
+            let replay = process_command(&mut restored, &store, &config, &mut executor, &wire)
+                .unwrap()
+                .0;
             assert_eq!(replay, first);
             assert_eq!(executor.calls, usize::from(!corrupted));
             assert_eq!(start, wire);

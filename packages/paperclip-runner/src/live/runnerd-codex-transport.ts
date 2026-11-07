@@ -5932,6 +5932,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           .digest("hex")
           .slice(0, 32)}`
       : `command_lab_${randomUUID().replaceAll("-", "")}`;
+    const wirePayload = prepareTurnTextPayload(type, payload);
     const existing = core.store.state.commands.find(
       (command) => command.commandId === commandId,
     );
@@ -5939,14 +5940,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       if (
         existing.type !== type ||
         durableRecoveryInternals.canonicalJson(existing.payload) !==
-          durableRecoveryInternals.canonicalJson(payload)
+          durableRecoveryInternals.canonicalJson(wirePayload)
       ) {
         throw new Error(
           `PRP steering correlation ${correlationId} was reused with different content`,
         );
       }
     } else {
-      core.queueCommand(type, prepareTurnTextPayload(type, payload), commandId, true);
+      core.queueCommand(type, wirePayload, commandId, true);
     }
     await this.#waitCommand(type, commandId);
   }
