@@ -81,3 +81,49 @@ when it is in the latest contract's explicit `supersedesContractId` ancestry,
 with each link owned by this company/issue and strictly decreasing revision.
 The new saved result must still belong to the latest current contract. No old
 result, assessment or contract is rewritten, and an unrelated revision is held.
+
+## Saved document revisions and authors
+
+When a completion review card is created, `bind_reviewer` records every issue
+document's `documentId`, `key`, `revisionId` and `revisionNumber` in
+`payload.target.boundDocuments`, in the same transaction as the card. System
+bookkeeping documents (`continuation-summary`, `pipeline-case-body`) are not
+submitted work and are excluded. A task without documents records an empty list.
+
+Acceptance, through the HTTP route, the reviewer's `resolve_review` tool or a
+system actor, re-reads the issue documents while holding the issue row
+`FOR UPDATE` and requires the same set at the same revisions. A later revision,
+an added document or a removed document returns 409
+`native_completion_review_documents_stale`. A card saved before this binding
+existed returns 409 `native_completion_review_documents_unbound` once the issue
+has documents. A task without documents still completes normally.
+
+The issue row is the only lock used. The `paperclip_bump_issue_revision_from_child`
+triggers (migration 0313) lock the issue `FOR UPDATE` before every
+`issue_documents` insert, update or delete and every update of a linked
+`documents` row, whichever service, route or import performs it. A writer
+therefore waits for an approval that holds the issue, and an approval waits for
+a writer that already reached the trigger and then sees its committed change.
+The reader does not lock document rows: a writer holds its document row before
+its trigger waits for the issue, so a document share lock would deadlock (40P01).
+
+An approving agent must not have written any revision up to a bound revision,
+whether the revision records it in the agent column or only through its creating
+run. That case returns 403 `native_completion_review_author_excluded`. Author
+exclusion applies to an agent's independent content QA only. A human resolver
+keeps the existing addressee and `human_only` audience rules and may decide on
+documents they wrote; the version binding still applies. System actors keep
+their existing rules.
+
+Rejection stays available in each of these cases, so the reviewer can send stale
+work back and the worker can resubmit the current revisions. The rule adds no
+database column, migration, resolver policy or reviewer tool. `human_only` cards
+remain human-only.
+
+The "native completion review document binding" cases in
+`paperclip-control-plane-port.test.ts` drive the native finalizer and the real
+HTTP accept/reject routes against PostgreSQL. They cover multiple documents, a
+revision saved after submission, both agent-authorship forms, a `human_only`
+owner deciding on their own revision (including after a later revision), a task
+without documents, an unbound card, and both orders of a concurrent document
+write and approval.

@@ -113,6 +113,7 @@ import {
 } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
+import { assertNativeCompletionDocumentBindingCurrent } from "./native-runtime/native-completion-document-binding.js";
 import {
   assertIssueReviewVerdictActorAllowed,
   isIssueReviewVerdictInteraction,
@@ -2256,6 +2257,14 @@ export function issueThreadInteractionService(
         lockedCurrent,
         args.actor,
       );
+      if (isNativeCompletionReview(lockedCurrent)) {
+        await assertNativeCompletionDocumentBindingCurrent(tx as unknown as Db, {
+          companyId: issueContext.companyId,
+          issueId: issueContext.id,
+          payload: lockedCurrent.payload,
+          actor: args.actor,
+        });
+      }
 
       const interaction = hydrateInteraction(lockedCurrent);
       const selectedOptionIds =

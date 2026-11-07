@@ -1511,12 +1511,24 @@ export const requestConfirmationIssueDocumentTargetSchema =
     revisionNumber: z.number().int().positive().nullable().optional(),
   });
 
+export const requestConfirmationBoundDocumentSchema = z.object({
+  documentId: z.string().guid(),
+  key: issueDocumentKeySchema,
+  revisionId: z.string().guid(),
+  revisionNumber: z.number().int().positive(),
+});
+
 export const requestConfirmationCustomTargetSchema =
   requestConfirmationTargetBaseSchema.extend({
     type: z.literal("custom"),
     key: z.string().trim().min(1).max(120),
     revisionId: z.string().trim().min(1).max(255).nullable().optional(),
     revisionNumber: z.number().int().positive().nullable().optional(),
+    boundDocuments: z
+      .array(requestConfirmationBoundDocumentSchema)
+      .max(500)
+      .nullable()
+      .optional(),
   });
 
 export const requestConfirmationTargetSchema = z.discriminatedUnion("type", [
