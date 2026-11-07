@@ -141,12 +141,14 @@ jobs:
           sha256sum pnpm-lock.yaml > remote-verification/lock.sha256
           git rev-parse HEAD > remote-verification/source.txt
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
-      - if: inputs.publish_eval_image
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Authenticate the optional upstream image publication
+        if: inputs.publish_eval_image
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
       - name: Build checksum-verified Grok provider image
         if: inputs.publish_eval_image
         env:
@@ -211,3 +213,6 @@ jobs:
           name: grok-remote-verification-${{ github.run_id }}
           path: remote-verification/
           retention-days: 7
+      - name: Clear optional upstream registry authentication
+        if: always() && inputs.publish_eval_image
+        run: docker logout ghcr.io
