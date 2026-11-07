@@ -1695,7 +1695,7 @@ function resolveOperationAuthLevel(
   if (path === "/api/mcp/setup" || path === "/api/mcp/device/consent" || path.startsWith("/api/mcp/requests/") || path.startsWith("/api/mcp/connections")) return "board";
   if (PUBLIC_OPERATIONS.has(key)) return "public";
   if (key === "POST /api/companies/{companyId}/agent-commentary") return "agent_heartbeat";
-  if (key === "POST /api/mcp/project-tools" || key === "POST /api/mcp/qa-review" || key === "POST /api/companies/{companyId}/slack/tasks/{issueId}/tools" || key === "GET /api/issues/{id}/requirement-envelope" || key === "POST /api/issues/{id}/approval-stage-decisions") return "agent_run";
+  if (key === "POST /api/mcp/project-tools" || key === "POST /api/mcp/qa-review" || key === "POST /api/companies/{companyId}/slack/tasks/{issueId}/tools" || key === "GET /api/issues/{id}/requirement-envelope" || key === "POST /api/issues/{id}/approval-stage-decisions" || key === "POST /api/issues/{id}/review-stage-decisions") return "agent_run";
   if (RUNTIME_TOOLS_OPERATIONS.has(key)) return "runtime_tools";
   if (INSTANCE_ADMIN_OPERATIONS.has(key)) return "instance_admin";
   if (
@@ -4120,14 +4120,15 @@ registry.registerPath({
   },
 });
 
+for (const stageType of ["approval", "review"] as const) {
 registry.registerPath({
   method: "post",
-  path: "/api/issues/{id}/approval-stage-decisions",
+  path: `/api/issues/{id}/${stageType}-stage-decisions`,
   tags: ["issues"],
-  summary: "Decide the current configured Issue approval stage",
+  summary: `Decide the current configured Issue ${stageType} stage`,
   description:
     "Requires the assigned active native agent's run-bound JWT in standard work mode. " +
-    "The exact pending approval stage, status version, issue revision, and nullable last decision ID " +
+    `The exact pending ${stageType} stage, status version, issue revision, and nullable last decision ID ` +
     "are checked before and inside the issue transaction. Approve advances to the next pending " +
     "stage, or marks the Issue done after the final stage; " +
     "request_changes returns work to the worker. The summary is committed as the decision comment. " +
@@ -4154,6 +4155,7 @@ registry.registerPath({
     422: r.unprocessable,
   },
 });
+}
 
 registry.registerPath({
   method: "post",

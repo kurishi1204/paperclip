@@ -136,6 +136,13 @@ const APPROVAL_STAGE_DEFINITION = {
   },
 };
 
+const REVIEW_STAGE_TOOL = "decide_issue_review_stage";
+const REVIEW_STAGE_DEFINITION = {
+  ...APPROVAL_STAGE_DEFINITION,
+  name: REVIEW_STAGE_TOOL,
+  description: "Decide the configured review stage assigned to this running task. Read get_task_context and supply the exact stage and issue versions. Approve or request concrete changes. This is separate from a document or completion-review interaction.",
+};
+
 type Binding = {
   /** Server-derived scope for one addressed native completion review. */
   nativeReview?: NativeReviewAssignmentContext;
@@ -292,7 +299,7 @@ export class PaperclipRunnerToolAuthority {
     definitions.push(LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION);
     definitions.push(REUSE_CHAT_ATTACHMENT_TOOL_DEFINITION);
     definitions.push(READ_CHAT_ATTACHMENT_TOOL_DEFINITION);
-    if (workMode === "standard") definitions.push(APPROVAL_STAGE_DEFINITION);
+    if (workMode === "standard") definitions.push(APPROVAL_STAGE_DEFINITION, REVIEW_STAGE_DEFINITION);
     const connectionTools = [...RUNTIME_CONNECTION_TOOL_DEFINITIONS,
       ...(this.binding.connectorAssignments ?? []).flatMap((assignment) => assignment.tools)];
     const assignedTools = this.binding.assignedMcpTools?.definitions((tools) =>
@@ -305,13 +312,13 @@ export class PaperclipRunnerToolAuthority {
     callId: string;
     arguments: unknown;
   }): Promise<unknown> {
-    if (call.tool === APPROVAL_STAGE_TOOL) {
+    if (call.tool === APPROVAL_STAGE_TOOL || call.tool === REVIEW_STAGE_TOOL) {
       if (this.binding.nativeReview || this.binding.documentReviewInteractionId || (this.binding.workMode ?? "standard") !== "standard") {
         throw forbidden("Approval stage decision is unavailable in this run mode");
       }
       // A prior verdict may have returned the task to its worker. Receipt
       // recovery therefore precedes #boundContext, which requires assignment.
-      return this.#decideIssueApprovalStage(call.callId, call.arguments);
+      return this.#decideIssueApprovalStage(call.callId, call.arguments, call.tool === REVIEW_STAGE_TOOL ? "review" : "approval");
     }
     if (this.binding.nativeReview || this.binding.documentReviewInteractionId) {
       if (call.tool === "resolve_review") return this.#resolveReview(call.arguments);
@@ -855,7 +862,7 @@ export class PaperclipRunnerToolAuthority {
     return approval;
   }
 
-  async #decideIssueApprovalStage(callId: string, value: unknown): Promise<unknown> {
+  async #decideIssueApprovalStage(callId: string, value: unknown, stageType: "approval" | "review"): Promise<unknown> {
     const raw = record(value);
     const expectedKeys = ["decision", "summary", "expectedStageId", "expectedStatusVersion", "expectedRevision", "expectedLastDecisionId"];
     if (Object.keys(raw).some((key) => !expectedKeys.includes(key)) || expectedKeys.some((key) => !(key in raw)) ||
@@ -874,7 +881,7 @@ export class PaperclipRunnerToolAuthority {
       expectedRevision: raw.expectedRevision as number,
       expectedLastDecisionId: lastDecisionId === null ? null : requiredUuid(lastDecisionId),
     };
-    const digest = createHash("sha256").update(canonicalJson(input)).digest("hex");
+    const digest = createHash("sha256").update(canonicalJson(stageType === "approval" ? input : { ...input, stageType })).digest("hex");
     const [identity] = await this.db.select({ run: heartbeatRuns, actor: agents }).from(heartbeatRuns)
       .innerJoin(agents, eq(agents.id, this.binding.agentId)).where(and(
         eq(heartbeatRuns.id, this.binding.runId), eq(heartbeatRuns.companyId, this.binding.companyId),
@@ -944,7 +951,7 @@ export class PaperclipRunnerToolAuthority {
         if (current.issue.workMode !== "standard") throw forbidden("Approval stage decision requires standard work mode");
         const state = record(current.issue.executionState);
         if (current.issue.status !== "in_review" || state.status !== "pending" ||
-            state.currentStageType !== "approval" || state.currentStageId !== input.expectedStageId ||
+            state.currentStageType !== stageType || state.currentStageId !== input.expectedStageId ||
             record(state.currentParticipant).type !== "agent" ||
             record(state.currentParticipant).agentId !== this.binding.agentId ||
             current.issue.statusVersion !== input.expectedStatusVersion || current.issue.revision !== input.expectedRevision ||
@@ -967,7 +974,7 @@ export class PaperclipRunnerToolAuthority {
           throw forbidden("Approval stage goal or control action is active");
         }
         if (attempts[receiptKey] !== undefined) history.push({ ...atStage, stageId: receiptKey });
-        attempts[receiptKey] = { digest, callId, input, reservedAt: new Date().toISOString() };
+        attempts[receiptKey] = { digest, callId, input, stageType, reservedAt: new Date().toISOString() };
         await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, approvalStageAttempts: attempts,
           approvalStageAttemptHistory: history } })
           .where(eq(heartbeatRuns.id, this.binding.runId));
@@ -995,7 +1002,7 @@ export class PaperclipRunnerToolAuthority {
         eq(issueExecutionDecisions.companyId, this.binding.companyId),
         eq(issueExecutionDecisions.issueId, this.binding.issueId),
         eq(issueExecutionDecisions.stageId, input.expectedStageId),
-        eq(issueExecutionDecisions.stageType, "approval"),
+        eq(issueExecutionDecisions.stageType, stageType),
         eq(issueExecutionDecisions.actorAgentId, this.binding.agentId),
         eq(issueExecutionDecisions.createdByRunId, this.binding.runId),
       )).orderBy(desc(issueExecutionDecisions.createdAt)).limit(2);
@@ -1016,7 +1023,7 @@ export class PaperclipRunnerToolAuthority {
       const apiUrl = this.binding.apiUrl ?? process.env.PAPERCLIP_API_URL;
       if (!apiUrl) throw new Error("Paperclip API origin is unavailable");
       const token = createLocalAgentJwt(this.binding.agentId, this.binding.companyId, identity.actor.adapterType, this.binding.runId, identity.run.responsibleUserId);
-      const response = await fetch(`${apiUrl.replace(/\/$/, "")}/api/issues/${this.binding.issueId}/approval-stage-decisions`, {
+      const response = await fetch(`${apiUrl.replace(/\/$/, "")}/api/issues/${this.binding.issueId}/${stageType}-stage-decisions`, {
         method: "POST", redirect: "error", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify(input), signal: AbortSignal.timeout(30_000),
       });

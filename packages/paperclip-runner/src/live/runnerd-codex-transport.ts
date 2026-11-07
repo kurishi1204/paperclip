@@ -1,3 +1,4 @@
+import { prepareTurnTextPayload } from "./turn-text-transfer.js";
 import { resolveAcpxProviderMode } from "../drivers/acpx/provider-mode.js";
 import { isAcpxCanonicalInputMethod } from "../drivers/acpx/profile-extensions.js";
 import { RunnerdTraceFrameIndex } from "./runnerd-trace-frame-index.js";
@@ -5945,7 +5946,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         );
       }
     } else {
-      core.queueCommand(type, payload, commandId, true);
+      core.queueCommand(type, prepareTurnTextPayload(type, payload), commandId, true);
     }
     await this.#waitCommand(type, commandId);
   }
@@ -5958,7 +5959,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const core = this.#core;
     if (core === null) throw new Error("PRP provider thread is not started");
     const commandId = `command_lab_${randomUUID().replaceAll("-", "")}`;
-    core.queueCommand(type, payload, commandId, true);
+    core.queueCommand(type, prepareTurnTextPayload(type, payload), commandId, true);
     await this.#waitCommand(type, commandId, deadline);
     const command = core.getCommand(commandId);
     if (command?.status !== "completed" || command.type !== type) {

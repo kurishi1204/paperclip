@@ -73,3 +73,8 @@ provider notifications to PRP events. The server supplies the bootstrap ticket
 only through the child environment, stores the process identity for bounded
 cancellation, and waits for the durable result and terminal pair. The existing
 local fake-runner mode remains unchanged.
+
+
+## Large turn text
+
+The controller can send `turn.start` or `turn.steer` text as a `textTransfer` object instead of `text`. The encoding is `gzip-base64.v1`. The object binds the exact UTF-8 byte count and SHA-256 digest to canonical standard-base64 gzip data. The runner restores the text only after it stores the original command intent and before it calls the provider. The original compressed command remains the journal and replay identity. Mixed forms, unknown codecs, invalid UTF-8, extra gzip streams, digest/size mismatches, and expansion beyond 1 MiB fail before provider execution. The encrypted frame and command bounds do not change. Small input keeps its existing wire form. Deploy the matching controller and runner build together; an older runner rejects a transfer with no plain `text`, rather than running a partial prompt.

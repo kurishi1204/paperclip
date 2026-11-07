@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issueExecutionDecisions, issues } from "@paperclipai/db";
 
@@ -30,7 +30,7 @@ export async function readFormalIssueApprovalDecision(input: {
   const decisions = await input.db.select().from(issueExecutionDecisions).where(and(
     eq(issueExecutionDecisions.companyId, input.issue.companyId),
     eq(issueExecutionDecisions.issueId, input.issue.id),
-    eq(issueExecutionDecisions.stageType, "approval"),
+    inArray(issueExecutionDecisions.stageType, ["approval", "review"]),
     eq(issueExecutionDecisions.actorAgentId, input.agentId),
     eq(issueExecutionDecisions.createdByRunId, input.runId),
   )).orderBy(desc(issueExecutionDecisions.createdAt), desc(issueExecutionDecisions.id));
@@ -38,7 +38,9 @@ export async function readFormalIssueApprovalDecision(input: {
   for (const decision of decisions) {
     const attempt = object(attempts[decision.stageId]);
     const reservedInput = object(attempt.input);
-    const digest = createHash("sha256").update(canonicalJson(reservedInput)).digest("hex");
+    const stageType = attempt.stageType ?? "approval";
+    if (stageType !== decision.stageType) continue;
+    const digest = createHash("sha256").update(canonicalJson(stageType === "approval" ? reservedInput : { ...reservedInput, stageType })).digest("hex");
     if (attempt.digest !== digest || reservedInput.expectedStageId !== decision.stageId ||
         reservedInput.summary !== decision.body ||
         reservedInput.decision !== (decision.outcome === "approved" ? "approve" : "request_changes") ||
