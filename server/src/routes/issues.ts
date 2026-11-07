@@ -10637,6 +10637,28 @@ export function issueRoutes(
     res.json(result.document);
   });
 
+  router.get("/issues/:id/documents/:key/revisions/:revisionId/digest", async (req, res) => {
+    const key = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
+    const revision = z.string().uuid().safeParse(req.params.revisionId);
+    if (!key.success || !revision.success) throw badRequest("Invalid document key or revision id");
+    const readDigest = (issue: typeof issueRows.$inferSelect, executor: Db) =>
+      documentService(executor).getIssueDocumentRevisionDigest({
+        companyId: issue.companyId, issueId: issue.id,
+        key: key.data, revisionId: revision.data,
+      });
+    if (isSelfTaskDocumentRequest(req)) {
+      const digest = await withSelfTaskDocument(req, res, false, readDigest);
+      if (!digest) throw notFound("Document revision not found");
+      res.json(digest);
+      return;
+    }
+    const issue = await getAccessibleResource(req, res, getIssueById(req, req.params.id as string), "Issue not found");
+    if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
+    const digest = await readDigest(issue, db);
+    if (!digest) throw notFound("Document revision not found");
+    res.json(digest);
+  });
+
   router.get("/issues/:id/documents/:key/revisions", async (req, res) => {
     if (isSelfTaskDocumentRequest(req)) {
       const revisions = await withSelfTaskDocument(req, res, false, async (issue, executor) =>

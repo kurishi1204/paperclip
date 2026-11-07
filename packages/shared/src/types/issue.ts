@@ -120,6 +120,19 @@ export interface IssueDocument extends IssueDocumentSummary {
   body: string;
 }
 
+/** A mechanical digest of one persisted revision; not a content or QA verdict. */
+export interface IssueDocumentRevisionDigest {
+  issueId: string;
+  key: string;
+  documentId: string;
+  revisionId: string;
+  revisionNumber: number;
+  algorithm: "sha256";
+  encoding: "utf-8";
+  bodyBytes: number;
+  bodySha256: string;
+}
+
 export interface DocumentRevision {
   id: string;
   companyId: string;

@@ -4377,6 +4377,24 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/issues/{id}/documents/{key}/revisions/{revisionId}/digest",
+  tags: ["issues"],
+  summary: "Compute UTF-8 byte length and SHA-256 of a saved document revision",
+  description: "Read-only mechanical verification of the persisted body, with the same issue-read authorization. No content approval is performed and the body is not returned.",
+  request: { params: z.object({ id: z.string(), key: z.string(), revisionId: z.string().uuid() }) },
+  responses: {
+    200: r.ok(z.object({
+      issueId: z.string().uuid(), key: z.string(), documentId: z.string().uuid(),
+      revisionId: z.string().uuid(), revisionNumber: z.number().int().positive(),
+      algorithm: z.literal("sha256"), encoding: z.literal("utf-8"),
+      bodyBytes: z.number().int().nonnegative(), bodySha256: z.string().regex(/^[0-9a-f]{64}$/),
+    })),
+    400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/issues/{id}/documents/{key}/revisions",
   tags: ["issues"],
   summary: "List issue document revisions",

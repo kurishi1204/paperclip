@@ -1,8 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { documentRevisions, documents, issueDocuments, issues } from "@paperclipai/db";
-import { isSystemIssueDocumentKey, issueDocumentKeySchema } from "@paperclipai/shared";
+import { isSystemIssueDocumentKey, issueDocumentKeySchema, type IssueDocumentRevisionDigest } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
 import { insertRowsInChunks } from "./batch-insert.js";
@@ -167,6 +167,40 @@ export function documentService(db: Db) {
         .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, key)))
         .then((rows) => rows[0] ?? null);
       return row ? mapIssueDocumentRow(row, true) : null;
+    },
+
+    getIssueDocumentRevisionDigest: async (input: {
+      companyId: string; issueId: string; key: string; revisionId: string;
+    }): Promise<IssueDocumentRevisionDigest | null> => {
+      const key = normalizeDocumentKey(input.key);
+      const [revision] = await db.select({
+        documentId: documents.id,
+        revisionId: documentRevisions.id,
+        revisionNumber: documentRevisions.revisionNumber,
+        body: documentRevisions.body,
+      }).from(issueDocuments)
+        .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
+        .innerJoin(documentRevisions, eq(documentRevisions.documentId, documents.id))
+        .where(and(
+          eq(issueDocuments.companyId, input.companyId),
+          eq(documents.companyId, input.companyId),
+          eq(documentRevisions.companyId, input.companyId),
+          eq(issueDocuments.issueId, input.issueId),
+          eq(issueDocuments.key, key),
+          eq(documentRevisions.id, input.revisionId),
+        )).limit(1);
+      if (!revision) return null;
+      // Hash the stored body itself. Do not normalize whitespace or use an
+      // author's claimed verification values embedded in the document.
+      const body = Buffer.from(revision.body, "utf8");
+      return {
+        issueId: input.issueId, key,
+        documentId: revision.documentId, revisionId: revision.revisionId,
+        revisionNumber: revision.revisionNumber,
+        algorithm: "sha256", encoding: "utf-8",
+        bodyBytes: body.length,
+        bodySha256: createHash("sha256").update(body).digest("hex"),
+      };
     },
 
     listIssueDocumentRevisions: async (issueId: string, rawKey: string,

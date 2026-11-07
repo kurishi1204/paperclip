@@ -1231,6 +1231,7 @@ export type {
   IssueThreadInteractionPayload,
   IssueThreadInteractionResult,
   IssueDocument,
+  IssueDocumentRevisionDigest,
   IssueDocumentSummary,
   DocumentRevision,
   DocumentFormat,
