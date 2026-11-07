@@ -89,6 +89,21 @@ describe("ACPX runtime sandbox", () => {
     },
   );
 
+  it.each(["approve-paperclip", "approve-reads"] as const)("writes only the assigned review-stage SDK rule for %s on open and recovery", async (permissionMode) => {
+    const fixture = await sandboxFixture("claude");
+    const binding = { ...fixture.binding, permissionMode };
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const sandbox = await prepareAcpxRuntimeSandbox({ binding, agent: "claude", tools: [
+        { name: "decide_issue_review_stage" }, { name: "decide_approval" },
+        { name: "mcp__other__decide_issue_review_stage" },
+      ] });
+      const settings = JSON.parse(await readFile(join(sandbox.agentHomeDirectory, "settings.json"), "utf8"));
+      expect(settings.permissions.allow).toEqual(permissionMode === "approve-paperclip" ? ["mcp__paperclip__decide_issue_review_stage"] : []);
+    }
+    const unassigned = await prepareAcpxRuntimeSandbox({ binding, agent: "claude", tools: [] });
+    expect(JSON.parse(await readFile(join(unassigned.agentHomeDirectory, "settings.json"), "utf8")).permissions.allow).toEqual([]);
+  });
+
   it("pins Claude's exact model in isolated settings on open and recovery", async () => {
     const fixture = await sandboxFixture("claude");
     for (const model of ["claude-sonnet-5", "custom-claude-model"]) {
