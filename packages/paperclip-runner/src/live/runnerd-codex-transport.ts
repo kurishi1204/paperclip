@@ -1,3 +1,4 @@
+import { prepareTurnTextPayload } from "./turn-text-transfer.js";
 import { resolveAcpxProviderMode } from "../drivers/acpx/provider-mode.js";
 import { isAcpxCanonicalInputMethod } from "../drivers/acpx/profile-extensions.js";
 import { RunnerdTraceFrameIndex } from "./runnerd-trace-frame-index.js";
@@ -5931,6 +5932,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           .digest("hex")
           .slice(0, 32)}`
       : `command_lab_${randomUUID().replaceAll("-", "")}`;
+    const wirePayload = prepareTurnTextPayload(type, payload);
     const existing = core.store.state.commands.find(
       (command) => command.commandId === commandId,
     );
@@ -5938,14 +5940,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       if (
         existing.type !== type ||
         durableRecoveryInternals.canonicalJson(existing.payload) !==
-          durableRecoveryInternals.canonicalJson(payload)
+          durableRecoveryInternals.canonicalJson(wirePayload)
       ) {
         throw new Error(
           `PRP steering correlation ${correlationId} was reused with different content`,
         );
       }
     } else {
-      core.queueCommand(type, payload, commandId, true);
+      core.queueCommand(type, wirePayload, commandId, true);
     }
     await this.#waitCommand(type, commandId);
   }
@@ -5958,7 +5960,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const core = this.#core;
     if (core === null) throw new Error("PRP provider thread is not started");
     const commandId = `command_lab_${randomUUID().replaceAll("-", "")}`;
-    core.queueCommand(type, payload, commandId, true);
+    core.queueCommand(type, prepareTurnTextPayload(type, payload), commandId, true);
     await this.#waitCommand(type, commandId, deadline);
     const command = core.getCommand(commandId);
     if (command?.status !== "completed" || command.type !== type) {

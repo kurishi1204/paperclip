@@ -11,4 +11,7 @@ export const nativeApprovalStageDecisionSchema = z.object({
   expectedLastDecisionId: z.string().uuid().nullable(),
 }).strict();
 
-export type NativeApprovalStageDecision = z.infer<typeof nativeApprovalStageDecisionSchema>;
+export type NativeApprovalStageDecision = z.infer<typeof nativeApprovalStageDecisionSchema> & {
+  /** Set by the dedicated route, never accepted from the JSON body. */
+  expectedStageType?: "approval" | "review";
+};

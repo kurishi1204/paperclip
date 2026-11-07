@@ -1735,3 +1735,8 @@ After the controller has made a run and wake terminal, the finalizer alone may s
 A new native document-review status decision carries its observed binding and verdict into the commit transaction. The committer locks and rechecks that snapshot before recording the decision/effects; a changed document, receipt or verdict requests existing re-arbitration. An already-committed decision remains an idempotent historical receipt, and is not reinterpreted against later document updates.
 
 A fixed document-review history query is constrained at the data source to its assigned document/revision IDs and returns explicit assigned-revision scope metadata. It does not fetch newer bodies that may arrive after admission was read; ordinary document histories retain their existing behavior.
+
+
+### Native configured review and approval stages
+
+An assigned native participant uses `decide_issue_review_stage` for a configured review stage and `decide_issue_approval_stage` for a configured approval stage. These tools use separate run-bound endpoints with the same exact stage, issue revision, status version, participant, and prior-decision checks. They do not resolve document-review or completion-review interactions. Ordinary `call_api` cannot invoke either endpoint. The server fixes the expected stage type from the endpoint; a client cannot select another type in its JSON body. Completed decisions and uncertain sends retain the existing reservation and no-replay rules.

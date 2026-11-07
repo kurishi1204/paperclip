@@ -21,7 +21,9 @@ type RpcResult = {
 type RunnerApiServer = Awaited<ReturnType<typeof startRunnerApiTestServer>>;
 type RunnerFixture = Awaited<ReturnType<RunnerApiServer["fixture"]>>;
 
-describe("native issue approval stage", () => {
+describe.each(["approval", "review"] as const)("native issue %s stage", (stageType) => {
+  const stageTool = stageType === "approval" ? "decide_issue_approval_stage" : "decide_issue_review_stage";
+  const stagePath = `/api/issues/{id}/${stageType}-stage-decisions`;
   let server: RunnerApiServer;
   let bridge: RunnerToolBridge;
   let fixture: RunnerFixture;
@@ -59,7 +61,7 @@ describe("native issue approval stage", () => {
     ]);
     const policy = normalizeIssueExecutionPolicy({ stages: [
       { id: reviewStageId, type: "review", participants: [{ type: "agent", agentId: reviewerId }] },
-      { id: approvalStageId, type: "approval", participants: [{ type: "agent", agentId: fixture.agentId }] },
+      { id: approvalStageId, type: stageType, participants: [{ type: "agent", agentId: fixture.agentId }] },
     ] });
     await server.db.insert(issueExecutionDecisions).values({
       id: previousDecisionId, companyId: fixture.companyId, issueId: fixture.issueId,
@@ -70,7 +72,7 @@ describe("native issue approval stage", () => {
       status: "in_review", executionPolicy: policy as unknown as Record<string, unknown>, executionRunId: fixture.runId,
       executionState: {
         status: "pending", currentStageId: approvalStageId, currentStageIndex: 1,
-        currentStageType: "approval", currentParticipant: { type: "agent", agentId: fixture.agentId },
+        currentStageType: stageType, currentParticipant: { type: "agent", agentId: fixture.agentId },
         returnAssignee: { type: "agent", agentId: workerId }, reviewRequest: null,
         completedStageIds: [reviewStageId], lastDecisionId: previousDecisionId,
         lastDecisionOutcome: "approved", monitor: null, changesRequestedCount: 0,
@@ -95,6 +97,30 @@ describe("native issue approval stage", () => {
     vi.unstubAllEnvs();
   });
 
+  it.each(["approve", "request_changes"] as const)("keeps a human-only %s decision outside agent authority", async (decision) => {
+    await server.db.update(issues).set({ reviewPolicy: "human_only" }).where(eq(issues.id, fixture.issueId));
+    const current = (await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!;
+    const token = createLocalAgentJwt(fixture.agentId, fixture.companyId, "paperclip_runner", fixture.runId)!;
+    const argumentsForDecision = {
+      decision, summary: "This must remain a human decision.", expectedStageId: approvalStageId,
+      expectedStatusVersion: current.statusVersion, expectedRevision: current.revision,
+      expectedLastDecisionId: previousDecisionId,
+    };
+    const response = await fetch(`${server.apiUrl}/api/issues/${fixture.issueId}/${stageType}-stage-decisions`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(argumentsForDecision),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.text()).toContain("human_only");
+    const result = await rpc(`human-only-${decision}`, "tools/call", { name: stageTool, arguments: argumentsForDecision });
+    expect(result.result?.isError).toBe(true);
+    const updated = (await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!;
+    expect(updated).toMatchObject({ status: current.status, statusVersion: current.statusVersion, revision: current.revision, executionState: current.executionState });
+    expect(await server.db.select().from(issueExecutionDecisions).where(and(
+      eq(issueExecutionDecisions.issueId, fixture.issueId), eq(issueExecutionDecisions.stageId, approvalStageId),
+    ))).toHaveLength(0);
+  });
+
   it("control: the bound run reads its task through the real bridge", async () => {
     const listed = await rpc("control-list", "tools/list");
     expect(listed.result?.tools?.map(({ name }) => name)).toContain("get_task_context");
@@ -107,7 +133,7 @@ describe("native issue approval stage", () => {
   it("records request_changes only through a run-bound approval tool and preserves the approver run", async () => {
     const listed = await rpc("approval-list", "tools/list");
     const names = listed.result?.tools?.map(({ name }) => name) ?? [];
-    expect(names).toContain("decide_issue_approval_stage");
+    expect(names).toContain(stageTool);
     expect(names).not.toContain("decide_approval");
 
     const current = (await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!;
@@ -116,14 +142,14 @@ describe("native issue approval stage", () => {
     const taskContext = JSON.parse(context.result!.content![0]!.text) as { executionStage?: Record<string, unknown> };
     expect(taskContext.executionStage).toMatchObject({
       stageId: approvalStageId,
-      stageType: "approval",
+      stageType,
       statusVersion: current.statusVersion,
       revision: current.revision,
       lastDecisionId: previousDecisionId,
     });
     const summary = "The worker must add the missing acceptance evidence.";
     const decision = await rpc("approval-decision", "tools/call", {
-      name: "decide_issue_approval_stage",
+      name: stageTool,
       arguments: {
         decision: "request_changes", summary,
         expectedStageId: approvalStageId,
@@ -140,7 +166,7 @@ describe("native issue approval stage", () => {
     ));
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
-      stageType: "approval", actorAgentId: fixture.agentId,
+      stageType, actorAgentId: fixture.agentId,
       createdByRunId: fixture.runId, outcome: "changes_requested",
     });
     expect(rows[0]!.body).toContain(summary);
@@ -158,7 +184,7 @@ describe("native issue approval stage", () => {
 
   it("approves the final stage without cancelling the deciding run", async () => {
     const current = (await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!;
-    const result = await rpc("approve", "tools/call", { name: "decide_issue_approval_stage", arguments: {
+    const result = await rpc("approve", "tools/call", { name: stageTool, arguments: {
       decision: "approve", summary: "All acceptance evidence is present.",
       expectedStageId: approvalStageId, expectedStatusVersion: current.statusVersion,
       expectedRevision: current.revision, expectedLastDecisionId: previousDecisionId,
@@ -167,7 +193,7 @@ describe("native issue approval stage", () => {
     const [decision] = await server.db.select().from(issueExecutionDecisions).where(and(
       eq(issueExecutionDecisions.issueId, fixture.issueId), eq(issueExecutionDecisions.stageId, approvalStageId),
     ));
-    expect(decision).toMatchObject({ stageType: "approval", outcome: "approved", actorAgentId: fixture.agentId, createdByRunId: fixture.runId });
+    expect(decision).toMatchObject({ stageType, outcome: "approved", actorAgentId: fixture.agentId, createdByRunId: fixture.runId });
     const [updated] = await server.db.select().from(issues).where(eq(issues.id, fixture.issueId));
     expect(updated?.status).toBe("done");
     const [run] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
@@ -185,7 +211,7 @@ describe("native issue approval stage", () => {
     }
     const current = (await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!;
     const token = createLocalAgentJwt(fixture.agentId, fixture.companyId, "paperclip_runner", fixture.runId)!;
-    const response = await fetch(`${server.apiUrl}/api/issues/${fixture.issueId}/approval-stage-decisions`, {
+    const response = await fetch(`${server.apiUrl}/api/issues/${fixture.issueId}/${stageType}-stage-decisions`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
@@ -224,7 +250,7 @@ describe("native issue approval stage", () => {
       lastDecisionOutcome: null,
     } }).where(eq(issues.id, fixture.issueId));
     const current = (await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!;
-    const malformed = await rpc(`bad-null-sentinel-${sentinel}`, "tools/call", { name: "decide_issue_approval_stage", arguments: {
+    const malformed = await rpc(`bad-null-sentinel-${sentinel}`, "tools/call", { name: stageTool, arguments: {
       decision: "approve", summary: "First approval stage accepted.", expectedStageId: approvalStageId,
       expectedStatusVersion: current.statusVersion, expectedRevision: current.revision,
       expectedLastDecisionId: "not-a-uuid",
@@ -232,7 +258,7 @@ describe("native issue approval stage", () => {
     expect(malformed.result?.isError).toBe(true);
     const [before] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
     expect((before?.resultJson as Record<string, unknown>)?.approvalStageAttempts).toBeUndefined();
-    const verdict = await rpc(`null-sentinel-${sentinel}`, "tools/call", { name: "decide_issue_approval_stage", arguments: {
+    const verdict = await rpc(`null-sentinel-${sentinel}`, "tools/call", { name: stageTool, arguments: {
       decision: "approve", summary: "First approval stage accepted.", expectedStageId: approvalStageId,
       expectedStatusVersion: current.statusVersion, expectedRevision: current.revision,
       expectedLastDecisionId: sentinel,
@@ -256,7 +282,7 @@ describe("native issue approval stage", () => {
     vi.stubEnv("PAPERCLIP_API_URL", "");
     try {
       const unavailable = await rpc("missing-api-origin", "tools/call", {
-        name: "decide_issue_approval_stage", arguments: args,
+        name: stageTool, arguments: args,
       });
       expect(unavailable.result?.isError).toBe(true);
       const [run] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
@@ -265,7 +291,7 @@ describe("native issue approval stage", () => {
         eq(issueExecutionDecisions.issueId, fixture.issueId), eq(issueExecutionDecisions.stageId, approvalStageId),
       ))).toHaveLength(0);
     } finally { vi.stubEnv("PAPERCLIP_API_URL", server.apiUrl); }
-    const retry = await rpc("origin-restored", "tools/call", { name: "decide_issue_approval_stage", arguments: args });
+    const retry = await rpc("origin-restored", "tools/call", { name: stageTool, arguments: args });
     expect(retry.result?.isError).not.toBe(true);
   });
 
@@ -275,7 +301,7 @@ describe("native issue approval stage", () => {
       expectedStageId: approvalStageId, expectedStatusVersion: current.statusVersion,
       expectedRevision: current.revision, expectedLastDecisionId: previousDecisionId };
     const token = createLocalAgentJwt(fixture.agentId, fixture.companyId, "paperclip_runner", fixture.runId)!;
-    const post = async (body: object, auth = token) => fetch(`${server.apiUrl}/api/issues/${fixture.issueId}/approval-stage-decisions`, {
+    const post = async (body: object, auth = token) => fetch(`${server.apiUrl}/api/issues/${fixture.issueId}/${stageType}-stage-decisions`, {
       method: "POST", headers: { Authorization: `Bearer ${auth}`, "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
     expect((await post({ ...valid, unexpected: true })).status).toBe(400);
@@ -315,7 +341,7 @@ describe("native issue approval stage", () => {
     const nativeFetch = globalThis.fetch.bind(globalThis);
     let posted = 0;
     const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (resource, options) => {
-      if (typeof resource === "string" && resource.endsWith(`/api/issues/${fixture.issueId}/approval-stage-decisions`) && options?.method === "POST") {
+      if (typeof resource === "string" && resource.endsWith(`/api/issues/${fixture.issueId}/${stageType}-stage-decisions`) && options?.method === "POST") {
         posted += 1;
         const committed = await nativeFetch(resource, options);
         expect(committed.status).toBe(200);
@@ -325,7 +351,7 @@ describe("native issue approval stage", () => {
     });
     try {
       for (const callId of ["lost-first", "lost-first", "lost-second"]) {
-        const result = await rpc(callId, "tools/call", { name: "decide_issue_approval_stage", arguments: args });
+        const result = await rpc(callId, "tools/call", { name: stageTool, arguments: args });
         expect(result.result?.isError).not.toBe(true);
       }
       expect(posted).toBe(1);
@@ -345,13 +371,13 @@ describe("native issue approval stage", () => {
       agentId: fixture.agentId, adapterType: "paperclip_runner", taskKey: fixture.issueId,
       goalJson: { objective: "Continue work", status: "active" },
     }).returning();
-    const active = await rpc("goal-active", "tools/call", { name: "decide_issue_approval_stage", arguments: args });
+    const active = await rpc("goal-active", "tools/call", { name: stageTool, arguments: args });
     expect(active.result?.isError).toBe(true);
     await server.db.update(agentTaskSessions).set({ goalJson: { objective: "Continue work", status: "complete" } })
       .where(eq(agentTaskSessions.id, session!.id));
     await server.db.insert(agentSessionGoalActions).values({ companyId: fixture.companyId,
       sessionId: session!.id, requestId: randomUUID(), action: "pause", payloadJson: {}, status: "pending" });
-    const pending = await rpc("goal-pending", "tools/call", { name: "decide_issue_approval_stage", arguments: args });
+    const pending = await rpc("goal-pending", "tools/call", { name: stageTool, arguments: args });
     expect(pending.result?.isError).toBe(true);
     const [run] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
     expect((run?.resultJson as Record<string, unknown> | null)?.approvalStageAttempts).toBeUndefined();
@@ -362,9 +388,9 @@ describe("native issue approval stage", () => {
   });
 
   it("denies the approval receiver through generic call_api", async () => {
-    expect(runnerApiRestriction("POST", "/api/issues/{id}/approval-stage-decisions")).not.toBeNull();
+    expect(runnerApiRestriction("POST", stagePath)).not.toBeNull();
     const attempt = await rpc("generic-approval", "tools/call", { name: "call_api", arguments: {
-      operationId: "POST /api/issues/{id}/approval-stage-decisions", pathParams: { id: fixture.issueId },
+      operationId: `POST ${stagePath}`, pathParams: { id: fixture.issueId },
       body: { decision: "approve" },
     } });
     expect(attempt.result?.isError).toBe(true);
@@ -382,14 +408,14 @@ describe("native issue approval stage", () => {
     const nativeFetch = globalThis.fetch.bind(globalThis);
     let posted = 0;
     const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (resource, options) => {
-      if (typeof resource === "string" && resource.endsWith(`/api/issues/${fixture.issueId}/approval-stage-decisions`) && options?.method === "POST") posted += 1;
+      if (typeof resource === "string" && resource.endsWith(`/api/issues/${fixture.issueId}/${stageType}-stage-decisions`) && options?.method === "POST") posted += 1;
       return nativeFetch(resource, options);
     });
     try {
       const parallel = await Promise.all(["parallel-one", "parallel-two"].map((id) =>
-        rpc(id, "tools/call", { name: "decide_issue_approval_stage", arguments: args })));
+        rpc(id, "tools/call", { name: stageTool, arguments: args })));
       expect(parallel.some((result) => result.result?.isError !== true)).toBe(true);
-      const replay = await rpc("parallel-three", "tools/call", { name: "decide_issue_approval_stage", arguments: args });
+      const replay = await rpc("parallel-three", "tools/call", { name: stageTool, arguments: args });
       expect(replay.result?.isError).not.toBe(true);
       expect(posted).toBe(1);
       const decisions = await server.db.select().from(issueExecutionDecisions).where(and(
@@ -407,21 +433,21 @@ describe("native issue approval stage", () => {
     const nativeFetch = globalThis.fetch.bind(globalThis);
     let posted = 0;
     const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (resource, options) => {
-      if (typeof resource === "string" && resource.endsWith(`/api/issues/${fixture.issueId}/approval-stage-decisions`) && options?.method === "POST") {
+      if (typeof resource === "string" && resource.endsWith(`/api/issues/${fixture.issueId}/${stageType}-stage-decisions`) && options?.method === "POST") {
         posted += 1;
         if (posted === 1) return new Response("prewrite conflict", { status: 409 });
       }
       return nativeFetch(resource, options);
     });
     try {
-      expect((await rpc("definite-old", "tools/call", { name: "decide_issue_approval_stage", arguments: firstArgs })).result?.isError).toBe(true);
-      expect((await rpc("definite-old", "tools/call", { name: "decide_issue_approval_stage", arguments: firstArgs })).result?.isError).toBe(true);
+      expect((await rpc("definite-old", "tools/call", { name: stageTool, arguments: firstArgs })).result?.isError).toBe(true);
+      expect((await rpc("definite-old", "tools/call", { name: stageTool, arguments: firstArgs })).result?.isError).toBe(true);
       expect(posted).toBe(1);
       await server.db.update(issues).set({ title: "Revised evidence" }).where(eq(issues.id, fixture.issueId));
       const freshContext = await rpc("definite-context", "tools/call", { name: "get_task_context", arguments: {} });
       const stage = (JSON.parse(freshContext.result!.content![0]!.text) as { executionStage: Record<string, unknown> }).executionStage;
       const freshArgs = { ...firstArgs, expectedRevision: stage.revision as number };
-      const decided = await rpc("definite-new", "tools/call", { name: "decide_issue_approval_stage", arguments: freshArgs });
+      const decided = await rpc("definite-new", "tools/call", { name: stageTool, arguments: freshArgs });
       expect(decided.result?.isError).not.toBe(true);
       expect(posted).toBe(2);
       const [run] = await server.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
@@ -442,18 +468,18 @@ describe("native issue approval stage", () => {
     const nativeFetch = globalThis.fetch.bind(globalThis);
     let posted = 0;
     const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (resource, options) => {
-      if (typeof resource === "string" && resource.endsWith(`/api/issues/${fixture.issueId}/approval-stage-decisions`) && options?.method === "POST") {
+      if (typeof resource === "string" && resource.endsWith(`/api/issues/${fixture.issueId}/${stageType}-stage-decisions`) && options?.method === "POST") {
         posted += 1;
         return new Response("uncertain", { status: 503 });
       }
       return nativeFetch(resource, options);
     });
     try {
-      expect((await rpc("unknown-old", "tools/call", { name: "decide_issue_approval_stage", arguments: firstArgs })).result?.isError).toBe(true);
+      expect((await rpc("unknown-old", "tools/call", { name: stageTool, arguments: firstArgs })).result?.isError).toBe(true);
       await server.db.update(issues).set({ title: "Fresh issue version" }).where(eq(issues.id, fixture.issueId));
       const freshContext = await rpc("unknown-context", "tools/call", { name: "get_task_context", arguments: {} });
       const stage = (JSON.parse(freshContext.result!.content![0]!.text) as { executionStage: Record<string, unknown> }).executionStage;
-      expect((await rpc("unknown-new", "tools/call", { name: "decide_issue_approval_stage", arguments: {
+      expect((await rpc("unknown-new", "tools/call", { name: stageTool, arguments: {
         ...firstArgs, expectedRevision: stage.revision,
       } })).result?.isError).toBe(true);
       expect(posted).toBe(1);
@@ -467,7 +493,7 @@ describe("native issue approval stage", () => {
   it("keeps a later worker lease and decision through the actual same-run finalizer and replay", async () => {
     const initial = (await server.db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]!;
     const summary = "The worker must supply the missing verification artifact.";
-    const verdict = await rpc("formal-before-finish", "tools/call", { name: "decide_issue_approval_stage", arguments: {
+    const verdict = await rpc("formal-before-finish", "tools/call", { name: stageTool, arguments: {
       decision: "request_changes", summary, expectedStageId: approvalStageId,
       expectedStatusVersion: initial.statusVersion, expectedRevision: initial.revision,
       expectedLastDecisionId: previousDecisionId,
@@ -477,7 +503,7 @@ describe("native issue approval stage", () => {
       eq(issueExecutionDecisions.issueId, fixture.issueId), eq(issueExecutionDecisions.stageId, approvalStageId),
     ));
     expect(original).toMatchObject({ companyId: fixture.companyId, issueId: fixture.issueId,
-      stageType: "approval", actorAgentId: fixture.agentId, createdByRunId: fixture.runId,
+      stageType, actorAgentId: fixture.agentId, createdByRunId: fixture.runId,
       outcome: "changes_requested", body: summary });
 
     const contractId = randomUUID(), sessionId = randomUUID(), runnerInstanceId = randomUUID();

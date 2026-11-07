@@ -13066,11 +13066,19 @@ export function issueRoutes(
         issue.workMode !== "standard" ||
         issue.executionRunId !== actor.runId || issue.status !== "in_review" ||
         issue.statusVersion !== expected.expectedStatusVersion || issue.revision !== expected.expectedRevision ||
-        state?.status !== "pending" || state.currentStageType !== "approval" ||
+        state?.status !== "pending" || state.currentStageType !== (expected.expectedStageType ?? "approval") ||
         state.currentStageId !== expected.expectedStageId || state.lastDecisionId !== expected.expectedLastDecisionId ||
         state.currentParticipant?.type !== "agent" || state.currentParticipant.agentId !== actor.agentId) {
       throw conflict("Approval stage or run binding changed; read the task again before deciding");
     }
+    // Both approval and change requests are review verdicts. This helper is
+    // called before effects and again with the issue row locked, so a policy
+    // change cannot authorize an agent verdict inside the decision transaction.
+    await assertIssueReviewVerdictActorAllowed(query, {
+      issue,
+      actor: { type: "agent", id: actor.agentId },
+      reviewPolicy: issue.reviewPolicy,
+    });
     const runQuery = query.select({ id: heartbeatRuns.id, agentStatus: agents.status }).from(heartbeatRuns)
       .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, heartbeatRuns.companyId))).where(and(
       eq(heartbeatRuns.id, actor.runId), eq(heartbeatRuns.companyId, issue.companyId),
@@ -13656,7 +13664,7 @@ export function issueRoutes(
       }
       if (formalApprovalExpected && (
         !transition.decision || transition.decision.stageId !== formalApprovalExpected.expectedStageId ||
-        transition.decision.stageType !== "approval" ||
+        transition.decision.stageType !== (formalApprovalExpected.expectedStageType ?? "approval") ||
         transition.decision.outcome !== (formalApprovalExpected.decision === "approve" ? "approved" : "changes_requested")
       )) {
         throw conflict("Approval stage transition no longer matches the run-bound verdict");
@@ -15517,14 +15525,16 @@ export function issueRoutes(
       res.json({ ...issueResponse, changes, comment });
   };
   router.patch("/issues/:id", validateIssueMutationBody(updateIssueRouteSchema), (req, res) => handleIssuePatch(req, res));
-  router.post("/issues/:id/approval-stage-decisions", async (req, res) => {
-    const expected = nativeApprovalStageDecisionSchema.parse(req.body);
+  const handleNativeStageDecision = (req: Request, res: Response, stageType: "approval" | "review") => {
+    const expected = { ...nativeApprovalStageDecisionSchema.parse(req.body), expectedStageType: stageType };
     req.body = {
       status: expected.decision === "approve" ? "done" : "in_progress",
       comment: expected.summary,
     };
     return handleIssuePatch(req, res, expected);
-  });
+  };
+  router.post("/issues/:id/approval-stage-decisions", (req, res) => handleNativeStageDecision(req, res, "approval"));
+  router.post("/issues/:id/review-stage-decisions", (req, res) => handleNativeStageDecision(req, res, "review"));
 
   router.delete("/issues/:id", async (req, res) => {
     const id = req.params.id as string;

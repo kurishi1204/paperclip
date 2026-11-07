@@ -102,7 +102,7 @@ describe("PaperclipRunnerToolAuthority", () => {
       issueId,
       runId,
     });
-    expect(authority.definitions()).toHaveLength(39);
+    expect(authority.definitions()).toHaveLength(40);
     const questions = authority.definitions().find(tool => tool.name === "request_human_input")!;
     expect(questions.description).toContain("ask only the next unanswered question");
     expect(questions.description).toContain("Never fabricate answers");
@@ -136,6 +136,8 @@ describe("PaperclipRunnerToolAuthority", () => {
         "update_skill",
         "list_agents",
         "get_agent",
+        "decide_issue_approval_stage",
+        "decide_issue_review_stage",
         "list_approvals",
         "get_approval",
         "get_approval_context",

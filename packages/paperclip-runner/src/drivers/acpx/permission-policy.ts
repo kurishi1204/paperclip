@@ -49,8 +49,8 @@ export function claudePaperclipPermissionRules(
     // Server-provided task-stage tool, not a general approval capability. The
     // server still locks and verifies the current participant, stage, versions,
     // submitted document and active goals before committing a decision.
-    if (name === "decide_issue_approval_stage") return mode === "approve-paperclip"
-      ? ["mcp__paperclip__decide_issue_approval_stage"] : [];
+    if (name === "decide_issue_approval_stage" || name === "decide_issue_review_stage") return mode === "approve-paperclip"
+      ? [`mcp__paperclip__${name}`] : [];
     // The server exposes this tool only to the bound native completion
     // reviewer. Its authority checks still verify the exact review, intent,
     // company, agent and active run before accepting or rejecting the work.

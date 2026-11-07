@@ -19,9 +19,9 @@ describe("ACPX permission policy", () => {
     expect(claudePaperclipPermissionRules([], "approve-paperclip")).toEqual([]);
     expect(claudePaperclipPermissionRules([{ name: "mcp__other__resolve_review" }], "approve-paperclip")).toEqual([]);
   });
-  it("allows the assigned task approval-stage tool only in approve-paperclip, keeping general approvals closed", () => {
-    const tools = ["decide_issue_approval_stage", "decide_approval", "mcp__other__decide_issue_approval_stage"].map(name => ({ name }));
-    expect(claudePaperclipPermissionRules(tools, "approve-paperclip")).toEqual(["mcp__paperclip__decide_issue_approval_stage"]);
+  it.each(["decide_issue_approval_stage", "decide_issue_review_stage"])("allows only the assigned %s in approve-paperclip, keeping general approvals closed", (name) => {
+    const tools = [name, "decide_approval", `mcp__other__${name}`].map(name => ({ name }));
+    expect(claudePaperclipPermissionRules(tools, "approve-paperclip")).toEqual([`mcp__paperclip__${name}`]);
     expect(claudePaperclipPermissionRules(tools, "approve-reads")).toEqual([]);
     expect(claudePaperclipPermissionRules(tools, "deny-all")).toEqual([]);
     expect(claudePaperclipPermissionRules([], "approve-paperclip")).toEqual([]);

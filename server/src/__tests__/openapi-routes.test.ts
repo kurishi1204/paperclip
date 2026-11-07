@@ -247,9 +247,9 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
-  it("documents the strict native approval-stage decision accepted by the Issue receiver", () => {
+  it.each(["approval", "review"])("documents the strict native %s-stage decision accepted by the Issue receiver", (stageType) => {
     const { spec } = loadSpecRoutes();
-    const operation = spec.paths["/api/issues/{id}/approval-stage-decisions"].post;
+    const operation = spec.paths[`/api/issues/{id}/${stageType}-stage-decisions`].post;
     expect(operation.security).toEqual([{ AgentRunAuth: [] }]);
     expect(operation["x-paperclip-authorization"]).toEqual({
       actor: "agent", heartbeatBound: true, taskBound: true,

@@ -1761,7 +1761,10 @@ fn process_command<E: CommandExecutor>(
     // in the effect window, recovery remains indeterminate unless the provider
     // explicitly supports exact, idempotent semantic result delivery above.
     store.save(state)?;
-    let mut execution = match executor.execute(command) {
+    let decoded = super::turn_text_transfer::decode_turn_text(command);
+    let executed =
+        decoded.and_then(|decoded| executor.execute(decoded.as_ref().unwrap_or(command)));
+    let mut execution = match executed {
         Ok(execution) => execution,
         Err(error) => {
             // Failure facts may follow a full retained provider backlog. Only
@@ -2357,6 +2360,58 @@ mod tests {
             deadline_at: None,
             precondition: None,
             payload: json!({}),
+        }
+    }
+
+    #[test]
+    fn compressed_turn_text_reaches_executor_once_and_replays_the_wire_receipt() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use flate2::{write::GzEncoder, Compression};
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+
+        struct TextExecutor {
+            calls: usize,
+            expected: String,
+        }
+        impl CommandExecutor for TextExecutor {
+            fn execute(&mut self, value: &Command) -> Result<CommandExecution, DurableRunnerError> {
+                assert_eq!(value.payload["text"], self.expected);
+                assert!(value.payload.get("textTransfer").is_none());
+                self.calls += 1;
+                Ok(CommandExecution::result(json!({"accepted":true})))
+            }
+        }
+        for corrupted in [false, true] {
+            let directory = std::env::temp_dir().join(format!(
+                "paperclip-turn-text-replay-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let config = config(directory.clone());
+            let store = DurableStateStore::new(&directory).unwrap();
+            let (mut state, _) = store.load_or_create(&config).unwrap();
+            let expected = "preserved input\n引用".repeat(40000);
+            let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+            gzip.write_all(expected.as_bytes()).unwrap();
+            let mut start = command("turn.start");
+            start.payload = json!({"textTransfer": {"encoding":"gzip-base64.v1", "bytes":expected.len(),
+                "sha256": if corrupted { "0".repeat(64) } else { format!("{:x}", Sha256::digest(expected.as_bytes())) },
+                "data":STANDARD.encode(gzip.finish().unwrap())}});
+            let wire = start.clone();
+            let mut executor = TextExecutor { calls: 0, expected };
+            let first = process_command(&mut state, &store, &config, &mut executor, &start)
+                .unwrap()
+                .0;
+            assert_eq!(first.status, if corrupted { "failed" } else { "completed" });
+            assert_eq!(executor.calls, usize::from(!corrupted));
+            let (mut restored, _) = store.load_or_create(&config).unwrap();
+            let replay = process_command(&mut restored, &store, &config, &mut executor, &wire)
+                .unwrap()
+                .0;
+            assert_eq!(replay, first);
+            assert_eq!(executor.calls, usize::from(!corrupted));
+            assert_eq!(start, wire);
+            fs::remove_dir_all(directory).unwrap();
         }
     }
 

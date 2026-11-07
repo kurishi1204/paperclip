@@ -1,6 +1,6 @@
 # Upstream release workflow reference
 
-These four files are byte-preserved references for the upstream
+These files are byte-preserved references for the upstream
 `paperclipai/paperclip` release infrastructure. They are outside
 `.github/workflows` deliberately. They do not register runnable workflows in
 the COLO fork.
@@ -21,3 +21,5 @@ preserved definitions. Their assertions and the upstream release scripts are
 unchanged. Restoring an upstream workflow to `.github/workflows` is a separate
 publication decision that requires checking its destinations, credentials,
 action policy, and triggers first.
+
+The byte-preserved `docker-runner-manual.yml` reference contains the original upstream manual image/EC2 qualification definition. The active `docker-runner-check.yml` retains its original pull-request native Docker build job. It has no manual publication jobs or credentials. This separates the fork CI result from upstream-only skipped jobs without changing the native build or the action allowlist.

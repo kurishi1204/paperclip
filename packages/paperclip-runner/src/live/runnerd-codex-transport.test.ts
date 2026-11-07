@@ -2565,6 +2565,47 @@ function fakeCodexArgs(stateDirectory: string, ...args: string[]): string[] {
   ];
 }
 
+it("delivers large turn text exactly through the bounded durable wire", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "runnerd-large-turn-text-"));
+  const tracePath = join(directory, "trace.ndjson");
+  const text = JSON.stringify({ task: { prompt: 'Saved result\n引用 "full text"'.repeat(24000) } });
+  expect(Buffer.byteLength(JSON.stringify({ text }))).toBeGreaterThan(522240);
+  let core!: DurablePrpControlPlane;
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: defaultCapabilityRunnerdBinary(), codexCommand: fakeCodex,
+    codexArgs: fakeCodexArgs(directory), stateDirectory: join(directory, "state"),
+    environment: { PAPERCLIP_PROVIDER_TRACE_PATH: tracePath, PAPERCLIP_PROVIDER_TRACE_MAX_BYTES: String(64 * 1024 * 1024) },
+    controlPlaneRegistration: async (authority) => {
+      core = authority; await authority.start(); return { release: () => undefined };
+    },
+  });
+  bundle.transport.setServerRequestHandler(async () => ({ success: true,
+    contentItems: [{ type: "inputText", text: JSON.stringify({ ok: true, result: { task: { title: "Large text fixture" } } }) }],
+  }));
+  try {
+    await bundle.transport.request("thread/start", { cwd: directory, dynamicTools: [{
+      name: "get_task_context", description: "Read the active task.", inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    }] });
+    await bundle.transport.request("turn/start", { input: [{ type: "text", text }] });
+    let completed = false;
+    for await (const notification of bundle.transport.notifications()) {
+      if (notification.method === "turn/completed") { completed = true; break; }
+    }
+    expect(completed).toBe(true);
+    const starts = (await readProviderRequestFrames(tracePath)).filter(frame => frame.method === "turn/start");
+    expect(starts).toHaveLength(1);
+    expect((starts[0]!.params as { input: Array<{ text: string }> }).input[0]!.text).toBe(text);
+    const commands = core.store.state.commands.filter(command => command.type === "turn.start");
+    expect(commands).toHaveLength(1);
+    expect(commands[0]!.payload).toHaveProperty("textTransfer");
+    expect(Buffer.byteLength(JSON.stringify(commands[0]))).toBeLessThan(522240);
+    expect(commands[0]!.status).toBe("completed");
+  } finally {
+    await bundle.transport.close(); await rm(directory, { recursive: true, force: true });
+  }
+  expect(bundle.evidence()).toMatchObject({ runnerExited: true, runnerExitCode: 0 });
+}, 30_000);
+
 function assignedRuntimeContext(
   skillRoot: string,
   instructionRoot: string,
@@ -4549,13 +4590,16 @@ it("captures exact provider frames and correlates Rust and TypeScript interpreta
   await rm(hostHome, { recursive: true, force: true });
 }, 30_000);
 
-it("steers the active provider turn through the durable PRP command path", async () => {
+it.each(["plain", "compressed"])("steers and reuses the exact %s payload through the durable PRP command path", async (mode) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-steering-"));
+  const tracePath = join(stateDirectory, "provider.ndjson");
+  const steeringText = mode === "compressed" ? 'Prioritize the mobile queue layout. 引用 "full text"\n'.repeat(8000) : "Prioritize the mobile queue layout.";
   const bundle = createCapabilityRunnerdCodexTransport({
     runnerBinary: defaultCapabilityRunnerdBinary(),
     codexCommand: fakeCodex,
     codexArgs: fakeCodexArgs(stateDirectory, "--linger-after-turn-start"),
     stateDirectory,
+    environment: { PAPERCLIP_PROVIDER_TRACE_PATH: tracePath, PAPERCLIP_PROVIDER_TRACE_MAX_BYTES: String(16 * 1024 * 1024) },
   });
   bundle.transport.setServerRequestHandler(async () => ({
     success: true,
@@ -4583,13 +4627,13 @@ it("steers the active provider turn through the durable PRP command path", async
 
     await expect(
       bundle.transport.request("turn/steer", {
-        input: [{ type: "text", text: "Prioritize the mobile queue layout." }],
+        input: [{ type: "text", text: steeringText }],
         correlationId: "queued-comment-1",
       }),
     ).resolves.toEqual({});
     await expect(
       bundle.transport.request("turn/steer", {
-        input: [{ type: "text", text: "Prioritize the mobile queue layout." }],
+        input: [{ type: "text", text: steeringText }],
         correlationId: "queued-comment-1",
       }),
     ).resolves.toEqual({});
@@ -4625,6 +4669,13 @@ it("steers the active provider turn through the durable PRP command path", async
     }
     expect(methods).toContain("turn/started");
     expect(acknowledged).toBe(true);
+    await expect(bundle.transport.request("turn/steer", {
+      input: [{ type: "text", text: steeringText + " changed" }],
+      correlationId: "queued-comment-1",
+    })).rejects.toThrow("reused with different content");
+    const steers = (await readProviderRequestFrames(tracePath)).filter(frame => frame.method === "turn/steer");
+    expect(steers).toHaveLength(1);
+    expect((steers[0]!.params as { input: Array<{ text: string }> }).input[0]!.text).toBe(steeringText);
   } finally {
     await bundle.transport.close();
     await rm(stateDirectory, { recursive: true, force: true });
