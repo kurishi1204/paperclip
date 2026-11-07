@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { documents, issueDocuments, issues } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, type SourceTrustMetadata } from "@paperclipai/shared";
 import { documentService } from "./documents.js";
+import { recordSystemSummaryRevision } from "./system-document-provenance.js";
 import { summarizeRunErrorForModel } from "./heartbeat-run-summary.js";
 
 export { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY };
@@ -245,6 +246,11 @@ export async function getIssueContinuationSummaryDocument(
   };
 }
 
+/** The change summary every system refresh records with its creating run. */
+export function continuationSummaryChangeSummary(runId: string) {
+  return `Refresh continuation summary after run ${runId}`;
+}
+
 export async function refreshIssueContinuationSummary(input: {
   db: Db;
   issueId: string;
@@ -256,6 +262,7 @@ export async function refreshIssueContinuationSummary(input: {
     db
       .select({
         id: issues.id,
+        companyId: issues.companyId,
         conversationAgentId: issues.conversationAgentId,
         identifier: issues.identifier,
         title: issues.title,
@@ -276,16 +283,22 @@ export async function refreshIssueContinuationSummary(input: {
     agent,
     previousSummaryBody: existing?.body ?? null,
   });
-  const result = await documentService(db).upsertIssueDocument({
-    issueId,
-    key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
-    title: ISSUE_CONTINUATION_SUMMARY_TITLE,
-    format: "markdown",
-    body,
-    baseRevisionId: existing?.latestRevisionId ?? null,
-    changeSummary: `Refresh continuation summary after run ${run.id}`,
-    createdByAgentId: agent.id,
-    createdByRunId: run.id,
+  return await db.transaction(async (tx) => {
+    const connection = tx as unknown as Db;
+    const result = await documentService(connection).upsertIssueDocument({
+      issueId,
+      key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+      title: ISSUE_CONTINUATION_SUMMARY_TITLE,
+      format: "markdown",
+      body,
+      baseRevisionId: existing?.latestRevisionId ?? null,
+      changeSummary: continuationSummaryChangeSummary(run.id),
+      createdByAgentId: agent.id,
+      createdByRunId: run.id,
+    }, { systemDocumentKey: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY });
+    if (!result.document.latestRevisionId) throw new Error("System summary has no persisted revision");
+    await recordSystemSummaryRevision(connection, { companyId: issue.companyId, issueId,
+      documentId: result.document.id, revisionId: result.document.latestRevisionId, agentId: agent.id, runId: run.id });
+    return result.document;
   });
-  return result.document;
 }

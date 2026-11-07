@@ -2,6 +2,7 @@ import {createHash,randomUUID} from "node:crypto";
 import {and,eq,sql} from "drizzle-orm";
 import {agents,issues,heartbeatRuns,agentWakeupRequests,documents,documentRevisions,issueDocuments,type Db} from "@paperclipai/db";
 import {conflict} from "../errors.js";
+import {isSystemIssueDocumentKey} from "@paperclipai/shared";
 import {commanderAdmissionSchema,commanderAdmissionDigest,commanderPolicySchema,type CommanderAdmission} from "./commander-cycle.js";
 import {applyIssueExecutionPolicyTransition,parseIssueExecutionState} from "./issue-execution-policy.js";
 import {logActivity} from "./activity-log.js";
@@ -44,6 +45,8 @@ export async function completeCommanderHermesResult(db:Db,runId:string,claim:Cla
   const [q]=await tx.select().from(agents).where(eq(agents.id,h?.reviewerAgentId??randomUUID()));
   const text=result.result,urls=result.source_urls,searches=result.web_search_count;
   if(!i||!r||!h||r.status!=="running"||i.companyId!==r.companyId||i.status!=="in_progress"||i.revision!==claim.revision||i.statusVersion!==claim.statusVersion||i.assigneeAgentId!==r.agentId||i.assigneeUserId||i.executionPolicy||i.executionState||hash(i.description??"")!==claim.admission.descriptionSha256||!a||JSON.stringify(a)!==JSON.stringify(claim.admission)||c?.adapterConfig?.commanderCycleToolsOnly!==true||Date.parse(a.expiresAt)<=Date.now()||!parent||parent.agentId!==c.id||parent.companyId!==r.companyId||!["running","succeeded"].includes(parent.status)||!q||q.companyId!==r.companyId||q.id===r.agentId||q.adapterConfig?.qaReviewToolsOnly!==true||["paused","terminated"].includes(q.status)||typeof text!=="string"||!text.trim()||!Number.isInteger(searches)||Number(searches)<1||!Array.isArray(urls)||urls.length<1||urls.some(u=>typeof u!=="string"||!u.startsWith("https://")))throw conflict("Commander fixed result, current issue or independent QA authority changed");
+  // System issue document keys are reserved for their internal writers.
+  if(isSystemIssueDocumentKey(h.documentKey))throw conflict("Commander result document key is reserved for the server");
   const existing=await tx.select().from(issueDocuments).where(and(eq(issueDocuments.issueId,i.id),eq(issueDocuments.key,h.documentKey)));if(existing.length)throw conflict("Commander result document already exists");
   const body="# Fixed commander-dispatched Hermes result\n\n"+JSON.stringify({runId,commanderRunId:parent.id,admissionId:a.id,reportSha256:hash(text),source_urls:urls,web_search_count:searches},null,2)+"\n\n"+text;
   const documentId=randomUUID(),revisionId=randomUUID();

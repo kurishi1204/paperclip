@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { documentRevisions, documents, issueDocuments, issues } from "@paperclipai/db";
-import { isSystemIssueDocumentKey, issueDocumentKeySchema, type IssueDocumentRevisionDigest } from "@paperclipai/shared";
+import { isSystemIssueDocumentKey, issueDocumentKeySchema, type IssueDocumentRevisionDigest, type SystemIssueDocumentKey } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
 import { insertRowsInChunks } from "./batch-insert.js";
@@ -107,6 +107,30 @@ export const issueDocumentSelect = {
   createdAt: documents.createdAt,
   updatedAt: documents.updatedAt,
 };
+
+/**
+ * Server-only write options. They are passed as a separate argument by the
+ * internal writer that owns a system document; no request body maps to them.
+ */
+export type IssueDocumentWriteOptions = {
+  /** Names the reserved system document this internal writer maintains. */
+  systemDocumentKey?: SystemIssueDocumentKey;
+};
+
+/**
+ * System issue document keys (continuation summary, pipeline case body) are
+ * reserved. Ordinary saves, restores and removals through this service cannot
+ * use them, so authored work cannot take a system key. The owning internal
+ * writer names its key explicitly.
+ */
+function assertIssueDocumentKeyWritable(key: string, options?: IssueDocumentWriteOptions) {
+  if (isSystemIssueDocumentKey(key) && options?.systemDocumentKey !== key) {
+    throw unprocessable(`Issue document key "${key}" is reserved for the server.`, {
+      code: "issue_document_key_reserved",
+      key,
+    });
+  }
+}
 
 export function documentService(db: Db) {
   const filterSystemDocuments = <T extends { key: string }>(rows: T[], includeSystem: boolean) =>
@@ -249,8 +273,9 @@ export function documentService(db: Db) {
       createdByRunId?: string | null;
       sourceTrust?: typeof documents.$inferInsert.sourceTrust;
       lockedDocumentStrategy?: "conflict" | "create_new_document";
-    }) => {
+    }, options?: IssueDocumentWriteOptions) => {
       const key = normalizeDocumentKey(input.key);
+      assertIssueDocumentKeyWritable(key, options);
       const issue = await db
         .select({ id: issues.id, companyId: issues.companyId })
         .from(issues)
@@ -628,8 +653,9 @@ export function documentService(db: Db) {
       revisionId: string;
       createdByAgentId?: string | null;
       createdByUserId?: string | null;
-    }) => {
+    }, options?: IssueDocumentWriteOptions) => {
       const key = normalizeDocumentKey(input.key);
+      assertIssueDocumentKeyWritable(key, options);
       return db.transaction(async (tx) => {
         const existing = await tx
           .select(issueDocumentSelect)
@@ -822,8 +848,9 @@ export function documentService(db: Db) {
       });
     },
 
-    deleteIssueDocument: async (issueId: string, rawKey: string) => {
+    deleteIssueDocument: async (issueId: string, rawKey: string, options?: IssueDocumentWriteOptions) => {
       const key = normalizeDocumentKey(rawKey);
+      assertIssueDocumentKeyWritable(key, options);
       return db.transaction(async (tx) => {
         const existing = await tx
           .select(issueDocumentSelect)

@@ -81,7 +81,7 @@ describeEmbeddedPostgres("documentService system issue documents", () => {
       title: "Continuation Summary",
       format: "markdown",
       body: "# Handoff",
-    });
+    }, { systemDocumentKey: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY });
 
     return { issueId };
   }
@@ -111,6 +111,26 @@ describeEmbeddedPostgres("documentService system issue documents", () => {
       key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
       body: "# Handoff",
     }));
+  });
+
+  it("reserves system document keys for their internal writer", async () => {
+    const { issueId } = await createIssueWithDocuments();
+    const summary = (await svc.getIssueDocumentByKey(issueId, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY))!;
+    const reserved = { status: 422, details: { code: "issue_document_key_reserved" } };
+    for (const key of [ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, "pipeline-case-body"]) {
+      await expect(svc.upsertIssueDocument({ issueId, key, format: "markdown", body: "Authored work",
+        baseRevisionId: key === ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY ? summary.latestRevisionId : null }))
+        .rejects.toMatchObject(reserved);
+    }
+    await expect(svc.restoreIssueDocumentRevision({ issueId, key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+      revisionId: summary.latestRevisionId! })).rejects.toMatchObject(reserved);
+    await expect(svc.deleteIssueDocument(issueId, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY)).rejects.toMatchObject(reserved);
+    // Another system key does not unlock this one.
+    await expect(svc.upsertIssueDocument({ issueId, key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, format: "markdown",
+      body: "x", baseRevisionId: summary.latestRevisionId }, { systemDocumentKey: "pipeline-case-body" }))
+      .rejects.toMatchObject(reserved);
+    expect(await svc.getIssueDocumentByKey(issueId, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY))
+      .toMatchObject({ body: "# Handoff", latestRevisionId: summary.latestRevisionId });
   });
 
   it("explains the revision guard and rejects missing or stale update revisions without changing the document", async () => {

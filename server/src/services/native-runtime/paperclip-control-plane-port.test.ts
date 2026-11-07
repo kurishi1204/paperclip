@@ -1,3 +1,4 @@
+import { activityRoutes } from "../../routes/activity.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { asc, eq, sql } from "drizzle-orm";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
@@ -63,6 +64,8 @@ import { materializeRuntimeQuestionFallback } from "./native-session-executor.js
 import { documentService } from "../documents.js";
 import { issueRoutes } from "../../routes/issues.js";
 import { errorHandler } from "../../middleware/index.js";
+import { refreshIssueContinuationSummary } from "../issue-continuation-summary.js";
+import { createNativeCompletionReviewFixture } from "../../__tests__/helpers/native-completion-review-fixture.js";
 import {
   subscribeAllCompanyLiveEvents,
   subscribeCompanyLiveEvents,
@@ -1475,17 +1478,15 @@ describe("PaperclipControlPlanePort conformance", () => {
     await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, agentReview.id));
 
     await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, issueId));
-    const newRevision = "review-round-two";
+    const newRevision = randomUUID();
     const reviews = [];
     for (const key of ["one", "two"]) {
-      reviews.push(await issueThreadInteractionService(db).create(
-        { id: issueId, companyId: identity.companyId },
-        { kind: "request_confirmation", title: `Review ${key}`, addresseeUserId: "reviewer-24",
-          resolverPolicy: "human_only", continuationPolicy: "wake_assignee", sourceRunId: runId,
-          payload: { version: 1, prompt: `Approve ${key}`, acceptLabel: "Approve", rejectLabel: "Decline", allowDeclineReason: true,
-            target: { type: "custom", key: "native_completion_review", revisionId: newRevision } } },
-        { systemId: "test-multiple-reviewers", runId },
-      ));
+      // Both reviewers belong to the same real decision, as the committer creates them.
+      reviews.push(await createNativeCompletionReviewFixture(db, { id: issueId, companyId: identity.companyId }, {
+        prompt: `Approve ${key}`, title: `Review ${key}`, decisionId: newRevision, sourceRunId: runId,
+        addresseeUserId: "reviewer-24", resolverPolicy: "human_only", continuationPolicy: "wake_assignee",
+        acceptLabel: "Approve", rejectLabel: "Decline", allowDeclineReason: true,
+      }));
     }
     await issueThreadInteractionService(db).rejectInteraction(
       { id: issueId, companyId: identity.companyId }, reviews[0]!.id,
@@ -1607,9 +1608,9 @@ describe("PaperclipControlPlanePort conformance", () => {
       expect(current.map(entry => entry.revisionNumber)).toEqual([2, 1]);
       expect(f.card).toMatchObject({ addresseeAgentId: reviewerAgentId, effectiveResolverPolicy: "anyone",
         payload: { target: { type: "custom", key: "native_completion_review", boundDocuments: current } } });
-      // Server bookkeeping written after submission is not submitted work.
-      await f.docs.upsertIssueDocument({ issueId: f.issueId, key: "continuation-summary", format: "markdown",
-        body: "Run summary", createdByAgentId: reviewerAgentId });
+      // Server bookkeeping written after submission by its internal writer is not submitted work.
+      await refreshIssueContinuationSummary({ db, issueId: f.issueId,
+        run: { id: f.runId, status: "succeeded", error: null }, agent: { id: identity.agentId, name: "Native conformance", adapterType: "codex_local" } });
       const accepted = await f.accept();
       expect(accepted.status, accepted.text).toBe(200);
       await expect(f.state()).resolves.toEqual({ issue: "done", card: "accepted" });
@@ -1736,7 +1737,7 @@ describe("PaperclipControlPlanePort conformance", () => {
         expect({ create: created.status, accept: accepted.status }).toEqual({ create: 422, accept: "not reached" });
       }
       expect(created.status).toBe(422);
-      expect(created.body).toMatchObject({ code: "native_completion_review_binding_server_owned" });
+      expect(created.body).toMatchObject({ code: "native_completion_review_reserved" });
       expect((await db.select({ status: issues.status }).from(issues).where(eq(issues.id, f.issueId)))[0]!.status).toBe("in_review");
     });
 
@@ -1769,6 +1770,114 @@ describe("PaperclipControlPlanePort conformance", () => {
       expect(accepted.status, accepted.text).toBe(200);
       await expect(f.state()).resolves.toEqual({ issue: "done", card: "accepted" });
     }, 120_000);
+
+    it("reserves the system document keys at the ordinary document entry", async () => {
+      const f = await submitForReview([], "owner");
+      const put = await f.owner.put(`/api/issues/${f.issueId}/documents/continuation-summary`)
+        .send({ format: "markdown", body: "Deliverable saved under a system key" });
+      if (put.status === 200 || put.status === 201) {
+        // Old path: the deliverable is excluded from the binding and a later revision is approvable.
+        const saved = (await f.docs.getIssueDocumentByKey(f.issueId, "continuation-summary"))!;
+        await f.owner.put(`/api/issues/${f.issueId}/documents/continuation-summary`)
+          .send({ format: "markdown", body: "Changed after submission", baseRevisionId: saved.latestRevisionId });
+        const accepted = await f.ownerAccept();
+        expect({ put: put.status, accept: accepted.status }).toEqual({ put: 422, accept: "not reached" });
+      }
+      expect(put.status).toBe(422);
+      expect(put.body).toMatchObject({ code: "issue_document_key_reserved" });
+      const pipe = await f.owner.put(`/api/issues/${f.issueId}/documents/pipeline-case-body`)
+        .send({ format: "markdown", body: "Not a case body" });
+      expect(pipe.status).toBe(422);
+    });
+
+    it("binds a pipeline case body as authored work", async () => {
+      const f = await submitForReview([], "agent", async (issueId) => {
+        // The pipeline links its case body document into the conversation issue directly.
+        const documentId = randomUUID(), revisionId = randomUUID();
+        await db.insert(documents).values({ id: documentId, companyId: identity.companyId, latestBody: "Case body A",
+          latestRevisionNumber: 1, createdByAgentId: identity.agentId });
+        await db.insert(documentRevisions).values({ id: revisionId, companyId: identity.companyId, documentId,
+          revisionNumber: 1, body: "Case body A", createdByAgentId: identity.agentId });
+        await db.update(documents).set({ latestRevisionId: revisionId }).where(eq(documents.id, documentId));
+        await db.insert(issueDocuments).values({ companyId: identity.companyId, issueId, documentId, key: "pipeline-case-body" });
+      });
+      const body = (await f.docs.getIssueDocumentByKey(f.issueId, "pipeline-case-body"))!;
+      expect((f.card.payload as { target: { boundDocuments: unknown[] } }).target.boundDocuments)
+        .toEqual([expect.objectContaining({ key: "pipeline-case-body", documentId: body.id })]);
+      const revisionB = randomUUID();
+      await db.insert(documentRevisions).values({ id: revisionB, companyId: identity.companyId, documentId: body.id,
+        revisionNumber: 2, body: "Case body B", createdByAgentId: identity.agentId });
+      await db.update(documents).set({ latestRevisionId: revisionB, latestRevisionNumber: 2, latestBody: "Case body B" })
+        .where(eq(documents.id, body.id));
+      const stale = await f.accept();
+      expect(stale.status).toBe(409);
+      expect(stale.body).toMatchObject({ code: "native_completion_review_documents_stale" });
+      await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+    });
+
+    it("binds a continuation summary whose current revision is not a system refresh", async () => {
+      const f = await submitForReview([], "agent", async (issueId) => {
+        // An ordinary legacy writer could forge the exact text marker and its own
+        // run ID. Those client-controlled values are not server provenance.
+        const [active] = await db.select({ runId: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, issueId));
+        expect(active?.runId).toBeTruthy();
+        const documentId = randomUUID(), revisionId = randomUUID();
+        await db.insert(documents).values({ id: documentId, companyId: identity.companyId, latestBody: "Deliverable",
+          latestRevisionNumber: 1, createdByAgentId: identity.agentId });
+        await db.insert(documentRevisions).values({ id: revisionId, companyId: identity.companyId, documentId,
+          revisionNumber: 1, body: "Deliverable", changeSummary: `Refresh continuation summary after run ${active!.runId}`,
+          createdByRunId: active!.runId, createdByAgentId: identity.agentId });
+        await db.update(documents).set({ latestRevisionId: revisionId }).where(eq(documents.id, documentId));
+        await db.insert(issueDocuments).values({ companyId: identity.companyId, issueId, documentId, key: "continuation-summary" });
+      });
+      expect((f.card.payload as { target: { boundDocuments: unknown[] } }).target.boundDocuments)
+        .toEqual([expect.objectContaining({ key: "continuation-summary" })]);
+      await refreshIssueContinuationSummary({ db, issueId: f.issueId,
+        run: { id: f.runId, status: "succeeded", error: null }, agent: { id: identity.agentId, name: "Native conformance", adapterType: "codex_local" } });
+      const stale = await f.accept();
+      expect(stale.status).toBe(409);
+      expect(stale.body).toMatchObject({ code: "native_completion_review_documents_stale" });
+      await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+    });
+
+    it("does not let the ordinary activity API forge system document provenance", async () => {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => { (req as any).actor = ownerActor; next(); });
+      app.use("/api", activityRoutes(db));
+      app.use(errorHandler);
+      const response = await request(app).post(`/api/companies/${identity.companyId}/activity`).send({
+        actorType: "system", actorId: "issue-continuation-summary", action: "issue.continuation_summary.refreshed",
+        entityType: "document", entityId: randomUUID(), details: { revisionId: randomUUID() },
+      });
+      expect(response.status).toBe(422);
+      expect(response.body).toMatchObject({ code: "system_document_provenance_reserved" });
+    });
+
+    it("refuses a native completion card without status-decision provenance", async () => {
+      const f = await submitForReview([], "owner");
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, f.card.id));
+      // Ordinary create cannot make the reserved card at all.
+      const created = await f.owner.post(`/api/issues/${f.issueId}/interactions`).send({
+        kind: "request_confirmation", continuationPolicy: "none",
+        payload: { version: 1, prompt: "Approve completion", target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } },
+      });
+      if (created.status === 200 || created.status === 201) {
+        const accepted = await f.owner.post(`/api/issues/${f.issueId}/interactions/${created.body.id}/accept`).send({});
+        expect({ create: created.status, accept: accepted.status }).toEqual({ create: 422, accept: "not reached" });
+      }
+      expect(created.status).toBe(422);
+      expect(created.body).toMatchObject({ code: "native_completion_review_reserved" });
+      // A stored card that only carries the key (no committer effect) has no authority either.
+      const [stored] = await db.insert(issueThreadInteractions).values({ companyId: identity.companyId, issueId: f.issueId,
+        kind: "request_confirmation", status: "pending", continuationPolicy: "none",
+        payload: { version: 1, prompt: "Approve completion", target: { type: "custom", key: "native_completion_review", revisionId: randomUUID() } },
+      }).returning();
+      const denied = await f.owner.post(`/api/issues/${f.issueId}/interactions/${stored!.id}/accept`).send({});
+      expect(denied.status).toBe(409);
+      expect(denied.body).toMatchObject({ code: "native_completion_review_provenance_missing" });
+      expect((await db.select({ status: issues.status }).from(issues).where(eq(issues.id, f.issueId)))[0]!.status).toBe("in_review");
+    });
 
     it("keeps a task without documents approvable and refuses an unbound card once documents exist", async () => {
       const plain = await submitForReview([]);

@@ -1,3 +1,5 @@
+import { SYSTEM_SUMMARY_REFRESH_ACTION } from "./system-document-provenance.js";
+import { unprocessable } from "../errors.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
 import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -625,11 +627,11 @@ export function activityService(db: Db) {
       return [fromContext, ...fromActivity];
     },
 
-    create: (data: typeof activityLog.$inferInsert) =>
-      db
-        .insert(activityLog)
-        .values(data)
-        .returning()
-        .then((rows) => rows[0]),
+    create: (data: typeof activityLog.$inferInsert) => {
+      if (data.action === SYSTEM_SUMMARY_REFRESH_ACTION) {
+        throw unprocessable("This activity action is reserved for the server.", { code: "system_document_provenance_reserved" });
+      }
+      return db.insert(activityLog).values(data).returning().then((rows) => rows[0]);
+    },
   };
 }

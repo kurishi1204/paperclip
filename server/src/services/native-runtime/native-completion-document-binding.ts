@@ -8,8 +8,9 @@ import {
   statusDecisionEffects,
   type Db,
 } from "@paperclipai/db";
-import { isSystemIssueDocumentKey, type RequestConfirmationBoundDocument } from "@paperclipai/shared";
+import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, type RequestConfirmationBoundDocument } from "@paperclipai/shared";
 import { conflict, forbidden, unprocessable } from "../../errors.js";
+import { readSystemSummaryRevisions } from "../system-document-provenance.js";
 
 type BindingActor = {
   agentId?: string | null;
@@ -17,8 +18,9 @@ type BindingActor = {
   runId?: string | null;
 };
 
-/** The only actor that may record a completion review document binding. */
+/** The only actor that may create a native completion review or its binding. */
 export const NATIVE_COMPLETION_BINDING_SYSTEM_ID = "native-status-committer";
+export const NATIVE_COMPLETION_REVIEW_TARGET_KEY = "native_completion_review";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -70,10 +72,17 @@ async function readLinkedDocuments(
       ),
     )
     .orderBy(asc(issueDocuments.key), asc(documents.id));
-  // System documents (shared SYSTEM_ISSUE_DOCUMENT_KEYS: continuation summary,
-  // pipeline case body) are server bookkeeping rewritten after runs, not
-  // submitted work.
-  return rows.filter((row) => !isSystemIssueDocumentKey(row.key));
+  // Only a revision recorded by the reserved internal writer is bookkeeping.
+  // Legacy/imported revisions, even with an exact forged textual marker, remain
+  // in the submitted work set. The pipeline case body is always submitted work.
+  const summaryRevisionIds = rows
+    .filter(row => row.key === ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY && row.revisionId)
+    .map(row => row.revisionId!);
+  const systemSummaryRevisions = await readSystemSummaryRevisions(
+    db, input.companyId, input.issueId, summaryRevisionIds,
+  );
+  return rows.filter((row) => !(row.key === ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY && row.revisionId &&
+    systemSummaryRevisions.has(row.revisionId)));
 }
 
 /**
@@ -96,37 +105,45 @@ function readTarget(payload: unknown) {
     ? (payload as { target?: unknown }).target
     : null;
   return target && typeof target === "object"
-    ? (target as { type?: unknown; revisionId?: unknown; boundDocuments?: unknown })
+    ? (target as { type?: unknown; key?: unknown; revisionId?: unknown; boundDocuments?: unknown })
     : null;
 }
 
 /**
- * A client cannot supply a completion review binding through the ordinary
- * interaction create entry. Only the status committer, which reads the saved
- * documents itself, records one.
+ * The native completion review card and its document binding are internal to
+ * the status committer. The ordinary interaction create entry (HTTP, runner
+ * tools, plugins) cannot create the reserved target key or supply a binding.
  */
-export function assertCompletionBindingServerOwned(payload: unknown, actor: { systemId?: string | null }) {
+export function assertNativeCompletionReviewCreateAllowed(payload: unknown, actor: { systemId?: string | null }) {
   const target = readTarget(payload);
-  if (target?.type === "custom" && target.boundDocuments !== undefined &&
-      actor.systemId !== NATIVE_COMPLETION_BINDING_SYSTEM_ID) {
+  if (target?.type !== "custom" || actor.systemId === NATIVE_COMPLETION_BINDING_SYSTEM_ID) return;
+  if (target.key === NATIVE_COMPLETION_REVIEW_TARGET_KEY) {
+    throw unprocessable("Native completion reviews are created by the server from a completion decision.", {
+      code: "native_completion_review_reserved",
+    });
+  }
+  if (target.boundDocuments !== undefined) {
     throw unprocessable("boundDocuments is recorded by the server for completion reviews and cannot be supplied.", {
       code: "native_completion_review_binding_server_owned",
     });
   }
 }
 
+type ReviewCard = { id: string; payload: unknown; createdByAgentId: string | null; createdByUserId: string | null };
+
 /**
- * A binding is trusted only on a card the status committer materialized for
- * the decision it names: a system-created card with a bind_reviewer effect row
- * pointing at it. Any other card is treated as carrying no binding.
+ * A native completion review is genuine only when the status committer
+ * materialized it for the decision it names: a system-created card with a
+ * bind_reviewer status-decision effect pointing at it. A card that merely
+ * carries the same target key has no authority.
  */
-async function readServerOwnedBinding(
+async function hasNativeCompletionReviewProvenance(
   db: Db,
-  input: { companyId: string; issueId: string; interaction: { id: string; payload: unknown; createdByAgentId: string | null; createdByUserId: string | null } },
-): Promise<RequestConfirmationBoundDocument[] | null> {
+  input: { companyId: string; issueId: string; interaction: ReviewCard },
+): Promise<boolean> {
   const target = readTarget(input.interaction.payload);
-  if (!Array.isArray(target?.boundDocuments) || typeof target.revisionId !== "string" ||
-      !UUID.test(target.revisionId) || input.interaction.createdByAgentId || input.interaction.createdByUserId) return null;
+  if (typeof target?.revisionId !== "string" || !UUID.test(target.revisionId) ||
+      input.interaction.createdByAgentId || input.interaction.createdByUserId) return false;
   const [effect] = await db
     .select({ id: statusDecisionEffects.id })
     .from(statusDecisionEffects)
@@ -139,7 +156,7 @@ async function readServerOwnedBinding(
       eq(statusDecisionEffects.targetId, input.interaction.id),
     ))
     .limit(1);
-  return effect ? (target.boundDocuments as RequestConfirmationBoundDocument[]) : null;
+  return Boolean(effect);
 }
 
 /**
@@ -153,10 +170,16 @@ export async function assertNativeCompletionDocumentBindingCurrent(
   input: {
     companyId: string;
     issueId: string;
-    interaction: { id: string; payload: unknown; createdByAgentId: string | null; createdByUserId: string | null };
+    interaction: ReviewCard;
     actor: BindingActor;
   },
 ) {
+  if (!await hasNativeCompletionReviewProvenance(db, input)) {
+    throw conflict(
+      "This completion review was not created from a completion decision and cannot complete the task.",
+      { code: "native_completion_review_provenance_missing" },
+    );
+  }
   const linked = await readLinkedDocuments(db, input);
   const inconsistent = linked.filter((row) => !row.revisionId);
   if (inconsistent.length > 0) {
@@ -167,11 +190,12 @@ export async function assertNativeCompletionDocumentBindingCurrent(
     );
   }
   const current = linked as RequestConfirmationBoundDocument[];
-  const bound = await readServerOwnedBinding(db, input);
+  const recorded = readTarget(input.interaction.payload)?.boundDocuments;
+  const bound = Array.isArray(recorded) ? (recorded as RequestConfirmationBoundDocument[]) : null;
   if (!bound) {
-    // Cards recorded before revision binding existed, or not materialized by
-    // the status committer, carry no trusted document set. Only a task that
-    // still has no documents can be approved from them.
+    // A genuine card recorded before revision binding existed carries no
+    // document set. Only a task that still has no documents can be approved
+    // from it; one with documents goes back for resubmission.
     if (current.length === 0) return;
     throw conflict(
       "This completion review did not record its document revisions. Request changes so the worker resubmits the current documents.",
