@@ -14,6 +14,7 @@ import {
   companyMemberships,
   completionContracts,
   createDb,
+  documentRevisions,
   documents,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -1530,7 +1531,8 @@ describe("PaperclipControlPlanePort conformance", () => {
 
     type Writer = "worker" | "reviewer_agent" | "reviewer_run_only" | "owner";
     /** Saves documents, finishes the worker run through the native finalizer and admits the named reviewer. */
-    async function submitForReview(documentsToSave: Array<{ key: string; writers: Writer[] }>, reviewBy: "agent" | "owner" = "agent") {
+    async function submitForReview(documentsToSave: Array<{ key: string; writers: Writer[] }>, reviewBy: "agent" | "owner" = "agent",
+      seed?: (issueId: string) => Promise<void>) {
       const issueId = randomUUID(), contractId = randomUUID(), runId = randomUUID();
       const reviewerOtherRunId = randomUUID(), reviewRunId = randomUUID(), runnerInstanceId = randomUUID();
       await db.insert(issues).values({ id: issueId, companyId: identity.companyId,
@@ -1562,6 +1564,7 @@ describe("PaperclipControlPlanePort conformance", () => {
           baseRevisionId = saved.document.latestRevisionId;
         }
       }
+      await seed?.(issueId);
       const port = new PaperclipControlPlanePort(db, {
         companyId: identity.companyId, issueId, runId, agentId: identity.agentId, sessionId: identity.sessionId,
         completionContractId: contractId, completionContractSha256: "document-binding-contract",
@@ -1704,6 +1707,68 @@ describe("PaperclipControlPlanePort conformance", () => {
       await expect(approval).rejects.toMatchObject({ status: 409, details: { code: "native_completion_review_documents_stale" } });
       await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
     });
+
+    it("refuses a legacy card when a linked document has no current revision instead of treating it as absent", async () => {
+      const f = await submitForReview([{ key: "report", writers: ["worker"] }]);
+      const payload = structuredClone(f.card.payload) as unknown as { target: Record<string, unknown> };
+      delete payload.target.boundDocuments;
+      await db.update(issueThreadInteractions).set({ payload: payload as any }).where(eq(issueThreadInteractions.id, f.card.id));
+      const linked = (await f.docs.getIssueDocumentByKey(f.issueId, "report"))!;
+      await db.update(documents).set({ latestRevisionId: null }).where(eq(documents.id, linked.id));
+      const denied = await f.accept();
+      expect(denied.status).toBe(409);
+      expect(denied.body).toMatchObject({ code: "native_completion_review_documents_inconsistent" });
+      await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+    });
+
+    it("does not accept a client-supplied binding through the ordinary create route", async () => {
+      const f = await submitForReview([{ key: "report", writers: ["worker"] }, { key: "appendix", writers: ["worker"] }], "owner");
+      const report = (await f.docs.getIssueDocumentByKey(f.issueId, "report"))!;
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, f.card.id));
+      const forgedEntry = { documentId: report.id, key: "report", revisionId: report.latestRevisionId!, revisionNumber: report.latestRevisionNumber };
+      const created = await f.owner.post(`/api/issues/${f.issueId}/interactions`).send({
+        kind: "request_confirmation", continuationPolicy: "none",
+        payload: { version: 1, prompt: "Approve completion", target: { type: "custom", key: "native_completion_review",
+          revisionId: randomUUID(), boundDocuments: [forgedEntry, forgedEntry] } },
+      });
+      if (created.status === 201 || created.status === 200) {
+        const accepted = await f.owner.post(`/api/issues/${f.issueId}/interactions/${created.body.id}/accept`).send({});
+        expect({ create: created.status, accept: accepted.status }).toEqual({ create: 422, accept: "not reached" });
+      }
+      expect(created.status).toBe(422);
+      expect(created.body).toMatchObject({ code: "native_completion_review_binding_server_owned" });
+      expect((await db.select({ status: issues.status }).from(issues).where(eq(issues.id, f.issueId)))[0]!.status).toBe("in_review");
+    });
+
+    it("checks the whole current set when a server-owned binding repeats an entry", async () => {
+      const f = await submitForReview([{ key: "report", writers: ["worker"] }, { key: "appendix", writers: ["worker"] }]);
+      const payload = structuredClone(f.card.payload) as unknown as { target: { boundDocuments: unknown[] } };
+      payload.target.boundDocuments = [payload.target.boundDocuments[0], payload.target.boundDocuments[0]];
+      await db.update(issueThreadInteractions).set({ payload: payload as any }).where(eq(issueThreadInteractions.id, f.card.id));
+      const denied = await f.accept();
+      expect(denied.status).toBe(409);
+      expect(denied.body).toMatchObject({ code: "native_completion_review_documents_stale" });
+      await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+    });
+
+    it("binds and approves a submission with more than 500 documents", async () => {
+      const f = await submitForReview([], "agent", async (issueId) => {
+        const ids = Array.from({ length: 501 }, () => ({ documentId: randomUUID(), revisionId: randomUUID() }));
+        await db.insert(documents).values(ids.map(({ documentId }, index) => ({ id: documentId, companyId: identity.companyId,
+          latestBody: `part ${index}`, latestRevisionNumber: 1, createdByAgentId: identity.agentId })));
+        await db.insert(documentRevisions).values(ids.map(({ documentId, revisionId }, index) => ({ id: revisionId,
+          companyId: identity.companyId, documentId, revisionNumber: 1, body: `part ${index}`, createdByAgentId: identity.agentId })));
+        for (const { documentId, revisionId } of ids) {
+          await db.update(documents).set({ latestRevisionId: revisionId }).where(eq(documents.id, documentId));
+        }
+        await db.insert(issueDocuments).values(ids.map(({ documentId }, index) => ({ companyId: identity.companyId, issueId,
+          documentId, key: `part-${String(index).padStart(3, "0")}` })));
+      });
+      expect((f.card.payload as { target: { boundDocuments: unknown[] } }).target.boundDocuments).toHaveLength(501);
+      const accepted = await f.accept();
+      expect(accepted.status, accepted.text).toBe(200);
+      await expect(f.state()).resolves.toEqual({ issue: "done", card: "accepted" });
+    }, 120_000);
 
     it("keeps a task without documents approvable and refuses an unbound card once documents exist", async () => {
       const plain = await submitForReview([]);

@@ -1524,9 +1524,9 @@ export const requestConfirmationCustomTargetSchema =
     key: z.string().trim().min(1).max(120),
     revisionId: z.string().trim().min(1).max(255).nullable().optional(),
     revisionNumber: z.number().int().positive().nullable().optional(),
+    // Server-owned: every submitted document is recorded, so no count cap.
     boundDocuments: z
       .array(requestConfirmationBoundDocumentSchema)
-      .max(500)
       .nullable()
       .optional(),
   });

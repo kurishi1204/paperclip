@@ -51,7 +51,7 @@ import {
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
-import { readNativeCompletionDocumentRevisions } from "./native-completion-document-binding.js";
+import { NATIVE_COMPLETION_BINDING_SYSTEM_ID, readNativeCompletionDocumentRevisions } from "./native-completion-document-binding.js";
 import { buildIssueBlockersResolvedWakeIdempotencyKey, buildIssueBlockersResolvedWakeStateKey } from "../issue-dependency-wakeups.js";
 import {
   persistActivity,
@@ -592,7 +592,7 @@ async function materializeDecisionEffect(input: {
     const interaction = await issueThreadInteractionService(input.tx).create(
       input.issue,
       reviewInput,
-      { systemId: "native-status-committer", runId: input.runId },
+      { systemId: NATIVE_COMPLETION_BINDING_SYSTEM_ID, runId: input.runId },
     );
     // The card and its next actor commit together. The post-commit dispatcher
     // revalidates this exact review before granting a scoped reviewer run.

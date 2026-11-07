@@ -92,11 +92,27 @@ submitted work and are excluded. A task without documents records an empty list.
 
 Acceptance, through the HTTP route, the reviewer's `resolve_review` tool or a
 system actor, re-reads the issue documents while holding the issue row
-`FOR UPDATE` and requires the same set at the same revisions. A later revision,
-an added document or a removed document returns 409
-`native_completion_review_documents_stale`. A card saved before this binding
-existed returns 409 `native_completion_review_documents_unbound` once the issue
-has documents. A task without documents still completes normally.
+`FOR UPDATE`, then applies these checks in order:
+
+- A linked, non-system document without a current revision makes the saved set
+  unverifiable: 409 `native_completion_review_documents_inconsistent`. It is
+  never treated as absent.
+- The binding is trusted only on a system-created card that has a
+  `bind_reviewer` status-decision effect pointing at it for the decision named
+  in `target.revisionId`. Any other card, including one saved before this
+  binding existed, carries no trusted binding: 409
+  `native_completion_review_documents_unbound` once the issue has documents.
+  A task without documents still completes normally.
+- Each document appears once in the binding and the binding equals the whole
+  current set (same ids, keys and revisions). A repeated entry, a later
+  revision, an added document or a removed document returns 409
+  `native_completion_review_documents_stale`.
+
+`boundDocuments` is server-owned. The ordinary interaction create entry rejects
+a client-supplied value with 422 `native_completion_review_binding_server_owned`;
+only the status committer's system identity records one, and an idempotent
+replay reuses the recorded value. The binding has no count cap, because issue
+documents have none: every submitted document is recorded.
 
 The issue row is the only lock used. The `paperclip_bump_issue_revision_from_child`
 triggers (migration 0313) lock the issue `FOR UPDATE` before every
@@ -122,8 +138,14 @@ remain human-only.
 
 The "native completion review document binding" cases in
 `paperclip-control-plane-port.test.ts` drive the native finalizer and the real
-HTTP accept/reject routes against PostgreSQL. They cover multiple documents, a
-revision saved after submission, both agent-authorship forms, a `human_only`
-owner deciding on their own revision (including after a later revision), a task
-without documents, an unbound card, and both orders of a concurrent document
+HTTP create/accept/reject routes against PostgreSQL. They cover multiple
+documents, a revision saved after submission, both agent-authorship forms, a
+`human_only` owner deciding on their own revision (including after a later
+revision), a task without documents, an unbound card, a linked document without
+a current revision, a client-supplied duplicate binding, a repeated entry in a
+server-owned binding, 501 documents, and both orders of a concurrent document
 write and approval.
+
+System documents are those in `SYSTEM_ISSUE_DOCUMENT_KEYS`
+(`packages/shared/src/constants.ts`: `continuation-summary` and
+`pipeline-case-body`, checked by `isSystemIssueDocumentKey`).
