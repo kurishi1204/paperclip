@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, heartbeatRuns, issues, issueThreadInteractions, activityLog } from "@paperclipai/db";
+import { agents, companies, heartbeatRuns, issues, issueThreadInteractions, activityLog, issueComments } from "@paperclipai/db";
 import { documentService } from "../documents.js";
 import { startRunnerApiTestServer } from "../../__tests__/helpers/runner-api-server.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
@@ -145,6 +145,41 @@ describe("dedicated fixed-document reviewer handoff", () => {
     expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId,f.issueId))).toHaveLength(1);
     const events=await server.db.select().from(activityLog).where(eq(activityLog.companyId,f.companyId));
     expect(events.filter(x=>x.action==="issue.thread_interaction_created")).toHaveLength(1);
+  });
+  it("rechecks a reviewer paused after the initial read but before creation", async () => {
+    const { f, reviewerId, args } = await seed();
+    const original = server.db.transaction.bind(server.db);
+    const racedDb = new Proxy(server.db, { get(target, key) {
+      if (key === "transaction") return async (...parameters: Parameters<typeof original>) => {
+        await server.db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerId));
+        return original(...parameters);
+      };
+      return Reflect.get(target, key, target);
+    } });
+    await expect(issueThreadInteractionService(racedDb).create(
+      { id: f.issueId, companyId: f.companyId },
+      { kind: "request_confirmation", addresseeAgentId: reviewerId, idempotencyKey: args.idempotencyKey,
+        sourceRunId: f.runId, title: args.title, summary: args.prompt, continuationPolicy: "wake_assignee",
+        payload: { version: 1, prompt: args.prompt, ...args.payload } } as never,
+      { agentId: f.agentId, runId: f.runId },
+    )).rejects.toThrow("invokable");
+    expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId))).toHaveLength(0);
+  });
+  it.each(["current", "historical"] as const)("keeps named QA pending after an unrelated %s human comment", async (path) => {
+    const { f, args, call } = await seed();
+    const named = await call({ ...args, payload: { ...args.payload, supersedeOnUserComment: true } }) as any;
+    const [comment] = await server.db.insert(issueComments).values({
+      companyId: f.companyId, issueId: f.issueId, authorType: "user", authorUserId: "fixture-human",
+      body: "An unrelated operational comment.", createdAt: new Date(Date.now() + 1000),
+    }).returning();
+    const service = issueThreadInteractionService(server.db);
+    const expired = path === "current"
+      ? await service.expireRequestConfirmationsSupersededByComment(
+        { id: f.issueId, companyId: f.companyId }, comment, { userId: "fixture-human" })
+      : await service.expireRequestConfirmationsSupersededByHistoricalComments({ id: f.issueId, companyId: f.companyId });
+    expect(expired).toHaveLength(0);
+    const [row] = await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, named.interaction.id));
+    expect(row.status).toBe("pending");
   });
   it("keeps creation and decision escape hatches closed", () => {
     expect(runnerApiMutationRestriction("/api/issues/{id}/interactions")).not.toBeNull();

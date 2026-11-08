@@ -111,7 +111,7 @@ import {
   publishActivity,
   type ActivityPublication,
 } from "./activity-log.js";
-import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
+import { evaluateAgentInvokability, evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
 import { assertNativeCompletionDocumentBindingCurrent, assertNativeCompletionReviewCreateAllowed } from "./native-runtime/native-completion-document-binding.js";
 import {
@@ -882,6 +882,12 @@ function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
 
 function shouldSupersedeInteractionOnUserComment(interaction: UserCommentSupersedableInteraction) {
   if (interaction.kind === "connection_intent") return false;
+  // A document's QA lifecycle follows its fixed revision, not unrelated
+  // conversation traffic. Apply this to both immediate and historical readers,
+  // including existing cards which opted into comment supersession.
+  if (interaction.kind === "request_confirmation" && interaction.addresseeAgentId
+    && interaction.payload.target?.type === "issue_document"
+    && interaction.payload.target.key !== "plan") return false;
   if (interaction.kind === "request_confirmation" && interaction.payload.toolAction) return false;
   return interaction.payload.supersedeOnUserComment === true;
 }
@@ -3774,6 +3780,23 @@ export function issueThreadInteractionService(
             .for("update");
           if (!issueRow || isTerminalIssueStatus(issueRow.status)) {
             throw conflict("Cannot create an interaction on a closed issue");
+          }
+          if (namedDocumentReview) {
+            // The early check is only a fast failure. Lock the current reviewer
+            // and its company reporting chain until insertion commits, so pause,
+            // termination and reporting changes cannot invalidate that check.
+            const companyAgents = await tx.select({
+              id: agents.id, companyId: agents.companyId, name: agents.name,
+              reportsTo: agents.reportsTo, status: agents.status,
+            }).from(agents).where(eq(agents.companyId, issue.companyId))
+              .orderBy(asc(agents.id)).for("share");
+            const reviewer = companyAgents.find(agent => agent.id === data.addresseeAgentId);
+            const invokability = evaluateAgentInvokability(reviewer, companyAgents);
+            if (!invokability.invokable) {
+              throw unprocessable("addresseeAgentId must reference an invokable agent", {
+                reason: invokability.reason, ...invokability.details,
+              });
+            }
           }
           if (namedDocumentReview && (issueRow.workMode !== "standard"
             || data.payload.target?.type !== "issue_document"
