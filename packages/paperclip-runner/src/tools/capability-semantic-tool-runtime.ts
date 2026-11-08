@@ -1556,6 +1556,9 @@ function commandForOperation(
         changeSummary: typeof input.changeSummary === "string" ? input.changeSummary : undefined,
       };
     case "request_human_input":
+      if (input.addresseeAgentId != null) {
+        throw new Error("named_document_review_requires_live_server");
+      }
       return {
         kind: "request_human_input",
         interactionKind: requireString(input.interactionKind) as never,

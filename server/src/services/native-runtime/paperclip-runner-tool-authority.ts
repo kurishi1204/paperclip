@@ -2184,8 +2184,24 @@ export class PaperclipRunnerToolAuthority {
               },
             }
           : suppliedPayload;
+        const addresseeAgentId = nullableProviderId(input.addresseeAgentId);
+        if (addresseeAgentId !== null) {
+          const target = record(normalizedPayload.target);
+          if (!["standard", "planning"].includes(context.issue.workMode)
+            || kind !== "request_confirmation" || target.type !== "issue_document"
+            || target.issueId !== context.issue.id
+            || !nullableProviderId(target.documentId) || !nullableProviderId(target.key)
+            || !nullableProviderId(target.revisionId)
+            || normalizedPayload.toolAction !== undefined || normalizedPayload.secretProposal !== undefined) {
+            throw new Error("paperclip_runner_document_review_requires_fixed_confirmation");
+          }
+        }
+        // Forward only the addressee. The interaction service still owns same-company,
+        // independent/invokable actor checks, current revision binding and resolver caps.
+        // Never forward or synthesize a less restrictive resolver policy here.
         const interaction = await issueThreadInteractionService(tx).create(context.issue, {
           kind,
+          ...(addresseeAgentId !== null ? { addresseeAgentId } : {}),
           idempotencyKey,
           sourceRunId: this.binding.runId,
           title: requiredString(input.title),

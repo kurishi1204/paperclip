@@ -305,6 +305,18 @@ describe("Capability exposure and authorization", () => {
     });
   });
 
+  it("does not silently simulate a named employee document review", async () => {
+    const { adapter, runtime } = await runtimeFor();
+    expect(await runtime.invoke({
+      operationId: "request_human_input",
+      input: { interactionKind: "confirmation", title: "Fixed document QA",
+        prompt: "Use an independent live reviewer.", addresseeAgentId: "reviewer-1",
+        continuationPolicy: "wake_assignee" },
+      idempotencyKey: "live-review-only",
+    })).toMatchObject({ ok: false, error: { code: "operation_unsupported" } });
+    expect(adapter.snapshot().interactions).toHaveLength(0);
+  });
+
   it("keeps a pending human-input handoff in review instead of weakening the lifecycle", async () => {
     const { adapter, runtime } = await runtimeFor();
     expect(await runtime.invoke({
