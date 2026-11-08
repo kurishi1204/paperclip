@@ -50,6 +50,7 @@ import {
   ACPX_SIDECAR_PROTOCOL_VERSION,
   boundedSidecarText,
   boundedSidecarValue,
+  encodeAcpxToolInput,
   frameAcpxToolClassification,
   parseAcpxSidecarRequest,
   record,
@@ -752,15 +753,16 @@ async function waitForTool(call: RunnerToolCall): Promise<unknown> {
       if (call.signal.aborted) abort();
     });
   }
-  emit(
+  const forwarded = emit(
     "runtime.tool_called",
     {
       callId,
       operationId,
-      input: boundedSidecarValue(record(call.arguments)),
+      input: encodeAcpxToolInput(call.arguments),
     },
     activeTurnId,
   );
+  if (!forwarded) throw new Error("ACPX tool call exceeds the sidecar frame limit");
   return await new Promise((settle, reject) => {
     const abort = () => {
       const pending = tools.get(callId);

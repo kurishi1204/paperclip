@@ -458,3 +458,34 @@ fn input_parent_tool_is_bounded_scope_checked_and_provider_neutral() {
         }
     ));
 }
+
+#[test]
+fn decodes_lossless_tool_input_at_sidecar_budget() {
+    let overhead = serde_json::to_vec(&json!({"body": ""})).unwrap().len();
+    let input = json!({"body": "x".repeat(240 * 1024 - overhead)});
+    assert_eq!(serde_json::to_vec(&input).unwrap().len(), 240 * 1024);
+    let payload = json!({
+        "callId": "c".repeat(160), "operationId": "write_document", "input": input.clone()
+    });
+    assert!(serde_json::to_vec(&payload).unwrap().len() < 256 * 1024);
+    let decoded = decode_acpx_event(
+        &active_scope(),
+        &event(GeneratedAcpxSidecarEventType::RuntimeToolCalled, payload),
+    )
+    .unwrap();
+    assert!(
+        matches!(decoded, AcpxEventPayload::ToolCalled { input: received, .. } if received == input)
+    );
+
+    // Preserve the receiver's existing hard limit. The sidecar rejects these
+    // values before dispatch rather than relying on a decoder failure.
+    for size in [256 * 1024, 480 * 1024] {
+        let payload = json!({"callId": "call-large", "operationId": "write_document", "input": {"body": "x".repeat(size)}});
+        let error = decode_acpx_event(
+            &active_scope(),
+            &event(GeneratedAcpxSidecarEventType::RuntimeToolCalled, payload),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("256 KiB admission limit"));
+    }
+}

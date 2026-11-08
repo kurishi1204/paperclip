@@ -335,7 +335,7 @@ describe("sandbox callback bridge", () => {
     expect(forwarded).toEqual(["GET /api/openapi.json"]);
   });
 
-  it("denies non-allowlisted requests by default", async () => {
+  it.each([100, 1_500])("denies non-allowlisted requests before stop (poll interval %sms)", async (pollIntervalMs) => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-default-policy-"));
     cleanupDirs.push(rootDir);
 
@@ -346,6 +346,7 @@ describe("sandbox callback bridge", () => {
     const worker = await startSandboxCallbackBridgeWorker({
       client: createFileSystemSandboxCallbackBridgeQueueClient(),
       queueDir,
+      pollIntervalMs,
       handleRequest: async () => {
         handled += 1;
         return {
@@ -354,6 +355,8 @@ describe("sandbox callback bridge", () => {
         };
       },
     });
+
+    cleanupFns.push(() => worker.stop({ drainTimeoutMs: 5_000 }));
 
     await writeFile(
       path.posix.join(directories.requestsDir, "req-1.json"),
@@ -369,7 +372,9 @@ describe("sandbox callback bridge", () => {
       "utf8",
     );
 
-    await worker.stop({ drainTimeoutMs: 1_000 });
+    // Verify the authorization result while the worker is running. Stopping
+    // immediately tests the drain deadline instead and may correctly return 503.
+    await waitForJsonFile(directories.responsesDir, 5_000);
 
     const response = JSON.parse(
       await readFile(path.posix.join(directories.responsesDir, "req-1.json"), "utf8"),

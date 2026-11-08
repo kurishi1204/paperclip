@@ -4,6 +4,7 @@ import {
   ACPX_SIDECAR_MAX_FRAME_BYTES,
   boundedSidecarText,
   boundedSidecarValue,
+  encodeAcpxToolInput,
   frameAcpxToolClassification,
   parseAcpxSidecarRequest,
   safeSidecarText,
@@ -80,6 +81,30 @@ describe("ACPX sidecar request parsing", () => {
       omitted: true,
       reason: "object_required",
     });
+  });
+
+  it("preserves large executed input while diagnostics remain bounded", () => {
+    const value = { key: "synthetic", body: "合成の文書。".repeat(6000), idempotencyKey: "original-id" };
+    expect(Buffer.byteLength(JSON.stringify(value))).toBeGreaterThan(64 * 1024);
+    expect(boundedSidecarValue(value)).toEqual({ omitted: true, reason: "payload_limit" });
+    expect(encodeAcpxToolInput(value)).toEqual(value);
+    expect(JSON.stringify(encodeAcpxToolInput(value))).toBe(JSON.stringify(value));
+  });
+
+  it("rejects input over runnerd's byte budget or changed on the wire", () => {
+    const limit = 240 * 1024;
+    const overhead = Buffer.byteLength(JSON.stringify({ body: "" }));
+    const atLimit = { body: "x".repeat(limit - overhead) };
+    expect(Buffer.byteLength(JSON.stringify(atLimit))).toBe(limit);
+    expect(encodeAcpxToolInput(atLimit)).toEqual(atLimit);
+    expect(() => encodeAcpxToolInput({ body: atLimit.body + "x" })).toThrow("240 KiB");
+    expect(() => encodeAcpxToolInput({ body: "\ud800" })).toThrow("changing its identity");
+    expect(() => encodeAcpxToolInput({ ["bad\ud800"]: "value" })).toThrow("changing its identity");
+    expect(() => encodeAcpxToolInput(null)).toThrow("must be an object");
+    expect(() => encodeAcpxToolInput([])).toThrow("must be an object");
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(() => encodeAcpxToolInput(cyclic)).toThrow("not JSON serializable");
   });
 
   it("bounds tool text on Unicode scalar boundaries", () => {

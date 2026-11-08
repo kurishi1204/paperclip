@@ -117,6 +117,28 @@ export function parseAcpxSidecarRequest(value: unknown): AcpxSidecarRequest {
   };
 }
 
+/** Executed tool arguments must never use diagnostic omission or Unicode repair. */
+export function encodeAcpxToolInput(value: unknown): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("ACPX tool input must be an object");
+  }
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new Error("ACPX tool input is not JSON serializable");
+  }
+  // Reserve 16 KiB for metadata beneath runnerd's 256 KiB event admission cap.
+  // This also stays below the 480 KiB encrypted semantic input budget.
+  if (!serialized || Buffer.byteLength(serialized) > 240 * 1024) {
+    throw new Error("ACPX tool input exceeds the 240 KiB event input budget");
+  }
+  if (stringifyAcpxSidecarFrame(value) !== serialized) {
+    throw new Error("ACPX tool input cannot be encoded without changing its identity");
+  }
+  return JSON.parse(serialized) as Record<string, unknown>;
+}
+
 export function boundedSidecarValue(
   value: unknown,
   maxBytes = 64 * 1024,
