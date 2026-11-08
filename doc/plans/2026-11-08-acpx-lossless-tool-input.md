@@ -7,3 +7,5 @@ The ordinary tool path previously used the 64 KiB diagnostic value limiter. A la
 The existing diagnostic limits, generated tool catalog, permissions and server validation remain in effect. The change does not add an operation or bypass authorization. Reserved completion tools retain their existing validation.
 
 Verification covers a large synthetic document through the real local HTTP tool bridge, exact JSON equality, byte limits at the native decoder, invalid Unicode, invalid input, frame rejection and pending-call cleanup. Production acceptance requires the qualified release and a fresh normal business continuation. A local test alone does not establish that acceptance.
+
+The callback policy test observes the normal denial before stopping the worker. It covers normal and slow polling. A shutdown drain deadline is a separate behavior and must not replace the authorization result.
