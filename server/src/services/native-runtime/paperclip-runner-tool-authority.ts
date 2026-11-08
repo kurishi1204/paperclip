@@ -616,13 +616,18 @@ export class PaperclipRunnerToolAuthority {
           ? await service.listIssueDocumentRevisions(this.binding.issueId,key,{
               companyId:review.binding.companyId,documentId:review.binding.documentId,revisionId:review.binding.revisionId,
             })
-          : await service.listIssueDocumentRevisions(this.binding.issueId,key);
+          : await service.listIssueDocumentRevisions(this.binding.issueId,key,undefined,{
+              limit: boundedLimit(input.limit ?? 5) + 1,
+              ...(typeof input.beforeRevisionNumber === "number" ? {beforeRevisionNumber:input.beforeRevisionNumber} : {}),
+            });
         if(review && (revisions.length!==1 || revisions[0]!.documentId!==review.binding.documentId ||
             revisions[0]!.id!==review.binding.revisionId)) {
           throw forbidden("The fixed document revision is no longer available.");
         }
-        return {revisions,...(review?{scope:{mode:"assigned_revision",documentId:review.binding.documentId,
-          revisionId:review.binding.revisionId}}:{})};
+        const limit=boundedLimit(input.limit ?? 5), selected=review?revisions:revisions.slice(0,limit);
+        return {revisions:selected,...(review?{scope:{mode:"assigned_revision",documentId:review.binding.documentId,
+          revisionId:review.binding.revisionId}}:{pagination:{limit,hasMore:revisions.length>limit,
+            nextBeforeRevisionNumber:revisions.length>limit?selected.at(-1)!.revisionNumber:null}})};
       }
       case "write_document": return this.#writeDocument(input);
       case "list_agents":

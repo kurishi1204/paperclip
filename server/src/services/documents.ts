@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, lt } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { documentRevisions, documents, issueDocuments, issues } from "@paperclipai/db";
 import { isSystemIssueDocumentKey, issueDocumentKeySchema, type IssueDocumentRevisionDigest, type SystemIssueDocumentKey } from "@paperclipai/shared";
@@ -229,9 +229,10 @@ export function documentService(db: Db) {
 
     listIssueDocumentRevisions: async (issueId: string, rawKey: string,
       revisionScope?: { companyId: string; documentId: string; revisionId: string },
+      page?: { limit: number; beforeRevisionNumber?: number },
     ) => {
       const key = normalizeDocumentKey(rawKey);
-      return db
+      const query = db
         .select({
           id: documentRevisions.id,
           companyId: documentRevisions.companyId,
@@ -256,8 +257,10 @@ export function documentService(db: Db) {
           revisionScope ? eq(documentRevisions.companyId, revisionScope.companyId) : undefined,
           revisionScope ? eq(documents.id, revisionScope.documentId) : undefined,
           revisionScope ? eq(documentRevisions.id, revisionScope.revisionId) : undefined,
+          page?.beforeRevisionNumber === undefined ? undefined : lt(documentRevisions.revisionNumber, page.beforeRevisionNumber),
         ))
         .orderBy(desc(documentRevisions.revisionNumber));
+      return page ? query.limit(page.limit) : query;
     },
 
     upsertIssueDocument: async (input: {

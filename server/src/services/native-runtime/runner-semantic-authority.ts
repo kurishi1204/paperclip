@@ -1,6 +1,6 @@
 import { readTaskQuestionContext } from "../issue-question-context.js";
 import { isConversation } from "../agent-conversations.js";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, lt } from "drizzle-orm";
 
 import type { Db } from "@paperclipai/db";
 import {
@@ -241,6 +241,7 @@ export class PaperclipRunnerSemanticAuthority {
           }
           case "list_document_revisions": {
             const key = requiredString(input.key);
+            const limit = boundedLimit(input.limit ?? 5);
             const rows = await this.#db
               .select({
                 id: documentRevisions.id,
@@ -264,13 +265,15 @@ export class PaperclipRunnerSemanticAuthority {
                   eq(issueDocuments.issueId, this.#binding.issueId),
                   eq(issueDocuments.key, key),
                   eq(documentRevisions.companyId, this.#binding.companyId),
+                  typeof input.beforeRevisionNumber === "number" ? lt(documentRevisions.revisionNumber,input.beforeRevisionNumber) : undefined,
                 ),
               )
               .orderBy(desc(documentRevisions.revisionNumber))
-              .limit(boundedLimit(input.limit));
+              .limit(limit + 1);
+            const selected = rows.slice(0,limit);
             return {
-              value: jsonValue({ revisions: rows }),
-              references: rows.map((row) => ({
+              value: jsonValue({ revisions: selected, pagination: {limit,hasMore:rows.length>limit,nextBeforeRevisionNumber:rows.length>limit?selected.at(-1)!.revisionNumber:null} }),
+              references: selected.map((row) => ({
                 kind: "document_revision" as const,
                 id: row.id,
               })),

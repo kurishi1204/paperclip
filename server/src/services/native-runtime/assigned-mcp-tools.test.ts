@@ -20,7 +20,7 @@ describe("assigned MCP runner tools", () => {
   const callName = "paperclip_call_assigned_tool";
 
   it("cannot shadow any native catalog operation with an assigned app tool", async () => {
-    const nativeNames = new Set(CAPABILITY_SEMANTIC_TOOL_CATALOG.map(tool => tool.operationId));
+    const nativeNames = new Set<string>(CAPABILITY_SEMANTIC_TOOL_CATALOG.map(tool => tool.operationId));
     // A raw app name is mutating even when it spells a native read operation.
     const f = fixture([...nativeNames].map(name => descriptor(name, "write")));
     const assigned = await createAssignedMcpTools(f);
