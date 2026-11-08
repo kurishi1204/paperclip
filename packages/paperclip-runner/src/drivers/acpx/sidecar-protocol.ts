@@ -128,9 +128,10 @@ export function encodeAcpxToolInput(value: unknown): Record<string, unknown> {
   } catch {
     throw new Error("ACPX tool input is not JSON serializable");
   }
-  // Match runnerd's encrypted semantic input budget, below the 1 MiB frame cap.
-  if (!serialized || Buffer.byteLength(serialized) > 480 * 1024) {
-    throw new Error("ACPX tool input exceeds the 480 KiB encrypted transport limit");
+  // Reserve 16 KiB for metadata beneath runnerd's 256 KiB event admission cap.
+  // This also stays below the 480 KiB encrypted semantic input budget.
+  if (!serialized || Buffer.byteLength(serialized) > 240 * 1024) {
+    throw new Error("ACPX tool input exceeds the 240 KiB event input budget");
   }
   if (stringifyAcpxSidecarFrame(value) !== serialized) {
     throw new Error("ACPX tool input cannot be encoded without changing its identity");

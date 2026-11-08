@@ -92,12 +92,12 @@ describe("ACPX sidecar request parsing", () => {
   });
 
   it("rejects input over runnerd's byte budget or changed on the wire", () => {
-    const limit = 480 * 1024;
+    const limit = 240 * 1024;
     const overhead = Buffer.byteLength(JSON.stringify({ body: "" }));
     const atLimit = { body: "x".repeat(limit - overhead) };
     expect(Buffer.byteLength(JSON.stringify(atLimit))).toBe(limit);
     expect(encodeAcpxToolInput(atLimit)).toEqual(atLimit);
-    expect(() => encodeAcpxToolInput({ body: atLimit.body + "x" })).toThrow("480 KiB");
+    expect(() => encodeAcpxToolInput({ body: atLimit.body + "x" })).toThrow("240 KiB");
     expect(() => encodeAcpxToolInput({ body: "\ud800" })).toThrow("changing its identity");
     expect(() => encodeAcpxToolInput({ ["bad\ud800"]: "value" })).toThrow("changing its identity");
     expect(() => encodeAcpxToolInput(null)).toThrow("must be an object");

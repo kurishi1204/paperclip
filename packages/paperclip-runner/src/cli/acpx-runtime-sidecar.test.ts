@@ -72,7 +72,7 @@ describe("qualified ACPX runtime sidecar", () => {
     await expect(pending).rejects.toThrow("cancelled");
     expect(tools.size).toBe(0);
     emitted.length = 0;
-    for (const argumentsValue of [{ body: "x".repeat(480 * 1024) }, { body: "\ud800" }]) {
+    for (const argumentsValue of [{ body: "x".repeat(240 * 1024) }, { body: "\ud800" }]) {
       await expect(wait({ callId: "rejected-write", tool: "write_document", arguments: argumentsValue, signal: new AbortController().signal })).rejects.toThrow();
       expect(emitted).toHaveLength(0);
       expect(tools.size).toBe(0);
