@@ -133,43 +133,42 @@ const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockTrackRoutineCreated = vi.hoisted(() => vi.fn());
 const mockGetTelemetryClient = vi.hoisted(() => vi.fn());
 
-function registerModuleMocks() {
-  vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
+  vi.mock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
 
-  vi.doMock("@paperclipai/shared/telemetry", () => ({
+  vi.mock("@paperclipai/shared/telemetry", () => ({
     trackRoutineCreated: mockTrackRoutineCreated,
     trackErrorHandlerCrash: vi.fn(),
   }));
 
-  vi.doMock("../telemetry.js", () => ({
+  vi.mock("../telemetry.js", () => ({
     getTelemetryClient: mockGetTelemetryClient,
   }));
 
-  vi.doMock("../services/access.js", () => ({
+  vi.mock("../services/access.js", () => ({
     accessService: () => mockAccessService,
   }));
 
-  vi.doMock("../services/routines.js", () => ({
+  vi.mock("../services/routines.js", () => ({
     routineService: () => mockRoutineService,
   }));
 
-  vi.doMock("../services/activity-log.js", () => ({
+  vi.mock("../services/activity-log.js", () => ({
     logActivity: mockLogActivity,
   }));
 
-  vi.doMock("../services/index.js", () => ({
+  vi.mock("../services/index.js", () => ({
     accessService: () => mockAccessService,
     documentAnnotationService: () => mockAnnotationService,
     logActivity: mockLogActivity,
     routineService: () => mockRoutineService,
   }));
-}
 
 async function createApp(actor: Record<string, unknown>) {
-  const [{ errorHandler }, { routineRoutes }] = await Promise.all([
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    vi.importActual<typeof import("../routes/routines.js")>("../routes/routines.js"),
-  ]);
+  // One module generation with hoisted mocks. Resetting/reimporting these
+  // shared dependency graphs concurrently can bind a real telemetry client
+  // while the assertion observes a different mock generation.
+  const { errorHandler } = await import("../middleware/index.js");
+  const { routineRoutes } = await import("../routes/routines.js");
   const app = express();
   app.use(express.json({ verify: (req, _res, buf) => { (req as any).rawBody = buf; } }));
   app.use((req, _res, next) => {
@@ -195,17 +194,6 @@ describe("routine routes", () => {
   });
 
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("@paperclipai/shared/telemetry");
-    vi.doUnmock("../telemetry.js");
-    vi.doUnmock("../services/access.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../services/activity-log.js");
-    vi.doUnmock("../services/routines.js");
-    vi.doUnmock("../routes/routines.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
     mockRoutineService.list.mockResolvedValue([routine]);
@@ -681,6 +669,7 @@ describe("routine routes", () => {
       userId: "board-user",
       runId: null,
     });
-    expect(mockTrackRoutineCreated).toHaveBeenCalledWith(expect.anything());
+    expect(mockGetTelemetryClient).toHaveBeenCalledOnce();
+    expect(mockTrackRoutineCreated).toHaveBeenCalledWith(mockGetTelemetryClient.mock.results[0]!.value);
   });
 });

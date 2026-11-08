@@ -620,6 +620,7 @@ import {
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
+import { ensureNamedDocumentReviewWake } from "./named-document-review-wake.js";
 import { readCurrentPendingDocumentReviewWake, isCurrentPendingDocumentReviewWake, hasServerRecordedNonAssigneeWake, pendingDocumentReviewRetryProfile, hasPendingDocumentReviewAdmission } from "./pending-document-review-wake.js";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
@@ -20336,6 +20337,66 @@ export function heartbeatService(
     }
   }
 
+  async function resumePendingNamedDocumentReviewIntents(cutoff: Date | null) {
+    // The native create transaction commits this intent with its card and
+    // semantic receipt. A crash before the immediate post-commit callback
+    // therefore cannot erase the work. Never replay an existing queue receipt,
+    // including failed or unknown prior delivery.
+    const intents = await db.select({
+      companyId: issueThreadInteractions.companyId,
+      issueId: issueThreadInteractions.issueId,
+      creatorAgentId: issueThreadInteractions.createdByAgentId,
+      interactionId: issueThreadInteractions.id,
+    }).from(issueThreadInteractions)
+      .innerJoin(activityLog, and(
+        eq(activityLog.companyId, issueThreadInteractions.companyId),
+        sql`${activityLog.entityId} = ${issueThreadInteractions.issueId}::text`,
+        eq(activityLog.agentId, issueThreadInteractions.createdByAgentId),
+        eq(activityLog.runId, issueThreadInteractions.sourceRunId),
+        eq(activityLog.action, "issue.thread_interaction_created"),
+        eq(activityLog.actorType, "agent"),
+        sql`${activityLog.details}->'documentReviewWakeIntent'->>'schema' = 'paperclip.named-document-review-wake/v1'`,
+        sql`${activityLog.details}->'documentReviewWakeIntent'->>'interactionId' = ${issueThreadInteractions.id}::text`,
+        sql`${activityLog.details}->'documentReviewWakeIntent'->>'reviewerAgentId' = ${issueThreadInteractions.addresseeAgentId}::text`,
+      ))
+      .innerJoin(heartbeatRuns, and(
+        eq(heartbeatRuns.id, issueThreadInteractions.sourceRunId),
+        eq(heartbeatRuns.companyId, issueThreadInteractions.companyId),
+        eq(heartbeatRuns.agentId, issueThreadInteractions.createdByAgentId),
+        eq(heartbeatRuns.nativeIssueId, issueThreadInteractions.issueId),
+        eq(heartbeatRuns.runtimeMode, "native"),
+      ))
+      .innerJoin(issues, and(
+        eq(issues.id, issueThreadInteractions.issueId),
+        eq(issues.companyId, issueThreadInteractions.companyId),
+        eq(issues.workMode, "standard"),
+        notInArray(issues.status, ["done", "cancelled"]),
+      ))
+      .innerJoin(companies, and(
+        eq(companies.id, issueThreadInteractions.companyId),
+        eq(companies.status, "active"),
+      ))
+      .where(and(
+        eq(issueThreadInteractions.status, "pending"),
+        eq(issueThreadInteractions.kind, "request_confirmation"),
+        isNotNull(issueThreadInteractions.createdByAgentId),
+        isNotNull(issueThreadInteractions.addresseeAgentId),
+        cutoff ? gte(activityLog.createdAt, cutoff) : undefined,
+        notExists(db.select({ one: sql`1` }).from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, issueThreadInteractions.companyId),
+          sql`${agentWakeupRequests.idempotencyKey} = 'interaction-pending:' || ${issueThreadInteractions.id}::text`,
+        ))),
+      )).orderBy(asc(activityLog.createdAt), asc(activityLog.id));
+    const errors: unknown[] = [];
+    for (const intent of intents) {
+      try {
+        await ensureNamedDocumentReviewWake(db, { ...intent, creatorAgentId: intent.creatorAgentId! },
+          (agentId, options) => enqueueWakeup(agentId, options));
+      } catch (error) { errors.push(error); }
+    }
+    if (errors.length) throw new AggregateError(errors, "Named document review delivery is incomplete");
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeDeferredQaDecisionWakes();
@@ -20440,6 +20501,9 @@ export function heartbeatService(
     for (const agentId of agentIds) {
       await startNextQueuedRunForAgent(agentId);
     }
+    // Ordinary queued work proceeds even when a separate review intent needs
+    // repair. Propagate delivery failures afterward instead of hiding them.
+    await resumePendingNamedDocumentReviewIntents(cutoff);
   }
 
   async function recoverActiveSessionGoals() {
@@ -28894,6 +28958,33 @@ export function heartbeatService(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
 
+          if (!executionWaitRequestId && reason === "interaction_pending" && opts.idempotencyKey) {
+            const interactionId = readNonEmptyString(payload?.interactionId);
+            if (!interactionId || opts.idempotencyKey !== `interaction-pending:${interactionId}`) {
+              throw new HttpError(409, "Pending interaction wake key differs from its card");
+            }
+            // Native tools and HTTP creation use the same durable queue receipt.
+            // The issue lock serializes new deliveries across processes. A
+            // deferred queue consumer still resumes its original receipt above.
+            const prior = await tx.select().from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+            )).limit(2);
+            if (prior.length > 1) throw new HttpError(409, "Pending interaction has duplicate wake receipts");
+            if (prior[0]) {
+              const wake = prior[0];
+              if (wake.payload?.issueId !== issueId || wake.payload?.interactionId !== interactionId
+                || wake.payload?.interactionKind !== payload?.interactionKind
+                || wake.requestedByActorType !== opts.requestedByActorType
+                || wake.requestedByActorId !== opts.requestedByActorId) {
+                throw new HttpError(409, "Pending interaction wake receipt binding changed");
+              }
+              const [run] = wake.runId ? await tx.select().from(heartbeatRuns)
+                .where(eq(heartbeatRuns.id, wake.runId)).limit(1) : [];
+              return run ? { kind: "replayed" as const, run } : { kind: "deferred" as const };
+            }
+          }
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
               eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),

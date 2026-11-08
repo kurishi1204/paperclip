@@ -72,6 +72,7 @@ import { approvalService } from "../approvals.js";
 import { documentService, documentRevisionPage } from "../documents.js";
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
+import { ensureNamedDocumentReviewWake } from "../named-document-review-wake.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext, type NativeReviewAssignmentContext } from "./native-review-participant.js";
 import { getNativeDocumentReviewAssignment } from "./native-document-review-participant.js";
 import { childReviewOutcomes } from "./child-review-outcomes.js";
@@ -172,7 +173,7 @@ type Binding = {
   enqueueWakeup?: (agentId: string, options: {
     source: "assignment" | "automation";
     triggerDetail: "system";
-    reason: "issue_assigned" | "issue_commented";
+    reason: "issue_assigned" | "issue_commented" | "interaction_pending";
     payload: Record<string, unknown>;
     idempotencyKey: string;
     requestedByActorType: "agent";
@@ -1995,6 +1996,7 @@ export class PaperclipRunnerToolAuthority {
       try {
         const context = await this.#lockAuthorizedMutationContext(
           tx as unknown as Db,
+          operationId === "request_human_input" && nullableProviderId(input.addresseeAgentId) !== null,
         );
         const isFilePreparation =
           operationId === "register_deliverable" ||
@@ -2085,7 +2087,7 @@ export class PaperclipRunnerToolAuthority {
     });
   }
 
-  async #lockAuthorizedMutationContext(tx: Db): Promise<{
+  async #lockAuthorizedMutationContext(tx: Db, namedDocumentReview = false): Promise<{
     run: typeof heartbeatRuns.$inferSelect;
     issue: typeof issues.$inferSelect;
     actor: typeof agents.$inferSelect;
@@ -2094,6 +2096,13 @@ export class PaperclipRunnerToolAuthority {
     await tx.select({ id: issues.id }).from(issues).where(and(
       eq(issues.id, this.binding.issueId), eq(issues.companyId, this.binding.companyId),
     )).for("update");
+    if (namedDocumentReview) {
+      // Review creation reads actor state; a shared lock keeps it stable without
+      // conflicting with another review's shared reporting-chain locks.
+      await tx.select({ id: agents.id }).from(agents).where(and(
+        eq(agents.id, this.binding.agentId), eq(agents.companyId, this.binding.companyId),
+      )).for("share");
+    }
     // Authorization for writes is intentionally re-read only after the
     // transaction starts. Locking the run and issue in the same statement
     // closes the gap between the discovery-time check and the mutation: a
@@ -2114,7 +2123,7 @@ export class PaperclipRunnerToolAuthority {
         eq(issues.executionRunId, this.binding.runId),
         eq(agents.companyId, this.binding.companyId),
       ))
-      .for("update")
+      .for("update", { of: namedDocumentReview ? [heartbeatRuns, issues] : [heartbeatRuns, issues, agents] })
       .limit(1);
     if (
       !context
@@ -2147,6 +2156,9 @@ export class PaperclipRunnerToolAuthority {
       interactionKind as keyof typeof interactionKinds
     ];
     if (!kind) throw new Error("paperclip_runner_interaction_kind_invalid");
+    if (nullableProviderId(input.addresseeAgentId) !== null && !this.binding.enqueueWakeup) {
+      throw new Error("paperclip_runner_document_review_scheduler_unavailable");
+    }
     const prompt = requiredString(input.prompt);
     const idempotencyKey = requiredString(input.idempotencyKey);
     let publication: Awaited<ReturnType<typeof persistActivity>>["publication"] | null = null;
@@ -2184,8 +2196,24 @@ export class PaperclipRunnerToolAuthority {
               },
             }
           : suppliedPayload;
+        const addresseeAgentId = nullableProviderId(input.addresseeAgentId);
+        if (addresseeAgentId !== null) {
+          const target = record(normalizedPayload.target);
+          if (context.issue.workMode !== "standard" || target.key === "plan"
+            || kind !== "request_confirmation" || target.type !== "issue_document"
+            || target.issueId !== context.issue.id
+            || !nullableProviderId(target.documentId) || !nullableProviderId(target.key)
+            || !nullableProviderId(target.revisionId)
+            || normalizedPayload.toolAction !== undefined || normalizedPayload.secretProposal !== undefined) {
+            throw new Error("paperclip_runner_document_review_requires_fixed_confirmation");
+          }
+        }
+        // Forward only the addressee. The interaction service still owns same-company,
+        // independent/invokable actor checks, current revision binding and resolver caps.
+        // Never forward or synthesize a less restrictive resolver policy here.
         const interaction = await issueThreadInteractionService(tx).create(context.issue, {
           kind,
+          ...(addresseeAgentId !== null ? { addresseeAgentId } : {}),
           idempotencyKey,
           sourceRunId: this.binding.runId,
           title: requiredString(input.title),
@@ -2203,7 +2231,10 @@ export class PaperclipRunnerToolAuthority {
               supersedeOnUserComment: normalizedPayload.supersedeOnUserComment ?? false,
             } : {}),
           },
-        } as never, { agentId: this.binding.agentId, userId: null, identityContextId });
+        } as never, { agentId: this.binding.agentId, runId: this.binding.runId, userId: null, identityContextId });
+        if (addresseeAgentId !== null && interaction.sourceRunId !== this.binding.runId) {
+          return { interaction, disposition: "duplicate" };
+        }
         const activity = await persistActivity(tx, {
           companyId: this.binding.companyId,
           actorType: "agent",
@@ -2220,6 +2251,13 @@ export class PaperclipRunnerToolAuthority {
             interactionStatus: interaction.status,
             continuationPolicy: interaction.continuationPolicy,
             source: "paperclip_runner_protocol",
+            ...(addresseeAgentId !== null ? {
+              documentReviewWakeIntent: {
+                schema: "paperclip.named-document-review-wake/v1",
+                interactionId: interaction.id,
+                reviewerAgentId: interaction.addresseeAgentId,
+              },
+            } : {}),
           },
         });
         publication = activity.publication;
@@ -2227,6 +2265,13 @@ export class PaperclipRunnerToolAuthority {
       },
     );
     if (publication) publishActivity(publication);
+    if (nullableProviderId(input.addresseeAgentId) !== null) {
+      const interaction = record(record(result).interaction);
+      await ensureNamedDocumentReviewWake(this.db, {
+        companyId: this.binding.companyId, issueId: this.binding.issueId,
+        creatorAgentId: this.binding.agentId, interactionId: requiredString(interaction.id),
+      }, this.binding.enqueueWakeup!);
+    }
     return result;
   }
 }

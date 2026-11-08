@@ -111,7 +111,7 @@ import {
   publishActivity,
   type ActivityPublication,
 } from "./activity-log.js";
-import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
+import { evaluateAgentInvokability, evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
 import { assertNativeCompletionDocumentBindingCurrent, assertNativeCompletionReviewCreateAllowed } from "./native-runtime/native-completion-document-binding.js";
 import {
@@ -626,6 +626,11 @@ function isUserCommentSupersedableKind(
   ).includes(kind);
 }
 
+function isNamedBusinessDocumentReview(input: CreateIssueThreadInteraction) {
+  return input.kind === "request_confirmation" && Boolean(input.addresseeAgentId)
+    && input.payload.target?.type === "issue_document" && input.payload.target.key !== "plan";
+}
+
 function isEquivalentCreateRequest(
   row: IssueThreadInteractionRow,
   input: CreateIssueThreadInteraction,
@@ -640,7 +645,9 @@ function isEquivalentCreateRequest(
     row.continuationPolicy === input.continuationPolicy &&
     (row.idempotencyKey ?? null) === (input.idempotencyKey ?? null) &&
     (row.sourceCommentId ?? null) === (input.sourceCommentId ?? null) &&
-    (row.sourceRunId ?? null) === (input.sourceRunId ?? null) &&
+    ((row.sourceRunId ?? null) === (input.sourceRunId ?? null)
+      || (isNamedBusinessDocumentReview(input) && Boolean(actor.agentId)
+        && Boolean(actor.runId) && actor.runId === input.sourceRunId)) &&
     (row.title ?? null) === (input.title ?? null) &&
     (row.summary ?? null) === (input.summary ?? null) &&
     (row.createdByAgentId ?? null) === (actor.agentId ?? null) &&
@@ -875,6 +882,12 @@ function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
 
 function shouldSupersedeInteractionOnUserComment(interaction: UserCommentSupersedableInteraction) {
   if (interaction.kind === "connection_intent") return false;
+  // A document's QA lifecycle follows its fixed revision, not unrelated
+  // conversation traffic. Apply this to both immediate and historical readers,
+  // including existing cards which opted into comment supersession.
+  if (interaction.kind === "request_confirmation" && interaction.addresseeAgentId
+    && interaction.payload.target?.type === "issue_document"
+    && interaction.payload.target.key !== "plan") return false;
   if (interaction.kind === "request_confirmation" && interaction.payload.toolAction) return false;
   return interaction.payload.supersedeOnUserComment === true;
 }
@@ -1762,6 +1775,12 @@ function normalizeQuestionAnswers(args: {
     .filter((answer): answer is AskUserQuestionsAnswer => Boolean(answer));
 }
 
+function namedDocumentReviewCondition() {
+  return sql<boolean>`(${issueThreadInteractions.kind} = 'request_confirmation'
+    AND ${issueThreadInteractions.addresseeAgentId} IS NOT NULL
+    AND COALESCE(${issueThreadInteractions.payload}->'target'->>'type', '') = 'issue_document')`;
+}
+
 async function getIssueDocumentTargetSnapshot(
   db: Db | any,
   args: {
@@ -1783,6 +1802,9 @@ async function getIssueDocumentTargetSnapshot(
       key: issueDocuments.key,
       latestRevisionId: documents.latestRevisionId,
       latestRevisionNumber: documents.latestRevisionNumber,
+      createdByAgentId: documents.createdByAgentId,
+      createdByUserId: documents.createdByUserId,
+      updatedByAgentId: documents.updatedByAgentId,
     })
     .from(issueDocuments)
     .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
@@ -1803,6 +1825,9 @@ async function getIssueDocumentTargetSnapshot(
         key: string;
         latestRevisionId: string | null;
         latestRevisionNumber: number;
+        createdByAgentId: string | null;
+        createdByUserId: string | null;
+        updatedByAgentId: string | null;
       }>,
     ) => rows[0] ?? null,
   );
@@ -1887,6 +1912,7 @@ async function assertRequestConfirmationTargetIsCurrent(
       "request_confirmation target revisionNumber must match the current issue document revision",
     );
   }
+  return snapshot;
 }
 
 async function expireStaleRequestConfirmationTarget(
@@ -3409,6 +3435,7 @@ export function issueThreadInteractionService(
             eq(issueThreadInteractions.kind, "request_confirmation"),
             eq(issueThreadInteractions.status, "pending"),
             isNotNull(issueThreadInteractions.createdByAgentId),
+            sql`NOT ${namedDocumentReviewCondition()}`,
           ),
         )
         .orderBy(
@@ -3603,6 +3630,9 @@ export function issueThreadInteractionService(
         }
       }
 
+      const namedDocumentReview = data.kind === "request_confirmation"
+        && Boolean(data.addresseeAgentId) && data.payload.target?.type === "issue_document";
+
       if (normalizedData.idempotencyKey) {
         const existing = await getIdempotentInteraction({
           issueId: issue.id,
@@ -3610,6 +3640,26 @@ export function issueThreadInteractionService(
           idempotencyKey: normalizedData.idempotencyKey,
         });
         if (existing) {
+          if (isNamedBusinessDocumentReview(normalizedData)
+            && existing.sourceRunId !== normalizedData.sourceRunId) {
+            // The request belongs to the task, while its original execution
+            // provenance stays immutable. Only a fresh authenticated current run
+            // may retrieve that same request across a run boundary.
+            if (!actor.agentId || !actor.runId || actor.runId !== normalizedData.sourceRunId) {
+              throw conflict("Cross-run document review reuse requires the current creating agent run");
+            }
+            await db.transaction(async (tx) => {
+              await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
+              const [currentIssue] = await tx.select({ workMode: issues.workMode })
+                .from(issues).where(and(eq(issues.id, issue.id),eq(issues.companyId,issue.companyId))).for("update");
+              const retryTarget = normalizedData.kind === "request_confirmation"
+                && normalizedData.payload.target?.type === "issue_document" ? normalizedData.payload.target : null;
+              if (currentIssue?.workMode !== "standard"
+                || (retryTarget?.issueId ?? issue.id) !== issue.id) {
+                throw unprocessable("Named reviews require a standard-mode business document on the same issue");
+              }
+            });
+          }
           if (!isEquivalentCreateRequest(existing, normalizedData, actor, defaultAddresseeUserId)) {
             throw conflict(
               "Interaction idempotency key already exists for a different request",
@@ -3706,8 +3756,20 @@ export function issueThreadInteractionService(
         // create keep returning the (by now expired) original.
         const result = await db.transaction(async (tx) => {
           await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
+          let creationPolicy = policy;
+          if (namedDocumentReview) {
+            // Hold current governance through creation; never manufacture a weaker
+            // policy merely to make an employee review invokable.
+            const [currentCompany] = await tx.select({ governance: companies.interactionResolverGovernance })
+              .from(companies).where(eq(companies.id, issue.companyId)).for("share");
+            creationPolicy = resolveInteractionPolicy({ kind: data.kind, requested: data.resolverPolicy,
+              governance: currentCompany?.governance ?? {}, hasToolAction: false, hasSecretProposal: false });
+            if (creationPolicy.effectiveResolverPolicy === "human_only") {
+              throw unprocessable("Named document reviews cannot use a human-only resolver policy");
+            }
+          }
           const [issueRow] = await tx
-            .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId, conversationAgentId: issues.conversationAgentId, conversationUserId: issues.conversationUserId })
+            .select({ status: issues.status, workMode: issues.workMode, assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId, conversationAgentId: issues.conversationAgentId, conversationUserId: issues.conversationUserId })
             .from(issues)
             .where(
               and(
@@ -3718,6 +3780,44 @@ export function issueThreadInteractionService(
             .for("update");
           if (!issueRow || isTerminalIssueStatus(issueRow.status)) {
             throw conflict("Cannot create an interaction on a closed issue");
+          }
+          if (normalizedData.idempotencyKey) {
+            const [existing] = await tx.select().from(issueThreadInteractions).where(and(
+              eq(issueThreadInteractions.companyId, issue.companyId),
+              eq(issueThreadInteractions.issueId, issue.id),
+              eq(issueThreadInteractions.idempotencyKey, normalizedData.idempotencyKey),
+            )).limit(1);
+            if (existing) {
+              if (!isEquivalentCreateRequest(existing, normalizedData, actor, defaultAddresseeUserId)) {
+                throw conflict("Interaction idempotency key already exists for a different request", {
+                  idempotencyKey: normalizedData.idempotencyKey,
+                });
+              }
+              return { row: existing, supersededRows: [], replayed: true };
+            }
+          }
+          if (namedDocumentReview) {
+            // The early check is only a fast failure. Lock the current reviewer
+            // and its company reporting chain until insertion commits, so pause,
+            // termination and reporting changes cannot invalidate that check.
+            const companyAgents = await tx.select({
+              id: agents.id, companyId: agents.companyId, name: agents.name,
+              reportsTo: agents.reportsTo, status: agents.status,
+            }).from(agents).where(eq(agents.companyId, issue.companyId))
+              .orderBy(asc(agents.id)).for("share");
+            const reviewer = companyAgents.find(agent => agent.id === data.addresseeAgentId);
+            const invokability = evaluateAgentInvokability(reviewer, companyAgents);
+            if (!invokability.invokable) {
+              throw unprocessable("addresseeAgentId must reference an invokable agent", {
+                reason: invokability.reason, ...invokability.details,
+              });
+            }
+          }
+          if (namedDocumentReview && (issueRow.workMode !== "standard"
+            || data.payload.target?.type !== "issue_document"
+            || (data.payload.target.issueId ?? issue.id) !== issue.id
+            || data.payload.target.key === "plan")) {
+            throw unprocessable("Named reviews require a standard-mode business document on the same issue");
           }
           if (data.addresseeUserId) {
             const [user] = await tx.select({ id: authUsers.id }).from(authUsers)
@@ -3786,12 +3886,38 @@ export function issueThreadInteractionService(
           // longer slip between the check and the insert to leave a confirmation
           // pointing at a stale revision.
           if (requiresCurrentTarget) {
-            await assertRequestConfirmationTargetIsCurrent(tx, {
+            const currentTarget = await assertRequestConfirmationTargetIsCurrent(tx, {
               companyId: issue.companyId,
               issueId: issue.id,
               target: data.payload.target ?? null,
               lockForUpdate: true,
             });
+            if (namedDocumentReview) {
+              if (!currentTarget || !(currentTarget.createdByAgentId || currentTarget.createdByUserId)
+                || currentTarget.createdByAgentId === data.addresseeAgentId
+                || currentTarget.updatedByAgentId === data.addresseeAgentId) {
+                throw unprocessable("The review addressee must be independent of the document creator and latest editor");
+              }
+              if (data.payload.target?.type !== "issue_document"
+                || data.payload.target.documentId !== currentTarget.documentId) {
+                throw unprocessable("Named document reviews require a fixed document identity");
+              }
+              // The issue row above serializes concurrent creation. A distinct key
+              // may not silently replace, duplicate or rewrite an active QA request.
+              const [existingReview] = await tx.select({ id: issueThreadInteractions.id })
+                .from(issueThreadInteractions).where(and(
+                  eq(issueThreadInteractions.companyId, issue.companyId),
+                  eq(issueThreadInteractions.issueId, issue.id),
+                  eq(issueThreadInteractions.status, "pending"),
+                  eq(issueThreadInteractions.addresseeAgentId, data.addresseeAgentId!),
+                  namedDocumentReviewCondition(),
+                  sql`${issueThreadInteractions.payload}->'target'->>'documentId' = ${currentTarget.documentId}`,
+                  sql`${issueThreadInteractions.payload}->'target'->>'revisionId' = ${currentTarget.latestRevisionId}`,
+                )).limit(1);
+              if (existingReview) throw conflict("A pending fixed-document review already exists; reuse its original request", {
+                code: "document_review_already_pending", interactionId: existingReview.id,
+              });
+            }
           }
           const [row] = await tx
             .insert(issueThreadInteractions)
@@ -3801,11 +3927,11 @@ export function issueThreadInteractionService(
               kind: data.kind,
               status: "pending",
               continuationPolicy: data.continuationPolicy,
-              requestedResolverPolicy: policy.requestedResolverPolicy,
-              effectiveResolverPolicy: policy.effectiveResolverPolicy,
-              resolverPolicyProvenance: policy.resolverPolicyProvenance,
+              requestedResolverPolicy: creationPolicy.requestedResolverPolicy,
+              effectiveResolverPolicy: creationPolicy.effectiveResolverPolicy,
+              resolverPolicyProvenance: creationPolicy.resolverPolicyProvenance,
               effectiveResolverPolicySource:
-                policy.effectiveResolverPolicySource,
+                creationPolicy.effectiveResolverPolicySource,
               idempotencyKey: data.idempotencyKey ?? null,
               originCommentIds,
               sourceCommentId: data.sourceCommentId ?? null,
@@ -3828,6 +3954,7 @@ export function issueThreadInteractionService(
           // Scoped to the same agent + issue + kind; other actors are untouched.
           const canSupersedeSiblingCards =
             options.supersedePendingSiblingInteractions !== false &&
+            !namedDocumentReview &&
             ((data.kind === "request_confirmation" &&
               data.payload.toolAction === undefined &&
               data.payload.secretProposal === undefined) ||
@@ -3862,6 +3989,7 @@ export function issueThreadInteractionService(
                 eq(issueThreadInteractions.kind, data.kind),
                 eq(issueThreadInteractions.createdByAgentId, actor.agentId),
                 eq(issueThreadInteractions.status, "pending"),
+                sql`NOT ${namedDocumentReviewCondition()}`,
                 ne(issueThreadInteractions.id, row.id),
 
               ),
@@ -3895,6 +4023,9 @@ export function issueThreadInteractionService(
           );
           return { row, supersededRows };
         });
+        if ("replayed" in result && result.replayed) {
+          return hydrateInteraction(result.row);
+        }
         created = result.row;
         superseded = result.supersededRows;
       } catch (error) {
