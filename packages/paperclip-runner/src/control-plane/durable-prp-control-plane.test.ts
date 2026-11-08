@@ -2419,7 +2419,62 @@ describe("DurablePrpControlPlane", () => {
     } finally { await core.stop(); rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("reports an oversized semantic result without exposing its content or redispatching", async () => {
+  it("delivers a bounded explicit error for an oversized read and settles the next call", async () => {
+    const root = mkdtempSync(resolve(tmpdir(), "paperclip-read-result-limit-"));
+    const oversized = { revisions: [{ body: "PRIVATE_READ_CONTENT".repeat(40_000) }] };
+    const handler = vi.fn(async (call: { operationId: string }) => ({
+      result: call.operationId === "list_document_revisions" ? oversized : { saved: true },
+    }));
+    const options = { stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest, onSemanticToolInput: handler };
+    const core = new DurablePrpControlPlane(options);
+    try {
+      await core.start();
+      const client = (await authenticate(core, core.issueBootstrapTicket()))!;
+      const read = semanticInputEvent();
+      ((read.payload as any).payload as any).semantic_tool.operationId = "list_document_revisions";
+      sendSecure(client, read);
+      await vi.waitFor(() => expect(core.store.state.commands).toHaveLength(1));
+      const frames = [await receiveSecure(client), await receiveSecure(client)];
+      const wire = frames.find((frame) => frame?.kind === "command")!.payload as any;
+      const serialized = JSON.stringify(oversized);
+      expect(wire.payload).toMatchObject({
+        callId: "call-1", operationId: "list_document_revisions", isError: true,
+        result: { error: {
+          code: "semantic_read_result_delivery_too_large", retryable: false,
+          originalResultBytes: Buffer.byteLength(serialized),
+          originalResultSha256: createHash("sha256").update(serialized).digest("hex"),
+        } },
+      });
+      expect(JSON.stringify(wire)).not.toContain("PRIVATE_READ_CONTENT");
+      expect(Buffer.byteLength(JSON.stringify(wire))).toBeLessThan(4_096);
+      sendSecure(client, { protocol: "paperclip.runner", version: 1, kind: "command_result", payload: {
+        commandId: wire.commandId, controllerSeq: wire.controllerSeq, commandType: wire.type,
+        status: "completed", result: { status: "delivered", callId: "call-1" },
+      } });
+      await vi.waitFor(() => expect(core.semanticToolResultsSettled()).toBe(true));
+      const write = semanticInputEvent(2, { body: "ordinary follow-up" });
+      const semantic = ((write.payload as any).payload as any).semantic_tool;
+      semantic.operationId = "write_document"; semantic.callId = "call-2";
+      sendSecure(client, write);
+      const next = [await receiveSecure(client), await receiveSecure(client)];
+      const nextWire = next.find((frame) => frame?.kind === "command")!.payload as any;
+      expect(nextWire.payload).toMatchObject({ callId: "call-2", isError: false, result: { saved: true } });
+      sendSecure(client, { protocol: "paperclip.runner", version: 1, kind: "command_result", payload: {
+        commandId: nextWire.commandId, controllerSeq: nextWire.controllerSeq, commandType: nextWire.type,
+        status: "completed", result: { status: "delivered", callId: "call-2" },
+      } });
+      await vi.waitFor(() => expect(core.semanticToolResultsSettled()).toBe(true));
+      expect(handler).toHaveBeenCalledTimes(2);
+      expect(core.semanticToolSettlementDiagnostics()).toMatchObject({ persistenceFailed: false, pending: [], deliveries: [] });
+      const reopened = new DurablePrpControlPlane(options);
+      expect(reopened.semanticToolResultsSettled()).toBe(true);
+      await reopened.stop();
+      expect(handler).toHaveBeenCalledTimes(2);
+      client.socket.destroy();
+    } finally { await core.stop(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["write_document", "uncatalogued_operation"])("retains oversized uncertain results for %s", async (operationId) => {
     const root = mkdtempSync(resolve(tmpdir(), "paperclip-result-limit-"));
     const handler = vi.fn(async () => ({ result: { privateContent: "x".repeat(600_000) } }));
     const core = new DurablePrpControlPlane({ stateDirectory: root, identity,
@@ -2427,10 +2482,12 @@ describe("DurablePrpControlPlane", () => {
     try {
       await core.start();
       const client = (await authenticate(core, core.issueBootstrapTicket()))!;
-      sendSecure(client, semanticInputEvent());
+      const event = semanticInputEvent();
+      ((event.payload as any).payload as any).semantic_tool.operationId = operationId;
+      sendSecure(client, event);
       await vi.waitFor(() => expect(core.semanticToolSettlementDiagnostics()).toMatchObject({
         persistenceFailed: true,
-        failures: [{ callId: "call-1", operationId: "get_task_context", stage: "persist_result", code: "command_payload_too_large" }],
+        failures: [{ callId: "call-1", operationId, stage: "persist_result", code: "command_payload_too_large" }],
       }));
       expect(core.store.state.commands).toEqual([]);
       expect(core.semanticToolResultsSettled()).toBe(false);

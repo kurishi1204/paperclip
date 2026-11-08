@@ -28,6 +28,8 @@ import { dirname, resolve } from "node:path";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 
+import { capabilitySemanticTool } from "../tools/capability-semantic-tool-catalog.js";
+
 import { NativeSessionProtocolIntegrityError } from "../contracts/native-session-backend.js";
 import { ACPX_CREDENTIAL_BINDING_ENV, ACPX_CREDENTIAL_NAMES, CLAUDE_ROUTING_ENV_KEYS } from "../drivers/acpx/environment.js";
 import { githubCredentialEnvironment } from "../github-credential-environment.js";
@@ -3298,21 +3300,44 @@ export class DurablePrpControlPlane {
           this.disconnectActiveRunner();
         };
         const queueResult = (result: unknown, isError: boolean): void => {
-          try {
-            // Retain the full input once in its canonical event. Copying a
-            // large write into its result command can exceed the wire bound
-            // after the write has already committed. Bind it by exact digest.
-            const { input, ...metadata } = call;
+          // Keep one canonical input and its exact result correlation. An
+          // oversized read is a delivery failure, not an unknown mutation.
+          const { input, ...metadata } = call;
+          const enqueue = (value: unknown, failed: boolean): void => {
             this.queueCommand(
               "semantic_tool.result",
-              { ...metadata, inputDigest: canonicalDigest(input), result, isError },
+              { ...metadata, inputDigest: canonicalDigest(input), result: value, isError: failed },
               commandId,
               true,
             );
+          };
+          try {
+            enqueue(result, isError);
           } catch (error) {
-            // A result that cannot fit the bounded durable journal cannot be
-            // acknowledged as a usable tool response. Force a reconnect so
-            // the caller can recover or terminate the run explicitly.
+            if (
+              error instanceof CommandJournalLimitError &&
+              error.code === "command_payload_too_large" &&
+              capabilitySemanticTool(call.operationId)?.sideEffectClass === "read"
+            ) {
+              // queueCommand rejects this bound before appending or sending.
+              // Do not repeat the read, expose its contents, or claim that its
+              // response was delivered. Keep writes and unknown operations on
+              // the original fail-closed outcome-reconciliation path.
+              try {
+                const serialized = JSON.stringify(result);
+                enqueue({ error: {
+                  code: "semantic_read_result_delivery_too_large",
+                  retryable: false,
+                  message: "This read response exceeds the bounded tool transport and was not delivered. Use a narrower read or the existing paginated/artifact API. This read performed no mutation.",
+                  originalResultBytes: Buffer.byteLength(serialized),
+                  originalResultSha256: createHash("sha256").update(serialized).digest("hex"),
+                } }, true);
+                return;
+              } catch (deliveryError) {
+                recordFailure("persist_result", deliveryError);
+                return;
+              }
+            }
             recordFailure("persist_result", error);
           }
         };
