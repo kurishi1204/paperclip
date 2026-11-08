@@ -2251,6 +2251,13 @@ export class PaperclipRunnerToolAuthority {
             interactionStatus: interaction.status,
             continuationPolicy: interaction.continuationPolicy,
             source: "paperclip_runner_protocol",
+            ...(addresseeAgentId !== null ? {
+              documentReviewWakeIntent: {
+                schema: "paperclip.named-document-review-wake/v1",
+                interactionId: interaction.id,
+                reviewerAgentId: interaction.addresseeAgentId,
+              },
+            } : {}),
           },
         });
         publication = activity.publication;

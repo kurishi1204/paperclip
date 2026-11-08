@@ -1,5 +1,6 @@
 import express from "express";
 import * as documentsModule from "../services/documents.js";
+import * as reviewWakeModule from "../services/named-document-review-wake.js";
 import {commitNativeStatusDecision,NativeStatusRaceError} from "../services/native-runtime/status-decision-committer.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import request from "supertest";
@@ -13,7 +14,7 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, companies, createDb, documents, documentRevisions,
-  heartbeatRuns, issueDocuments, issueThreadInteractions, issues, authUsers, companyMemberships,
+  heartbeatRuns, issueDocuments, issueThreadInteractions, issues, authUsers, companyMemberships, activityLog,
   completionContracts,nativeRunResults,workAssessments,nativeRunFinalizations,statusDecisions,statusDecisionEffects } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
@@ -611,6 +612,77 @@ suite("pending independent document review through real dispatch", () => {
         binding: { documentId: x.documentId, revisionId: x.revisionId } } } });
     const [task] = await db.select().from(issues).where(eq(issues.id, x.issueId));
     expect(task.assigneeAgentId).toBe(x.ownerId);
+  });
+  async function interruptedDedicatedReview() {
+    const x = await seed();
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, x.runId));
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, x.wakeupRequestId));
+    await db.delete(issueThreadInteractions).where(eq(issueThreadInteractions.id, x.interactionId));
+    const creatorRunId = randomUUID(), key = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: creatorRunId, companyId: x.companyId, agentId: x.ownerId,
+      status: "running", runtimeMode: "native", nativeIssueId: x.issueId, contextSnapshot: { issueId: x.issueId } });
+    await db.update(issues).set({ executionRunId: creatorRunId }).where(eq(issues.id, x.issueId));
+    heartbeat = heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } });
+    const authority = new PaperclipRunnerToolAuthority(db, { companyId: x.companyId,
+      issueId: x.issueId, runId: creatorRunId, agentId: x.ownerId,
+      enqueueWakeup: (agentId, options) => heartbeat!.wakeup(agentId, options) });
+    const interrupted = vi.spyOn(reviewWakeModule, "ensureNamedDocumentReviewWake")
+      .mockRejectedValueOnce(new Error("synthetic process loss after card commit"));
+    try {
+      await expect(authority.execute({ tool: "request_human_input", callId: randomUUID(),
+        arguments: { idempotencyKey: key, interactionKind: "confirmation", title: "Durable review",
+          prompt: "Review this fixed synthetic document.", addresseeAgentId: x.reviewerId,
+          continuationPolicy: "wake_assignee", payload: { target: x.target } } }))
+        .rejects.toThrow("synthetic process loss");
+    } finally { interrupted.mockRestore(); }
+    const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, x.issueId));
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, creatorRunId));
+    expect((source.resultJson as any).semanticToolReceipts[key].result.interaction.id).toBe(card.id);
+    const [intent] = await db.select().from(activityLog).where(eq(activityLog.runId, creatorRunId));
+    expect(intent.details).toMatchObject({ documentReviewWakeIntent: {
+      schema: "paperclip.named-document-review-wake/v1", interactionId: card.id,
+      reviewerAgentId: x.reviewerId } });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, x.companyId))).toHaveLength(0);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, creatorRunId));
+    const release = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, {
+        resolveResponsibleUserId: async () => "owner",
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+        resolveSessionBeforeForWakeup: async () => null,
+      }),
+      recovery: { escalateStrandedAssignedIssue: async () => {},
+        escalateStrandedRecoveryIssueInPlace: async () => {} },
+    });
+    await release({ companyId: x.companyId, runId: creatorRunId, now: new Date(), suppressImmediateRecovery: true });
+    // A new service instance reads durable database state, not an in-memory task.
+    heartbeat = heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } });
+    return { ...x, cardId: card.id };
+  }
+  it("recovers the committed review intent after process loss without another tool call", async () => {
+    const x = await interruptedDedicatedReview();
+    await Promise.all([heartbeat!.resumeQueuedRuns(), heartbeat!.resumeQueuedRuns()]);
+    await heartbeat!.drainActiveRunExecutions();
+    expect(mockAdapterExecute).toHaveBeenCalledOnce();
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey,
+      `interaction-pending:${x.cardId}`));
+    expect(wakes).toHaveLength(1);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wakes[0].runId!));
+    expect(run).toMatchObject({ status: "succeeded", runnerProfileJson: {
+      pendingDocumentReviewAdmission: { interactionId: x.cardId,
+        binding: { documentId: x.documentId, revisionId: x.revisionId } } } });
+    await heartbeat!.resumeQueuedRuns(); await heartbeat!.drainActiveRunExecutions();
+    expect(mockAdapterExecute).toHaveBeenCalledOnce();
+  });
+  it.each(["failed", "claimed"] as const)("does not resend a saved %s wake while reconciling a review intent", async status => {
+    const x = await interruptedDedicatedReview();
+    const [saved] = await db.insert(agentWakeupRequests).values({ companyId: x.companyId,
+      agentId: x.reviewerId, source: "automation", reason: "interaction_pending", status,
+      requestedByActorType: "agent", requestedByActorId: x.ownerId,
+      idempotencyKey: `interaction-pending:${x.cardId}`,
+      payload: { issueId: x.issueId, interactionId: x.cardId, interactionKind: "request_confirmation" } }).returning();
+    await heartbeat!.resumeQueuedRuns(); await heartbeat!.drainActiveRunExecutions();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, x.companyId))).toEqual([saved]);
   });
   it("creates the normal review wake, claims its execution lock, and reaches the adapter", async () => {
     const x=await seed();

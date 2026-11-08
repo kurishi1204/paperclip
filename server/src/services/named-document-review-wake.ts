@@ -2,6 +2,7 @@ import { and, eq } from "drizzle-orm";
 import { WAKEUP_REQUEST_STATUSES } from "@paperclipai/shared";
 import { agentWakeupRequests, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { parseObject } from "../adapters/utils.js";
+import { isCurrentPendingDocumentReviewWake } from "./pending-document-review-wake.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
 
 type Enqueue = (agentId: string, options: {
@@ -42,6 +43,10 @@ export async function ensureNamedDocumentReviewWake(db: Db, binding: {
     });
     let wake = await receipt();
     if (!wake) {
+      if (!await isCurrentPendingDocumentReviewWake(db, {
+        companyId: binding.companyId, issueId: binding.issueId,
+        agentId: card.addresseeAgentId, contextSnapshot: { interactionId: card.id },
+      })) throw new Error("paperclip_runner_document_review_wake_target_changed");
       await enqueue(card.addresseeAgentId, {
         source: "automation", triggerDetail: "system", reason: "interaction_pending",
         payload: { issueId: card.issueId, interactionId: card.id, interactionKind: card.kind,

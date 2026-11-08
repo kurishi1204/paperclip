@@ -9,3 +9,5 @@ The scenario simulator does not implement live employee review dispatch. It retu
 Qualification keeps old failed attempts, tests the actual saved addressee against the old authority, and exercises the real isolated database/HTTP fixture. Production acceptance still requires same-head independent review, normal CI/build and an actual existing-employee fixed-version QA handoff; local checks alone do not complete it.
 
 The dedicated tool uses the existing server scheduler after commit, with the canonical interaction-pending receipt. Same-key requests are rechecked under the issue lock. Native review creation shares its actor-state lock so concurrent reviewers do not take conflicting exclusive actor locks.
+
+The existing created-activity record also stores a server-owned wake intent in the same transaction as the card and semantic receipt. The normal scheduler reconciles undelivered intents after restart. Any existing queue receipt, including an unresolved failure, prevents re-enqueue; current document admission and the normal issue lock remain authoritative. Delivery failures are returned after unrelated queued work proceeds.
