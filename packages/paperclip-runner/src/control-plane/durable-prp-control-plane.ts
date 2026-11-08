@@ -602,7 +602,10 @@ function unsettledSemanticInput(
       command.result.status !== "completed" ||
       command.result.commandId !== commandId ||
       command.result.controllerSeq !== command.controllerSeq ||
-      command.result.commandType !== command.type
+      command.result.commandType !== command.type ||
+      !isRecord(command.result.result) ||
+      command.result.result.status !== "delivered" ||
+      command.result.result.callId !== semantic.callId
     )
       return true;
     return (

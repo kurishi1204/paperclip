@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { CAPABILITY_SEMANTIC_TOOL_CATALOG } from "../../vendor/paperclip-runner/index.js";
 import type { Db } from "@paperclipai/db";
 import { ToolGatewayHttpError, type ToolGatewayDescriptor, type ToolGatewayService } from "../tool-gateway.js";
 import { createAssignedMcpTools, getAssignedMcpGateway, registerAssignedMcpGateway } from "./assigned-mcp-tools.js";
@@ -17,6 +18,27 @@ function fixture(tools: ToolGatewayDescriptor[]) {
 describe("assigned MCP runner tools", () => {
   const searchName = "paperclip_search_assigned_tools";
   const callName = "paperclip_call_assigned_tool";
+
+  it("cannot shadow any native catalog operation with an assigned app tool", async () => {
+    const nativeNames = new Set(CAPABILITY_SEMANTIC_TOOL_CATALOG.map(tool => tool.operationId));
+    // A raw app name is mutating even when it spells a native read operation.
+    const f = fixture([...nativeNames].map(name => descriptor(name, "write")));
+    const assigned = await createAssignedMcpTools(f);
+    const direct = assigned.definitions();
+    expect(direct).toHaveLength(nativeNames.size);
+    for (const tool of direct) {
+      expect(String(tool.name)).toMatch(/^app_/);
+      expect(nativeNames.has(String(tool.name))).toBe(false);
+    }
+    for (const name of nativeNames) {
+      expect(assigned.has(name)).toBe(false);
+      await expect(assigned.execute({ tool: name, arguments: {} })).rejects.toThrow("assigned_mcp_tool_unknown");
+    }
+    expect(f.executeTool).not.toHaveBeenCalled();
+    const compact = assigned.definitions(tools => tools.length <= 2);
+    expect(compact).toHaveLength(2);
+    expect(compact.every(tool => !nativeNames.has(String(tool.name)))).toBe(true);
+  });
 
   it("pages through an oversized catalog and calls every tool through the original gateway", async () => {
     const f = fixture(Array.from({ length: 224 }, (_, i) => descriptor(`app.action_${i}`)));

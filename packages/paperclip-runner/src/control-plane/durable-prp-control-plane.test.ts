@@ -1536,7 +1536,7 @@ describe("DurablePrpControlPlane", () => {
             controllerSeq: 1,
             commandType: "semantic_tool.result",
             status: "completed",
-            result: {},
+            result: { status: "delivered", callId: "call-1" },
           },
         });
         expect(core.semanticToolResultsSettled()).toBe(true);
@@ -2474,7 +2474,36 @@ describe("DurablePrpControlPlane", () => {
     } finally { await core.stop(); rmSync(root, { recursive: true, force: true }); }
   });
 
-  it.each(["write_document", "uncatalogued_operation"])("retains oversized uncertain results for %s", async (operationId) => {
+  it.each([
+    {},
+    { status: "queued", callId: "call-1" },
+    { status: "delivered", callId: "another-call" },
+  ])("keeps a completed command unsettled without its exact delivery receipt (%j)", async (receipt) => {
+    const root = mkdtempSync(resolve(tmpdir(), "paperclip-result-delivery-receipt-"));
+    const handler = vi.fn(async () => ({ result: { safe: true } }));
+    const options = { stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest, onSemanticToolInput: handler };
+    const core = new DurablePrpControlPlane(options);
+    try {
+      await core.start();
+      const client = (await authenticate(core, core.issueBootstrapTicket()))!;
+      sendSecure(client, semanticInputEvent());
+      const frames = [await receiveSecure(client), await receiveSecure(client)];
+      const wire = frames.find((frame) => frame?.kind === "command")!.payload as any;
+      sendSecure(client, { protocol: "paperclip.runner", version: 1, kind: "command_result", payload: {
+        commandId: wire.commandId, controllerSeq: wire.controllerSeq, commandType: wire.type,
+        status: "completed", result: receipt,
+      } });
+      await vi.waitFor(() => expect(core.store.state.commands[0]?.status).toBe("completed"));
+      expect(core.semanticToolResultsSettled()).toBe(false);
+      const reopened = new DurablePrpControlPlane(options);
+      expect(reopened.semanticToolResultsSettled()).toBe(false);
+      await reopened.stop();
+      expect(handler).toHaveBeenCalledOnce();
+      client.socket.destroy();
+    } finally { await core.stop(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["write_document", "paperclip_call_assigned_tool", "app_list_document_revisions_fixture", "uncatalogued_operation"])("retains oversized uncertain results for %s", async (operationId) => {
     const root = mkdtempSync(resolve(tmpdir(), "paperclip-result-limit-"));
     const handler = vi.fn(async () => ({ result: { privateContent: "x".repeat(600_000) } }));
     const core = new DurablePrpControlPlane({ stateDirectory: root, identity,
