@@ -7,8 +7,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { normalizeAcpxPermission } from "../drivers/acpx/acp-permission-adapter.js";
 import { ACPX_CAPABILITY_PROFILES } from "../drivers/acpx/capability-profiles.js";
 import { resolveQualifiedAcpxProfile } from "../drivers/acpx/qualified-profiles.js";
-import { ACPX_SIDECAR_PROTOCOL_VERSION, stringifyAcpxSidecarFrame } from "../drivers/acpx/sidecar-protocol.js";
+import { ACPX_SIDECAR_PROTOCOL_VERSION, boundedSidecarValue, encodeAcpxToolInput, stringifyAcpxSidecarFrame } from "../drivers/acpx/sidecar-protocol.js";
 import { canonicalProviderEventsFromAcpxRuntimeEvent } from "../provider-events.js";
+import { startRunnerToolBridge } from "../drivers/runner-tool-bridge.js";
 import {
   awaitSidecarCleanupWithin,
   closeActiveSidecarHostWithin,
@@ -57,6 +58,71 @@ describe("qualified ACPX runtime sidecar", () => {
     await expect(pending).resolves.toEqual({ outcome: "cancel" });
     expect(permissions.size).toBe(0);
   });
+  it("forwards a large write exactly and rejects invalid input before dispatch", async () => {
+    const tools = new Map<string, unknown>();
+    const emitted: Array<{ input?: unknown }> = [];
+    const wait = loadWaitForTool({ tools, emitted });
+    const args = { body: "合成の文書。".repeat(6000), key: "synthetic", idempotencyKey: "fixed-id" };
+    const abort = new AbortController();
+    const pending = wait({ callId: "large-write", tool: "write_document", arguments: args, signal: abort.signal });
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]!.input).toEqual(args);
+    expect(JSON.stringify(emitted[0]!.input)).toBe(JSON.stringify(args));
+    abort.abort();
+    await expect(pending).rejects.toThrow("cancelled");
+    expect(tools.size).toBe(0);
+    emitted.length = 0;
+    for (const argumentsValue of [{ body: "x".repeat(480 * 1024) }, { body: "\ud800" }]) {
+      await expect(wait({ callId: "rejected-write", tool: "write_document", arguments: argumentsValue, signal: new AbortController().signal })).rejects.toThrow();
+      expect(emitted).toHaveLength(0);
+      expect(tools.size).toBe(0);
+    }
+  });
+
+  it("does not strand an ordinary call when its frame is rejected", async () => {
+    const tools = new Map<string, unknown>();
+    const emitted: unknown[] = [];
+    await expect(loadWaitForTool({ tools, emitted, rejectEmission: true })({
+      callId: "rejected-frame", tool: "write_document", arguments: { body: "synthetic" }, signal: new AbortController().signal,
+    })).rejects.toThrow("sidecar frame limit");
+    expect(tools.size).toBe(0);
+    expect(emitted).toHaveLength(1);
+  });
+
+  it("delivers a large document through the real HTTP tool bridge without omission", async () => {
+    const tools = new Map<string, unknown>();
+    const emitted: Array<{ input: unknown }> = [];
+    const args = { key: "synthetic-document", body: "合成の保存本文。".repeat(6000), idempotencyKey: "synthetic-once" };
+    const wait = loadWaitForTool({ tools, emitted });
+    const bridge = await startRunnerToolBridge({
+      tools: [{ name: "write_document", inputSchema: {
+        type: "object", required: ["key", "body", "idempotencyKey"],
+        properties: { key: { type: "string" }, body: { type: "string" }, idempotencyKey: { type: "string" } },
+      } }],
+      handler: wait,
+    });
+    try {
+      const response = fetch(bridge.url, { method: "POST",
+        headers: { Authorization: "Bearer " + bridge.secret, "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call",
+          params: { name: "write_document", arguments: args } }),
+      });
+      await vi.waitFor(() => expect(tools.size).toBe(1));
+      expect(emitted).toHaveLength(1);
+      expect(JSON.stringify(emitted[0]!.input)).toBe(JSON.stringify(args));
+      const pending = tools.get("7") as { cleanup(): void; settle(value: unknown): void };
+      tools.delete("7"); pending.cleanup(); pending.settle({ saved: true });
+      const received = await response;
+      expect(received.status).toBe(200);
+      const rpc = await received.json();
+      expect(rpc.error).toBeUndefined();
+      expect(rpc.result).toBeDefined();
+      expect(tools.size).toBe(0);
+    } finally {
+      await bridge.close();
+    }
+  });
+
   it("preserves ACP input presence through the bounded sidecar handoff", () => {
     const source = readFileSync(
       fileURLToPath(new URL("./acpx-runtime-sidecar.ts", import.meta.url)),
@@ -716,7 +782,8 @@ class SidecarProcess {
 function loadWaitForTool(input: {
   tools: Map<string, unknown>;
   emitted: unknown[];
-}): (call: { callId: string; tool: string; arguments: Record<string, unknown>; signal: AbortSignal }) => Promise<unknown> {
+  rejectEmission?: boolean;
+}): (call: { callId: string; tool: string; arguments: unknown; signal: AbortSignal }) => Promise<unknown> {
   const source = readFileSync(
     fileURLToPath(new URL("./acpx-runtime-sidecar.ts", import.meta.url)),
     "utf8",
@@ -732,23 +799,24 @@ function loadWaitForTool(input: {
     );
   const factory = new Function(
     "boundedIdentity", "tools", "turnId", "emit", "PRP_COMPLETION_TOOL_NAME",
-    "PRP_BLOCK_TOOL_NAME", "validatePrpStructuredRunResult", "boundedSidecarValue", "record", "MAX_PENDING_TOOLS", "stringifyAcpxSidecarFrame",
+    "PRP_BLOCK_TOOL_NAME", "validatePrpStructuredRunResult", "boundedSidecarValue", "record", "MAX_PENDING_TOOLS", "stringifyAcpxSidecarFrame", "encodeAcpxToolInput",
     `return (${functionSource});`,
   );
   return factory(
     (value: string) => value,
     input.tools,
     "test-turn",
-    (_eventType: string, payload: unknown) => input.emitted.push(payload),
+    (_eventType: string, payload: unknown) => { input.emitted.push(payload); return input.rejectEmission !== true; },
     "paperclip_finish",
     "paperclip_block",
     (argumentsValue: unknown) => ({
       ok: true,
       result: argumentsValue,
     }),
-    (value: unknown) => value,
+    boundedSidecarValue,
     (value: unknown) => value,
     512,
     stringifyAcpxSidecarFrame,
+    encodeAcpxToolInput,
   );
 }
