@@ -183,6 +183,58 @@ fn runtime_context_session_identity(context: &Value) -> Option<Value> {
     Some(identity)
 }
 
+// A registered file copy may move between authenticated runs without changing
+// the immutable instructions it contains. Comparison tokens never leave this
+// function and cannot occur in admitted instruction text (which rejects NUL).
+fn immutable_run_copy_identity(descriptor: &AcpxProviderDescriptor) -> Option<(Value, String)> {
+    let context = runtime_context_session_identity(&descriptor.runtime_context)?;
+    let mut roots = Vec::<(String, String)>::new();
+    for pointer in [
+        "/instructions/bundle/rootPath",
+        "/instructions/workingCopy/rootPath",
+    ] {
+        if let Some(value) = descriptor.runtime_context.pointer(pointer) {
+            roots.push((value.as_str()?.to_owned(), pointer.to_owned()));
+        }
+    }
+    if let Some(skills) = descriptor
+        .runtime_context
+        .get("skills")
+        .and_then(Value::as_array)
+    {
+        for (index, skill) in skills.iter().enumerate() {
+            if let Some(value) = skill.pointer("/bundle/rootPath") {
+                roots.push((
+                    value.as_str()?.to_owned(),
+                    format!("/skills/{index}/bundle/rootPath"),
+                ));
+            }
+        }
+    }
+    for (root, _) in &roots {
+        if !Path::new(root).is_absolute()
+            || root.contains('\0')
+            || root
+                .split('/')
+                .skip(1)
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return None;
+        }
+    }
+    // Replace a child root before its parent. Equal roots with different roles
+    // are ambiguous, so keep them fail-closed.
+    roots.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.1.cmp(&b.1)));
+    if roots.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return None;
+    }
+    let mut instructions = descriptor.instructions.clone();
+    for (root, role) in roots {
+        instructions = instructions.replace(&root, &format!("\0registered-copy:{role}\0"));
+    }
+    Some((context, instructions))
+}
+
 impl AcpxProviderDescriptor {
     fn validate_session(
         &self,
@@ -1071,6 +1123,26 @@ impl AcpxCommandExecutor {
                     "ACPX run.attach changed runtime context outside a new authenticated run",
                 ));
             }
+            durable_descriptor.instructions = previous_descriptor.instructions.clone();
+            durable_descriptor.runtime_context = previous_descriptor.runtime_context.clone();
+        }
+        if run_attachment_policy(&descriptor.agent) == RunAttachmentPolicy::ImmutableInstructions {
+            let current = immutable_run_copy_identity(&durable_descriptor);
+            let previous = immutable_run_copy_identity(&previous_descriptor);
+            let same_profile = current
+                .zip(previous)
+                .is_some_and(|(current, previous)| current == previous);
+            let copies_changed = durable_descriptor.instructions
+                != previous_descriptor.instructions
+                || durable_descriptor.runtime_context != previous_descriptor.runtime_context;
+            if !same_profile || (copies_changed && descriptor.run_id == state.descriptor.run_id) {
+                return Err(DurableRunnerError::invalid(
+                    "ACPX run.attach changed the immutable instruction profile",
+                ));
+            }
+            // The original unmodified descriptor is stored after admission.
+            // This affects identity comparison only, never provider policy,
+            // the model, current file grants, or instruction contents.
             durable_descriptor.instructions = previous_descriptor.instructions.clone();
             durable_descriptor.runtime_context = previous_descriptor.runtime_context.clone();
         }
@@ -2976,9 +3048,10 @@ mod tests {
             args: Vec::new(),
             artifacts: vec![artifact(&command)],
         };
-        let mut descriptor_value = descriptor("codex");
+        let mut descriptor_value = descriptor("claude");
         descriptor_value["sidecarCommand"] = json!(command);
-        descriptor_value["runtimeContext"] = json!({ "instructions": { "digest": "stable" }, "mcp": { "digest": "before" }, "aggregateDigest": "before" });
+        descriptor_value["runtimeContext"] = json!({ "instructions": { "digest": "stable", "bundle": {"rootPath":"/private/bundle-run-1"}, "workingCopy":{"rootPath":"/private/copy-run-1","entryPath":"AGENTS.md","kind":"agent_files"}}, "mcp": { "digest": "before" }, "aggregateDigest": "before" });
+        descriptor_value["instructions"] = json!("Use the unchanged instructions. AGENT_HOME is /private/copy-run-1. Read-only bundle: /private/bundle-run-1.");
         descriptor_value["sidecarArgs"] = json!([]);
         descriptor_value["runtimeDirectory"] = json!(runtime);
         descriptor_value["cwd"] = json!(workspace);
@@ -3098,10 +3171,51 @@ mod tests {
             .contains("requires run.attach before commands from a new run"));
 
         descriptor_value["runId"] = json!("run-2");
+        // A real task continuation rebuilds the same authenticated files in a
+        // new run directory. Their location is not a new instruction profile.
+        descriptor_value["runtimeContext"]["instructions"]["bundle"]["rootPath"] =
+            json!("/private/bundle-run-2");
+        descriptor_value["runtimeContext"]["instructions"]["workingCopy"]["rootPath"] =
+            json!("/private/copy-run-2");
+        descriptor_value["instructions"] = json!("Use the unchanged instructions. AGENT_HOME is /private/copy-run-2. Read-only bundle: /private/bundle-run-2.");
+        let mut same_run_copy_change = descriptor_value.clone();
+        same_run_copy_change["runId"] = json!("run-1");
+        assert!(original
+            .attach_run(&json!({"provider": same_run_copy_change}))
+            .is_err());
+        let mut invalid_copy = descriptor_value.clone();
+        invalid_copy["runtimeContext"]["instructions"]["workingCopy"]["rootPath"] = json!("/");
+        assert!(attached
+            .attach_run(&json!({"provider": invalid_copy}))
+            .is_err());
+        let mut unknown_policy = descriptor_value.clone();
+        unknown_policy["runtimeContext"]["newPolicy"] = json!(true);
+        assert!(attached
+            .attach_run(&json!({"provider": unknown_policy}))
+            .is_err());
         attached
             .attach_run(&json!({"provider": descriptor_value}))
             .unwrap();
         assert_eq!(attached.state.as_ref().unwrap().descriptor.run_id, "run-2");
+        assert_eq!(
+            attached.state.as_ref().unwrap().descriptor.runtime_context["instructions"]
+                ["workingCopy"]["rootPath"],
+            "/private/copy-run-2"
+        );
+        assert!(attached
+            .state
+            .as_ref()
+            .unwrap()
+            .descriptor
+            .instructions
+            .contains("/private/copy-run-2"));
+        assert!(!attached
+            .state
+            .as_ref()
+            .unwrap()
+            .descriptor
+            .instructions
+            .contains('\0'));
         assert!(!marker.exists());
 
         // In-place warm handoff executes under the old authority. Only the
