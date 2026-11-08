@@ -40,8 +40,10 @@ describe("dedicated fixed-document reviewer handoff", () => {
   it("preserves the human-only company cap without forwarding a weaker resolver policy", async () => {
     const { f, reviewerId, call } = await seed();
     await server.db.update(companies).set({ interactionResolverGovernance: { request_confirmation: { defaultPolicy: "human_only", cap: "human_only" } } }).where(eq(companies.id, f.companyId));
-    const result = await call() as any;
-    expect(result.interaction).toMatchObject({ addresseeAgentId: reviewerId, requestedResolverPolicy: "human_only", effectiveResolverPolicy: "human_only" });
+    await expect(call()).rejects.toThrow("human-only");
+    expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId))).toHaveLength(0);
+    const [company] = await server.db.select().from(companies).where(eq(companies.id, f.companyId));
+    expect(company.interactionResolverGovernance).toEqual({ request_confirmation: { defaultPolicy: "human_only", cap: "human_only" } });
   });
   it("does not turn an ordinary human question into an employee request", async () => {
     const { f, args, call } = await seed();
@@ -66,6 +68,46 @@ describe("dedicated fixed-document reviewer handoff", () => {
     const { f, call } = await seed("ask");
     await expect(call()).rejects.toThrow("document_review_requires_fixed_confirmation");
     expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId))).toHaveLength(0);
+  });
+  it("rejects the document creator or latest editor before creating a review", async () => {
+    for (const creator of [true, false]) {
+      const { f, reviewerId, doc, args, call } = await seed();
+      const key = creator ? "reviewer-owned" : "notes";
+      await documentService(server.db).upsertIssueDocument({ issueId: f.issueId, key,
+        title: "Reviewer authored notes", format: "markdown", body: "Synthetic reviewer-authored content.",
+        baseRevisionId: creator ? null : doc.latestRevisionId, changeSummary: null,
+        createdByAgentId: reviewerId, createdByRunId: null });
+      const current = (await documentService(server.db).getIssueDocumentByKey(f.issueId, key))!;
+      await expect(call({ ...args, payload: { target: { ...args.payload.target, key,
+        documentId: current.id, revisionId: current.latestRevisionId } } })).rejects.toThrow("independent of the document");
+      expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId))).toHaveLength(0);
+    }
+  });
+  it("allows one pending reviewer binding under concurrent different retry keys", async () => {
+    const { f, args, call } = await seed();
+    const results = await Promise.allSettled([call(), call({ ...args, idempotencyKey: randomUUID() })]);
+    expect(results.filter(r => r.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter(r => r.status === "rejected")).toHaveLength(1);
+    expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId))).toHaveLength(1);
+  });
+  it("isolates document QA from unrelated human confirmations and the sweeper", async () => {
+    const { f, args, call } = await seed();
+    const named = await call() as any;
+    const humanArgs = { ...args, addresseeAgentId: null, idempotencyKey: randomUUID(),
+      title: "Unrelated human confirmation", payload: { target: { type: "custom", key: "ordinary-human-question" } } };
+    const oldHuman = await call(humanArgs) as any;
+    const human = await call({ ...humanArgs, idempotencyKey: randomUUID(), title: "Updated human confirmation" }) as any;
+    await documentService(server.db).upsertIssueDocument({ issueId: f.issueId, key: "next-notes", title: "Next notes", format: "markdown", body: "Another independent synthetic document.", baseRevisionId: null, changeSummary: null, createdByAgentId: f.agentId, createdByRunId: f.runId });
+    const doc = (await documentService(server.db).getIssueDocumentByKey(f.issueId, "next-notes"))!;
+    const otherNamed = await call({ ...args, idempotencyKey: randomUUID(), payload: { target: { ...args.payload.target, key: doc.key, documentId: doc.id, revisionId: doc.latestRevisionId } } }) as any;
+    const { issueThreadInteractionService } = await import("../issue-thread-interactions.js");
+    await issueThreadInteractionService(server.db).sweepSupersededPendingRequestConfirmations();
+    const rows = await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId));
+    const status = (id: string) => rows.find(r => r.id === id)?.status;
+    expect(status(named.interaction.id)).toBe("pending");
+    expect(status(otherNamed.interaction.id)).toBe("pending");
+    expect(status(human.interaction.id)).toBe("pending");
+    expect(status(oldHuman.interaction.id)).toBe("expired");
   });
   it("keeps creation and decision escape hatches closed", () => {
     expect(runnerApiMutationRestriction("/api/issues/{id}/interactions")).not.toBeNull();
