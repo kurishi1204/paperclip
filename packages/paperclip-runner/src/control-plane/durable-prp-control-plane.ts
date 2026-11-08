@@ -604,7 +604,7 @@ function unsettledSemanticInput(
       command.result.controllerSeq !== command.controllerSeq ||
       command.result.commandType !== command.type ||
       !isRecord(command.result.result) ||
-      command.result.result.status !== "delivered" ||
+      !["delivered", "settled_after_turn", "duplicate"].includes(String(command.result.result.status)) ||
       command.result.result.callId !== semantic.callId
     )
       return true;
@@ -1645,7 +1645,7 @@ export class DurablePrpControlPlane {
     ).length;
   }
 
-  /** A reusable close requires every admitted callback's exact durable result. */
+  /** A reusable close requires every admitted callback's exact durable settlement receipt. */
   semanticToolResultsSettled(): boolean {
     return (
       !this.#semanticResultPersistenceFailed &&
@@ -1680,6 +1680,18 @@ export class DurablePrpControlPlane {
           inputDigest: canonicalDigest(tool.input),
         };
       }),
+      // Journal settlement is distinct from delivery to a live model turn.
+      // The real Codex backend persists after-turn results and exact duplicate
+      // results without delivering them again. Neither permits effect replay.
+      settledWithoutLiveDelivery: this.#store.state.commands
+        .filter((command) => command.type === "semantic_tool.result" && command.status === "completed"
+          && isRecord(command.result) && isRecord(command.result.result)
+          && ["settled_after_turn", "duplicate"].includes(String(command.result.result.status))
+          && command.result.result.callId === command.payload.callId)
+        .map((command) => ({
+          commandId:command.commandId,callId:command.payload.callId,operationId:command.payload.operationId,
+          status:(command.result!.result as Record<string,unknown>).status,providerDeliveryConfirmed:false,
+        })),
       deliveries: this.#store.state.commands
         .filter((command) => command.type === "semantic_tool.result" && command.status !== "completed")
         .map((command) => ({

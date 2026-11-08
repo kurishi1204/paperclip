@@ -2478,7 +2478,9 @@ describe("DurablePrpControlPlane", () => {
     {},
     { status: "queued", callId: "call-1" },
     { status: "delivered", callId: "another-call" },
-  ])("keeps a completed command unsettled without its exact delivery receipt (%j)", async (receipt) => {
+    { status: "settled_after_turn", callId: "another-call" },
+    { status: "duplicate", callId: "another-call" },
+  ])("keeps a completed command unsettled without its exact terminal receipt (%j)", async (receipt) => {
     const root = mkdtempSync(resolve(tmpdir(), "paperclip-result-delivery-receipt-"));
     const handler = vi.fn(async () => ({ result: { safe: true } }));
     const options = { stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest, onSemanticToolInput: handler };
@@ -2497,6 +2499,32 @@ describe("DurablePrpControlPlane", () => {
       expect(core.semanticToolResultsSettled()).toBe(false);
       const reopened = new DurablePrpControlPlane(options);
       expect(reopened.semanticToolResultsSettled()).toBe(false);
+      await reopened.stop();
+      expect(handler).toHaveBeenCalledOnce();
+      client.socket.destroy();
+    } finally { await core.stop(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["settled_after_turn","duplicate"] as const)("accepts exact provider journal settlement without claiming live delivery (%s)", async (status) => {
+    const root = mkdtempSync(resolve(tmpdir(), "paperclip-result-terminal-receipt-"));
+    const handler = vi.fn(async () => ({ result: { safe: true } }));
+    const options = { stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest, onSemanticToolInput: handler };
+    const core = new DurablePrpControlPlane(options);
+    try {
+      await core.start();
+      const client = (await authenticate(core, core.issueBootstrapTicket()))!;
+      sendSecure(client, semanticInputEvent());
+      const frames = [await receiveSecure(client), await receiveSecure(client)];
+      const wire = frames.find((frame) => frame?.kind === "command")!.payload as any;
+      sendSecure(client, { protocol: "paperclip.runner", version: 1, kind: "command_result", payload: {
+        commandId: wire.commandId, controllerSeq: wire.controllerSeq, commandType: wire.type,
+        status: "completed", result: {status,callId:"call-1"},
+      } });
+      await vi.waitFor(() => expect(core.store.state.commands[0]?.status).toBe("completed"));
+      expect(core.semanticToolResultsSettled()).toBe(true);
+      expect(core.semanticToolSettlementDiagnostics()).toMatchObject({settledWithoutLiveDelivery:[{callId:"call-1",status,providerDeliveryConfirmed:false}]});
+      const reopened = new DurablePrpControlPlane(options);
+      expect(reopened.semanticToolResultsSettled()).toBe(true);
       await reopened.stop();
       expect(handler).toHaveBeenCalledOnce();
       client.socket.destroy();

@@ -8,7 +8,7 @@ The original input, source event, correlation and command-result acknowledgement
 
 Verification uses the real authenticated encrypted PRP channel: an oversized synthetic revision read returns the bounded error, an ordinary following write runs once, both deliveries settle, and reopening the controller does not redispatch. Negative tests retain quarantine for a write and an uncatalogued operation. This change does not claim that all history fits a single response or that a tool error is business acceptance.
 
-Delivery requires the completed command's inner receipt to say delivered and carry the exact original callId; queued, missing, malformed or another call's receipt remains unsettled after reopen. Codex, ACPX and managed provider backends already emit this receipt shape.
+Settlement requires a completed command with an exact original callId and a known provider receipt: delivered, settled_after_turn, or duplicate. Codex durably records an after-turn result and rejects a conflicting duplicate before emitting these latter receipts; they are not evidence of live-model delivery. Missing, queued, malformed or another call's receipt remains unsettled after reopen. Diagnostics expose settledWithoutLiveDelivery separately. Provider drain and suspension proof remain independently required, so journal settlement alone cannot certify a reusable provider.
 
 Assigned application tools cannot shadow catalog read operations: the production gateway maps every raw app tool name into an app_-prefixed name with a digest, and its two on-demand wrapper names are separate from native catalog operations. The namespace proof covers every current native operation and preserves the original gateway. No extra routing restriction or permission is introduced.
 
