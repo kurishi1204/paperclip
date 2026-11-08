@@ -183,6 +183,91 @@ fn runtime_context_session_identity(context: &Value) -> Option<Value> {
     Some(identity)
 }
 
+// Match only the generated final grant block from composeNativeSystemInstructions
+// (src/contracts/runtime-context.ts). Entry content and path examples remain
+// opaque, exact bytes; a registered root is never replaced across the full text.
+fn registered_instruction_grant_footer(context: &Value) -> Option<String> {
+    let instructions = context.get("instructions")?;
+    let root = instructions.pointer("/bundle/rootPath")?.as_str()?;
+    let mut parts = Vec::<String>::new();
+    if let Some(connection) = context.get("connectionInstructions") {
+        parts.push(connection.get("text")?.as_str()?.to_owned());
+    }
+    if let Some(copy) = instructions.get("workingCopy") {
+        let copy_root = copy.get("rootPath")?.as_str()?;
+        let entry = copy.get("entryPath")?.as_str()?;
+        let text = match copy.get("kind").and_then(Value::as_str) {
+            Some("agent_files") => format!("Your persistent agent directory (AGENT_HOME) is {copy_root}. Your instruction entry is {entry}, relative to that directory. All supported files and subfolders there are restored across tasks and sessions, and collected after this provider stops. Write task deliverables in the task working directory. Only changed or deleted files synchronize; the last sync wins for the same file. Temporary copies are cleaned up without retaining file history. Check the save receipt before claiming persistence."),
+            None if copy.get("kind").is_none() => format!("Your editable agent instruction file is {copy_root}/{entry}. Edit this registered private copy normally. After this run stops, Paperclip saves changed content as a persistent revision if your responsible user still has permission and the baseline has not changed. Check the run's instruction-save receipt before claiming persistence. Conflicts are preserved for explicit resolution. Repository instruction files, skills, and this run's loaded prompt are separate and are not collected."),
+            _ => return None,
+        };
+        parts.push(text);
+    }
+    parts.push(format!("Read-only instruction sibling root: {root}"));
+    Some(
+        parts
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    )
+}
+
+fn immutable_run_copy_identity(descriptor: &AcpxProviderDescriptor) -> Option<(Value, String)> {
+    let context = runtime_context_session_identity(&descriptor.runtime_context)?;
+    let mut roots = Vec::<&str>::new();
+    for pointer in [
+        "/instructions/bundle/rootPath",
+        "/instructions/workingCopy/rootPath",
+    ] {
+        if let Some(value) = descriptor.runtime_context.pointer(pointer) {
+            roots.push(value.as_str()?);
+        }
+    }
+    if let Some(skills) = descriptor
+        .runtime_context
+        .get("skills")
+        .and_then(Value::as_array)
+    {
+        for skill in skills {
+            if let Some(value) = skill.pointer("/bundle/rootPath") {
+                roots.push(value.as_str()?);
+            }
+        }
+    }
+    if roots.iter().any(|root| {
+        !Path::new(root).is_absolute()
+            || root.chars().any(char::is_control)
+            || root
+                .split('/')
+                .skip(1)
+                .any(|part| part.is_empty() || part == "." || part == "..")
+    }) {
+        return None;
+    }
+    if let (Some(footer), Some(prompt)) = (
+        registered_instruction_grant_footer(&descriptor.runtime_context),
+        descriptor
+            .runtime_context
+            .pointer("/prompt/text")
+            .and_then(Value::as_str),
+    ) {
+        if let Some(entry) = descriptor.instructions.strip_suffix(&footer) {
+            if entry.starts_with(prompt) {
+                // NUL cannot appear in admitted instructions. This comparison
+                // token never reaches stored descriptors or provider text.
+                return Some((context, format!("{entry}\0registered-instruction-footer\0")));
+            }
+        }
+    }
+    // Opaque/legacy instructions keep the original exact comparison, including
+    // copy paths. An unknown framing never authorizes a relocation.
+    Some((
+        descriptor.runtime_context.clone(),
+        descriptor.instructions.clone(),
+    ))
+}
+
 impl AcpxProviderDescriptor {
     fn validate_session(
         &self,
@@ -1071,6 +1156,26 @@ impl AcpxCommandExecutor {
                     "ACPX run.attach changed runtime context outside a new authenticated run",
                 ));
             }
+            durable_descriptor.instructions = previous_descriptor.instructions.clone();
+            durable_descriptor.runtime_context = previous_descriptor.runtime_context.clone();
+        }
+        if run_attachment_policy(&descriptor.agent) == RunAttachmentPolicy::ImmutableInstructions {
+            let current = immutable_run_copy_identity(&durable_descriptor);
+            let previous = immutable_run_copy_identity(&previous_descriptor);
+            let same_profile = current
+                .zip(previous)
+                .is_some_and(|(current, previous)| current == previous);
+            let copies_changed = durable_descriptor.instructions
+                != previous_descriptor.instructions
+                || durable_descriptor.runtime_context != previous_descriptor.runtime_context;
+            if !same_profile || (copies_changed && descriptor.run_id == state.descriptor.run_id) {
+                return Err(DurableRunnerError::invalid(
+                    "ACPX run.attach changed the immutable instruction profile",
+                ));
+            }
+            // The original unmodified descriptor is stored after admission.
+            // This affects identity comparison only, never provider policy,
+            // the model, current file grants, or instruction contents.
             durable_descriptor.instructions = previous_descriptor.instructions.clone();
             durable_descriptor.runtime_context = previous_descriptor.runtime_context.clone();
         }
@@ -2954,6 +3059,69 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn immutable_copy_descriptor(
+        run: &str,
+        entry: &str,
+        shared_skills: bool,
+    ) -> AcpxProviderDescriptor {
+        let mut value = descriptor("claude");
+        let copy = format!("/private/copy-{run}");
+        let bundle = format!("/private/bundle-{run}");
+        value["runId"] = json!(run);
+        value["runtimeContext"] = json!({
+            "prompt":{"text":"Trusted"},
+            "instructions":{"bundle":{"rootPath":bundle,"digest":"stable"},"workingCopy":{"rootPath":copy,"entryPath":"AGENTS.md","kind":"agent_files"}},
+            "skills":if shared_skills {json!([
+                {"key":"one","bundle":{"rootPath":"/private/shared-skills","digest":"one"}},
+                {"key":"two","bundle":{"rootPath":"/private/shared-skills","digest":"two"}}
+            ])} else {json!([])}
+        });
+        value["instructions"] = json!(format!("Trusted\n\n{entry}\n\nYour persistent agent directory (AGENT_HOME) is {copy}. Your instruction entry is AGENTS.md, relative to that directory. All supported files and subfolders there are restored across tasks and sessions, and collected after this provider stops. Write task deliverables in the task working directory. Only changed or deleted files synchronize; the last sync wins for the same file. Temporary copies are cleaned up without retaining file history. Check the save receipt before claiming persistence.\n\nRead-only instruction sibling root: {bundle}"));
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_copy_identity_preserves_unregistered_sibling_paths() {
+        let old = immutable_copy_descriptor(
+            "run-1",
+            "Keep /private/copy-run-1-extra/approval.txt.",
+            false,
+        );
+        let new = immutable_copy_descriptor(
+            "run-2",
+            "Keep /private/copy-run-2-extra/approval.txt.",
+            false,
+        );
+        let old_identity = immutable_run_copy_identity(&old).unwrap();
+        let new_identity = immutable_run_copy_identity(&new).unwrap();
+        assert_ne!(
+            old_identity, new_identity,
+            "a sibling path is not a registered copy"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_copy_identity_allows_shared_registered_skill_roots() {
+        let old = immutable_run_copy_identity(&immutable_copy_descriptor(
+            "run-1",
+            "Unchanged content.",
+            true,
+        ));
+        let new = immutable_run_copy_identity(&immutable_copy_descriptor(
+            "run-2",
+            "Unchanged content.",
+            true,
+        ));
+        assert!(
+            old.is_some() && new.is_some(),
+            "shared registered skill roots are valid"
+        );
+        assert_eq!(old, new);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn restores_settled_session_for_explicit_run_attachment_only() {
         let directory = temporary_directory("cross-run-attach");
@@ -2976,9 +3144,10 @@ mod tests {
             args: Vec::new(),
             artifacts: vec![artifact(&command)],
         };
-        let mut descriptor_value = descriptor("codex");
+        let mut descriptor_value = descriptor("claude");
         descriptor_value["sidecarCommand"] = json!(command);
-        descriptor_value["runtimeContext"] = json!({ "instructions": { "digest": "stable" }, "mcp": { "digest": "before" }, "aggregateDigest": "before" });
+        descriptor_value["runtimeContext"] = json!({ "prompt":{"text":"Trusted"}, "instructions": { "digest": "stable", "bundle": {"rootPath":"/private/bundle-run-1"}, "workingCopy":{"rootPath":"/private/copy-run-1","entryPath":"AGENTS.md","kind":"agent_files"}}, "mcp": { "digest": "before" }, "aggregateDigest": "before" });
+        descriptor_value["instructions"] = json!("Trusted\n\nUse the unchanged instructions.\n\nYour persistent agent directory (AGENT_HOME) is /private/copy-run-1. Your instruction entry is AGENTS.md, relative to that directory. All supported files and subfolders there are restored across tasks and sessions, and collected after this provider stops. Write task deliverables in the task working directory. Only changed or deleted files synchronize; the last sync wins for the same file. Temporary copies are cleaned up without retaining file history. Check the save receipt before claiming persistence.\n\nRead-only instruction sibling root: /private/bundle-run-1");
         descriptor_value["sidecarArgs"] = json!([]);
         descriptor_value["runtimeDirectory"] = json!(runtime);
         descriptor_value["cwd"] = json!(workspace);
@@ -3098,10 +3267,51 @@ mod tests {
             .contains("requires run.attach before commands from a new run"));
 
         descriptor_value["runId"] = json!("run-2");
+        // A real task continuation rebuilds the same authenticated files in a
+        // new run directory. Their location is not a new instruction profile.
+        descriptor_value["runtimeContext"]["instructions"]["bundle"]["rootPath"] =
+            json!("/private/bundle-run-2");
+        descriptor_value["runtimeContext"]["instructions"]["workingCopy"]["rootPath"] =
+            json!("/private/copy-run-2");
+        descriptor_value["instructions"] = json!("Trusted\n\nUse the unchanged instructions.\n\nYour persistent agent directory (AGENT_HOME) is /private/copy-run-2. Your instruction entry is AGENTS.md, relative to that directory. All supported files and subfolders there are restored across tasks and sessions, and collected after this provider stops. Write task deliverables in the task working directory. Only changed or deleted files synchronize; the last sync wins for the same file. Temporary copies are cleaned up without retaining file history. Check the save receipt before claiming persistence.\n\nRead-only instruction sibling root: /private/bundle-run-2");
+        let mut same_run_copy_change = descriptor_value.clone();
+        same_run_copy_change["runId"] = json!("run-1");
+        assert!(original
+            .attach_run(&json!({"provider": same_run_copy_change}))
+            .is_err());
+        let mut invalid_copy = descriptor_value.clone();
+        invalid_copy["runtimeContext"]["instructions"]["workingCopy"]["rootPath"] = json!("/");
+        assert!(attached
+            .attach_run(&json!({"provider": invalid_copy}))
+            .is_err());
+        let mut unknown_policy = descriptor_value.clone();
+        unknown_policy["runtimeContext"]["newPolicy"] = json!(true);
+        assert!(attached
+            .attach_run(&json!({"provider": unknown_policy}))
+            .is_err());
         attached
             .attach_run(&json!({"provider": descriptor_value}))
             .unwrap();
         assert_eq!(attached.state.as_ref().unwrap().descriptor.run_id, "run-2");
+        assert_eq!(
+            attached.state.as_ref().unwrap().descriptor.runtime_context["instructions"]
+                ["workingCopy"]["rootPath"],
+            "/private/copy-run-2"
+        );
+        assert!(attached
+            .state
+            .as_ref()
+            .unwrap()
+            .descriptor
+            .instructions
+            .contains("/private/copy-run-2"));
+        assert!(!attached
+            .state
+            .as_ref()
+            .unwrap()
+            .descriptor
+            .instructions
+            .contains('\0'));
         assert!(!marker.exists());
 
         // In-place warm handoff executes under the old authority. Only the
