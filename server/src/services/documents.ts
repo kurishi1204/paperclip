@@ -8,6 +8,22 @@ import { isUniqueViolation } from "../db-errors.js";
 import { insertRowsInChunks } from "./batch-insert.js";
 import type { ImportIssueDocumentRow } from "./import-write-types.js";
 
+export function documentRevisionPage(input: Record<string, unknown>) {
+  const limit=input.limit === undefined ? 5 : input.limit;
+  if(typeof limit !== "number" || !Number.isInteger(limit) || limit<1 || limit>200) {
+    throw unprocessable("Invalid document history limit");
+  }
+  if(input.cursor === undefined) return {limit,cursor:undefined};
+  const value=input.cursor;
+  if(!value || typeof value !== "object" || Array.isArray(value)) throw unprocessable("Invalid document history cursor");
+  const cursor=value as Record<string,unknown>;
+  if(Object.keys(cursor).length!==2 || typeof cursor.documentId!=="string" ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(cursor.documentId) ||
+      typeof cursor.beforeRevisionNumber!=="number" || !Number.isSafeInteger(cursor.beforeRevisionNumber) ||
+      cursor.beforeRevisionNumber<1) throw unprocessable("Invalid document history cursor");
+  return {limit,cursor:{documentId:cursor.documentId,beforeRevisionNumber:cursor.beforeRevisionNumber}};
+}
+
 function normalizeDocumentKey(key: string) {
   const normalized = key.trim().toLowerCase();
   const parsed = issueDocumentKeySchema.safeParse(normalized);
@@ -229,7 +245,7 @@ export function documentService(db: Db) {
 
     listIssueDocumentRevisions: async (issueId: string, rawKey: string,
       revisionScope?: { companyId: string; documentId: string; revisionId: string },
-      page?: { limit: number; beforeRevisionNumber?: number },
+      page?: { limit: number; beforeRevisionNumber?: number; documentId?: string },
     ) => {
       const key = normalizeDocumentKey(rawKey);
       const query = db
@@ -258,6 +274,7 @@ export function documentService(db: Db) {
           revisionScope ? eq(documents.id, revisionScope.documentId) : undefined,
           revisionScope ? eq(documentRevisions.id, revisionScope.revisionId) : undefined,
           page?.beforeRevisionNumber === undefined ? undefined : lt(documentRevisions.revisionNumber, page.beforeRevisionNumber),
+          page?.documentId === undefined ? undefined : eq(documents.id, page.documentId),
         ))
         .orderBy(desc(documentRevisions.revisionNumber));
       return page ? query.limit(page.limit) : query;

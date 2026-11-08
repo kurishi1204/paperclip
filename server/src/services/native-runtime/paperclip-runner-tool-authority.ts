@@ -69,7 +69,7 @@ import {
 import { CAPABILITY_SEMANTIC_TOOL_CATALOG, runnerCodexDynamicToolsFit, SemanticToolOutcomeUnknownError } from "../../vendor/paperclip-runner/index.js";
 import { agentService } from "../agents.js";
 import { approvalService } from "../approvals.js";
-import { documentService } from "../documents.js";
+import { documentService, documentRevisionPage } from "../documents.js";
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext, type NativeReviewAssignmentContext } from "./native-review-participant.js";
@@ -610,6 +610,7 @@ export class PaperclipRunnerToolAuthority {
       case "list_document_revisions": {
         const review=await this.#assertDocumentReviewKey(input.key);
         const service=documentService(this.db), key=requiredString(input.key);
+        const {limit,cursor}=documentRevisionPage(input);
         // Bound the query itself: a newer revision can arrive after admission
         // was read, but this request must never fetch/return its body.
         const revisions=review
@@ -617,17 +618,17 @@ export class PaperclipRunnerToolAuthority {
               companyId:review.binding.companyId,documentId:review.binding.documentId,revisionId:review.binding.revisionId,
             })
           : await service.listIssueDocumentRevisions(this.binding.issueId,key,undefined,{
-              limit: boundedLimit(input.limit ?? 5) + 1,
-              ...(typeof input.beforeRevisionNumber === "number" ? {beforeRevisionNumber:input.beforeRevisionNumber} : {}),
+              limit: limit + 1, ...(cursor ? {documentId:cursor.documentId,beforeRevisionNumber:cursor.beforeRevisionNumber} : {}),
             });
         if(review && (revisions.length!==1 || revisions[0]!.documentId!==review.binding.documentId ||
             revisions[0]!.id!==review.binding.revisionId)) {
           throw forbidden("The fixed document revision is no longer available.");
         }
-        const limit=boundedLimit(input.limit ?? 5), selected=review?revisions:revisions.slice(0,limit);
+        if(!review && cursor && revisions.length===0) throw new Error("paperclip_runner_document_history_cursor_expired");
+        const selected=review?revisions:revisions.slice(0,limit);
         return {revisions:selected,...(review?{scope:{mode:"assigned_revision",documentId:review.binding.documentId,
           revisionId:review.binding.revisionId}}:{pagination:{limit,hasMore:revisions.length>limit,
-            nextBeforeRevisionNumber:revisions.length>limit?selected.at(-1)!.revisionNumber:null}})};
+            nextCursor:revisions.length>limit?{documentId:selected[0]!.documentId,beforeRevisionNumber:selected.at(-1)!.revisionNumber}:null}})};
       }
       case "write_document": return this.#writeDocument(input);
       case "list_agents":
