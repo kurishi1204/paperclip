@@ -240,7 +240,7 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
         prompt: text("Question or decision prompt.", 10_000),
         payload: openObject,
         addresseeAgentId: nullableText(
-          "Optional existing independent employee for a fixed document confirmation only; omit for human questions and approvals.",
+          "Optional existing independent employee for a fixed standard-mode business document confirmation only; never key plan. Omit for human questions and approvals.",
           240,
         ),
         targetRevisionId: nullableText(

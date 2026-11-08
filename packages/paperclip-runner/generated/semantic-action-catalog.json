@@ -750,7 +750,7 @@
       "additionalProperties": false,
       "properties": {
         "addresseeAgentId": {
-          "description": "Optional existing independent employee for a fixed document confirmation only; omit for human questions and approvals.",
+          "description": "Optional existing independent employee for a fixed standard-mode business document confirmation only; never key plan. Omit for human questions and approvals.",
           "maxLength": 240,
           "type": [
             "string",

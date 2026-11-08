@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, issueThreadInteractions } from "@paperclipai/db";
+import { agents, companies, heartbeatRuns, issues, issueThreadInteractions, activityLog } from "@paperclipai/db";
 import { documentService } from "../documents.js";
 import { startRunnerApiTestServer } from "../../__tests__/helpers/runner-api-server.js";
+import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
+import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { runnerApiMutationRestriction } from "./runner-api-policy.js";
 
 describe("dedicated fixed-document reviewer handoff", () => {
@@ -108,6 +110,41 @@ describe("dedicated fixed-document reviewer handoff", () => {
     expect(status(otherNamed.interaction.id)).toBe("pending");
     expect(status(human.interaction.id)).toBe("pending");
     expect(status(oldHuman.interaction.id)).toBe("expired");
+  });
+  it("keeps plan adoption out of business-document QA", async () => {
+    for (const mode of ["standard", "planning"] as const) {
+      const { f, args, call } = await seed(mode);
+      await documentService(server.db).upsertIssueDocument({ issueId:f.issueId,key:"plan",title:"Owner plan",format:"markdown",body:"Synthetic plan approval is distinct from employee QA.",baseRevisionId:null,changeSummary:null,createdByAgentId:f.agentId,createdByRunId:f.runId });
+      const plan=(await documentService(server.db).getIssueDocumentByKey(f.issueId,"plan"))!;
+      await expect(call({...args,payload:{target:{type:"issue_document",issueId:f.issueId,key:"plan",documentId:plan.id,revisionId:plan.latestRevisionId}}})).rejects.toThrow("document_review_requires_fixed_confirmation");
+      expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId,f.issueId))).toHaveLength(0);
+    }
+  });
+  it("enforces the same business scope at the common service entry", async () => {
+    for (const mode of ["ask", "planning"] as const) {
+      const {f,args}=await seed(mode);
+      await expect(issueThreadInteractionService(server.db).create({id:f.issueId,companyId:f.companyId},{kind:"request_confirmation",addresseeAgentId:args.addresseeAgentId,idempotencyKey:args.idempotencyKey,sourceRunId:f.runId,title:args.title,summary:args.prompt,continuationPolicy:"wake_assignee",payload:{version:1,prompt:args.prompt,...args.payload}} as never,{agentId:f.agentId,runId:f.runId})).rejects.toThrow("standard-mode business document");
+      expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId,f.issueId))).toHaveLength(0);
+    }
+  });
+  it("rejects another task's document before creating an unusable review", async () => {
+    const {f,args}=await seed();
+    await documentService(server.db).upsertIssueDocument({issueId:f.blockerId,key:"foreign-notes",title:"Other task notes",format:"markdown",body:"Synthetic same-company other-task document.",baseRevisionId:null,changeSummary:null,createdByAgentId:f.agentId,createdByRunId:null});
+    const doc=(await documentService(server.db).getIssueDocumentByKey(f.blockerId,"foreign-notes"))!;
+    await expect(issueThreadInteractionService(server.db).create({id:f.issueId,companyId:f.companyId},{kind:"request_confirmation",addresseeAgentId:args.addresseeAgentId,idempotencyKey:args.idempotencyKey,sourceRunId:f.runId,title:args.title,summary:args.prompt,continuationPolicy:"wake_assignee",payload:{version:1,prompt:args.prompt,target:{type:"issue_document",issueId:f.blockerId,key:doc.key,documentId:doc.id,revisionId:doc.latestRevisionId}}} as never,{agentId:f.agentId,runId:f.runId})).rejects.toThrow("standard-mode business document");
+    expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId,f.issueId))).toHaveLength(0);
+  });
+  it("reuses a stable document-review key after a fresh authorized run", async () => {
+    const {f,args,call}=await seed();const first=await call() as any;const nextRunId=randomUUID();
+    await server.db.update(heartbeatRuns).set({status:"succeeded",finishedAt:new Date()}).where(eq(heartbeatRuns.id,f.runId));
+    await server.db.insert(heartbeatRuns).values({id:nextRunId,companyId:f.companyId,agentId:f.agentId,status:"running",runtimeMode:"native",nativeIssueId:f.issueId,contextSnapshot:{issueId:f.issueId}});
+    await server.db.update(issues).set({executionRunId:nextRunId}).where(eq(issues.id,f.issueId));
+    const next=new PaperclipRunnerToolAuthority(server.db,{companyId:f.companyId,agentId:f.agentId,issueId:f.issueId,runId:nextRunId,apiUrl:f.apiUrl,storage:f.storage,apiToolsEnabled:true});
+    const second=await next.execute({tool:"request_human_input",callId:randomUUID(),arguments:args}) as any;
+    expect(second).toMatchObject({disposition:"duplicate",interaction:{id:first.interaction.id,sourceRunId:f.runId}});
+    expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId,f.issueId))).toHaveLength(1);
+    const events=await server.db.select().from(activityLog).where(eq(activityLog.companyId,f.companyId));
+    expect(events.filter(x=>x.action==="issue.thread_interaction_created")).toHaveLength(1);
   });
   it("keeps creation and decision escape hatches closed", () => {
     expect(runnerApiMutationRestriction("/api/issues/{id}/interactions")).not.toBeNull();

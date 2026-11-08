@@ -626,6 +626,11 @@ function isUserCommentSupersedableKind(
   ).includes(kind);
 }
 
+function isNamedBusinessDocumentReview(input: CreateIssueThreadInteraction) {
+  return input.kind === "request_confirmation" && Boolean(input.addresseeAgentId)
+    && input.payload.target?.type === "issue_document" && input.payload.target.key !== "plan";
+}
+
 function isEquivalentCreateRequest(
   row: IssueThreadInteractionRow,
   input: CreateIssueThreadInteraction,
@@ -640,7 +645,9 @@ function isEquivalentCreateRequest(
     row.continuationPolicy === input.continuationPolicy &&
     (row.idempotencyKey ?? null) === (input.idempotencyKey ?? null) &&
     (row.sourceCommentId ?? null) === (input.sourceCommentId ?? null) &&
-    (row.sourceRunId ?? null) === (input.sourceRunId ?? null) &&
+    ((row.sourceRunId ?? null) === (input.sourceRunId ?? null)
+      || (isNamedBusinessDocumentReview(input) && Boolean(actor.agentId)
+        && Boolean(actor.runId) && actor.runId === input.sourceRunId)) &&
     (row.title ?? null) === (input.title ?? null) &&
     (row.summary ?? null) === (input.summary ?? null) &&
     (row.createdByAgentId ?? null) === (actor.agentId ?? null) &&
@@ -3617,6 +3624,9 @@ export function issueThreadInteractionService(
         }
       }
 
+      const namedDocumentReview = data.kind === "request_confirmation"
+        && Boolean(data.addresseeAgentId) && data.payload.target?.type === "issue_document";
+
       if (normalizedData.idempotencyKey) {
         const existing = await getIdempotentInteraction({
           issueId: issue.id,
@@ -3624,6 +3634,26 @@ export function issueThreadInteractionService(
           idempotencyKey: normalizedData.idempotencyKey,
         });
         if (existing) {
+          if (isNamedBusinessDocumentReview(normalizedData)
+            && existing.sourceRunId !== normalizedData.sourceRunId) {
+            // The request belongs to the task, while its original execution
+            // provenance stays immutable. Only a fresh authenticated current run
+            // may retrieve that same request across a run boundary.
+            if (!actor.agentId || !actor.runId || actor.runId !== normalizedData.sourceRunId) {
+              throw conflict("Cross-run document review reuse requires the current creating agent run");
+            }
+            await db.transaction(async (tx) => {
+              await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
+              const [currentIssue] = await tx.select({ workMode: issues.workMode })
+                .from(issues).where(and(eq(issues.id, issue.id),eq(issues.companyId,issue.companyId))).for("update");
+              const retryTarget = normalizedData.kind === "request_confirmation"
+                && normalizedData.payload.target?.type === "issue_document" ? normalizedData.payload.target : null;
+              if (currentIssue?.workMode !== "standard"
+                || (retryTarget?.issueId ?? issue.id) !== issue.id) {
+                throw unprocessable("Named reviews require a standard-mode business document on the same issue");
+              }
+            });
+          }
           if (!isEquivalentCreateRequest(existing, normalizedData, actor, defaultAddresseeUserId)) {
             throw conflict(
               "Interaction idempotency key already exists for a different request",
@@ -3705,9 +3735,6 @@ export function issueThreadInteractionService(
         }
       }
 
-      const namedDocumentReview = data.kind === "request_confirmation"
-        && Boolean(data.addresseeAgentId) && data.payload.target?.type === "issue_document";
-
       const requiresCurrentTarget =
         data.kind === "request_confirmation" ||
         data.kind === "request_checkbox_confirmation" ||
@@ -3736,7 +3763,7 @@ export function issueThreadInteractionService(
             }
           }
           const [issueRow] = await tx
-            .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId, conversationAgentId: issues.conversationAgentId, conversationUserId: issues.conversationUserId })
+            .select({ status: issues.status, workMode: issues.workMode, assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId, conversationAgentId: issues.conversationAgentId, conversationUserId: issues.conversationUserId })
             .from(issues)
             .where(
               and(
@@ -3747,6 +3774,12 @@ export function issueThreadInteractionService(
             .for("update");
           if (!issueRow || isTerminalIssueStatus(issueRow.status)) {
             throw conflict("Cannot create an interaction on a closed issue");
+          }
+          if (namedDocumentReview && (issueRow.workMode !== "standard"
+            || data.payload.target?.type !== "issue_document"
+            || (data.payload.target.issueId ?? issue.id) !== issue.id
+            || data.payload.target.key === "plan")) {
+            throw unprocessable("Named reviews require a standard-mode business document on the same issue");
           }
           if (data.addresseeUserId) {
             const [user] = await tx.select({ id: authUsers.id }).from(authUsers)

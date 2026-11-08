@@ -2187,7 +2187,7 @@ export class PaperclipRunnerToolAuthority {
         const addresseeAgentId = nullableProviderId(input.addresseeAgentId);
         if (addresseeAgentId !== null) {
           const target = record(normalizedPayload.target);
-          if (!["standard", "planning"].includes(context.issue.workMode)
+          if (context.issue.workMode !== "standard" || target.key === "plan"
             || kind !== "request_confirmation" || target.type !== "issue_document"
             || target.issueId !== context.issue.id
             || !nullableProviderId(target.documentId) || !nullableProviderId(target.key)
@@ -2219,7 +2219,10 @@ export class PaperclipRunnerToolAuthority {
               supersedeOnUserComment: normalizedPayload.supersedeOnUserComment ?? false,
             } : {}),
           },
-        } as never, { agentId: this.binding.agentId, userId: null, identityContextId });
+        } as never, { agentId: this.binding.agentId, runId: this.binding.runId, userId: null, identityContextId });
+        if (addresseeAgentId !== null && interaction.sourceRunId !== this.binding.runId) {
+          return { interaction, disposition: "duplicate" };
+        }
         const activity = await persistActivity(tx, {
           companyId: this.binding.companyId,
           actorType: "agent",
