@@ -7349,7 +7349,7 @@ export async function executePaperclipNativeSession(input: {
     options: {
       source: "assignment" | "automation";
       triggerDetail: "system";
-      reason: "issue_assigned" | "issue_commented";
+      reason: "issue_assigned" | "issue_commented" | "interaction_pending";
       payload: Record<string, unknown>;
       idempotencyKey: string;
       requestedByActorType: "agent";
@@ -10791,7 +10791,7 @@ export async function createRunnerdBackend(input: {
     options: {
       source: "assignment" | "automation";
       triggerDetail: "system";
-      reason: "issue_assigned" | "issue_commented";
+      reason: "issue_assigned" | "issue_commented" | "interaction_pending";
       payload: Record<string, unknown>;
       idempotencyKey: string;
       requestedByActorType: "agent";

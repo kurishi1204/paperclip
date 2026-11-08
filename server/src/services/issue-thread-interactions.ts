@@ -3781,6 +3781,21 @@ export function issueThreadInteractionService(
           if (!issueRow || isTerminalIssueStatus(issueRow.status)) {
             throw conflict("Cannot create an interaction on a closed issue");
           }
+          if (normalizedData.idempotencyKey) {
+            const [existing] = await tx.select().from(issueThreadInteractions).where(and(
+              eq(issueThreadInteractions.companyId, issue.companyId),
+              eq(issueThreadInteractions.issueId, issue.id),
+              eq(issueThreadInteractions.idempotencyKey, normalizedData.idempotencyKey),
+            )).limit(1);
+            if (existing) {
+              if (!isEquivalentCreateRequest(existing, normalizedData, actor, defaultAddresseeUserId)) {
+                throw conflict("Interaction idempotency key already exists for a different request", {
+                  idempotencyKey: normalizedData.idempotencyKey,
+                });
+              }
+              return { row: existing, supersededRows: [], replayed: true };
+            }
+          }
           if (namedDocumentReview) {
             // The early check is only a fast failure. Lock the current reviewer
             // and its company reporting chain until insertion commits, so pause,
@@ -4008,6 +4023,9 @@ export function issueThreadInteractionService(
           );
           return { row, supersededRows };
         });
+        if ("replayed" in result && result.replayed) {
+          return hydrateInteraction(result.row);
+        }
         created = result.row;
         superseded = result.supersededRows;
       } catch (error) {

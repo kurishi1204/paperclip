@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, heartbeatRuns, issues, issueThreadInteractions, activityLog, issueComments } from "@paperclipai/db";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { agents, companies, heartbeatRuns, issues, issueThreadInteractions, activityLog, issueComments, agentWakeupRequests } from "@paperclipai/db";
 import { documentService } from "../documents.js";
 import { startRunnerApiTestServer } from "../../__tests__/helpers/runner-api-server.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
+import * as interactionsModule from "../issue-thread-interactions.js";
 import { runnerApiMutationRestriction } from "./runner-api-policy.js";
 
 describe("dedicated fixed-document reviewer handoff", () => {
@@ -24,8 +25,13 @@ describe("dedicated fixed-document reviewer handoff", () => {
       addresseeAgentId: reviewerId, continuationPolicy: "wake_assignee",
       payload: { target: { type: "issue_document", issueId: f.issueId, key: doc.key,
         documentId: doc.id, revisionId: doc.latestRevisionId } } };
+    const enqueue = async (agentId: string, options: any) => {
+      return server.db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId,
+        ...options, status: "queued" }).returning().then(rows => rows[0]);
+    };
+    f.authority = new PaperclipRunnerToolAuthority(server.db, { ...f, enqueueWakeup: enqueue });
     const call = (arguments_: Record<string, unknown> = args) => f.authority.execute({ tool: "request_human_input", callId: randomUUID(), arguments: arguments_ });
-    return { f, reviewerId, doc, args, call };
+    return { f, reviewerId, doc, args, call, enqueue };
   }
   it("binds the existing other employee and exact saved document once", async () => {
     const { f, reviewerId, doc, args, call } = await seed();
@@ -135,11 +141,11 @@ describe("dedicated fixed-document reviewer handoff", () => {
     expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId,f.issueId))).toHaveLength(0);
   });
   it("reuses a stable document-review key after a fresh authorized run", async () => {
-    const {f,args,call}=await seed();const first=await call() as any;const nextRunId=randomUUID();
+    const {f,args,call,enqueue}=await seed();const first=await call() as any;const nextRunId=randomUUID();
     await server.db.update(heartbeatRuns).set({status:"succeeded",finishedAt:new Date()}).where(eq(heartbeatRuns.id,f.runId));
     await server.db.insert(heartbeatRuns).values({id:nextRunId,companyId:f.companyId,agentId:f.agentId,status:"running",runtimeMode:"native",nativeIssueId:f.issueId,contextSnapshot:{issueId:f.issueId}});
     await server.db.update(issues).set({executionRunId:nextRunId}).where(eq(issues.id,f.issueId));
-    const next=new PaperclipRunnerToolAuthority(server.db,{companyId:f.companyId,agentId:f.agentId,issueId:f.issueId,runId:nextRunId,apiUrl:f.apiUrl,storage:f.storage,apiToolsEnabled:true});
+    const next=new PaperclipRunnerToolAuthority(server.db,{companyId:f.companyId,agentId:f.agentId,issueId:f.issueId,runId:nextRunId,apiUrl:f.apiUrl,storage:f.storage,apiToolsEnabled:true,enqueueWakeup:enqueue});
     const second=await next.execute({tool:"request_human_input",callId:randomUUID(),arguments:args}) as any;
     expect(second).toMatchObject({disposition:"duplicate",interaction:{id:first.interaction.id,sourceRunId:f.runId}});
     expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId,f.issueId))).toHaveLength(1);
@@ -181,6 +187,72 @@ describe("dedicated fixed-document reviewer handoff", () => {
     const [row] = await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, named.interaction.id));
     expect(row.status).toBe("pending");
   });
+  it("fails before card creation when the server scheduler is unavailable", async () => {
+    const { f, args } = await seed();
+    const authority = new PaperclipRunnerToolAuthority(server.db, f);
+    await expect(authority.execute({ tool: "request_human_input", callId: randomUUID(), arguments: args }))
+      .rejects.toThrow("document_review_scheduler_unavailable");
+    expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId))).toHaveLength(0);
+  });
+  it("keeps concurrent same-key common-service creation idempotent", async () => {
+    const { f, args } = await seed();
+    const original = server.db.transaction.bind(server.db);
+    let arrivals = 0, release!: () => void;
+    const both = new Promise<void>(resolve => { release = resolve; });
+    const racedDb = new Proxy(server.db, { get(target, key) {
+      if (key === "transaction") return async (...parameters: Parameters<typeof original>) => {
+        if (++arrivals === 2) release();
+        await both;
+        return original(...parameters);
+      };
+      return Reflect.get(target, key, target);
+    } });
+    const service = issueThreadInteractionService(racedDb);
+    const create = () => service.create({ id: f.issueId, companyId: f.companyId },
+      { kind: "request_confirmation", addresseeAgentId: args.addresseeAgentId,
+        idempotencyKey: args.idempotencyKey, sourceRunId: f.runId, title: args.title,
+        summary: args.prompt, continuationPolicy: "wake_assignee",
+        payload: { version: 1, prompt: args.prompt, ...args.payload } } as never,
+      { agentId: f.agentId, runId: f.runId });
+    const results = await Promise.all([create(), create()]);
+    expect(results[0].id).toBe(results[1].id);
+    expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId))).toHaveLength(1);
+  });
+  it("allows concurrent native employees to request each other's independent review", async () => {
+    const { f, args, call, enqueue, reviewerId } = await seed();
+    const otherRun = randomUUID();
+    await server.db.insert(heartbeatRuns).values({ id: otherRun, companyId: f.companyId,
+      agentId: reviewerId, status: "running", runtimeMode: "native", nativeIssueId: f.blockerId,
+      contextSnapshot: { issueId: f.blockerId } });
+    await server.db.update(issues).set({ status: "in_progress", workMode: "standard",
+      assigneeAgentId: reviewerId, executionRunId: otherRun }).where(eq(issues.id, f.blockerId));
+    await documentService(server.db).upsertIssueDocument({ issueId: f.blockerId, key: "notes",
+      title: "Other employee notes", format: "markdown", body: "Independent synthetic notes.",
+      baseRevisionId: null, changeSummary: null, createdByAgentId: reviewerId, createdByRunId: otherRun });
+    const doc = (await documentService(server.db).getIssueDocumentByKey(f.blockerId, "notes"))!;
+    const other = new PaperclipRunnerToolAuthority(server.db, { ...f, agentId: reviewerId,
+      issueId: f.blockerId, runId: otherRun, enqueueWakeup: enqueue });
+    const original = interactionsModule.issueThreadInteractionService;
+    let arrivals = 0, release!: () => void;
+    const both = new Promise<void>(resolve => { release = resolve; });
+    const spy = vi.spyOn(interactionsModule, "issueThreadInteractionService").mockImplementation(currentDb => {
+      const service = original(currentDb);
+      return { ...service, create: async (...parameters: Parameters<typeof service.create>) => {
+        if (++arrivals === 2) release();
+        await both;
+        return service.create(...parameters);
+      } };
+    });
+    try {
+      const results = await Promise.allSettled([call(), other.execute({ tool: "request_human_input",
+        callId: randomUUID(), arguments: { ...args, idempotencyKey: randomUUID(), addresseeAgentId: f.agentId,
+          payload: { target: { type: "issue_document", issueId: f.blockerId,
+            key: doc.key, documentId: doc.id, revisionId: doc.latestRevisionId } } } })]);
+      expect(results.map(r => r.status)).toEqual(["fulfilled", "fulfilled"]);
+      expect(await server.db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.companyId, f.companyId))).toHaveLength(2);
+      expect(await server.db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(2);
+    } finally { spy.mockRestore(); }
+  }, 20_000);
   it("keeps creation and decision escape hatches closed", () => {
     expect(runnerApiMutationRestriction("/api/issues/{id}/interactions")).not.toBeNull();
     expect(runnerApiMutationRestriction("/api/issues/{id}/interactions/{interactionId}/accept")).not.toBeNull();

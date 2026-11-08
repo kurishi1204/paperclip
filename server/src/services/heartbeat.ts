@@ -28894,6 +28894,33 @@ export function heartbeatService(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
 
+          if (!executionWaitRequestId && reason === "interaction_pending" && opts.idempotencyKey) {
+            const interactionId = readNonEmptyString(payload?.interactionId);
+            if (!interactionId || opts.idempotencyKey !== `interaction-pending:${interactionId}`) {
+              throw new HttpError(409, "Pending interaction wake key differs from its card");
+            }
+            // Native tools and HTTP creation use the same durable queue receipt.
+            // The issue lock serializes new deliveries across processes. A
+            // deferred queue consumer still resumes its original receipt above.
+            const prior = await tx.select().from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+            )).limit(2);
+            if (prior.length > 1) throw new HttpError(409, "Pending interaction has duplicate wake receipts");
+            if (prior[0]) {
+              const wake = prior[0];
+              if (wake.payload?.issueId !== issueId || wake.payload?.interactionId !== interactionId
+                || wake.payload?.interactionKind !== payload?.interactionKind
+                || wake.requestedByActorType !== opts.requestedByActorType
+                || wake.requestedByActorId !== opts.requestedByActorId) {
+                throw new HttpError(409, "Pending interaction wake receipt binding changed");
+              }
+              const [run] = wake.runId ? await tx.select().from(heartbeatRuns)
+                .where(eq(heartbeatRuns.id, wake.runId)).limit(1) : [];
+              return run ? { kind: "replayed" as const, run } : { kind: "deferred" as const };
+            }
+          }
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
               eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
