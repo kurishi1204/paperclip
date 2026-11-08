@@ -844,7 +844,10 @@ describe("Codex protocol integrity propagation", () => {
             ).toBeGreaterThan(accepted);
             // Proposal admission is not the runner's durable result receipt.
             // Complete that exact command before asking close to certify reuse.
-            await commandResult("semantic_tool.result");
+            await commandResult("semantic_tool.result", {
+              status: "delivered",
+              callId: "early-composed-finish",
+            });
             expect(core.semanticToolResultsSettled()).toBe(true);
             // This fixture replaces only the runner process. Model the new
             // durable close contract explicitly instead of accepting an

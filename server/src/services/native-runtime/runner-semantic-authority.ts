@@ -1,6 +1,7 @@
+import { documentRevisionPage } from "../documents.js";
 import { readTaskQuestionContext } from "../issue-question-context.js";
 import { isConversation } from "../agent-conversations.js";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, lt } from "drizzle-orm";
 
 import type { Db } from "@paperclipai/db";
 import {
@@ -241,9 +242,11 @@ export class PaperclipRunnerSemanticAuthority {
           }
           case "list_document_revisions": {
             const key = requiredString(input.key);
+            const {limit,cursor} = documentRevisionPage(input);
             const rows = await this.#db
               .select({
                 id: documentRevisions.id,
+                documentId: documentRevisions.documentId,
                 revisionNumber: documentRevisions.revisionNumber,
                 title: documentRevisions.title,
                 format: documentRevisions.format,
@@ -264,13 +267,17 @@ export class PaperclipRunnerSemanticAuthority {
                   eq(issueDocuments.issueId, this.#binding.issueId),
                   eq(issueDocuments.key, key),
                   eq(documentRevisions.companyId, this.#binding.companyId),
+                  cursor ? lt(documentRevisions.revisionNumber,cursor.beforeRevisionNumber) : undefined,
+                  cursor ? eq(documentRevisions.documentId,cursor.documentId) : undefined,
                 ),
               )
               .orderBy(desc(documentRevisions.revisionNumber))
-              .limit(boundedLimit(input.limit));
+              .limit(limit + 1);
+            if(cursor && rows.length===0) throw new Error("paperclip_runner_document_history_cursor_expired");
+            const selected = rows.slice(0,limit);
             return {
-              value: jsonValue({ revisions: rows }),
-              references: rows.map((row) => ({
+              value: jsonValue({ revisions: selected, pagination: {limit,hasMore:rows.length>limit,nextCursor:rows.length>limit?{documentId:selected[0]!.documentId,beforeRevisionNumber:selected.at(-1)!.revisionNumber}:null} }),
+              references: selected.map((row) => ({
                 kind: "document_revision" as const,
                 id: row.id,
               })),

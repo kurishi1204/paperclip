@@ -27,7 +27,7 @@ export const listDocumentRevisionsAction = {
   },
   "documentation": {
     "title": "List document revisions",
-    "description": "Read bounded revision history for one active-task document.",
+    "description": "Read revision bodies in pages for one active-task document. Default 5; use limit=1 for large bodies. Follow pagination.nextCursor until hasMore=false.",
     "note": null
   },
   "examples": {
@@ -50,7 +50,7 @@ export const listDocumentRevisionsAction = {
       "operationId": "list_document_revisions",
       "version": 1,
       "title": "List document revisions",
-      "description": "Read bounded revision history for one active-task document.",
+      "description": "Read revision bodies in pages for one active-task document. Default 5; use limit=1 for large bodies. Follow pagination.nextCursor until hasMore=false.",
       "exposure": "always",
       "requiredClaims": [],
       "allowedModes": [
@@ -72,8 +72,9 @@ export const listDocumentRevisionsAction = {
             "type": "integer",
             "minimum": 1,
             "maximum": 200,
-            "default": 50
-          }
+            "default": 5
+          },
+          "cursor": {"type":"object","description":"Use pagination.nextCursor from the previous page; it binds the original document identity.","properties":{"documentId":{"type":"string","format":"uuid"},"beforeRevisionNumber":{"type":"integer","minimum":1}},"required":["documentId","beforeRevisionNumber"],"additionalProperties":false}
         },
         "required": [
           "key"
@@ -101,14 +102,16 @@ export const listDocumentRevisionsAction = {
       "operationId": "list_document_revisions",
       "version": 1,
       "title": "List document revisions",
-      "description": "Inspect revision history for one active-task document.",
+      "description": "Read revision bodies in pages. Default 5; use limit=1 for large bodies. Follow pagination.nextCursor until hasMore=false.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "key": {
             "type": "string",
             "minLength": 1
-          }
+          },
+          "limit": {"type":"integer","minimum":1,"maximum":200,"default":5},
+          "cursor": {"type":"object","description":"Use pagination.nextCursor from the previous page; it binds the original document identity.","properties":{"documentId":{"type":"string","format":"uuid"},"beforeRevisionNumber":{"type":"integer","minimum":1}},"required":["documentId","beforeRevisionNumber"],"additionalProperties":false}
         },
         "required": [
           "key"

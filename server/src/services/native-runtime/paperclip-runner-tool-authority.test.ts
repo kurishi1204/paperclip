@@ -180,6 +180,89 @@ describe("PaperclipRunnerToolAuthority", () => {
     ).rejects.toThrow("paperclip_runner_tool_not_advertised");
   });
 
+  it("pages actual large revision bodies without losing revisions or crossing a cursor after new writes", async () => {
+    const authority = new PaperclipRunnerToolAuthority(db, {companyId, agentId, issueId, runId});
+    const svc = documentService(db), key = "large-history-page";
+    const ids:string[]=[];
+    try {
+    for (let n=1;n<=7;n++) {
+      const x=await svc.upsertIssueDocument({issueId,key,title:"Synthetic revision "+n,format:"markdown",
+        body:"Synthetic revision "+n+"\n"+"x".repeat(180_000),createdByAgentId:agentId,baseRevisionId:ids.at(-1)});
+      ids.push(x.document.latestRevisionId!);
+    }
+    const schema=authority.definitions().find(t=>t.name==="list_document_revisions")!.inputSchema;
+    expect(schema).toMatchObject({properties:{limit:{default:5},cursor:{type:"object"}}});
+    type Page={revisions:Array<{id:string;documentId:string;revisionNumber:number;body:string}>;
+      pagination:{limit:number;hasMore:boolean;nextCursor:{documentId:string;beforeRevisionNumber:number}|null}};
+    const first=await authority.execute({tool:"list_document_revisions",callId:"large-history-first",arguments:{key,limit:1}}) as Page;
+    expect(first.revisions.map(r=>r.id)).toEqual([ids[6]]);
+    expect(first.pagination).toEqual({limit:1,hasMore:true,nextCursor:{documentId:first.revisions[0]!.documentId,beforeRevisionNumber:7}});
+    expect(first.revisions[0]!.body).toBe("Synthetic revision 7\n"+"x".repeat(180_000));
+    expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThan(200_000);
+    await svc.upsertIssueDocument({issueId,key,title:"Newer concurrent revision",format:"markdown",body:"New arrival",createdByAgentId:agentId,baseRevisionId:ids.at(-1)});
+    const received=[first.revisions[0]!.id];let cursor=first.pagination.nextCursor;
+    while(cursor!==null) {
+      const page=await authority.execute({tool:"list_document_revisions",callId:"large-history-"+cursor.beforeRevisionNumber,
+        arguments:{key,limit:1,cursor}}) as Page;
+      expect(page.revisions).toHaveLength(1);
+      expect(page.revisions[0]!.revisionNumber).toBe(cursor.beforeRevisionNumber-1);
+      expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThan(200_000);
+      received.push(page.revisions[0]!.id);cursor=page.pagination.nextCursor;
+    }
+    expect(received).toEqual([...ids].reverse());expect(new Set(received).size).toBe(7);
+    const defaultPage=await authority.execute({tool:"list_document_revisions",callId:"large-history-default",arguments:{key}}) as Page;
+    expect(defaultPage.revisions).toHaveLength(5);
+    expect(defaultPage.pagination).toEqual({limit:5,hasMore:true,nextCursor:{documentId:first.revisions[0]!.documentId,beforeRevisionNumber:4}});
+    } finally {await svc.deleteIssueDocument(issueId,key);}
+  });
+
+  it("honors every advertised history limit including 150 and 200", async () => {
+    const authority=new PaperclipRunnerToolAuthority(db,{companyId,agentId,issueId,runId}),svc=documentService(db),key="history-limit-contract";
+    let previous:string|undefined;
+    try {
+      for(let n=1;n<=201;n++) {
+        const x=await svc.upsertIssueDocument({issueId,key,title:"Revision "+n,format:"markdown",body:"Synthetic "+n,createdByAgentId:agentId,baseRevisionId:previous});
+        previous=x.document.latestRevisionId!;
+      }
+      for(const limit of [150,200]) {
+        const page=await authority.execute({tool:"list_document_revisions",callId:"cap-"+limit,arguments:{key,limit}}) as {
+          revisions:Array<{revisionNumber:number;documentId:string}>;pagination:{limit:number;hasMore:boolean;nextCursor:{documentId:string;beforeRevisionNumber:number}}};
+        expect(page.revisions).toHaveLength(limit);
+        expect(page.pagination).toEqual({limit,hasMore:true,nextCursor:{documentId:page.revisions[0]!.documentId,beforeRevisionNumber:202-limit}});
+      }
+    } finally {await svc.deleteIssueDocument(issueId,key);}
+  });
+
+  it("expires a history cursor when its document is deleted and the key is reused", async () => {
+    const authority=new PaperclipRunnerToolAuthority(db,{companyId,agentId,issueId,runId}),svc=documentService(db),key="history-key-reused";
+    try {
+      const x=await svc.upsertIssueDocument({issueId,key,title:"Old one",format:"markdown",body:"Old revision one",createdByAgentId:agentId});
+      await svc.upsertIssueDocument({issueId,key,title:"Old two",format:"markdown",body:"Old revision two",createdByAgentId:agentId,baseRevisionId:x.document.latestRevisionId});
+      const first=await authority.execute({tool:"list_document_revisions",callId:"old-first",arguments:{key,limit:1}}) as {
+        pagination:{nextCursor:{documentId:string;beforeRevisionNumber:number}}};
+      const cursor={documentId:x.document.id,beforeRevisionNumber:2};
+      await svc.deleteIssueDocument(issueId,key);
+      const replacement=await svc.upsertIssueDocument({issueId,key,title:"Replacement",format:"markdown",body:"Different document body",createdByAgentId:agentId});
+      expect(replacement.document.id).not.toBe(x.document.id);
+      await expect(authority.execute({tool:"list_document_revisions",callId:"old-next",arguments:{key,limit:1,cursor}}))
+        .rejects.toThrow("paperclip_runner_document_history_cursor_expired");
+      expect(first.pagination.nextCursor).toEqual(cursor);
+    } finally {await svc.deleteIssueDocument(issueId,key);}
+  });
+
+  it("rejects malformed history cursor and injected query options at the actual authority",async()=>{
+    const authority=new PaperclipRunnerToolAuthority(db,{companyId,agentId,issueId,runId});
+    for(const cursor of [null,[],{}, {documentId:"wrong",beforeRevisionNumber:2},
+      {documentId:issueId,beforeRevisionNumber:0}, {documentId:issueId,beforeRevisionNumber:2,limit:1000000}]) {
+      await expect(authority.execute({tool:"list_document_revisions",callId:"bad-history",arguments:{key:"any",cursor}}))
+        .rejects.toThrow("Invalid document history cursor");
+    }
+    for(const limit of [0,201,1.5,"1"]) {
+      await expect(authority.execute({tool:"list_document_revisions",callId:"bad-limit",arguments:{key:"any",limit}}))
+        .rejects.toThrow("Invalid document history limit");
+    }
+  });
+
   it("returns public task URLs from the current claimed origin in context and search results", async () => {
     const origin = vi.spyOn(cloudIdentity, "runtimeCanonicalOrigin").mockReturnValue("https://board.example");
     const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });

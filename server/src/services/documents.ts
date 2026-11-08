@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, lt } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { documentRevisions, documents, issueDocuments, issues } from "@paperclipai/db";
 import { isSystemIssueDocumentKey, issueDocumentKeySchema, type IssueDocumentRevisionDigest, type SystemIssueDocumentKey } from "@paperclipai/shared";
@@ -7,6 +7,22 @@ import { conflict, notFound, unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
 import { insertRowsInChunks } from "./batch-insert.js";
 import type { ImportIssueDocumentRow } from "./import-write-types.js";
+
+export function documentRevisionPage(input: Record<string, unknown>) {
+  const limit=input.limit === undefined ? 5 : input.limit;
+  if(typeof limit !== "number" || !Number.isInteger(limit) || limit<1 || limit>200) {
+    throw unprocessable("Invalid document history limit");
+  }
+  if(input.cursor === undefined) return {limit,cursor:undefined};
+  const value=input.cursor;
+  if(!value || typeof value !== "object" || Array.isArray(value)) throw unprocessable("Invalid document history cursor");
+  const cursor=value as Record<string,unknown>;
+  if(Object.keys(cursor).length!==2 || typeof cursor.documentId!=="string" ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(cursor.documentId) ||
+      typeof cursor.beforeRevisionNumber!=="number" || !Number.isSafeInteger(cursor.beforeRevisionNumber) ||
+      cursor.beforeRevisionNumber<1) throw unprocessable("Invalid document history cursor");
+  return {limit,cursor:{documentId:cursor.documentId,beforeRevisionNumber:cursor.beforeRevisionNumber}};
+}
 
 function normalizeDocumentKey(key: string) {
   const normalized = key.trim().toLowerCase();
@@ -229,9 +245,10 @@ export function documentService(db: Db) {
 
     listIssueDocumentRevisions: async (issueId: string, rawKey: string,
       revisionScope?: { companyId: string; documentId: string; revisionId: string },
+      page?: { limit: number; beforeRevisionNumber?: number; documentId?: string },
     ) => {
       const key = normalizeDocumentKey(rawKey);
-      return db
+      const query = db
         .select({
           id: documentRevisions.id,
           companyId: documentRevisions.companyId,
@@ -256,8 +273,11 @@ export function documentService(db: Db) {
           revisionScope ? eq(documentRevisions.companyId, revisionScope.companyId) : undefined,
           revisionScope ? eq(documents.id, revisionScope.documentId) : undefined,
           revisionScope ? eq(documentRevisions.id, revisionScope.revisionId) : undefined,
+          page?.beforeRevisionNumber === undefined ? undefined : lt(documentRevisions.revisionNumber, page.beforeRevisionNumber),
+          page?.documentId === undefined ? undefined : eq(documents.id, page.documentId),
         ))
         .orderBy(desc(documentRevisions.revisionNumber));
+      return page ? query.limit(page.limit) : query;
     },
 
     upsertIssueDocument: async (input: {
