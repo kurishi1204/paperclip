@@ -597,7 +597,10 @@ export class PaperclipRunnerToolAuthority {
         const review = this.binding.documentReviewInteractionId
           ? await getNativeDocumentReviewAssignment(this.db, { ...this.binding, allowResolved: true }) : null;
         if (this.binding.documentReviewInteractionId && !review) throw forbidden("The fixed document review is no longer available.");
-        return { documents: review ? documents.filter(document => document.key === review.binding.key) : documents };
+        // Listing is discovery, not a bulk body read. Full bodies can exceed the
+        // bounded semantic transport before an agent can discover a document key.
+        const visible = review ? documents.filter(document => document.key === review.binding.key) : documents;
+        return { documents: visible.map(({ body: _body, ...metadata }) => metadata) };
       }
       case "read_document": {
         const review = await this.#assertDocumentReviewKey(input.key);

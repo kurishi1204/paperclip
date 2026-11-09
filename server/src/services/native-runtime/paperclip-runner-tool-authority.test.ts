@@ -885,6 +885,38 @@ describe("PaperclipRunnerToolAuthority", () => {
     ).rejects.toThrow("paperclip_runner_tool_idempotency_conflict");
   });
 
+  it("discovers documents without transporting large bodies and keeps exact body reads", async () => {
+    const service = documentService(db);
+    const keys = ["large-discovery-a", "large-discovery-b", "large-discovery-c"];
+    const addedIds: string[] = [];
+    const body = "Synthetic private document body.\n".repeat(12_000);
+    try {
+      for (const key of keys) {
+        await service.upsertIssueDocument({ issueId, key, title: key, format: "markdown", body,
+          baseRevisionId: null, changeSummary: null, createdByAgentId: agentId, createdByRunId: runId });
+        addedIds.push((await service.getIssueDocumentByKey(issueId, key))!.id);
+      }
+      const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+      const listed = await authority.execute({ tool: "list_documents", callId: "large-document-discovery", arguments: {} }) as {
+        documents: Array<{ key: string; id: string; latestRevisionId: string }>;
+      };
+      const encoded = JSON.stringify(listed);
+      expect(Buffer.byteLength(encoded)).toBeLessThan(64 * 1024);
+      expect(encoded).not.toContain("Synthetic private document body");
+      for (const key of keys) {
+        const metadata = listed.documents.find(document => document.key === key)!;
+        expect(metadata.id).toBeTruthy();
+        expect(metadata.latestRevisionId).toBeTruthy();
+        expect(metadata).not.toHaveProperty("body");
+        expect(metadata).not.toHaveProperty("latestBody");
+        const read = await authority.execute({ tool: "read_document", callId: `read-${key}`, arguments: { key } });
+        expect(read).toMatchObject({ document: { id: metadata.id, key, latestRevisionId: metadata.latestRevisionId, body } });
+      }
+    } finally {
+      if (addedIds.length) await db.delete(documents).where(inArray(documents.id, addedIds));
+    }
+  });
+
   it("writes a real revisioned document and replays the mutation receipt", async () => {
     const body = credentialDocumentBody;
     const authority = new PaperclipRunnerToolAuthority(db, {
