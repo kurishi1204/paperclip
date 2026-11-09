@@ -323,13 +323,43 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { admitTrustedJournal, assessForkChecks, assessDispositions, buildReviewSource, canonical, digest, checkReadiness, GREPTILE_APP } from "./check-readiness.mjs";
+import { admitTrustedJournal, assessForkChecks, assessDispositions, buildReviewSource, canonical, digest, checkReadiness, GREPTILE_APP, readCorpusManifest, readCorpusManifestBlock, readReviewSettings } from "./check-readiness.mjs";
 
 const FORK = "kurishi1204/paperclip";
-const HEAD = "1".repeat(40), BASE = "2".repeat(40), TREE = "3".repeat(40), BASE_TREE = "4".repeat(40);
 const hashBlob = (s) => createHash("sha1").update(`blob ${Buffer.byteLength(s)}\0${s}`).digest("hex");
-function forkFixture() {
-  const directory = mkdtempSync(path.join(os.tmpdir(),"fork-quality-test-"));
+// Real Git tree objects, including directory entries, keep fixture migration
+// neutral on the adopted reader before tree-integrity assertions are added.
+function fixtureTree(leaves) {
+  const rows = leaves.map(row => ({ ...row }));
+  const directories = new Set([""]);
+  for (const row of rows) {
+    const parts = row.path.split("/");
+    for (let i = 1; i < parts.length; i += 1) directories.add(parts.slice(0, i).join("/"));
+  }
+  let root;
+  for (const directory of [...directories].sort((a,b) => b.split("/").length-a.split("/").length || b.length-a.length)) {
+    const children = rows.filter(row => path.posix.dirname(row.path) === (directory || "."));
+    children.sort((a,b) => Buffer.compare(Buffer.from(path.posix.basename(a.path)+(a.type==="tree"?"/":"")),Buffer.from(path.posix.basename(b.path)+(b.type==="tree"?"/":""))));
+    const body = Buffer.concat(children.flatMap(row => [Buffer.from(`${row.mode==="040000"?"40000":row.mode} ${path.posix.basename(row.path)}\0`),Buffer.from(row.sha,"hex")]));
+    const sha = createHash("sha1").update(Buffer.concat([Buffer.from(`tree ${body.length}\0`),body])).digest("hex");
+    if (directory) rows.push({path:directory,type:"tree",mode:"040000",sha}); else root=sha;
+  }
+  return { sha:root,truncated:false,tree:rows };
+}
+const HEAD = "1".repeat(40), BASE = "2".repeat(40);
+const TREE = fixtureTree([{path:"sample.mjs",type:"blob",mode:"100644",sha:hashBlob("new source\n")}]).sha;
+const BASE_TREE = fixtureTree([{path:"sample.mjs",type:"blob",mode:"100644",sha:hashBlob("old source\n")}]).sha;
+function reindexFixtureTrees(f, headRows, baseRows) {
+  const prefix=`repos/${FORK}`, head=fixtureTree(headRows), base=fixtureTree(baseRows);
+  f.routes[`${prefix}/git/trees/${head.sha}?recursive=1`]=head;
+  f.routes[`${prefix}/git/trees/${base.sha}?recursive=1`]=base;
+  f.routes[`${prefix}/git/commits/${HEAD}`]={sha:HEAD,tree:{sha:head.sha}};
+  f.routes[`${prefix}/git/commits/${BASE}`]={sha:BASE,tree:{sha:base.sha}};
+  f.source.treeSha=head.sha;
+  return {head,base};
+}
+function forkFixture({tempRoot=os.tmpdir()}={}) {
+  const directory = mkdtempSync(path.join(tempRoot,"fork-quality-test-"));
   const root = path.join(directory,"operator"); mkdirSync(root,{mode:0o700});
   const old = "old source\n", current = "new source\n";
   const oldBlob = hashBlob(old), newBlob = hashBlob(current);
@@ -345,12 +375,15 @@ function forkFixture() {
   const start = { scriptSHA256:digest(launcher),combinedSHA256:inputSHA,combinedBytes:Buffer.byteLength(system)+1+Buffer.byteLength(material),sessionID:session,argv:["/fixture/actual-cli","--print","--session-id",session,"--max-turns","1","--model","claude-opus-5-5","--effort","high","--output-format","json","--safe-mode","--restricted","--tools","","--strict-mcp-config","--mcp-config",'{"mcpServers":{}}',"--setting-sources","","--settings",'{"disableAllHooks":true,"enabledPlugins":{}}',"--disable-slash-commands","--no-chrome","--permission-mode","dontAsk","--permission-prompts","none","--no-session-persistence","--system-prompt",system] };
   const data = { start,claim:{sessionID:session,singleAttempt:true,noRetry:true},process:{sessionID:session,pid:123},terminal:{nativeExit:0,inputSHA256:inputSHA,sessionID:session},raw,report,system,material,launcher,cli };
   const admission = { key:"one",kind:"trusted-cli-journal/v1",purpose:"independent_implementation_review",repository:FORK,pullRequest:1,headSha:HEAD,sourceInputSHA256:digest(canonical(source)),cliSHA256:digest(cli),cliInvocationPath:"/fixture/actual-cli",implementationSessionID:"different-implementation-session",artifacts:{} };
-  let registrySHA;
+  let registrySHA;const extraEntries=[],artifactPaths={};
   const seal = () => {
     const bytes = (name) => typeof data[name] === "string" ? Buffer.from(data[name]) : Buffer.from(JSON.stringify(data[name]));
     data.terminal.rawSHA256 = digest(bytes("raw"));
-    for(const name of Object.keys(data)) { const b=bytes(name);writeFileSync(path.join(root,name),b,{mode:0o600});admission.artifacts[name]={path:name,sha256:digest(b)}; }
-    const b=Buffer.from(JSON.stringify({schema:"paperclip.operator-review-registry/v1",entries:[admission]}));writeFileSync(path.join(root,"registry.json"),b,{mode:0o600});registrySHA=digest(b);
+    for(const name of Object.keys(data)) { const b=bytes(name),relative=artifactPaths[name]??name,target=path.join(root,relative);
+      if(artifactPaths[name])assert.deepEqual(readFileSync(target),b);
+      else writeFileSync(target,b,{mode:0o600});
+      admission.artifacts[name]={path:relative,sha256:digest(b)}; }
+    const b=Buffer.from(JSON.stringify({schema:"paperclip.operator-review-registry/v1",entries:[admission,...extraEntries]}));writeFileSync(path.join(root,"registry.json"),b,{mode:0o600});registrySHA=digest(b);
   };seal();
   const pointer={admissionKey:"one",pullRequest:1,headSha:HEAD,dispositions:[{sourceID:`independent_review:${digest(report)}`,sourceVersion:digest(report),bodySHA256:digest(report),disposition:"not_a_finding",reason:"The complete report contains no remaining finding",evidence:"sample.mjs:1"}]};
   const evidence=path.join(directory,"pointer.json");writeFileSync(evidence,JSON.stringify({schema:"paperclip.review-pointer/v1",repository:FORK,entries:[pointer]}));
@@ -366,16 +399,17 @@ function forkFixture() {
   routes[`${prefix}/rules/branches/master?per_page=100&page=1`]=[];
   routes[`${prefix}/branches/master`]={protected:false,commit:{sha:BASE}};
   routes[`${prefix}/pulls/1/files?per_page=100&page=1`]=[{filename:"sample.mjs",status:"modified",sha:newBlob}];
-  routes[`${prefix}/git/commits/${HEAD}`]={tree:{sha:TREE}};
-  routes[`${prefix}/git/commits/${BASE}`]={tree:{sha:BASE_TREE}};
+  routes[`${prefix}/git/commits/${HEAD}`]={sha:HEAD,tree:{sha:TREE}};
+  routes[`${prefix}/git/commits/${BASE}`]={sha:BASE,tree:{sha:BASE_TREE}};
   routes[`${prefix}/git/trees/${TREE}?recursive=1`]={sha:TREE,truncated:false,tree:[{path:"sample.mjs",type:"blob",mode:"100644",sha:newBlob}]};
   routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`]={sha:BASE_TREE,truncated:false,tree:[{path:"sample.mjs",type:"blob",mode:"100644",sha:oldBlob}]};
   for(const [b,text] of [[oldBlob,old],[newBlob,current]])routes[`${prefix}/git/blobs/${b}`]={sha:b,encoding:"base64",size:Buffer.byteLength(text),content:Buffer.from(text).toString("base64")};
   for(const route of [`issues/1/comments`,`pulls/1/comments`,`pulls/1/reviews`])routes[`${prefix}/${route}?per_page=100&page=1`]=[];
   routes[`${prefix}/compare/master...${HEAD}`]={behind_by:0,merge_base_commit:{sha:BASE}};
+  routes[`${prefix}/compare/${BASE}...${HEAD}`]=routes[`${prefix}/compare/master...${HEAD}`];
   const view={headRefOid:HEAD,reviewDecision:"",statusCheckRollup:[{__typename:"CheckRun",name:"ci",status:"COMPLETED",conclusion:"SUCCESS"}]};
   const reads=[];
-  return {directory,root,data,admission,source,pointer,seal,pr,ci,routes,view,reads,evidence,
+  return {directory,root,data,admission,extraEntries,artifactPaths,source,pointer,seal,pr,ci,routes,view,reads,evidence,
     options:()=>({review_evidence:evidence,trusted_review_root:root,trusted_review_registry_sha256:registrySHA}),
     admissionArgs:()=>({trustedRoot:root,registrySHA256:registrySHA,repository:FORK,pullRequest:1,headSha:HEAD,source,pointer,checkoutRoot:path.dirname(new URL(import.meta.url).pathname)}),
     deps:{getJson:(route)=>{reads.push(route);assert.ok(Object.hasOwn(routes,route),route);return structuredClone(routes[route]);},viewPullRequest:()=>structuredClone(view)},
@@ -505,7 +539,7 @@ test("first PR GET failure stays visible as unknown instead of disappearing from
 });
 
 test("review source paths use deterministic code-unit ordering",()=>{
- const f=forkFixture();try{const prefix=`repos/${FORK}`;const after=f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree[0],before=f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree[0];for(const [tree,row]of [[TREE,after],[BASE_TREE,before]])f.routes[`${prefix}/git/trees/${tree}?recursive=1`].tree=['a.mjs','Z.mjs'].map(p=>({...row,path:p}));const files=['a.mjs','Z.mjs'].map(filename=>({filename,status:'modified',sha:after.sha}));const result=buildReviewSource(f.deps.getJson,FORK,f.pr,files,TREE,BASE,BASE,[]);assert.deepEqual(result.changedFiles.map(x=>x.path),['Z.mjs','a.mjs']);}finally{f.close();}
+ const f=forkFixture();try{const prefix=`repos/${FORK}`;const after=f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree[0],before=f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree[0];const trees=reindexFixtureTrees(f,['a.mjs','Z.mjs'].map(p=>({...after,path:p})),['a.mjs','Z.mjs'].map(p=>({...before,path:p})));const files=['a.mjs','Z.mjs'].map(filename=>({filename,status:'modified',sha:after.sha}));const result=buildReviewSource(f.deps.getJson,FORK,f.pr,files,trees.head.sha,BASE,BASE,[]);assert.deepEqual(result.changedFiles.map(x=>x.path),['Z.mjs','a.mjs']);}finally{f.close();}
 });
 
 test("a new review or changed check inventory during final reads blocks the snapshot",async()=>{
@@ -740,6 +774,555 @@ function v2JournalFixture() {
  f.seal();
  return f;
 }
+
+function readJournalFixture({tempRoot=os.tmpdir(),dependencyContent="export const dependency = 1;\n",alreadyAdoptedRow=false}={}) {
+ const f=forkFixture({tempRoot}), dependency=dependencyContent, depBlob=hashBlob(dependency), prefix=`repos/${FORK}`;
+ f.source.dependencyFiles.push({path:"dependency.mjs",blobSha:depBlob,content:dependency});
+ f.pointer.dependencies=["dependency.mjs"];
+ writeFileSync(f.evidence,JSON.stringify({schema:"paperclip.review-pointer/v1",repository:FORK,entries:[f.pointer]}));
+ const dependencyRow={path:"dependency.mjs",type:"blob",mode:"100644",sha:depBlob};
+ const adoptedRow={path:"already.mjs",type:"blob",mode:"100644",sha:hashBlob("same\n")};
+ const adopted=alreadyAdoptedRow?[adoptedRow]:[];
+ reindexFixtureTrees(f,
+   [...f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree,dependencyRow,...adopted],
+   [...f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree,dependencyRow,...adopted]);
+ if(alreadyAdoptedRow){f.routes[`${prefix}/pulls/1/files?per_page=100&page=1`].push({filename:adoptedRow.path,status:"added",sha:adoptedRow.sha});f.pr.changed_files=2;}
+ f.routes[`${prefix}/git/blobs/${depBlob}`]={sha:depBlob,encoding:"base64",size:Buffer.byteLength(dependency),content:Buffer.from(dependency).toString("base64")};
+ f.admission.kind="trusted-cli-read-journal/v1";f.admission.sourceSchema="paperclip.fork-review-read-corpus/v1";
+ f.admission.sourceInputSHA256=digest(canonical(f.source));
+ const corpus=readCorpusManifest(f.source);mkdirSync(path.join(f.root,"corpus"),{mode:0o700});const cwd=realpathSync(path.join(f.root,"corpus"));
+ for(const file of corpus.files) { const target=path.join(cwd,file.path);mkdirSync(path.dirname(target),{recursive:true,mode:0o700});writeFileSync(target,file.content,{mode:0o400}); }
+ const inventory={schema:"paperclip.read-corpus-inventory/v1",root:cwd,files:corpus.files.map(file=>({path:file.path,mode:0o400,nlink:1,type:"file",sha256:file.sha256}))};
+ f.data.manifest=`${canonical(corpus.manifest)}\n`;f.data.corpusPre=inventory;f.data.corpusPost=structuredClone(inventory);
+ f.data.attempts={schema:"paperclip.review-attempts/v1",attempts:[{sessionID:f.data.start.sessionID,state:"completed"}]};
+ f.data.material=`Review all corpus files.\n${readCorpusManifestBlock(f.source)}`;
+ const combined=Buffer.concat([Buffer.from(f.data.system),Buffer.from([0]),Buffer.from(f.data.material)]);
+ f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(combined);f.data.start.combinedBytes=combined.length;f.data.start.cwd=cwd;f.data.start.home=path.join(realpathSync(f.directory),"synthetic-home");mkdirSync(f.data.start.home,{mode:0o700});
+ const argv=f.data.start.argv;argv[argv.indexOf("--max-turns")+1]="64";argv[argv.indexOf("--output-format")+1]="stream-json";argv.splice(argv.indexOf("--output-format")+2,0,"--verbose");argv[argv.indexOf("--tools")+1]="Read,Glob,Grep";argv[argv.indexOf("--settings")+1]=readReviewSettings(f.data.start,corpus);
+ const sid=f.data.start.sessionID;
+ const events=[{type:"system",subtype:"init",cwd,original_cwd:cwd,session_id:sid,model:"claude-opus-5-5",tools:["Glob","Grep","Read"],permissionMode:"dontAsk",per_turn_effort_active:true,
+   claude_code_version:"2.1.306",apiKeySource:"none",mcp_servers:[],skills:[],slash_commands:[],additional_directories:[],
+   plugins:[{name:"cc-plugin-agents-md",path:"builtin",source:"cc-plugin-agents-md@builtin"},{name:"cc-plugin-telemetry",path:"builtin",source:"cc-plugin-telemetry@builtin"},{name:"cc-plugin-plugin-authoring",path:"builtin",source:"cc-plugin-plugin-authoring@builtin"}],
+   agents:["claude","Explore","general-purpose","Plan"]}];
+ for(const [index,file] of corpus.files.entries()) {
+   const id=`toolu_fixture_${index}`,filePath=path.join(cwd,file.path),lines=file.content.split("\n");
+   events.push({type:"assistant",parent_tool_use_id:null,session_id:sid,message:{role:"assistant",content:[{type:"tool_use",id,name:"Read",input:{file_path:filePath}}]}});
+   events.push({type:"user",parent_tool_use_id:null,session_id:sid,message:{role:"user",content:[{type:"tool_result",tool_use_id:id,content:lines.map((line,i)=>`${i+1}\t${line}`).join("\n")}]},tool_use_result:{type:"text",file:{filePath,content:file.content,numLines:lines.length,startLine:1,totalLines:lines.length}},tool_result_meta:[{id,permission_decision:{decision:"accept",source:"config",reason_type:"mode"}}]});
+ }
+ events.splice(2,0,{type:"system",subtype:"thinking_tokens",session_id:sid,estimated_tokens:1,estimated_tokens_delta:1});
+ events.splice(3,0,{type:"rate_limit_event",session_id:sid,rate_limit_info:{status:"allowed"}});
+ events.push({type:"assistant",parent_tool_use_id:null,session_id:sid,message:{role:"assistant",content:[{type:"text",text:f.data.report}]}});
+ events.push({...f.data.raw,num_turns:4,stop_reason:"end_turn",safety_stops:0,result_index:0,api_error_status:null});
+ f.data.stream=events.map(event=>JSON.stringify(event)).join("\n")+"\n";
+ f.data.terminal.streamSHA256=digest(f.data.stream);
+ f.seal();
+ return {f,corpus,events,cwd,refresh(){f.data.stream=events.map(event=>JSON.stringify(event)).join("\n")+"\n";f.data.terminal.streamSHA256=digest(f.data.stream);f.seal();}};
+}
+// Use the public writer's files and pre-inventory as the actual admission
+// inputs. The receiver computes its own current inventory from the filesystem.
+function emittedReadJournalFixture({tempRoot=os.tmpdir(),emitPacket=null,dependencyContent,alreadyAdoptedRow=false}={}) {
+ const x=readJournalFixture({tempRoot,dependencyContent,alreadyAdoptedRow}),{f,events,corpus}=x,oldCwd=x.cwd;
+ rmSync(path.join(f.root,"corpus"),{recursive:true});
+ const output=path.join(f.root,"packet-one");
+ const profile=emitPacket ? emitPacket(f,output) : sourceCodec.emitReadCorpus(f.source,output,{checkoutRoot:process.cwd()});
+ const cwd=realpathSync(path.join(output,"corpus"));
+ for(let i=0;i<events.length;i++)events[i]=JSON.parse(JSON.stringify(events[i]).replaceAll(oldCwd,cwd));
+ f.data.manifest=readFileSync(path.join(output,"manifest.json"),"utf8");
+ f.data.material=readFileSync(path.join(output,"material.md"),"utf8");
+ f.data.corpusPre=readFileSync(path.join(output,"corpus-pre.json"),"utf8");
+ f.data.corpusPost=JSON.parse(f.data.corpusPre);
+ f.data.start.cwd=cwd;
+ f.data.start.argv[f.data.start.argv.indexOf("--settings")+1]=readReviewSettings(f.data.start,corpus);
+ const combined=Buffer.concat([Buffer.from(f.data.system),Buffer.from([0]),Buffer.from(f.data.material)]);
+ f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(combined);f.data.start.combinedBytes=combined.length;
+ Object.assign(f.artifactPaths,{manifest:"packet-one/manifest.json",material:"packet-one/material.md",corpusPre:"packet-one/corpus-pre.json"});
+ x.cwd=cwd;x.refresh();
+ return {...x,output,profile};
+}
+function emitDocumentedReadCommand(f,output,documentPath) {
+ const content=readFileSync(documentPath,"utf8");
+ const example=content.match(/`(?:node \.agents\/skills\/pr-gardening\/scripts\/)?check-readiness\.mjs --emit-review-input <PR>[^`]*--check-only`/);
+ assert.ok(example,`missing documented command: ${documentPath}`);
+ const command=example[0].slice(1,-1).replace("<PR>","1")
+   .replace(/<comma-separated[^>]*>/,"dependency.mjs").replace("<absolute-new-directory>",output);
+ const checkout=path.join(f.directory,"documented-checkout"),scripts=path.join(checkout,".agents/skills/pr-gardening/scripts");
+ mkdirSync(scripts,{recursive:true});
+ for(const name of ["check-readiness.mjs","lib.mjs"])copyFileSync(fileURLToPath(new URL(`./${name}`,import.meta.url)),path.join(scripts,name));
+ const routes=path.join(f.directory,"documented-routes.json"),calls=path.join(f.directory,"documented-gh-calls.jsonl");
+ writeFileSync(routes,JSON.stringify(f.routes));
+ const bin=path.join(f.directory,"documented-bin");mkdirSync(bin);
+ const stub=path.join(bin,"gh");writeFileSync(stub,`#!${process.execPath}\nconst fs=require('fs');const args=process.argv.slice(2),routes=JSON.parse(fs.readFileSync(${JSON.stringify(routes)},'utf8'));fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(args)+'\\n');if(args[0]==='api'&&args[1]==='--method'&&args[2]==='GET'&&Object.hasOwn(routes,args[3]))process.stdout.write(JSON.stringify(routes[args[3]]));else process.exit(8);\n`);chmodSync(stub,0o700);
+ const invoke=(line)=>spawnSync("/bin/sh",["-c",line],{cwd:checkout,env:{PATH:bin+path.delimiter+path.dirname(process.execPath)},encoding:"utf8"});
+ const dry=invoke(command);assert.equal(dry.status,0,dry.stderr);assert.equal(existsSync(output),false);
+ const profile=JSON.parse(dry.stdout),written=invoke(command.replace(/ --check-only$/, ""));
+ assert.equal(written.status,0,written.stderr);
+ assert.deepEqual(JSON.parse(written.stdout).recommendedRanges,profile.recommendedRanges);
+ assert.equal(profile.corpusRoot,realpathSync(path.join(output,"corpus")));
+ assert.ok(readFileSync(path.join(output,"material.md"),"utf8").includes(`The absolute corpus root is ${profile.corpusRoot}`));
+ assert.ok(readFileSync(calls,"utf8").trim().split("\n").map(JSON.parse).every(args=>args[0]==="api"&&args[1]==="--method"&&args[2]==="GET"));
+}
+for(const name of ["skill","contributing"])test(`documented ${name} Read command reaches actual admission through fake GitHub`,()=>{
+ const documentPath=name==="skill"?fileURLToPath(new URL('../SKILL.md',import.meta.url)):fileURLToPath(new URL('../../../../CONTRIBUTING.md',import.meta.url));
+ const x=emittedReadJournalFixture({emitPacket:(f,output)=>emitDocumentedReadCommand(f,output,documentPath)});
+ try {const review=admitTrustedJournal(x.f.admissionArgs());assert.equal(review.status,"valid",JSON.stringify(review));assert.equal(review.deliveredFiles,x.corpus.files.length);}
+ finally{x.f.close();}
+});
+test("emitted Read packet reaches the actual admitted receiver",()=>{
+ const x=emittedReadJournalFixture();try{
+   const review=admitTrustedJournal(x.f.admissionArgs());
+   assert.equal(review.status,"valid",JSON.stringify(review));
+   assert.equal(review.deliveredFiles,x.corpus.files.length);
+ }finally{x.f.close();}
+});
+test("emitter's actual recommended ranges reach admission and one missing boundary fails",()=>{
+ const x=emittedReadJournalFixture({dependencyContent:"export const value = 1;\n".repeat(1200)}),{f,events,corpus}=x;
+ try {
+   const ranges=x.profile.recommendedRanges;
+   assert.deepEqual(ranges,sourceCodec.emitReadCorpus(f.source,path.join(f.root,"unused-profile"),{checkOnly:true,checkoutRoot:process.cwd()}).recommendedRanges);
+   const splitPath=corpus.files.find(file=>file.role==="deps").path;
+   assert.ok(ranges.filter(range=>range.path===splitPath).length>1);
+   const start=events[0],final=events.slice(-2),pairs=[];
+   for(const [index,range] of ranges.entries()){
+     const file=corpus.files.find(row=>row.path===range.path),filePath=path.join(x.cwd,range.path);
+     assert.ok(file);
+     const lines=file.content.split("\n"),slice=lines.slice(range.offset-1,range.offset-1+range.limit);
+     const id=`toolu_recommended_${index}`;
+     pairs.push(
+       {type:"assistant",parent_tool_use_id:null,session_id:f.data.start.sessionID,message:{role:"assistant",content:[{type:"tool_use",id,name:"Read",input:{file_path:filePath,offset:range.offset,limit:range.limit}}]}},
+       {type:"user",parent_tool_use_id:null,session_id:f.data.start.sessionID,message:{role:"user",content:[{type:"tool_result",tool_use_id:id,content:slice.map((line,i)=>`${range.offset+i}\t${line}`).join("\n")}]},tool_use_result:{type:"text",file:{filePath,content:slice.join("\n"),numLines:slice.length,startLine:range.offset,totalLines:lines.length}},tool_result_meta:[{id,permission_decision:{decision:"accept",source:"config",reason_type:"mode"}}]}
+     );
+   }
+   events.splice(0,events.length,start,...pairs,...final);x.refresh();
+   const admitted=admitTrustedJournal(f.admissionArgs());
+   assert.equal(admitted.status,"valid",JSON.stringify(admitted));
+   assert.equal(admitted.toolCalls,ranges.length);
+   assert.equal(admitted.deliveredFiles,corpus.files.length);
+   const missing=ranges.find(range=>range.path===splitPath&&range.offset>1);
+   const at=events.findIndex(event=>event.type==="assistant"&&event.message?.content?.[0]?.input?.file_path===path.join(x.cwd,splitPath)&&event.message.content[0].input.offset===missing.offset);
+   assert.ok(at>0);
+   events.splice(at,2);x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"read_coverage_incomplete"});
+ }finally{f.close();}
+});
+test("emitted Read packets for two candidates share one pinned registry",()=>{
+ const x=emittedReadJournalFixture(),{f,corpus}=x;try{
+   const output=path.join(f.root,"packet-two");sourceCodec.emitReadCorpus(f.source,output,{checkoutRoot:process.cwd()});
+   const cwd=realpathSync(path.join(output,"corpus")),session="22222222-2222-4222-8222-222222222222";
+   const data=structuredClone(f.data),oldSession=f.data.start.sessionID;
+   data.manifest=readFileSync(path.join(output,"manifest.json"),"utf8");
+   data.material=readFileSync(path.join(output,"material.md"),"utf8");
+   data.corpusPre=readFileSync(path.join(output,"corpus-pre.json"),"utf8");data.corpusPost=JSON.parse(data.corpusPre);
+   data.start.cwd=cwd;data.start.sessionID=data.claim.sessionID=data.process.sessionID=data.terminal.sessionID=data.raw.session_id=session;
+   data.attempts.attempts[0].sessionID=session;
+   data.start.argv=data.start.argv.map(value=>value===oldSession?session:value);
+   data.start.argv[data.start.argv.indexOf("--settings")+1]=readReviewSettings(data.start,corpus);
+   data.stream=data.stream.replaceAll(x.cwd,cwd).replaceAll(oldSession,session);
+   const combined=Buffer.concat([Buffer.from(data.system),Buffer.from([0]),Buffer.from(data.material)]);
+   data.start.combinedSHA256=data.terminal.inputSHA256=digest(combined);data.start.combinedBytes=combined.length;
+   data.terminal.rawSHA256=digest(JSON.stringify(data.raw));data.terminal.streamSHA256=digest(data.stream);
+   const entry=structuredClone(f.admission);entry.key="two";entry.pullRequest=2;entry.implementationSessionID="second-implementation-session";entry.artifacts={};
+   const evidence=path.join(output,"evidence");mkdirSync(evidence,{mode:0o700});
+   for(const [name,value] of Object.entries(data)){
+     const bytes=Buffer.from(typeof value==="string"?value:JSON.stringify(value));
+     const relative=["manifest","material","corpusPre"].includes(name)?`packet-two/${{manifest:"manifest.json",material:"material.md",corpusPre:"corpus-pre.json"}[name]}`:`packet-two/evidence/${name}`;
+     const target=path.join(f.root,relative);
+     if(["manifest","material","corpusPre"].includes(name))assert.deepEqual(readFileSync(target),bytes);
+     else writeFileSync(target,bytes,{mode:0o600});
+     entry.artifacts[name]={path:relative,sha256:digest(bytes)};
+   }
+   f.extraEntries.push(entry);f.seal();
+   const first=admitTrustedJournal(f.admissionArgs());
+   const second=admitTrustedJournal({...f.admissionArgs(),pullRequest:2,pointer:{admissionKey:"two",pullRequest:2,headSha:HEAD}});
+   assert.equal(first.status,"valid",JSON.stringify(first));assert.equal(second.status,"valid",JSON.stringify(second));
+   chmodSync(path.join(output,"corpus",corpus.files[0].path),0o600);
+   assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
+   assert.deepEqual(admitTrustedJournal({...f.admissionArgs(),pullRequest:2,pointer:{admissionKey:"two",pullRequest:2,headSha:HEAD}}),
+     {status:"invalid",code:"independent_review_invalid",subcode:"corpus_inventory"});
+ }finally{x.f.close();}
+});
+test("emitted Read packet rejects a writable packet parent",()=>{
+ const x=emittedReadJournalFixture();try{
+   chmodSync(x.output,0o770);
+   assert.deepEqual(admitTrustedJournal(x.f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"corpus_inventory"});
+ }finally{x.f.close();}
+});
+test("emitted Read packet through a directory alias records canonical corpus root",()=>{
+ const root=realpathSync(mkdtempSync(path.join(os.tmpdir(),"read-corpus-alias-")));
+ const physical=path.join(root,"physical"),alias=path.join(root,"alias");
+ mkdirSync(physical,{mode:0o700});symlinkSync(physical,alias,"dir");
+ let x;try{
+   assert.notEqual(realpathSync(alias),alias);
+   x=emittedReadJournalFixture({tempRoot:alias});
+   assert.equal(JSON.parse(readFileSync(path.join(x.output,"corpus-pre.json"),"utf8")).root,x.cwd);
+   assert.equal(x.profile.corpusRoot,x.cwd);
+   const review=admitTrustedJournal(x.f.admissionArgs());assert.equal(review.status,"valid",JSON.stringify(review));
+ }finally{x?.f.close();rmSync(alias);rmSync(root,{recursive:true,force:true});}
+});
+test("read journal old kind fails and new pinned kind reaches real readiness with full reconstructed source",async()=>{
+ const x=readJournalFixture(),{f,corpus}=x;try{
+   assert.deepEqual(corpus.files.map(file=>({path:file.path,mode:statSync(path.join(x.cwd,file.path)).mode&0o777,nlink:statSync(path.join(x.cwd,file.path)).nlink,type:"file",sha256:digest(readFileSync(path.join(x.cwd,file.path)))})),f.data.corpusPre.files);
+   f.admission.kind="trusted-cli-journal/v1";delete f.admission.sourceSchema;f.seal();
+   const old=await checkReadiness(document,f.options(),f.deps);assert.equal(old.pullRequests[0].independentReview.subcode,"source_not_in_launch_input");
+   f.admission.kind="trusted-cli-read-journal/v1";f.admission.sourceSchema="paperclip.fork-review-read-corpus/v1";f.seal();
+   const accepted=await checkReadiness(document,f.options(),f.deps);
+   assert.equal(accepted.pullRequests[0].verdict,"ready",JSON.stringify(accepted));
+   const review=accepted.pullRequests[0].independentReview;
+   assert.equal(review.status,"valid");assert.equal(review.evidenceKind,"read-journal-delivered-source");
+   assert.equal(review.deliveredFiles,corpus.files.length);assert.equal(review.requiredFiles,corpus.files.length);
+   assert.equal(review.toolCalls,corpus.files.length);assert.equal(review.manifestSHA256,digest(canonical(corpus.manifest)));
+   assert.match(renderReport(accepted),/Read corpus: manifest [0-9a-f]{64}; delivered 3\/3 files; tool calls 3; configured max turns 64; reported turn counter 4/);
+   assert.equal(accepted.pullRequests[0].source.changedFiles[0].before.content,"old source\n");
+   assert.equal(accepted.pullRequests[0].source.dependencyFiles[0].content,"export const dependency = 1;\n");
+ }finally{f.close();}
+});
+test("main-relative producer excludes an adopted row before Read corpus delivery and admission",async()=>{
+ const x=emittedReadJournalFixture({alreadyAdoptedRow:true}),{f,corpus}=x;
+ try {
+   const accepted=await checkReadiness(document,f.options(),f.deps);
+   const row=accepted.pullRequests[0];
+   assert.equal(row.verdict,"ready",JSON.stringify(row));
+   assert.equal(row.sourceRelation.totalRows,2);
+   assert.equal(row.sourceRelation.realRows,1);
+   assert.equal(row.sourceRelation.alreadyAdoptedRows,1);
+   assert.deepEqual(row.source.changedFiles.map(file=>file.path),["sample.mjs"]);
+   assert.deepEqual(row.source,f.source);
+   assert.equal(row.independentReview.status,"valid");
+   assert.equal(row.independentReview.evidenceKind,"read-journal-delivered-source");
+   assert.equal(row.independentReview.deliveredFiles,corpus.files.length);
+   const route=`repos/${FORK}/pulls/1/files?per_page=100&page=1`;
+   f.routes[route].splice(0,1);f.pr.changed_files=1;
+   const missing=await checkReadiness(document,f.options(),f.deps);
+   assert.equal(missing.pullRequests[0].verdict,"needs_gardening");
+   assert.ok(missing.pullRequests[0].reasons.some(reason=>reason.code==="readiness_unknown"&&reason.subcode==="source_tree_change_unlisted"));
+ } finally {f.close();}
+});
+test("main-relative public read CLI accounts for an adopted row before journal admission",async()=>{
+ const documentPath=fileURLToPath(new URL('../SKILL.md',import.meta.url));
+ const x=emittedReadJournalFixture({alreadyAdoptedRow:true,emitPacket:(f,output)=>emitDocumentedReadCommand(f,output,documentPath)}),{f,corpus}=x;
+ try {
+   const calls=readFileSync(path.join(f.directory,'documented-gh-calls.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+   assert.ok(calls.length>0);
+   assert.ok(calls.every(args=>args[0]==='api'&&args[1]==='--method'&&args[2]==='GET'));
+   const row=(await checkReadiness(document,f.options(),f.deps)).pullRequests[0];
+   assert.equal(row.verdict,'ready',JSON.stringify(row));
+   assert.deepEqual(row.source.changedFiles.map(file=>file.path),['sample.mjs']);
+   assert.equal(row.sourceRelation.totalRows,2);
+   assert.equal(row.sourceRelation.realRows,1);
+   assert.equal(row.sourceRelation.alreadyAdoptedRows,1);
+   assert.equal(row.independentReview.status,'valid');
+   assert.equal(row.independentReview.evidenceKind,'read-journal-delivered-source');
+   assert.equal(row.independentReview.deliveredFiles,corpus.files.length);
+   assert.deepEqual(JSON.parse(f.data.manifest).files.map(file=>file.path),corpus.files.map(file=>file.path));
+ }finally{f.close();}
+});
+test("read journal combines exact Read ranges before accepting a full source file",async()=>{
+ const x=readJournalFixture(),{f,events}=x;try{
+   const target=x.corpus.files.find(file=>file.role==="after"&&file.sourcePath==="sample.mjs");
+   const use=events.find(e=>e.type==="assistant"&&e.message.content[0]?.input?.file_path===path.join(x.cwd,target.path)).message.content[0];
+   const index=events.findIndex(e=>e.type==="user"&&e.message.content[0].tool_use_id===use.id),first=events[index],id="toolu_fixture_split";
+   first.tool_use_result.file.numLines=1;first.tool_use_result.file.content="new source";first.message.content[0].content="1\tnew source";
+   const secondUse={type:"assistant",parent_tool_use_id:null,session_id:f.data.start.sessionID,message:{role:"assistant",content:[{...use,id,input:{file_path:use.input.file_path,offset:2,limit:1}}]}};
+   const secondResult={type:"user",parent_tool_use_id:null,session_id:f.data.start.sessionID,message:{role:"user",content:[{type:"tool_result",tool_use_id:id,content:"2\t"}]},tool_use_result:{type:"text",file:{filePath:use.input.file_path,content:"",numLines:1,startLine:2,totalLines:2}},tool_result_meta:[{id,permission_decision:{decision:"accept"}}]};
+   events.splice(index+1,0,secondUse,secondResult);x.refresh();
+   const result=await checkReadiness(document,f.options(),f.deps);
+   assert.equal(result.pullRequests[0].verdict,"ready",JSON.stringify(result.pullRequests[0].independentReview));
+   assert.equal(result.pullRequests[0].independentReview.toolCalls,4);
+   first.tool_use_result.file.content="new source\n";first.message.content[0].content="1\tnew source\n";x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"read_bytes_mismatch"});
+ }finally{f.close();}
+});
+test("read journal rejects an invented LF after a non-EOF Read range",()=>{
+ const x=readJournalFixture(),{f,events}=x;try{
+   const target=x.corpus.files.find(file=>file.role==="after"&&file.sourcePath==="sample.mjs");
+   const result=events.find(e=>e.type==="user"&&e.tool_use_result?.file?.filePath===path.join(x.cwd,target.path));
+   result.tool_use_result.file.numLines=1;
+   result.tool_use_result.file.content="new source\n";
+   result.message.content[0].content="1\tnew source\n";
+   x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"read_bytes_mismatch"});
+ }finally{f.close();}
+});
+test("observed narration index annotates synthetic thinking without changing Read evidence",()=>{
+ const x=readJournalFixture(),{f,events}=x;try{
+   const narration={type:"assistant",parent_tool_use_id:null,session_id:f.data.start.sessionID,
+     message:{role:"assistant",content:[{type:"thinking",thinking:"Synthetic thinking placeholder."}]},
+     narration_block_indexes:[0]};
+   events.splice(1,0,narration);x.refresh();
+   assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
+   for(const invalid of [[1],[-1],[0,0],["0"],[0.5],0,[]]){
+     narration.narration_block_indexes=invalid;x.refresh();
+     assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+       {status:"invalid",code:"independent_review_invalid",subcode:"journal_event_unsupported"});
+   }
+   narration.narration_block_indexes=[0];
+   narration.message.content[0].type="text";x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"journal_event_unsupported"});
+   narration.message.content[0].type="thinking";
+   const result=events.find(event=>event.type==="user"&&event.tool_use_result?.file);
+   result.tool_use_result.file.content="synthetic altered bytes";
+   result.message.content[0].content="1\tsynthetic altered bytes";x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"read_bytes_mismatch"});
+ }finally{f.close();}
+});
+test("Grep formatting metadata remains scoped discovery and cannot fill missing Reads",()=>{
+ const x=readJournalFixture(),{f,events}=x;try{
+   const id="toolu_synthetic_grep_format",sid=f.data.start.sessionID;
+   const use={type:"assistant",parent_tool_use_id:null,session_id:sid,message:{role:"assistant",content:[{type:"tool_use",id,name:"Grep",input:{pattern:"synthetic",path:x.cwd,output_mode:"content",head_limit:80,"-A":8,"-B":3}}]}};
+   const result={type:"user",parent_tool_use_id:null,session_id:sid,message:{role:"user",content:[{type:"tool_result",tool_use_id:id,content:"synthetic match"}]},tool_use_result:{mode:"content",numFiles:1},tool_result_meta:[{id,permission_decision:{decision:"accept"}}]};
+   events.splice(1,0,use,result);x.refresh();
+   const accepted=admitTrustedJournal(f.admissionArgs());
+   assert.equal(accepted.status,"valid",JSON.stringify(accepted));
+   assert.equal(accepted.deliveredFiles,x.corpus.files.length);
+   const input=use.message.content[0].input;
+   for(const [key,value] of [["head_limit","80"],["-A",-1],["-B",1.5],["unexpected",true]]){
+     const before=input[key];input[key]=value;x.refresh();
+     assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+       {status:"invalid",code:"independent_review_invalid",subcode:"journal_event_unsupported"});
+     if(before===undefined)delete input[key];else input[key]=before;
+   }
+   input.path=path.dirname(x.cwd);x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"read_path_outside_corpus"});
+   input.path=x.cwd;
+   const readAt=events.findIndex(event=>event.type==="assistant"&&event.message.content[0]?.name==="Read");
+   const readID=events[readAt].message.content[0].id;
+   const resultAt=events.findIndex(event=>event.type==="user"&&event.message.content[0]?.tool_use_id===readID);
+   assert.ok(resultAt>readAt);
+   events.splice(resultAt,1);events.splice(readAt,1);x.refresh();
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"read_coverage_incomplete"});
+ }finally{f.close();}
+});
+test("reported CLI turn counter is validated independently of configured 64-turn argv",()=>{
+ const x=readJournalFixture(),{f,events}=x;try{
+   assert.equal(f.data.start.argv[f.data.start.argv.indexOf("--max-turns")+1],"64");
+   events.at(-1).num_turns=89;x.refresh();
+   const accepted=admitTrustedJournal(f.admissionArgs());
+   assert.equal(accepted.status,"valid",JSON.stringify(accepted));
+   assert.equal(accepted.configuredMaxTurns,64);
+   assert.equal(accepted.reportedNumTurns,89);
+   for(const invalid of [0,-1,1.5,"89",null]){
+     events.at(-1).num_turns=invalid;x.refresh();
+     assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+       {status:"invalid",code:"independent_review_invalid",subcode:"provider_terminal"});
+   }
+ }finally{f.close();}
+});
+test("reported CLI turn counter rejects a raw JSON non-finite overflow",()=>{
+ const x=readJournalFixture(),{f,events}=x;try{
+   events.at(-1).num_turns=89;x.refresh();
+   const before='"num_turns":89',after='"num_turns":1e400';
+   assert.equal(f.data.stream.split(before).length-1,1);
+   f.data.stream=f.data.stream.replace(before,after);
+   f.data.terminal.streamSHA256=digest(f.data.stream);f.seal();
+   assert.equal(JSON.parse(f.data.stream.trim().split("\n").at(-1)).num_turns,Infinity);
+   assert.deepEqual(admitTrustedJournal(f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"provider_terminal"});
+ }finally{f.close();}
+});
+test("Grep searches literal path-like regex within the corpus without counting as source delivery",async()=>{
+ const x=readJournalFixture(),{f,events}=x;try{
+   const id="toolu_fixture_grep",sid=f.data.start.sessionID;
+   events.splice(1,0,
+     {type:"assistant",parent_tool_use_id:null,session_id:sid,message:{role:"assistant",content:[{type:"tool_use",id,name:"Grep",input:{pattern:"/api|../import",path:x.cwd,output_mode:"content"}}]}},
+     {type:"user",parent_tool_use_id:null,session_id:sid,message:{role:"user",content:[{type:"tool_result",tool_use_id:id,content:"No matches found"}]},tool_use_result:{mode:"content",numFiles:0},tool_result_meta:[{id,permission_decision:{decision:"accept"}}]});
+   x.refresh();const result=await checkReadiness(document,f.options(),f.deps);
+   assert.equal(result.pullRequests[0].verdict,"ready",JSON.stringify(result.pullRequests[0].independentReview));
+   assert.equal(result.pullRequests[0].independentReview.toolCalls,4);
+   assert.equal(result.pullRequests[0].independentReview.deliveredFiles,3);
+ }finally{f.close();}
+});
+for(const [name,mutate,subcode] of [
+ ["one source never read",x=>{x.events.splice(1,4);},"read_coverage_incomplete"],
+ ["altered Read bytes",x=>{const result=x.events.find(e=>e.type==="user");result.tool_use_result.file.content="altered\n";},"read_bytes_mismatch"],
+ ["partial Read only",x=>{const target=x.corpus.files.find(file=>file.role==="after"&&file.sourcePath==="sample.mjs");const result=x.events.find(e=>e.type==="user"&&e.tool_use_result?.file?.filePath===path.join(x.cwd,target.path));result.tool_use_result.file.content="new source";result.tool_use_result.file.numLines=1;result.message.content[0].content="1\tnew source";},"read_coverage_incomplete"],
+ ["Read outside corpus",x=>{const use=x.events.find(e=>e.type==="assistant");use.message.content[0].input.file_path=path.join(x.cwd,"..","outside");},"read_path_outside_corpus"],
+ ["orphan result",x=>{const result=x.events.find(e=>e.type==="user");result.message.content[0].tool_use_id="never_used";},"tool_pairing"],
+ ["mixed session",x=>{const result=x.events.find(e=>e.type==="user");result.session_id="other-session";},"journal_session"],
+ ["compaction event",x=>{x.events.splice(1,0,{type:"system",subtype:"compact_boundary",session_id:x.f.data.start.sessionID});},"journal_event_unsupported"],
+ ["unknown stream event",x=>{x.events.splice(1,0,{type:"future_event",session_id:x.f.data.start.sessionID});},"journal_event_unsupported"],
+ ["duplicate tool result",x=>{const result=x.events.find(e=>e.type==="user");x.events.splice(x.events.indexOf(result)+1,0,structuredClone(result));},"tool_pairing"],
+ ["failed Read",x=>{const result=x.events.find(e=>e.type==="user");result.message.content[0].is_error=true;},"read_tool_error"],
+ ["non GO verdict",x=>{x.events.at(-1).result="判定: CONDITIONAL GO\n";x.events.at(-2).message.content[0].text=x.f.data.report="判定: CONDITIONAL GO\n";},"review_not_go"],
+ ["GO text before final Read",x=>{const text=x.events.splice(x.events.length-2,1)[0];x.events.splice(1,0,text);},"report_before_source_delivery"],
+ ["result differs from final assistant text",x=>{x.events.at(-2).message.content[0].text="Different conclusion\n";},"report_before_source_delivery"],
+ ["unknown previous attempt",x=>{x.f.data.attempts.attempts.unshift({sessionID:"prior",state:"unknown"});},"retry_after_unknown"],
+ ["second head entry",x=>{x.f.extraEntries.push({...x.f.admission,key:"other"});},"review_not_unique"],
+ ["symlink in corpus",x=>{const file=x.corpus.files[0];rmSync(path.join(x.cwd,file.path));symlinkSync(path.join(x.cwd,x.corpus.files[1].path),path.join(x.cwd,file.path));},"corpus_inventory"],
+ ["manifest from other source",x=>{x.f.data.manifest='{"other":true}\n';},"review_source_binding"],
+ ["extra model usage",x=>{x.events.at(-1).modelUsage.other={provider:"firstParty"};},"actual_model_provider"],
+ ["resumed argv",x=>{x.f.data.start.argv.push("--resume","old-session");},"unsupported_launch_shape"],
+]) test(`read journal rejects ${name}`,()=>{const x=readJournalFixture();try{mutate(x);x.refresh();const result=admitTrustedJournal(x.f.admissionArgs());assert.deepEqual(result,{status:"invalid",code:"independent_review_invalid",subcode},JSON.stringify(result));}finally{x.f.close();}});
+test("read corpus fails closed on unmeasured text encodings and empty or unterminated files",()=>{
+ const f=forkFixture();try{for(const content of ["", "new\r\n", "\ufeffnew\n", "new"]) {
+   f.source.changedFiles[0].after.content=content;f.source.changedFiles[0].after.blobSha=hashBlob(content);
+   assert.throws(()=>readCorpusManifest(f.source),/read_encoding_unsupported/);
+ }}finally{f.close();}
+});
+test("read corpus maps instruction and tool-config source paths to inert physical asset names",()=>{
+ const f=forkFixture(),root=realpathSync(mkdtempSync(path.join(os.tmpdir(),"read-settings-")));try{
+   const file=f.source.changedFiles[0];file.path=file.before.path=file.after.path="AGENTS.md";
+   const dep="{\"mcpServers\":{}}\n";f.source.dependencyFiles.push({path:".mcp.json",blobSha:hashBlob(dep),content:dep});
+   const corpus=readCorpusManifest(f.source);
+   assert.deepEqual(new Set(corpus.manifest.files.map(row=>row.role)),new Set(["after","reverse","deps"]));
+   assert.deepEqual(new Set(corpus.manifest.files.map(row=>row.sourcePath)),new Set(["AGENTS.md",".mcp.json"]));
+   assert.ok(corpus.manifest.files.every(row=>/^assets\/[0-9a-f]{64}\.txt$/.test(row.path)));
+   const settings=JSON.parse(readReviewSettings());
+   assert.equal(settings.pluginConfigs["cc-plugin-agents-md@builtin"].options.instructionFiles,"managed-only");
+   assert.equal(settings.autoMemoryEnabled,false);
+   assert.equal(settings.disableAllHooks,true);
+   assert.deepEqual(settings.enabledPlugins,{});
+   assert.equal(Object.hasOwn(settings,"claudeMdExcludes"),false);
+ }finally{f.close();rmSync(root,{recursive:true,force:true});}
+});
+test("Read settings are independent of home aliases and case spelling",()=>{
+ const f=forkFixture(),root=realpathSync(mkdtempSync(path.join(os.tmpdir(),"read-settings-links-")));try{
+   const corpus=readCorpusManifest(f.source),cwd=path.join(root,"corpus"),home=path.join(root,"home");
+   mkdirSync(cwd);mkdirSync(home);
+   const homeAlias=path.join(root,"home-alias"),cwdAlias=path.join(root,"corpus-alias");
+   symlinkSync(home,homeAlias);symlinkSync(cwd,cwdAlias);
+   const settings=readReviewSettings();
+   assert.equal(readReviewSettings({cwd,home:homeAlias},corpus),settings);
+   assert.equal(readReviewSettings({cwd:cwdAlias,home},corpus),settings);
+   assert.equal(readReviewSettings({cwd,home:home.toUpperCase()},corpus),settings);
+ }finally{f.close();rmSync(root,{recursive:true,force:true});}
+});
+test("Read settings do not enumerate instructions below nested symlinks",()=>{
+ const f=forkFixture(),root=realpathSync(mkdtempSync(path.join(os.tmpdir(),"read-settings-nested-")));try{
+   const corpus=readCorpusManifest(f.source),cwd=path.join(root,"corpus"),home=path.join(root,"home");
+   mkdirSync(cwd);mkdirSync(home);
+   const physicalClaude=path.join(root,"physical-claude"),physicalRules=path.join(root,"physical-rules");
+   mkdirSync(physicalClaude);mkdirSync(physicalRules);
+   writeFileSync(path.join(physicalClaude,"CLAUDE.md"),"synthetic instruction\n");
+   writeFileSync(path.join(physicalClaude,"AGENTS.md"),"synthetic instruction\n");
+   symlinkSync(physicalRules,path.join(physicalClaude,"rules"));
+   symlinkSync(physicalClaude,path.join(home,".claude"));
+   assert.equal(readReviewSettings({cwd,home},corpus),readReviewSettings());
+   assert.equal(Object.hasOwn(JSON.parse(readReviewSettings()),"claudeMdExcludes"),false);
+ }finally{f.close();rmSync(root,{recursive:true,force:true});}
+});
+test("Read admission retains corpus authority when an instruction alias appears",()=>{
+ const x=readJournalFixture(),{f}=x;try{
+   assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
+   const physicalClaude=path.join(realpathSync(f.directory),"physical-claude");
+   mkdirSync(physicalClaude);writeFileSync(path.join(physicalClaude,"CLAUDE.md"),"synthetic instruction\n");
+   symlinkSync(physicalClaude,path.join(f.data.start.home,".claude"));
+   assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
+ }finally{f.close();}
+});
+test("Read admission uses fixed safe-mode settings when instruction aliases change",()=>{
+ const x=readJournalFixture(),{f,corpus}=x;try{
+   const initial=readReviewSettings(f.data.start,corpus);
+   assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
+   const physicalClaude=path.join(realpathSync(f.directory),"physical-claude");
+   mkdirSync(physicalClaude);writeFileSync(path.join(physicalClaude,"CLAUDE.md"),"synthetic instruction\n");
+   const alias=path.join(f.data.start.home,".claude");symlinkSync(physicalClaude,alias);
+   assert.equal(readReviewSettings(f.data.start,corpus),initial);
+   assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
+   rmSync(alias);
+   assert.equal(readReviewSettings(f.data.start,corpus),initial);
+   assert.equal(admitTrustedJournal(f.admissionArgs()).status,"valid");
+ }finally{x.f.close();}
+});
+for (const [name,mutate] of [
+ ["missing safe mode",argv=>argv.splice(argv.indexOf("--safe-mode"),1)],
+ ["altered fixed settings",argv=>{argv[argv.indexOf("--settings")+1]=JSON.stringify({autoMemoryEnabled:true});}],
+ ["old lexical exclusion settings",argv=>{const index=argv.indexOf("--settings")+1;argv[index]=JSON.stringify({...JSON.parse(argv[index]),claudeMdExcludes:[]});}],
+]) test(`Read admission rejects ${name}`,()=>{
+ const x=readJournalFixture();try{
+   mutate(x.f.data.start.argv);x.refresh();
+   assert.deepEqual(admitTrustedJournal(x.f.admissionArgs()),
+     {status:"invalid",code:"independent_review_invalid",subcode:"unsupported_launch_shape"});
+ }finally{x.f.close();}
+});
+test("read reverse asset is deterministic multiline text with complete before reconstruction",()=>{
+ const before=`${"old long paragraph ".repeat(160)}\n`,after="new paragraph\n",source=sourceV2Fixture(before,after);
+ source.dependencyFiles[0].content="dependency\n";source.dependencyFiles[0].blobSha=hashBlob("dependency\n");
+ const reverse=sourceCodec.readCorpusManifest(source).files.find(file=>file.role==="reverse");
+ const original=sourceCodec.reviewSourceV2(source).changedFiles[0].reverseDiff;
+ assert.ok(Buffer.byteLength(canonical(original))>2000);
+ assert.ok(reverse.content.split("\n").length>4);
+ assert.ok(Math.max(...reverse.content.split("\n").map(line=>Buffer.byteLength(line)))<2000);
+ assert.deepEqual(sourceCodec.parseReadReverseDiff(reverse.content),original);
+ assert.equal(sourceCodec.renderReadReverseDiff(original),reverse.content);
+ assert.equal(sourceCodec.restoreReviewSourceV2(sourceCodec.reviewSourceV2(source)).changedFiles[0].before.content,before);
+ assert.throws(()=>sourceCodec.parseReadReverseDiff(`${canonical(original)}\n`),/read_reverse_asset_invalid/);
+});
+test("read corpus rejects an unsupported physical line before emission",()=>{
+ const source=sourceV2Fixture("old\n",`${"x".repeat(2000)}\n`);
+ source.dependencyFiles[0].content="dependency\n";source.dependencyFiles[0].blobSha=hashBlob("dependency\n");
+ assert.throws(()=>sourceCodec.readCorpusManifest(source),/read_line_profile_unsupported/);
+});
+test("read emitter check-only and write use the same manifest and inert assets",()=>{
+ const x=readJournalFixture(),root=mkdtempSync(path.join(os.tmpdir(),"read-emitter-")),output=path.join(root,"packet");
+ try {
+   const dry=sourceCodec.emitReadCorpus(x.f.source,output,{checkOnly:true,checkoutRoot:process.cwd()});
+   assert.equal(dry.state,"CHECK_ONLY_NO_FILES_WRITTEN");assert.equal(existsSync(output),false);
+   const wrote=sourceCodec.emitReadCorpus(x.f.source,output,{checkoutRoot:process.cwd()});
+   assert.equal(wrote.state,"EMITTED");assert.equal(wrote.manifestSHA256,dry.manifestSHA256);
+   assert.deepEqual(wrote.recommendedRanges,dry.recommendedRanges);
+   assert.equal(wrote.recommendedDisplayBytes,16*1024);
+   assert.equal(dry.recommendedRanges.length,sourceCodec.readCorpusManifest(x.f.source).files.length);
+   const corpus=sourceCodec.readCorpusManifest(x.f.source);
+   assert.equal(readFileSync(path.join(output,"manifest.json"),"utf8"),`${canonical(corpus.manifest)}\n`);
+   assert.ok(readFileSync(path.join(output,"material.md"),"utf8").includes(`Suggested ranges: ${canonical(dry.recommendedRanges)}\n${sourceCodec.readCorpusManifestBlock(x.f.source)}\n`));
+   assert.deepEqual(JSON.parse(readFileSync(path.join(output,"corpus-pre.json"),"utf8")).files.map(row=>row.path).sort(),corpus.files.map(row=>row.path).sort());
+   for(const file of corpus.files){const target=path.join(output,"corpus",file.path);assert.equal(readFileSync(target,"utf8"),file.content);assert.equal(statSync(target).mode&0o777,0o400);}
+   assert.throws(()=>sourceCodec.emitReadCorpus(x.f.source,output,{checkOnly:true,checkoutRoot:process.cwd()}),/review_output_exists/);
+ }finally{x.f.close();rmSync(root,{recursive:true,force:true});}
+});
+test("read emitter recommends complete bounded ranges for a large source from one common entry",()=>{
+ const source=sourceV2Fixture("old\n","new\n");
+ source.dependencyFiles[0].content="export const value = 1;\n".repeat(3600);
+ source.dependencyFiles[0].blobSha=hashBlob(source.dependencyFiles[0].content);
+ const root=mkdtempSync(path.join(os.tmpdir(),"read-large-profile-")),output=path.join(root,"packet");
+ try {
+   const dry=sourceCodec.emitReadCorpus(source,output,{checkOnly:true,checkoutRoot:process.cwd()});
+   const wrote=sourceCodec.emitReadCorpus(source,output,{checkoutRoot:process.cwd()});
+   assert.deepEqual(wrote.recommendedRanges,dry.recommendedRanges);
+   const dependency=sourceCodec.readCorpusManifest(source).files.find(file=>file.role==="deps");
+   const ranges=dry.recommendedRanges.filter(range=>range.path===dependency.path);
+   assert.ok(ranges.length>1);
+   let next=1;
+   for(const range of ranges){assert.equal(range.offset,next);assert.ok(range.displayBytes<=16*1024);next+=range.limit;}
+   assert.equal(next,dependency.lines+1);
+   assert.ok(readFileSync(path.join(output,"material.md"),"utf8").includes(`Suggested ranges: ${canonical(dry.recommendedRanges)}`));
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+test("read emitter keeps the final LF empty line with its preceding line",()=>{
+ const source=sourceV2Fixture("old\n","new\n");
+ source.dependencyFiles[0].content=Array(9).fill("x".repeat(1700)).concat("y".repeat(1051)).join("\n")+"\n";
+ source.dependencyFiles[0].blobSha=hashBlob(source.dependencyFiles[0].content);
+ const root=mkdtempSync(path.join(os.tmpdir(),"read-eof-profile-")),output=path.join(root,"packet");
+ try {
+   const profile=sourceCodec.emitReadCorpus(source,output,{checkOnly:true,checkoutRoot:process.cwd()});
+   const dependency=sourceCodec.readCorpusManifest(source).files.find(file=>file.role==="deps");
+   const ranges=profile.recommendedRanges.filter(range=>range.path===dependency.path);
+   assert.ok(ranges.length>1);
+   assert.ok(ranges.at(-1).limit>=2,"isolated EOF-empty Read remains unmeasured");
+   assert.ok(ranges.every(range=>range.displayBytes<=16*1024));
+   assert.equal(ranges.reduce((total,range)=>total+range.limit,0),dependency.lines);
+   assert.equal(existsSync(output),false);
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
+for(const [name,mutate] of [
+ ["extra plugin",init=>init.plugins.push({name:"untrusted",path:"local",source:"untrusted@local"})],
+ ["extra agent",init=>init.agents.push("user-agent")],
+ ["nonempty MCP",init=>init.mcp_servers.push("private")],
+ ["nonempty skills",init=>init.skills.push("untrusted")],
+ ["nonempty slash commands",init=>init.slash_commands.push("untrusted")],
+ ["extra directory",init=>init.additional_directories.push("/private/tmp/other")],
+ ["unknown CLI version",init=>{init.claude_code_version="future";}],
+ ["different original cwd",init=>{init.original_cwd="/private/tmp/other";}],
+])test(`read journal rejects init ${name}`,()=>{
+ const x=readJournalFixture();try{mutate(x.events[0]);x.refresh();const r=admitTrustedJournal(x.f.admissionArgs());assert.deepEqual(r,{status:"invalid",code:"independent_review_invalid",subcode:"journal_execution"});}finally{x.f.close();}
+});
 test("explicit v2 registry admits only a restored exact logical v1 source",()=>{
  const f=v2JournalFixture();try{
   const review=admitTrustedJournal(f.admissionArgs());
@@ -790,7 +1373,7 @@ test("source v2 emitter preserves UTF8 BOM while default v1 behavior stays uncha
  const f=outputFixture();try{
  const source=sourceV2Fixture("\ufeffold\r\n","\ufeffnew\r\n");source.dependencyFiles=[];const file=source.changedFiles[0],prefix=`repos/${FORK}`;
  f.routes[`${prefix}/pulls/1/files?per_page=100&page=1`][0].sha=file.after.blobSha;
- f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree[0].sha=file.after.blobSha;f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree[0].sha=file.before.blobSha;
+ const trees=reindexFixtureTrees(f,[{path:file.after.path,type:'blob',mode:'100644',sha:file.after.blobSha}],[{path:file.before.path,type:'blob',mode:'100644',sha:file.before.blobSha}]);source.treeSha=trees.head.sha;
  for(const blob of [file.before,file.after])f.routes[`${prefix}/git/blobs/${blob.blobSha}`]={sha:blob.blobSha,encoding:"base64",size:Buffer.byteLength(blob.content),content:Buffer.from(blob.content).toString("base64")};writeFileSync(path.join(f.directory,"routes.json"),JSON.stringify(f.routes));
  const run=invokeSourceSchema(f,"v2");assert.equal(run.status,0,run.stderr);assert.deepEqual(sourceCodec.parseReviewSourceV2Block(run.stdout,source),source);
  const old=invokeSourceSchema(f,"v1");assert.equal(old.status,0,old.stderr);const body=JSON.parse(old.stdout.trimEnd().split("\n")[1]);assert.equal(body.changedFiles[0].after.content,"new\r\n");
@@ -830,8 +1413,7 @@ function bomReadinessFixture(location) {
  if(location==="dependency")f.source.dependencyFiles=[{path:"dependency.mjs",content:"\ufeffdependency\r\n",blobSha:hashBlob("\ufeffdependency\r\n")}];
  const file=f.source.changedFiles[0];
  f.routes[`${prefix}/pulls/1/files?per_page=100&page=1`][0].sha=file.after.blobSha;
- f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree=[file.after,...f.source.dependencyFiles].map(b=>({path:b.path,type:"blob",mode:"100644",sha:b.blobSha}));
- f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree=[{path:file.before.path,type:"blob",mode:"100644",sha:file.before.blobSha}];
+ reindexFixtureTrees(f,[file.after,...f.source.dependencyFiles].map(b=>({path:b.path,type:'blob',mode:'100644',sha:b.blobSha})),[file.before,...f.source.dependencyFiles].map(b=>({path:b.path,type:'blob',mode:'100644',sha:b.blobSha})));
  for(const b of [file.before,file.after,...f.source.dependencyFiles])f.routes[`${prefix}/git/blobs/${b.blobSha}`]={sha:b.blobSha,encoding:"base64",size:Buffer.byteLength(b.content),content:Buffer.from(b.content).toString("base64")};
  f.pointer.dependencies=f.source.dependencyFiles.map(b=>b.path);
  f.pointer.sourceSchema="paperclip.fork-review-source/v1"; // untrusted hint must not override registry v2
@@ -867,4 +1449,142 @@ test("untrusted pointer and unsupported registry cannot invoke a source factory"
 });
 test("admission rejects ambiguous direct source plus factory without invoking it",()=>{
  const f=v2JournalFixture();try{let calls=0;const r=admitTrustedJournal({...f.admissionArgs(),sourceFactory:()=>{calls++;return f.source;}});assert.equal(r.subcode,"review_source_factory");assert.equal(calls,0);}finally{f.close();}
+});
+
+// Main-relative repair RED population. These tests exercise the shared public
+// factory/entry points; they do not substitute a candidate readiness result for
+// an operator's adoption decision.
+function relationFixture(before, after, files) {
+ const blobs=new Map();
+ const leaves=values=>values.map(value=>{const content=value.content??value.path,sha=value.sha??hashBlob(content);blobs.set(sha,content);return{path:value.path,type:value.type??'blob',mode:value.mode??'100644',sha};});
+ const base=fixtureTree(leaves(before)),head=fixtureTree(leaves(after));
+ const get=route=>{
+  if(route.endsWith(`/git/commits/${BASE}`))return{sha:BASE,tree:{sha:base.sha}};
+  if(route.endsWith(`/git/trees/${base.sha}?recursive=1`))return structuredClone(base);
+  if(route.endsWith(`/git/trees/${head.sha}?recursive=1`))return structuredClone(head);
+  const sha=route.split('/').at(-1),content=blobs.get(sha);assert.notEqual(content,undefined,route);
+  return{sha,size:Buffer.byteLength(content),encoding:'base64',content:Buffer.from(content).toString('base64')};
+ };
+ const rows=files??after.map(x=>({filename:x.path,status:before.some(b=>b.path===x.path)?'modified':'added',sha:head.tree.find(r=>r.path===x.path).sha}));
+ const relation={};return{base,head,rows,relation,get,build:()=>buildReviewSource(get,FORK,{head:{sha:HEAD}},rows,head.sha,BASE,BASE,[],'paperclip.fork-review-source/v1',relation)};
+}
+function minimalRelationFixture(status='added') {
+ const f=relationFixture([{path:'X.txt',content:'same\n'},{path:'Y.txt',content:'before\n'}],[{path:'X.txt',content:'same\n'},{path:'Y.txt',content:'after\n'}]);f.rows[0].status=status;return f;
+}
+function refreshJournalSource(f) {
+ f.admission.sourceInputSHA256=digest(canonical(f.source));
+ f.data.material='Full reviewed source:\n'+(f.admission.kind==='trusted-cli-journal/v2'?sourceCodec.reviewSourceV2Block(f.source):`=== BEGIN PAPERCLIP REVIEW SOURCE ===\n${canonical(f.source)}\n=== END PAPERCLIP REVIEW SOURCE ===`);
+ const bytes=Buffer.concat([Buffer.from(f.data.system),Buffer.from([0]),Buffer.from(f.data.material)]);
+ f.data.start.combinedSHA256=f.data.terminal.inputSHA256=digest(bytes);f.data.start.combinedBytes=bytes.length;f.seal();
+}
+function addAlreadyAdoptedRow(f) {
+ const prefix=`repos/${FORK}`,row={path:'already.mjs',type:'blob',mode:'100644',sha:hashBlob('same\n')};
+ const head=f.routes[`${prefix}/git/trees/${TREE}?recursive=1`].tree,base=f.routes[`${prefix}/git/trees/${BASE_TREE}?recursive=1`].tree;
+ reindexFixtureTrees(f,[...head,row],[...base,row]);
+ f.routes[`${prefix}/git/blobs/${row.sha}`]={sha:row.sha,encoding:'base64',size:5,content:Buffer.from('same\n').toString('base64')};
+ f.routes[`${prefix}/pulls/1/files?per_page=100&page=1`].push({filename:row.path,status:'added',sha:row.sha});f.pr.changed_files=2;refreshJournalSource(f);
+}
+
+test('main-relative RED minimal stale added row excludes X and preserves complete Y',()=>{
+ const f=minimalRelationFixture();const source=f.build();assert.deepEqual(source.changedFiles.map(x=>x.path),['Y.txt']);assert.equal(source.changedFiles[0].before.content,'before\n');assert.equal(source.changedFiles[0].after.content,'after\n');assert.equal(f.relation.totalRows,2);assert.equal(f.relation.alreadyAdoptedRows,1);assert.equal(f.relation.unexplainedRows,0);
+});
+test('main-relative RED phantom modified is classified rather than serialized',()=>{const f=minimalRelationFixture('modified');assert.equal(f.build().changedFiles.length,1);assert.equal(f.relation.rows.filter(x=>x.classification==='already-adopted').length,1);});
+test('main-relative RED full thirteen rows partition into seven changes and six equal leaves',()=>{
+ const before=[],after=[];for(let i=0;i<13;i++){before.push({path:`dir/file-${i}.mjs`,content:`old ${i}\n`});after.push({path:`dir/file-${i}.mjs`,content:i<7?`new ${i}\n`:`old ${i}\n`});}
+ const f=relationFixture(before,after);f.rows[12].status='added';assert.equal(f.build().changedFiles.length,7);assert.equal(f.relation.totalRows,13);assert.equal(f.relation.alreadyAdoptedRows,6);assert.equal(f.relation.differentLeaves,7);assert.equal(f.relation.uncoveredLeaves,0);
+});
+test('main-relative RED unlisted tree changes cannot be omitted by a short file list',()=>{const f=minimalRelationFixture('modified');f.rows.splice(1);assert.throws(()=>f.build(),/source_tree_change_unlisted/);});
+test('main-relative RED a capped3000-row list cannot hide3500 changed leaves',()=>{
+ const before=[],after=[];for(let i=0;i<3500;i++){before.push({path:`f-${i}`,content:'before'});after.push({path:`f-${i}`,content:'after'});}const f=relationFixture(before,after);f.rows.length=3000;assert.throws(()=>f.build(),/source_tree_change_unlisted/);
+});
+test('main-relative RED duplicate tree paths fail before Map can overwrite them',()=>{const f=minimalRelationFixture('modified');f.head.tree.push({...f.head.tree[0]});assert.throws(()=>f.build(),/source_tree_duplicate_path/);});
+test('main-relative RED tree body must reconstruct its pinned Git object',()=>{const f=minimalRelationFixture('modified');f.head.tree[0].sha=hashBlob('corrupt');assert.throws(()=>f.build(),/source_tree_hash_mismatch/);});
+test('main-relative RED mode-only changes are explicitly unrepresented',()=>{const f=relationFixture([{path:'run',content:'same',mode:'100644'}],[{path:'run',content:'same',mode:'100755'}]);assert.throws(()=>f.build(),/source_mode_unrepresented/);});
+for(const [status,before,after,row] of [
+ ['added',[],[{path:'new',content:'new',mode:'100755'}],{filename:'new',status:'added',sha:hashBlob('new')}],
+ ['removed',[{path:'old',content:'old',mode:'100755'}],[],{filename:'old',status:'removed',sha:hashBlob('old')}],
+ ['renamed',[{path:'old',content:'old',mode:'100755'}],[{path:'new',content:'old',mode:'100755'}],{filename:'new',previous_filename:'old',status:'renamed',sha:hashBlob('old')}],
+ ['copied',[{path:'old',content:'old',mode:'100755'}],[{path:'old',content:'old',mode:'100755'},{path:'new',content:'old',mode:'100755'}],{filename:'new',previous_filename:'old',status:'copied',sha:hashBlob('old')}],
+])test(`main-relative unrepresented executable ${status} remains HOLD`,()=>{
+ const f=relationFixture(before,after,[row]);assert.throws(()=>f.build(),/source_mode_unrepresented/);
+});
+test('main-relative unchanged executable mode and new regular file remain representable',()=>{
+ const modified=relationFixture([{path:'run',content:'old',mode:'100755'}],[{path:'run',content:'new',mode:'100755'}]);
+ assert.equal(modified.build().changedFiles.length,1);
+ const added=relationFixture([],[{path:'new',content:'new',mode:'100644'}]);
+ assert.equal(added.build().changedFiles.length,1);
+ const removed=relationFixture([{path:'old',content:'old',mode:'100644'}],[],[{filename:'old',status:'removed',sha:hashBlob('old')}]);
+ assert.equal(removed.build().changedFiles.length,1);
+});
+test('main-relative identical adopted executable row adds no source change',()=>{
+ const f=relationFixture([{path:'same',content:'same',mode:'100755'},{path:'edit',content:'old'}],[{path:'same',content:'same',mode:'100755'},{path:'edit',content:'new'}]);
+ assert.deepEqual(f.build().changedFiles.map(file=>file.path),['edit']);
+ assert.equal(f.relation.alreadyAdoptedRows,1);
+});
+test('main-relative source failure retains received CI and findings without a ready verdict',async()=>{
+ const f=forkFixture();try{
+   const prefix=`repos/${FORK}`,old=hashBlob('old source\n'),current=hashBlob('new source\n');
+   reindexFixtureTrees(f,[{path:'sample.mjs',type:'blob',mode:'100755',sha:current}],[{path:'sample.mjs',type:'blob',mode:'100644',sha:old}]);
+   f.pr.comments=1;f.routes[`${prefix}/issues/1/comments?per_page=100&page=1`]=[{id:23,body:'Synthetic finding',created_at:'2026-01-01T00:00:00Z'}];
+   const result=await checkReadiness(document,f.options(),f.deps),row=result.pullRequests[0];
+   assert.equal(row.verdict,'needs_gardening');
+   assert.equal(row.checks.checks.length,1);
+   assert.equal(row.normalCI.conclusion,'success');
+   assert.equal(row.independentReview.status,'invalid');
+   assert.deepEqual(row.findings.sources.map(source=>source.id),['issue_comment:23']);
+   assert.ok(row.reasons.some(reason=>reason.code==='readiness_unknown'&&reason.subcode==='source_mode_unrepresented'));
+   assert.match(renderReport(result),/Synthetic finding|Findings: incomplete/);
+ }finally{f.close();}
+});
+test('main-relative RED non-rename previous_filename cannot alter the before source',()=>{const f=minimalRelationFixture('modified');f.rows[1].previous_filename='X.txt';assert.throws(()=>f.build(),/source_pr_row_unexplained/);});
+for(const version of ['v1','v2'])test(`main-relative RED ${version} readiness binds seven-relative source and retains complete received rows`,async()=>{
+ const f=version==='v2'?v2JournalFixture():forkFixture();try{addAlreadyAdoptedRow(f);const r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,'ready',JSON.stringify(r));assert.equal(r.pullRequests[0].source.changedFiles.length,1);assert.equal(r.pullRequests[0].sourceRelation.totalRows,2);assert.equal(r.pullRequests[0].sourceRelation.alreadyAdoptedRows,1);}finally{f.close();}
+});
+test('main-relative RED compare uses fixed current-main OID rather than a moving branch',async()=>{const f=forkFixture();try{delete f.routes[`repos/${FORK}/compare/master...${HEAD}`];const r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,'ready',JSON.stringify(r));assert.ok(f.reads.includes(`repos/${FORK}/compare/${BASE}...${HEAD}`));}finally{f.close();}});
+test('main-relative RED final PR row relation race blocks readiness',async()=>{const f=forkFixture();try{const get=f.deps.getJson;let count=0;f.deps.getJson=route=>{const v=get(route);if(route.includes('/pulls/1/files?')&&++count===2)v[0].status='added';return v;};const r=await checkReadiness(document,f.options(),f.deps);assert.ok(r.pullRequests[0].reasons.some(x=>x.code==='head_changed'),JSON.stringify(r));}finally{f.close();}});
+for(const schema of ['v1','v2'])test(`main-relative RED ${schema} emitter shares the accounted source`,()=>{
+ const f=outputFixture();try{addAlreadyAdoptedRow(f);writeFileSync(path.join(f.directory,'routes.json'),JSON.stringify(f.routes));const run=invokeSourceSchema(f,schema);assert.equal(run.status,0,run.stderr);if(schema==='v2')assert.deepEqual(sourceCodec.parseReviewSourceV2Block(run.stdout,f.source),f.source);else assert.equal(run.stdout,`=== BEGIN PAPERCLIP REVIEW SOURCE ===\n${canonical(f.source)}\n=== END PAPERCLIP REVIEW SOURCE ===\n`);}finally{f.close();}
+});
+
+test('main-relative control whole350-file delta is not limited to compare first300',()=>{const before=[],after=[];for(let i=0;i<350;i++){before.push({path:`f/${i}`,content:'old'});after.push({path:`f/${i}`,content:'new'});}const f=relationFixture(before,after);const s=f.build();assert.equal(s.changedFiles.length,350);assert.equal(new Set(s.changedFiles.map(x=>x.path)).size,350);});
+for(const status of ['added','modified','removed','renamed','copied'])test(`main-relative control canonical ${status} remains byte identical`,()=>{
+ const before=status==='added'?[]:[{path:status==='renamed'||status==='copied'?'old.mjs':'file.mjs',content:'old\n'}];const after=status==='removed'?[]:[...(status==='copied'?before:[]),{path:'file.mjs',content:'new\n'}];const filename='file.mjs',previous_filename=['renamed','copied'].includes(status)?'old.mjs':undefined;const sha=hashBlob(status==='removed'?'old\n':'new\n');
+ const f=relationFixture(before,after,[{filename,status,sha,...(previous_filename?{previous_filename}:{})}]);const s=f.build();const b=before[0],a=after.find(x=>x.path===filename);assert.equal(canonical(s),canonical({schema:'paperclip.fork-review-source/v1',repository:FORK,headSha:HEAD,treeSha:f.head.sha,baseSha:BASE,mergeBaseSha:BASE,changedFiles:[{path:filename,status,before:b?{path:b.path,blobSha:hashBlob(b.content),content:b.content}:null,after:a?{path:a.path,blobSha:hashBlob(a.content),content:a.content}:null}],dependencyFiles:[]}));
+});
+for(const fault of ['truncated','wrong root','blob content','duplicate PR row','unsupported symlink'])test(`main-relative control rejects ${fault}`,()=>{
+ const f=relationFixture([{path:'file',content:'old'}],[{path:'file',content:'new'}]);let code;
+ if(fault==='truncated'){f.head.truncated=true;code='source_tree_incomplete';}
+ if(fault==='wrong root')code='source_tree_incomplete';
+ if(fault==='duplicate PR row'){f.rows.push({...f.rows[0]});code='source_files_duplicate';}
+ if(fault==='unsupported symlink'){f.head.tree[0].mode='120000';const rebuilt=fixtureTree(f.head.tree);Object.assign(f.head,rebuilt);code='source_file_unsupported';}
+ const get=['blob content','wrong root'].includes(fault)?route=>{const v=f.get(route);if(fault==='blob content'&&route.includes('/git/blobs/'))v.content=Buffer.from('tampered').toString('base64');if(fault==='wrong root'&&route.includes('/git/trees/'))v.sha=BASE;return v;}:f.get;if(fault==='blob content')code='source_blob_mismatch';
+ assert.throws(()=>buildReviewSource(get,FORK,{head:{sha:HEAD}},f.rows,f.head.sha,BASE,BASE,[]),e=>e.message===code);
+});
+test('main-relative control absent deletion has no equal-leaf proof and stays HOLD',()=>{const f=relationFixture([],[],[{filename:'gone',status:'removed',sha:hashBlob('gone')}]);assert.throws(()=>f.build(),/source_pr_row_unexplained|source_files_mismatch/);});
+test('main-relative RED stale rename has explicit equal destination and absent origin proof',()=>{
+ const f=relationFixture([{path:'new',content:'same'},{path:'edit',content:'old'}],[{path:'new',content:'same'},{path:'edit',content:'new'}]);f.rows[0].status='renamed';f.rows[0].previous_filename='old';assert.deepEqual(f.build().changedFiles.map(x=>x.path),['edit']);assert.equal(f.relation.alreadyAdoptedRows,1);
+});
+test('main-relative RED two rows cannot both cover the old half of a rename',()=>{
+ const f=relationFixture([{path:'old',content:'old'}],[{path:'new',content:'new'}],[{filename:'new',previous_filename:'old',status:'renamed',sha:hashBlob('new')},{filename:'old',status:'removed',sha:hashBlob('old')}]);assert.throws(()=>f.build(),/source_tree_change_coverage/);
+});
+test('main-relative RED unknown tree shapes are explicit HOLD',()=>{const f=minimalRelationFixture('modified');f.head.tree[0].type='future';assert.throws(()=>f.build(),/source_tree_shape/);});
+test('main-relative RED final valid merge-base relation change blocks readiness',async()=>{
+ const f=forkFixture();try{const get=f.deps.getJson;let count=0;f.deps.getJson=route=>{const v=get(route);if(route===`repos/${FORK}/compare/${BASE}...${HEAD}`&&++count===2){v.behind_by=1;v.merge_base_commit.sha=HEAD;}return v;};const r=await checkReadiness(document,f.options(),f.deps);assert.ok(r.pullRequests[0].reasons.some(x=>x.code==='head_changed'),JSON.stringify(r));}finally{f.close();}
+});
+test('main-relative RED final emitter row race writes no output',()=>{
+ const f=outputFixture();try{
+ const counter=path.join(f.directory,'source-read-count');const stub=path.join(f.directory,'bin','gh');writeFileSync(stub,`#!${process.execPath}\nconst fs=require('fs'),a=process.argv.slice(2),routes=JSON.parse(fs.readFileSync(${JSON.stringify(path.join(f.directory,'routes.json'))},'utf8'));let v=routes[a[3]];if(a[3]?.includes('/pulls/1/files?')){let n=fs.existsSync(${JSON.stringify(counter)})?Number(fs.readFileSync(${JSON.stringify(counter)},'utf8')):0;fs.writeFileSync(${JSON.stringify(counter)},String(++n));if(n===2)v[0].status='added';}if(v)process.stdout.write(JSON.stringify(v));else process.exit(8);\n`);chmodSync(stub,0o700);
+ const target=path.join(f.directory,'must-not-exist.txt'),run=invokeSourceSchema(f,'v1',target);assert.equal(run.status,1);assert.match(run.stderr,/head_changed/);assert.equal(existsSync(target),false);
+ }finally{f.close();}
+});
+test('main-relative RED350 rows use all four pages at both snapshot boundaries',async()=>{
+ const f=forkFixture();try{
+ const before=[],after=[],files=[],pairs=[];const prefix=`repos/${FORK}`;
+ for(let i=0;i<350;i++){const p=`src/f-${i}.mjs`;before.push({path:p,type:'blob',mode:'100644',sha:hashBlob('old')});after.push({path:p,type:'blob',mode:'100644',sha:hashBlob('new')});files.push({filename:p,status:'modified',sha:hashBlob('new')});pairs.push({path:p,status:'modified',before:{path:p,blobSha:hashBlob('old'),content:'old'},after:{path:p,blobSha:hashBlob('new'),content:'new'}});}
+ reindexFixtureTrees(f,after,before);f.source.changedFiles=pairs.sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0);f.pr.changed_files=350;
+ for(let page=1;page<=4;page++)f.routes[`${prefix}/pulls/1/files?per_page=100&page=${page}`]=files.slice((page-1)*100,page*100);
+ for(const text of ['old','new'])f.routes[`${prefix}/git/blobs/${hashBlob(text)}`]={sha:hashBlob(text),encoding:'base64',size:text.length,content:Buffer.from(text).toString('base64')};refreshJournalSource(f);
+ const r=await checkReadiness(document,f.options(),f.deps);assert.equal(r.pullRequests[0].verdict,'ready',JSON.stringify(r.pullRequests[0].reasons));assert.equal(r.pullRequests[0].source.changedFiles.length,350);assert.equal(f.reads.filter(x=>x.includes('/pulls/1/files?')).length,8);
+ delete f.routes[`${prefix}/pulls/1/files?per_page=100&page=3`];const failed=await checkReadiness(document,f.options(),f.deps);assert.equal(failed.pullRequests[0].verdict,'needs_gardening');assert.equal(failed.pullRequests[0].reasons[0].code,'readiness_unknown');
+ }finally{f.close();}
 });
