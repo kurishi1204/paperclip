@@ -26,6 +26,26 @@ GitHub Actions owns `pnpm-lock.yaml`.
 - Pull request CI validates dependency resolution when manifests change.
 - Pushes to `master` regenerate `pnpm-lock.yaml` with `pnpm install --lockfile-only --no-frozen-lockfile`, commit it back if needed, and then run verification with `--frozen-lockfile`.
 
+## Test host check
+
+The standard Vitest runner (`pnpm test:run` and its grouped entries) checks the
+test host before it starts Vitest. A short
+probe opens its own ephemeral loopback listener and uses the production port-owner
+lookup to verify its PID. If this fails, install missing ownership tools and keep
+the original host `PATH` when adding toolchain directories. On macOS, this normally includes `/usr/sbin` for `lsof`.
+The probe cannot change managed services and has a 15-second process limit.
+`--dry-run` only prints the existing plan and does not run the probe.
+After dependency installation, check missing-lookup rejection, the real owner
+match, and the existing isolated chat CLI fixture:
+
+```sh
+node --test scripts/check-vitest-test-host.test.mjs
+pnpm exec vitest run --project @paperclipai/server server/src/__tests__/vitest-chat-shards.test.ts
+```
+
+The probe and its loader resolve from the runner source. The current working
+directory still selects the target test tree, including isolated CLI fixtures.
+
 ## Trusted PR Workflow
 
 The PR caller uses `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`.
