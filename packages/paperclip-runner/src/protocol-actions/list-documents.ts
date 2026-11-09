@@ -27,7 +27,7 @@ export const listDocumentsAction = {
   },
   "documentation": {
     "title": "List task documents",
-    "description": "List revisioned documents on the active task.",
+    "description": "List document metadata on the active task, without bodies. Use read_document with an exact key to read a body.",
     "note": null
   },
   "examples": {
@@ -48,7 +48,7 @@ export const listDocumentsAction = {
       "operationId": "list_documents",
       "version": 1,
       "title": "List task documents",
-      "description": "List revisioned documents on the active task.",
+      "description": "List document metadata on the active task, without bodies. Use read_document with an exact key to read a body.",
       "exposure": "always",
       "requiredClaims": [],
       "allowedModes": [

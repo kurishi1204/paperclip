@@ -137,6 +137,25 @@ export async function terminalizeLegacyExecution(input: {
           eq(issueRecoveryActions.status, "resolved"),
           or(
             sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
+            // A periodic scan can select this source before a new user turn
+            // commits. Its stopped actions remain unknown, but a matching
+            // server admission and successor already own further recovery.
+            updated.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive" ? and(
+              eq(issueRecoveryActions.outcome, "cancelled"),
+              sql`coalesce(${issueRecoveryActions.evidence}->>'runId', ${issueRecoveryActions.evidence}->>'sourceRunId') = ${run.id}`,
+              sql`exists (select 1 from ${heartbeatRuns} continued
+                where continued.company_id = ${run.companyId}
+                  and continued.agent_id = ${run.agentId}
+                  and continued.id <> ${run.id}
+                  and continued.id::text = ${issueRecoveryActions.evidence}->'explicitUserContinuation'->>'runId'
+                  and coalesce(continued.native_issue_id::text, continued.context_snapshot->>'issueId') = ${task.id}
+                  and continued.context_snapshot->'explicitUserContinuation'->>'previousRunId' =
+                    ${issueRecoveryActions.evidence}->'explicitUserContinuation'->>'previousRunId'
+                  and continued.context_snapshot->'explicitUserContinuation' ? 'commentId'
+                  and ${issueRecoveryActions.evidence}->'explicitUserContinuation' ? 'commentId'
+                  and continued.context_snapshot->'explicitUserContinuation'->>'commentId' is not distinct from
+                    ${issueRecoveryActions.evidence}->'explicitUserContinuation'->>'commentId')`,
+            ) : undefined,
             and(
               sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
               sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
