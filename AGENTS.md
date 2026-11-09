@@ -172,6 +172,7 @@ pnpm test:release-smoke
 Run the browser suites only when your change touches them or when you are explicitly verifying CI/release flows.
 
 For normal issue work, run the smallest relevant verification first. Do not default to repo-wide typecheck/build/test on every heartbeat when a narrower check is enough to prove the change.
+For fresh Paperclip Runner wake admission, follow [the Task preflight contract](doc/plans/2026-10-23-fresh-wake-task-admission.md): trace the entry, execution-time callee, first side effect, and smallest normal/fault pair before changing the gate. On the macOS arm64 acceptance host the owned embedded-Postgres test must execute with zero skips; other platforms retain the optional-database convention. Execution-time eligibility remains authoritative.
 
 Run this full check before claiming repo work done in a PR-ready hand-off, or when the change scope is broad enough that targeted checks are not sufficient:
 

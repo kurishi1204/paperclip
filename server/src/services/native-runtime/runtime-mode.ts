@@ -94,6 +94,19 @@ function ineligible(
   );
 }
 
+/** Shared Task-only check for fresh enqueue and the execution-time resolver. */
+export function assertPaperclipRunnerTaskEligibility(
+  issue: { id: string; workMode: string } | null,
+): void {
+  const allowedWorkModes = ["standard", "planning", "ask"];
+  if (!issue || !allowedWorkModes.includes(issue.workMode)) {
+    throw ineligible(
+      "paperclip_runner_issue_ineligible",
+      "Paperclip Runner requires a standard, planning, or ask task.",
+    );
+  }
+}
+
 export function resolveNativeRuntimeMode(input: {
   enabled: boolean;
   runtimeConfig: unknown;
@@ -139,13 +152,7 @@ export function resolveNativeRuntimeMode(input: {
       "Paperclip Runner requires an active agent.",
     );
   }
-  const allowedWorkModes = ["standard", "planning", "ask"];
-  if (!input.issue || !allowedWorkModes.includes(input.issue.workMode)) {
-    throw ineligible(
-      "paperclip_runner_issue_ineligible",
-      "Paperclip Runner requires a standard, planning, or ask task.",
-    );
-  }
+  assertPaperclipRunnerTaskEligibility(input.issue);
   const rollout = resolveNativeMigrationStatus({
     facts: { applicationEnabled: true },
     priorIssueStatus: "in_progress",
