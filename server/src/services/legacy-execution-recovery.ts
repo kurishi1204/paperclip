@@ -151,7 +151,9 @@ export async function terminalizeLegacyExecution(input: {
                   and coalesce(continued.native_issue_id::text, continued.context_snapshot->>'issueId') = ${task.id}
                   and continued.context_snapshot->'explicitUserContinuation'->>'previousRunId' =
                     ${issueRecoveryActions.evidence}->'explicitUserContinuation'->>'previousRunId'
-                  and continued.context_snapshot->'explicitUserContinuation'->>'commentId' =
+                  and continued.context_snapshot->'explicitUserContinuation' ? 'commentId'
+                  and ${issueRecoveryActions.evidence}->'explicitUserContinuation' ? 'commentId'
+                  and continued.context_snapshot->'explicitUserContinuation'->>'commentId' is not distinct from
                     ${issueRecoveryActions.evidence}->'explicitUserContinuation'->>'commentId')`,
             ) : undefined,
             and(

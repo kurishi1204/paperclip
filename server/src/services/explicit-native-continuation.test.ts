@@ -1457,7 +1457,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
   });
-  it.each(["valid", "missing_successor", "foreign_issue", "foreign_agent", "missing_context", "wrong_predecessor", "wrong_comment", "unlinked_receipt", "unsafe_archive"])(
+  it.each(["valid", "missing_successor", "foreign_issue", "foreign_agent", "missing_context", "wrong_predecessor", "wrong_comment", "unlinked_receipt", "unsafe_archive", "retry", "retry_missing_comment", "retry_missing_receipt_comment"])(
     "does not recreate an old legacy hold after an admitted user turn (%s)", async kind => {
       const f = await seed();
       await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, f.agentId));
@@ -1467,8 +1467,17 @@ const support = await getEmbeddedPostgresTestSupport();
       }).where(eq(heartbeatRuns.id, f.sourceRunId));
       await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
         .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
-      const continuation = await admit(f);
-      expect(continuation).toEqual({ previousRunId: f.sourceRunId, commentId: f.commentId });
+      const retry = kind.startsWith("retry");
+      const continuation = retry ? await db.transaction(async tx => {
+        await tx.select().from(issues).where(eq(issues.id, f.issueId)).for("update");
+        const result = await admitExplicitNativeContinuation({ ...f, db: tx as unknown as typeof db,
+          reason: "retry_failed_run", failedRunId: f.sourceRunId, commentId: null });
+        if (result) await tx.insert(heartbeatRuns).values({ id: f.successorRunId,
+          companyId: f.companyId, agentId: f.agentId, status: "queued" });
+        return result;
+      }) : await admit(f);
+      expect(continuation).toEqual({ previousRunId: f.sourceRunId, commentId: retry ? null : f.commentId,
+        ...(retry ? { failedRunId: f.sourceRunId } : {}) });
       expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
       if (kind === "missing_successor") await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, f.successorRunId));
       else {
@@ -1484,6 +1493,18 @@ const support = await getEmbeddedPostgresTestSupport();
             } }) },
         }).where(eq(heartbeatRuns.id, f.successorRunId));
       }
+      if (kind === "retry_missing_comment") {
+        const { commentId: omitted, ...incomplete } = continuation!;
+        await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId,
+          explicitUserContinuation: incomplete } }).where(eq(heartbeatRuns.id, f.successorRunId));
+      }
+      if (kind === "retry_missing_receipt_comment") {
+        const [receipt] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+        const authorization = receipt.evidence.explicitUserContinuation as Record<string, unknown>;
+        const { commentId: omitted, ...incomplete } = authorization;
+        await db.update(issueRecoveryActions).set({ evidence: { ...receipt.evidence,
+          explicitUserContinuation: incomplete } }).where(eq(issueRecoveryActions.id, receipt.id));
+      }
       if (kind === "unlinked_receipt") {
         const [receipt] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
         await db.update(issueRecoveryActions).set({ evidence: { ...receipt.evidence, runId: randomUUID() } })
@@ -1497,7 +1518,7 @@ const support = await getEmbeddedPostgresTestSupport();
       // user message acquired the task lock. Revisit after admission commits.
       await terminalizeLegacyExecution({ db, run: source, status: source.status });
       const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
-      if (kind === "valid") expect(blocker).toBeNull();
+      if (kind === "valid" || kind === "retry") expect(blocker).toBeNull();
       else expect(blocker).not.toBeNull();
       const [preserved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
       expect(preserved).toMatchObject({ status: "failed", resultJson: kind === "unsafe_archive"
