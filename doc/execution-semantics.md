@@ -578,6 +578,8 @@ A source-scoped recovery action is the default form. Use it when the next safe m
 
 Recovery-action ownership and source-task ownership are separate contracts. Assigning a manager or board owner to a recovery action authorizes that owner to repair or route the recovery action; it does not write that owner into the source issue's `assigneeAgentId`. Automatic retry and escalation preserve the source assignee. Reassignment requires an explicit source-task decision or a policy-defined serious-failure path, with the normal company, authorization, budget, checkout, active-run-lock, governed-action, and activity-log checks.
 
+A settled recovery action ID remains wake provenance. For the same company and source issue, a verified current assignee receives ordinary-work framing when no active or escalated recovery remains. Source-scoped and status-only recovery keep recovery framing. Unverified bindings retain prior projection behavior, including a null lookup for an unknown action ID without a recovery cause. This projection changes no status-only permission, execution blocker, no-replay hold, or admission gate.
+
 Use an issue-backed recovery action only when the recovery is genuinely independent work or when source-scoped handling would be unsafe or unclear. Examples include:
 
 - long or cross-agent repair work with its own assignee, subtasks, or blockers
