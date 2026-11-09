@@ -38,6 +38,13 @@ subscription quota exhaustion merely because ACP labels them `limit`.
 | `dangerouslySkipPermissions` | boolean | No | Skip permission prompts (default: `true`); the QA review mode below runs headlessly with `false` |
 | `qaReviewToolsOnly` | boolean | No | Run a local, restricted Claude CLI session with only the assigned-issue QA MCP tools (default: `false`) |
 
+CLI version and effort-support probes use a separate timeout of at most 20
+seconds. For a positive run timeout, each probe uses that value clamped to
+1–20 seconds.
+With `timeoutSec: 0`, the run has no timeout and each capability probe keeps
+its 20-second limit. An unverified CLI version still fails the model's version
+check.
+
 ## Headless formal QA review
 
 For a dedicated QA agent, set `engine: "cli"`, `qaReviewToolsOnly: true`,

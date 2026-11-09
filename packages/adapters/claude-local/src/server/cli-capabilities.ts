@@ -68,6 +68,12 @@ export function claudeCliVersionAtLeast(version: string, minimum: string): boole
   return true;
 }
 
+function capabilityProbeTimeoutSec(timeoutSec: number): number {
+  // A non-positive run timeout means unlimited. Capability probes still need
+  // their own finite budget instead of inheriting a one-second minimum.
+  return timeoutSec > 0 ? Math.max(1, Math.min(timeoutSec, 20)) : 20;
+}
+
 async function probeClaudeCommandVersion(input: {
   runId: string;
   command: string;
@@ -85,7 +91,7 @@ async function probeClaudeCommandVersion(input: {
     {
       cwd: input.cwd,
       env: input.env,
-      timeoutSec: Math.max(1, Math.min(input.timeoutSec, 20)),
+      timeoutSec: capabilityProbeTimeoutSec(input.timeoutSec),
       graceSec: Math.max(1, Math.min(input.graceSec, 5)),
       onLog: async () => {},
     },
@@ -127,7 +133,7 @@ async function probeClaudeCommandSupportsEffortFlag(input: {
     {
       cwd: input.cwd,
       env: input.env,
-      timeoutSec: Math.max(1, Math.min(input.timeoutSec, 20)),
+      timeoutSec: capabilityProbeTimeoutSec(input.timeoutSec),
       graceSec: Math.max(1, Math.min(input.graceSec, 5)),
       onLog: async () => {},
     },
