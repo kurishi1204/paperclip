@@ -27,13 +27,22 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { buildPaperclipRuntimeMcpServers, createManagedMcpRunConfig } from "../services/heartbeat.js";
+import { buildPaperclipRuntimeMcpServers, createAdapterRuntimeMcpAccess, createManagedMcpRunConfig } from "../services/heartbeat.js";
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
 
 import { toolAccessService } from "../services/tool-access.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+it("keeps runtime read approvals immutable across sources and readers", () => {
+  const tools = ["connections_search"];
+  const access = createAdapterRuntimeMcpAccess([{ name: "runtime", url: "https://paperclip.example/mcp", token: "run-token", connectionId: "runtime", readOnlyAutoApproveTools: tools }])!;
+  tools.push("connection_request");
+  const first = access.getServers();
+  (first[0]!.readOnlyAutoApproveTools as string[]).push("other");
+  expect(access.getServers()[0]!.readOnlyAutoApproveTools).toEqual(["connections_search"]);
+});
 
 describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
   let db!: ReturnType<typeof createDb>;

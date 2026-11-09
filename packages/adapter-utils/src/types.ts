@@ -197,6 +197,10 @@ export interface AdapterRuntimeMcpServer {
   url: string;
   token: string;
   connectionId: string;
+  /** Exact first-party read tools derived by the server for this runtime entry.
+   * Client approval UX only; endpoint authentication and authorization still apply.
+   * Unsupported readers must ignore this field rather than widen its scope. */
+  readOnlyAutoApproveTools?: readonly string[];
 }
 
 export interface AdapterRuntimeMcpAccess {

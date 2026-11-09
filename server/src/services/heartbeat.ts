@@ -122,6 +122,7 @@ import {
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES } from "./connection-tool-definitions.js";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   CHAT_PROVIDERS,
@@ -5020,13 +5021,17 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     },
   ];
 }
-function createAdapterRuntimeMcpAccess(
+export function createAdapterRuntimeMcpAccess(
   servers: AdapterRuntimeMcpServer[],
 ): AdapterRuntimeMcpAccess | undefined {
   if (servers.length === 0) return undefined;
-  const snapshot = servers.map((server) => Object.freeze({ ...server }));
+  const snapshot = servers.map((server) => Object.freeze({ ...server,
+    ...(server.readOnlyAutoApproveTools ? { readOnlyAutoApproveTools: Object.freeze([...server.readOnlyAutoApproveTools]) } : {}),
+  }));
   return Object.freeze({
-    getServers: () => snapshot.map((server) => ({ ...server })),
+    getServers: () => snapshot.map((server) => ({ ...server,
+      ...(server.readOnlyAutoApproveTools ? { readOnlyAutoApproveTools: [...server.readOnlyAutoApproveTools] } : {}),
+    })),
   });
 }
 
@@ -26141,6 +26146,7 @@ export function heartbeatService(
                 url: runtimeTools.mcpEndpoint,
                 token: runtimeTools.bearerToken,
                 connectionId: "paperclip-runtime-tools",
+                readOnlyAutoApproveTools: RUNTIME_CONNECTION_READ_ONLY_TOOL_NAMES,
               });
             }
             const qaLocalApiUrl = qaReviewMode || selfTaskDocumentMode ? qaReviewLocalApiUrl() : null;
