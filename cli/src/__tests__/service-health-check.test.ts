@@ -1,3 +1,4 @@
+import { Command } from "commander";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,7 +11,7 @@ import {
   renderLaunchdPlist,
   renderSystemdUnit,
 } from "../services/service-manager.js";
-import { resolveRestartExpectedVersion, withHotRestartLock } from "../commands/service.js";
+import { registerServiceCommands, resolveRestartExpectedVersion, withHotRestartLock } from "../commands/service.js";
 import type { PaperclipConfig } from "../config/schema.js";
 import { buildLocalHealthUrl } from "../utils/health-url.js";
 
@@ -32,6 +33,17 @@ afterEach(() => {
   else process.env.PAPERCLIP_HOME = previousPaperclipHome;
   if (previousServiceManaged === undefined) delete process.env.PAPERCLIP_SERVICE_MANAGED;
   else process.env.PAPERCLIP_SERVICE_MANAGED = previousServiceManaged;
+});
+
+it("describes restart drain as interruption rather than a completion wait", () => {
+  const program = new Command();
+  registerServiceCommands(program);
+  const service = program.commands.find((command) => command.name() === "service")!;
+  const restart = service.commands.find((command) => command.name() === "restart")!;
+  const help = restart.helpInformation().replace(/\s+/g, " ");
+  expect(help).toContain("server-stdio runs are drained");
+  expect(help).toContain("interrupt active runs at shutdown");
+  expect(help).toContain("Does not wait for completion");
 });
 
 function managerFixture(active = true) {
