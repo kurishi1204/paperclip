@@ -607,6 +607,15 @@ describe("PaperclipRunnerToolAuthority", () => {
         payload,
       },
     };
+    if (answerMode === "text") {
+      await expect(authority.execute({
+        ...call,
+        callId: "oversized-question",
+        arguments: { ...call.arguments, idempotencyKey: "oversized-question", prompt: "🙂".repeat(501) },
+      })).rejects.toThrow("paperclip_runner_prompt_too_long");
+      expect(await db.select().from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.issueId, binding.issueId))).toHaveLength(0);
+    }
     const first = await authority.execute(call);
     expect(first).toMatchObject({
       disposition: "applied",

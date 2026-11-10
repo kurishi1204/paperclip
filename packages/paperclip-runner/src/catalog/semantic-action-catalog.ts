@@ -238,7 +238,7 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
           ],
         },
         title: text("Interaction card title.", 300),
-        prompt: text("Question or decision prompt.", 10_000),
+        prompt: text("Short question or decision prompt, at most 1000 UTF-16 code units. Keep long QA material in a saved task document and bind its exact revision.", 1_000),
         payload: openObject,
         addresseeAgentId: nullableText(
           "Optional existing independent employee for a fixed standard-mode business document confirmation only; never key plan. Omit for human questions and approvals.",

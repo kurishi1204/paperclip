@@ -30,6 +30,21 @@ describe("core Paperclip protocol action contracts", () => {
     expect(action.live!.descriptor.description).not.toContain("Never infer answers, answer your own card");
   });
 
+  it("advertises the real prompt bound in both provider and scenario schemas", () => {
+    const action = PAPERCLIP_CORE_PROTOCOL_ACTIONS.find(action => action.id === "request_human_input")!;
+    for (const schema of [action.live!.descriptor.inputSchema, action.scenario!.descriptor.inputSchema]) {
+      const input = { ...action.examples.call.input, prompt: "x".repeat(1000) };
+      if (schema === action.scenario!.descriptor.inputSchema) delete (input as { idempotencyKey?: string }).idempotencyKey;
+      expect(ajv.validate(schema, input), JSON.stringify(ajv.errors)).toBe(true);
+      expect(ajv.validate(schema, { ...input, prompt: "x".repeat(1001) })).toBe(false);
+      // JSON Schema counts Unicode code points; the live server additionally
+      // enforces the UTF-16 bound before any interaction is created.
+      expect(ajv.validate(schema, { ...input, prompt: "🙂".repeat(501) })).toBe(true);
+    }
+    expect(action.live!.descriptor.description).toContain("1000 UTF-16 code units");
+    expect(action.live!.descriptor.description).toContain("exact documentId/key/revisionId");
+  });
+
   it.each(PAPERCLIP_CORE_PROTOCOL_ACTIONS.map((action) => [action.id, action] as const))(
     "%s has immutable metadata and schema-valid examples",
     (operationId, action) => {

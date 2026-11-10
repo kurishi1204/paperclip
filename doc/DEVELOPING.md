@@ -1307,6 +1307,13 @@ operator-controlled [runner API tools](runner-api-tools.md) rollout; enabling
 Agent Chat does not enable that API surface. Failed-turn retries restore the
 selected run's user comments so the agent can answer the original request.
 
+For Paperclip Runner `request_human_input`, keep the card `prompt` within 1,000
+UTF-16 code units (JavaScript string length). The server rejects longer prompts
+before creating an interaction. For a long business QA item, save the complete
+material as a task document and use a short confirmation bound to that exact
+document ID, key, and revision; do not truncate the material or post a second
+card to work around the limit.
+
 An unsaved Agent Chat uses an ephemeral `chat:<agent-id>` view-model ID. Task
 browser polling starts after the first send or upload creates a persisted task
 UUID. Saved chats retain the task browser's company and credential access checks.
