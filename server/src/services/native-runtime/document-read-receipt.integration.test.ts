@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { documentService } from "../documents.js";
+import { documentReadReceipt } from "./document-read-receipt.js";
 import { startRunnerApiTestServer } from "../../__tests__/helpers/runner-api-server.js";
 import { PaperclipRunnerSemanticAuthority } from "./runner-semantic-authority.js";
 
@@ -13,6 +14,12 @@ describe("native document read receipts through real authorities", () => {
   let server: Awaited<ReturnType<typeof startRunnerApiTestServer>>;
   beforeAll(async () => { server = await startRunnerApiTestServer(); }, 60_000);
   afterAll(async () => { await server?.close(); });
+
+  it("does not issue an empty-body receipt for metadata without a body", () => {
+    expect(() => documentReadReceipt({ companyId: "synthetic-company", issueId: "synthetic-task", agentId: "synthetic-reader", runId: "synthetic-run" },
+      { id: "synthetic-document", key: "notes", latestRevisionId: null, latestRevisionNumber: 0 }))
+      .toThrow("paperclip_document_read_body_unavailable");
+  });
 
   it("calculates both native read results from exact saved UTF-8 bodies and advances with the version", async () => {
     const f = await server.fixture({ disableWakeOnDemand: true });

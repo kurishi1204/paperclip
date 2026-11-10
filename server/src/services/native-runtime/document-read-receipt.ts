@@ -10,7 +10,7 @@ interface ReadBinding {
 interface ReadDocument {
   readonly id: string;
   readonly key: string;
-  readonly body: string;
+  readonly body?: string;
   readonly latestRevisionId: string | null;
   readonly latestRevisionNumber: number;
 }
@@ -20,6 +20,7 @@ interface ReadDocument {
  * A null revision ID remains null; the receipt does not invent a saved version.
  */
 export function documentReadReceipt(binding: ReadBinding, document: ReadDocument) {
+  if (typeof document.body !== "string") throw new Error("paperclip_document_read_body_unavailable");
   const bytes = Buffer.from(document.body, "utf8");
   return {
     schema: "paperclip.document-read-receipt.v1" as const,
