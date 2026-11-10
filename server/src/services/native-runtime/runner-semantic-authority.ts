@@ -1,3 +1,4 @@
+import { documentReadReceipt } from "./document-read-receipt.js";
 import { documentRevisionPage } from "../documents.js";
 import { readTaskQuestionContext } from "../issue-question-context.js";
 import { isConversation } from "../agent-conversations.js";
@@ -231,7 +232,7 @@ export class PaperclipRunnerSemanticAuthority {
               .limit(1);
             if (!row) throw new Error("paperclip_runner_document_not_found");
             return {
-              value: jsonValue({ document: row }),
+              value: jsonValue({ document: row, readReceipt: documentReadReceipt(this.#binding, row) }),
               references: [
                 {
                   kind: "document_revision",

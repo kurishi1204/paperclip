@@ -1,3 +1,4 @@
+import { documentReadReceipt } from "./document-read-receipt.js";
 import { readTaskQuestionContext } from "../issue-question-context.js";
 import { isConversation } from "../agent-conversations.js";
 import { setIssueTitle } from "../issue-title.js";
@@ -609,7 +610,7 @@ export class PaperclipRunnerToolAuthority {
         if (review && (document.id !== review.binding.documentId || document.latestRevisionId !== review.binding.revisionId)) {
           throw forbidden("The fixed document revision changed before the read completed.");
         }
-        return { document };
+        return { document, readReceipt: documentReadReceipt(this.binding, document) };
       }
       case "list_document_revisions": {
         const review=await this.#assertDocumentReviewKey(input.key);

@@ -162,7 +162,9 @@ suite("pending independent document review through real dispatch", () => {
       expect(await x.authority.execute({ tool:"get_task_context", callId:"context", arguments:{} }))
         .toMatchObject({ assignedReview:{ id:x.interactionId, status:"pending" }, activeTask:{ assigneeAgentId:x.ownerId } });
       expect(await x.authority.execute({ tool:"read_document", callId:"document", arguments:{key:"fixed-proposal"} }))
-        .toMatchObject({ document:{ id:x.documentId, latestRevisionId:x.revisionId, body:"Synthetic proposal only" } });
+        .toMatchObject({ document:{ id:x.documentId, latestRevisionId:x.revisionId, body:"Synthetic proposal only" },
+          readReceipt:{ computedBy:"paperclip_server_read_tool", documentId:x.documentId, revisionId:x.revisionId,
+            agentId:x.reviewerId, runId:x.runId, bodyBytes:23, bodySha256:"895c85e197de7d4913c6b57eac6a3ac43d5ed7aa9b86e84aa725c8ab11ba899a" } });
       await expect(x.authority.execute({ tool:"write_document", callId:"write", arguments:{} })).rejects.toThrow("may only inspect");
       await expect(x.authority.execute({ tool:"read_document", callId:"other-document", arguments:{key:"other-proposal"} })).rejects.toThrow("Read only the fixed document");
       const report = { reportedWorkDisposition:"done" } as PrpStructuredRunResult;

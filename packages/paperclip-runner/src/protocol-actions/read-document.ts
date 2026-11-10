@@ -1,4 +1,5 @@
 /** Canonical definition and documentation for `read_document`. */
+const readDocumentDescription = "Read the current revision of one active-task document. Native server reads include a run-bound readReceipt for the authorized source body before transport redaction. It is a server calculation, not agent reasoning or a QA verdict.";
 export const readDocumentAction = {
   "id": "read_document",
   "canonical": {
@@ -27,8 +28,8 @@ export const readDocumentAction = {
   },
   "documentation": {
     "title": "Read task document",
-    "description": "Read the current revision of one active-task document.",
-    "note": null
+    "description": readDocumentDescription,
+    "note": "Native server reads include readReceipt, computed from the authorized document body before transport redaction. The receipt binds the company, task, agent, run and document revision to UTF-8 bytes and SHA-256. It is a server tool calculation, not proof of agent reasoning or an independent provider attestation."
   },
   "examples": {
     "call": {
@@ -50,7 +51,7 @@ export const readDocumentAction = {
       "operationId": "read_document",
       "version": 1,
       "title": "Read task document",
-      "description": "Read the current revision of one active-task document.",
+      "description": readDocumentDescription,
       "exposure": "always",
       "requiredClaims": [],
       "allowedModes": [

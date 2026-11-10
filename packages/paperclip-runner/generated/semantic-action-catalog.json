@@ -330,7 +330,7 @@
       "planning",
       "skill_test"
     ],
-    "description": "Read the current revision of one active-task document.",
+    "description": "Read the current revision of one active-task document. Native server reads include a run-bound readReceipt for the authorized source body before transport redaction. It is a server calculation, not agent reasoning or a QA verdict.",
     "effect": "read",
     "inputSchema": {
       "additionalProperties": false,
