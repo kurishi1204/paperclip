@@ -1313,6 +1313,10 @@ before creating an interaction. For a long business QA item, save the complete
 material as a task document and use a short confirmation bound to that exact
 document ID, key, and revision; do not truncate the material or post a second
 card to work around the limit.
+The published JSON Schema `maxLength: 1000` counts Unicode code points, so a
+prompt containing supplementary characters can pass that precheck and still
+exceed the server's UTF-16 limit. An explicit server rejection creates no card;
+shorten the prompt and keep the complete material in the bound task document.
 
 An unsaved Agent Chat uses an ephemeral `chat:<agent-id>` view-model ID. Task
 browser polling starts after the first send or upload creates a persisted task

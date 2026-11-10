@@ -30,15 +30,16 @@ describe("core Paperclip protocol action contracts", () => {
     expect(action.live!.descriptor.description).not.toContain("Never infer answers, answer your own card");
   });
 
-  it("advertises the real prompt bound in both provider and scenario schemas", () => {
+  it("advertises the prompt precheck and leaves UTF-16 enforcement to the server", () => {
     const action = PAPERCLIP_CORE_PROTOCOL_ACTIONS.find(action => action.id === "request_human_input")!;
     for (const schema of [action.live!.descriptor.inputSchema, action.scenario!.descriptor.inputSchema]) {
       const input = { ...action.examples.call.input, prompt: "x".repeat(1000) };
       if (schema === action.scenario!.descriptor.inputSchema) delete (input as { idempotencyKey?: string }).idempotencyKey;
       expect(ajv.validate(schema, input), JSON.stringify(ajv.errors)).toBe(true);
       expect(ajv.validate(schema, { ...input, prompt: "x".repeat(1001) })).toBe(false);
-      // JSON Schema counts Unicode code points; the live server additionally
-      // enforces the UTF-16 bound before any interaction is created.
+      // JSON Schema counts Unicode code points, so its maxLength is a permissive
+      // precheck for supplementary characters. The server enforces UTF-16 before
+      // creating any interaction; no portable JSON Schema keyword expresses it.
       expect(ajv.validate(schema, { ...input, prompt: "🙂".repeat(501) })).toBe(true);
     }
     expect(action.live!.descriptor.description).toContain("1000 UTF-16 code units");
