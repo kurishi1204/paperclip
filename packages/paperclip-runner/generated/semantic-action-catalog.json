@@ -784,8 +784,8 @@
           "type": "object"
         },
         "prompt": {
-          "description": "Question or decision prompt.",
-          "maxLength": 10000,
+          "description": "Short question or decision prompt, at most 1000 UTF-16 code units. Keep long QA material in a saved task document and bind its exact revision.",
+          "maxLength": 1000,
           "minLength": 1,
           "type": "string"
         },

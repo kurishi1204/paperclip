@@ -2164,6 +2164,9 @@ export class PaperclipRunnerToolAuthority {
       throw new Error("paperclip_runner_document_review_scheduler_unavailable");
     }
     const prompt = requiredString(input.prompt);
+    if (prompt.length > 1000) {
+      throw new Error("paperclip_runner_prompt_too_long: prompt exceeds 1000 UTF-16 code units. Save complete QA material as a task document and use a short confirmation prompt bound to its exact documentId/key/revisionId; do not truncate the material or create a duplicate card.");
+    }
     const idempotencyKey = requiredString(input.idempotencyKey);
     let publication: Awaited<ReturnType<typeof persistActivity>>["publication"] | null = null;
     const result = await this.#withMutationReceipt(
