@@ -1,3 +1,4 @@
+import { readDocumentAction } from "../protocol-actions/read-document.js";
 import { listProjectsDescription, listProjectsInputSchema } from "../protocol-actions/list-projects.js";
 import { setTaskTitleAction } from "../protocol-actions/set-task-title.js";
 import { reassignTaskAction } from "../protocol-actions/reassign-task.js";
@@ -146,7 +147,7 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
   descriptor({
     operationId: "read_document",
     title: "Read task document",
-    description: "Read the current revision of one active-task document.",
+    description: readDocumentAction.live.descriptor.description,
     inputSchema: object({ key: text("Stable issue-document key.", 120) }, [
       "key",
     ]),

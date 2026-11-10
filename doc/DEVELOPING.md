@@ -1934,3 +1934,22 @@ Chromium. The test starts its own loopback Vite server and mocks API responses;
 it needs no running Paperclip instance or provider credentials. The same spec lives
 in the default `test:e2e` discovery tree, so the existing Chrome CI shards run it
 on pull requests.
+
+## Native document read receipts
+
+A native server `read_document` result includes the unchanged `document` and a
+`readReceipt`. The read tool computes the receipt from the selected source body,
+after the existing task, company and fixed-review checks. The receipt binds the
+company, task, agent, run, document key and revision to its UTF-8 byte count and
+SHA-256. It preserves spaces, line endings and the final newline. A missing
+revision ID stays null. A document list does not include bodies or receipts.
+
+`computedBy: "paperclip_server_read_tool"` identifies the calculation source.
+The explicit `bodyScope: "authorized_document_before_transport_redaction"`
+means later transport redaction can change the visible text. Do not compare a
+redacted copy with the source digest as if it were the source body.
+
+This receipt is not an agent's own calculation, a provider attestation, a QA
+verdict, or proof that the agent understood the document. A reviewer must still
+check the content and the requested revision. The existing persisted-revision
+digest API remains separate and unchanged. No read permission is added.
