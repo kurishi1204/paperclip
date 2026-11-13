@@ -1,6 +1,7 @@
 import fs from "node:fs";
+import { initialiseTestCluster, observePostmasterStartup, testPostgresBinaries, type InitializationContext } from "./test-embedded-postgres-initialization.js";
 import { beginTestIpc, cleanupSavedTestDatadirs } from "./test-embedded-postgres-ipc.js";
-import type { ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +23,7 @@ export const EMBEDDED_POSTGRES_TEST_TIMEOUT_MS = 90_000;
 type EmbeddedPostgresInstance = {
   process?: ChildProcess;
   initialise(): Promise<void>;
+  initialiseObserved?(context: InitializationContext): Promise<void>;
   start(): Promise<void>;
   stop(): Promise<void>;
 };
@@ -70,7 +72,55 @@ async function loadEmbeddedPostgresCtor(): Promise<EmbeddedPostgresCtor> {
   await prepareEmbeddedPostgresNativeRuntime();
   // Version-bound runtime seam: this shipped implementation exposes its ChildProcess
   // as a JavaScript property although the declaration marks it private.
-  return mod.default as unknown as EmbeddedPostgresCtor;
+  class ObservedEmbeddedPostgres extends mod.default {
+    private initializationController?: AbortController;
+    private initializationPromise?: Promise<void>;
+    private startupPromise?: Promise<void>;
+    private stopPromise?: Promise<void>;
+    private context?: InitializationContext;
+    async start(): Promise<void> {
+      if (!this.context || this.startupPromise) throw new Error("Missing initialization or repeated start");
+      const processOwner = this as unknown as {process?:ChildProcess;getUidAndGid():Promise<{uid?:number;gid?:number}>};
+      this.startupPromise = observePostmasterStartup(async () => {
+        const { postgres } = await testPostgresBinaries();
+        const ids = await processOwner.getUidAndGid();
+        // Final cancellation/datadir check is inside observePostmasterStartup,
+        // immediately before this synchronous launch+adoption (no await gap).
+        return () => spawn(postgres, ["-D",this.options.databaseDir,"-p",String(this.options.port),...this.options.postgresFlags],
+          {...ids,env:{...process.env,LC_MESSAGES:"C"}});
+      }, this.context, child => {processOwner.process=child;}, this.options.onLog);
+      await this.startupPromise;
+    }
+    async stop(): Promise<void> {
+      return this.stopPromise ??= (async () => {
+        // The dependency exit hook and explicit cleanup converge here too.
+        this.initializationController?.abort();
+        await this.initializationPromise?.catch(() => {});
+        await this.startupPromise?.catch(() => {});
+        const owner = this as unknown as {process?:ChildProcess};
+        if(owner.process && (owner.process.exitCode!==null || owner.process.signalCode!==null)) owner.process=undefined;
+        await super.stop();
+      })();
+    }
+    async initialiseObserved(context: InitializationContext): Promise<void> {
+      if (this.initializationPromise) throw new Error("Initialization already attempted; no replay");
+      this.initializationController = new AbortController();
+      // Version-bound private methods in 18.1.0-beta.16, inspected alongside
+      // binary.js. They retain the original root-user contract, without the
+      // inaccessible initialise() spawn or any user-creation option.
+      const permissionMethods = this as unknown as {
+        checkForRootUser(): Promise<void>;
+        getUidAndGid(): Promise<{uid?:number;gid?:number}>;
+      };
+      this.context = { ...context, signal: AbortSignal.any([context.signal, this.initializationController.signal]) };
+      this.initializationPromise = initialiseTestCluster({ ...this.options, permissionIds: async () => {
+        await permissionMethods.checkForRootUser();
+        return permissionMethods.getUidAndGid();
+      } }, this.context);
+      await this.initializationPromise;
+    }
+  }
+  return ObservedEmbeddedPostgres as unknown as EmbeddedPostgresCtor;
 }
 
 let embeddedPostgresCtorProvider: EmbeddedPostgresCtorProvider = loadEmbeddedPostgresCtor;
@@ -121,17 +171,29 @@ async function getAvailablePort(): Promise<number> {
 
 async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
   const EmbeddedPostgres = await getEmbeddedPostgresCtor();
+  assertNotInterrupted();
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix));
   const port = await getAvailablePort();
+  assertNotInterrupted();
 
   // Postgres writes the true reason for a failed start to its output, for
   // example `could not bind IPv4 address "127.0.0.1": Address already in use`.
   // The `start()` rejection carries an empty message, so we capture the output
   // in a bounded buffer and surface it in the thrown error.
   const logBuffer = createEmbeddedPostgresLogBuffer();
+  const originalDirectory = fs.lstatSync(dataDir);
+  const assertDataDirectory = () => {
+    const current = fs.lstatSync(dataDir);
+    if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== originalDirectory.dev ||
+        current.ino !== originalDirectory.ino || current.uid !== originalDirectory.uid)
+      throw new Error("Initialization datadir generation changed; no start/cleanup");
+  };
   const ipc = await beginTestIpc(dataDir);
   let instance:EmbeddedPostgresInstance;
-  try { instance = new EmbeddedPostgres({
+  try {
+    assertNotInterrupted();
+    assertDataDirectory();
+    instance = new EmbeddedPostgres({
     databaseDir: dataDir,
     user: "paperclip",
     password: "paperclip",
@@ -148,7 +210,7 @@ async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
     throw new AggregateError(failures,`Embedded Postgres constructor failed: ${String(error)}`);
   }
 
-  instanceEvidence.set(instance,{dataDir,ipc});
+  instanceEvidence.set(instance,{dataDir,ipc,assertDataDirectory});
   activeInstances.add(instance);
   return { dataDir, port, instance, getRecentLogs: () => logBuffer.getRecentLogs() };
 }
@@ -157,30 +219,58 @@ function cleanupEmbeddedPostgresTestDir(dataDir: string) {
   fs.rmSync(dataDir, {recursive:true,force:false});
 }
 
-const instanceEvidence = new WeakMap<EmbeddedPostgresInstance, {dataDir:string;ipc:Awaited<ReturnType<typeof beginTestIpc>>}>();
+const instanceEvidence = new WeakMap<EmbeddedPostgresInstance, {
+  dataDir:string; ipc:Awaited<ReturnType<typeof beginTestIpc>>; assertDataDirectory:()=>void;
+  initialization?: Promise<void>; initializationComplete?: boolean; startAttempted?: boolean;
+}>();
 const activeInstances = new Set<EmbeddedPostgresInstance>();
 let interruption = false;
+const initializationAbort = new AbortController();
+function assertNotInterrupted() {
+  if (interruption) throw new Error("Test interrupted; no new database start");
+}
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => {
   interruption = true;
+  initializationAbort.abort();
   void (async () => {
     for (const instance of activeInstances) {
-      const evidence=instanceEvidence.get(instance);
-      evidence?.ipc.record("interrupted",{signal,pid:instance.process?.pid,resume:"verify process generation and IPC identity; retain datadir"});
-      if(instance.process) {
-        try { await stopEmbeddedPostgresBounded(instance); }
-        catch(error) { console.error(String(error)); }
-      } else console.error(`Initialization exit unproven; retain ${evidence?.dataDir}`);
+      const evidence = instanceEvidence.get(instance);
+      try {
+        evidence?.ipc.record("interrupted", { signal, pid: instance.process?.pid,
+          resume: "retain datadir; child exit does not prove descendant or IPC cleanup" });
+      } catch (error) { console.error("Interrupted receipt write failed", String(error)); }
+      // The same owned promise handles cancellation and durable exit/close.
+      // A missing handle/receipt never becomes a positive initialization exit.
+      if (evidence?.initialization) await evidence.initialization.catch(() => {});
+      try { await stopEmbeddedPostgresBounded(instance); }
+      catch (error) { console.error(String(error)); }
     }
-    process.exit(signal==="SIGINT"?130:143);
+    process.exit(signal === "SIGINT" ? 130 : 143);
   })();
 });
-const EMBEDDED_POSTGRES_STOP_TIMEOUT_MS = 60000;
+
+const EMBEDDED_POSTGRES_STOP_TIMEOUT_MS = 60_000;
+const instanceStops = new WeakMap<EmbeddedPostgresInstance, Promise<void>>();
 async function stopEmbeddedPostgresBounded(instance: EmbeddedPostgresInstance | null, cleanupFn?:()=>void):Promise<void> {
+  if(!instance)throw new Error("Missing instance: cleanup cannot prove process exit");
+  const existing=instanceStops.get(instance);
+  if(existing)return existing;
+  const stopped=stopEmbeddedPostgresOnce(instance,cleanupFn);
+  instanceStops.set(instance,stopped);
+  return stopped;
+}
+async function stopEmbeddedPostgresOnce(instance: EmbeddedPostgresInstance, cleanupFn?:()=>void):Promise<void> {
   if(!instance) throw new Error("Missing instance: cleanup cannot prove process exit");
   const evidence=instanceEvidence.get(instance);
   const child=instance.process;
   let timer:ReturnType<typeof setTimeout>|undefined;
   try {
+    if (!child && evidence?.initialization && (!evidence.initializationComplete || !evidence.startAttempted || interruption)) {
+      // Release the lease through finish, but forbid its success marker even
+      // when an inventory happens to be unchanged. The receipt remains a hold.
+      await evidence.ipc.finish({ initializationUnproven: true });
+      throw new Error("Initialization exit/close unproven; retain datadir");
+    }
     evidence?.ipc.record("stop_requested",{pid:child?.pid,exitCode:child?.exitCode,signalCode:child?.signalCode});
     // The library waits forever when stop() is called after its child already exited.
     if(!child || child.exitCode!==null || child.signalCode!==null) {
@@ -190,7 +280,7 @@ async function stopEmbeddedPostgresBounded(instance: EmbeddedPostgresInstance | 
       if(child.exitCode===null&&child.signalCode===null) throw new Error("Postgres exit unproven; retain datadir");
     }
     evidence?.ipc.record("exit_observed",{pid:child?.pid,exitCode:child?.exitCode,signalCode:child?.signalCode});
-    const ipcCleanup = await evidence?.ipc.finish();
+    const ipcCleanup = await evidence?.ipc.finish({initializationUnproven:Boolean(evidence?.initialization && (!evidence.initializationComplete || interruption))});
     if(!ipcCleanup || typeof ipcCleanup.dataDirCleanupAllowed!=="boolean") throw new Error("IPC cleanup result missing; retain datadir");
     if(cleanupFn && (!child || child.exitCode!==0 || child.signalCode!==null)) throw new Error("Normal test database exit unproven; retain data");
     // Only this successfully exited child plus explicit whole-inventory permission permits
@@ -229,10 +319,28 @@ async function startEmbeddedPostgresWithRetry(tempDirPrefix: string): Promise<{
     if(interruption)throw new Error("Test interrupted; no new database start");
     const created = await createEmbeddedPostgresTestInstance(tempDirPrefix);
     try {
-      instanceEvidence.get(created.instance)?.ipc.record("initialise_started");
-      await created.instance.initialise();
-      instanceEvidence.get(created.instance)?.ipc.record("initialise_exited");
+      const evidence = instanceEvidence.get(created.instance)!;
+      // Schedule after assigning the promise, so signal cleanup sees preparation
+      // as well as the spawned child. Test constructors keep their mock seam.
+      evidence.initialization = Promise.resolve().then(async () => {
+        assertNotInterrupted();
+        evidence.assertDataDirectory();
+        evidence.ipc.record("initialise_started", { observedChild: Boolean(created.instance.initialiseObserved) });
+        if (created.instance.initialiseObserved) {
+          await created.instance.initialiseObserved({ signal: initializationAbort.signal, record: evidence.ipc.record, assertDataDirectory: evidence.assertDataDirectory });
+        } else {
+          await created.instance.initialise();
+        }
+        assertNotInterrupted();
+        evidence.assertDataDirectory();
+        evidence.ipc.record("initialise_exited");
+        evidence.initializationComplete = true;
+      });
+      await evidence.initialization;
+      assertNotInterrupted();
+      evidence.startAttempted = true;
       await created.instance.start();
+      assertNotInterrupted();
       instanceEvidence.get(created.instance)?.ipc.record("running",{pid:created.instance.process?.pid,spawnfile:created.instance.process?.spawnfile,postmasterPid:created.instance.process?fs.readFileSync(path.join(created.dataDir,"postmaster.pid"),"utf8"):null,segments:instanceEvidence.get(created.instance)?.ipc.snapshot()});
       return { port: created.port, dataDir: created.dataDir, instance: created.instance };
     } catch (error) {
@@ -241,7 +349,9 @@ async function startEmbeddedPostgresWithRetry(tempDirPrefix: string): Promise<{
         recentLogs: created.getRecentLogs(),
       });
       // Stop and verify residual IPC before considering another attempt; retain data.
-      await stopEmbeddedPostgresBounded(created.instance);
+      try { await stopEmbeddedPostgresBounded(created.instance); }
+      catch (stopError) { throw new AggregateError([lastError, stopError], `${lastError.message}; ${String(stopError)}`); }
+      if (interruption || !instanceEvidence.get(created.instance)?.initializationComplete) throw lastError;
       // Only a positively identified port collision permits a fresh attempt.
       if(!lastError.message.includes("Address already in use") || /shmget|shmat|No space left|Operation not permitted/.test(lastError.message)) throw lastError;
     }

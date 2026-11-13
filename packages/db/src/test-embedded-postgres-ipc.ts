@@ -90,6 +90,7 @@ function completedCleanupSide(file:string,rows:any[]){
 export function proveNormalOwnedCleanup(rows:any[],current:Segment[],directory:{dev:number;ino:number;uid:number;directory:boolean;symlink:boolean},pidGone:boolean,postmasterPresent:boolean){
   const need=(ok:unknown,reason:string)=>{if(!ok)throw new Error(`Owned IPC cleanup unproven: ${reason}`);};
   const one=(phase:string)=>{const values=rows.filter(x=>x.phase===phase);need(values.length===1,phase);return values[0];};
+  try{assertInitializationAllowsFinish(rows);}catch(error){need(false,String(error));}
   const reserved=one("reserved"),init=one("initialise_started"),initialized=one("initialise_exited"),running=one("running"),stop=one("stop_requested"),exit=one("exit_observed"),stopped=one("stopped_inventory");
   need([reserved,init,initialized,running,stop,exit,stopped].every((x,i,a)=>i===0||rows.indexOf(a[i-1])<rows.indexOf(x)),"phase order");
   need(rows.every(x=>x.ownerPid===reserved.ownerPid&&x.dataDir===reserved.dataDir&&x.device===reserved.device&&x.inode===reserved.inode),"receipt generation");
@@ -167,6 +168,30 @@ function ownedCompletion(file:string,raw:string,rows:any[],current:Segment[],rec
 }
 
 
+// Additive evidence: legacy completed initialization rows remain readable.
+// A direct initdb exit is never permission to clean a failed initialization.
+export function assertInitializationAllowsFinish(rows: any[]) {
+  const starts = rows.filter(x => x.phase === "initialise_started");
+  if (!starts.length) return; // constructor failure, before initdb was called
+  const completed = rows.filter(x => x.phase === "initialise_exited");
+  if (starts.length !== 1 || completed.length !== 1 || rows.indexOf(starts[0]) >= rows.indexOf(completed[0]))
+    throw new Error("Initialization exit unproven; retain datadir; no cleanup/retry");
+  if (!starts[0].extra?.observedChild) return; // old successful receipts
+  const phases = ["initialise_spawn_intent", "initialise_spawned", "initialise_child_exit", "initialise_child_close"];
+  const chain = phases.map(phase => rows.filter(x => x.phase === phase));
+  if (chain.some(values => values.length !== 1)) throw new Error("Initialization child evidence incomplete");
+  const [intent, spawned, exit, close] = chain.map(values => values[0]);
+  const ordered = [starts[0], intent, spawned, exit, close, completed[0]];
+  if (ordered.some((row,i) => i > 0 && rows.indexOf(ordered[i-1]) >= rows.indexOf(row)) ||
+      typeof intent.extra.generation !== "string" || !intent.extra.generation ||
+      !Number.isSafeInteger(spawned.extra.pid) || spawned.extra.pid <= 1 ||
+      [spawned,exit,close].some(row => row.extra.generation !== intent.extra.generation) ||
+      [exit,close].some(row => row.extra.pid !== spawned.extra.pid || row.extra.code !== 0 || row.extra.signal !== null) ||
+      close.extra.exitObserved !== true ||
+      rows.some(row => ["initialise_cancelled","initialise_child_error","initialise_spawn_failed"].includes(row.phase)))
+    throw new Error("Initialization child generation/normal exit/close unproven");
+}
+
 function verifyPriorReceiptRoot(snapshot:()=>Segment[]){
   const root=process.env.PAPERCLIP_TEST_IPC_PRIOR_RECEIPT_ROOT;
   if(!root)return [];
@@ -184,6 +209,7 @@ function verifyPriorReceiptRoot(snapshot:()=>Segment[]){
       if(completedCleanupSide(file,rows))completion="cleanup_complete";
       else if(ownedCompletion(file,raw,rows,current)) {completion="owned_cleanup_verified";const side=file+".recovery.json";if(fs.existsSync(side))recoverySha256=sha(fs.readFileSync(side,"utf8"));}
       else if(rows.some(x=>x.phase==="cleanup_verified")){
+        assertInitializationAllowsFinish(rows);
         const stopped=rows.findLast(x=>x.phase==="stopped_inventory");
         if(!stopped||stopped.extra.newSegments.length||stopped.extra.missing.length)throw new Error(`Prior inventory cleanup unproven: ${file}`);
         const running=rows.find(x=>x.phase==="running");
@@ -208,7 +234,7 @@ function verifyPriorReceiptRoot(snapshot:()=>Segment[]){
 // This is a Darwin test entry, scoped to a single receipt root and a kernel flock.
 // It never infers ownership from zero bytes, a nearby key, or current PID liveness.
 export async function beginTestIpc(dataDir:string) {
-  if(process.platform !== "darwin") return { record:(_phase:string,_extra:unknown={})=>{}, finish:async()=>({dataDirCleanupAllowed:true}), snapshot:()=>[] as Segment[] };
+  if(process.platform !== "darwin") return { record:(_phase:string,_extra:unknown={})=>{}, finish:async(options:{initializationUnproven?:boolean}={})=>{if(options.initializationUnproven)throw new Error("Initialization exit unproven; no cleanup");return {dataDirCleanupAllowed:true};}, snapshot:()=>[] as Segment[] };
   const {guard,directory}=prepareTestIpc()!;
   const root=path.dirname(directory);
   const {release,paths:leasePaths}=await acquireIpcLease(guard,root);
@@ -230,7 +256,8 @@ export async function beginTestIpc(dataDir:string) {
         const rows=raw.trim().split("\n").map(line=>JSON.parse(line));
         if(completedCleanupSide(file,rows))continue;
         if(ownedCompletion(file,raw,rows,snapshot()))continue;
-        if(rows.some(x=>x.phase==="cleanup_verified"||x.phase==="capacity_wait"))continue;
+        if(rows.some(x=>x.phase==="cleanup_verified")){assertInitializationAllowsFinish(rows);continue;}
+        if(rows.some(x=>x.phase==="capacity_wait"))continue;
         if(rows.some(x=>x.phase==="host_probe_failed")){
           const probe=file+".probe";privateFile(probe);const last=JSON.parse(fs.readFileSync(probe,"utf8").trim().split("\n").at(-1)!);
           if(last.remains!==false||last.removeError!==0)throw new Error(`Prior host probe cleanup unproven: ${probe}`);
@@ -274,8 +301,15 @@ export async function beginTestIpc(dataDir:string) {
     try{execFileSync(guard,["probe",file+".probe"],{encoding:"utf8"});record("host_probe",{receipt:file+".probe"});}
     catch(error){record("host_probe_failed",{error:String(error),receipt:file+".probe"});throw error;}
     let finished:Promise<{dataDirCleanupAllowed:boolean}>|undefined;
-    const finish=()=>finished??=(async()=>{
+    const finish=(options:{initializationUnproven?:boolean}={})=>finished??=(async()=>{
       try{
+        try {
+          if(options.initializationUnproven)throw new Error("Initialization exit unproven; no cleanup");
+          assertInitializationAllowsFinish(readRows(file).rows);
+        } catch(error) {
+          record("cleanup_blocked",{scope:"initialization",dataDirRetained:true});
+          throw error;
+        }
         const after=snapshot(),newSegments=after.filter(x=>!before.some(y=>identity(x)===identity(y))),missing=before.filter(x=>!after.some(y=>identity(x)===identity(y)));
         const current=fs.statSync(dataDir);record("stopped_inventory",{after,newSegments,missing});
         if(current.dev!==st.dev||current.ino!==st.ino||newSegments.length||missing.length){
@@ -311,6 +345,7 @@ export async function cleanupSavedTestDatadirs(cleanup:(directory:string)=>void)
         if(!fs.existsSync(reserved.dataDir))continue;
         const keep=(reason:string)=>results.push({receipt:file,dataDir:reserved.dataDir,action:"retain",reason});
         if(!fs.existsSync(commandFile)||JSON.parse(fs.readFileSync(commandFile,"utf8")).exitCode!==0){keep("failed or incomplete test run; investigation data");continue;}
+        try{assertInitializationAllowsFinish(rows);}catch{keep("initialization exit unproven");continue;}
         if(!running||!exit||exit.extra.exitCode!==0||exit.extra.signalCode!==null||exit.extra.pid!==running.extra.pid||!gone(exit.extra.pid)||!(rows.some(x=>x.phase==="cleanup_verified")||ownedCompletion(file,text,rows,current))){keep("exact normal exit/IPC cleanup unproven");continue;}
         if((reserved.extra.before as Segment[]).some(x=>!current.some(y=>identity(x)===identity(y)))||current.some(x=>!(reserved.extra.before as Segment[]).some(y=>identity(x)===identity(y)))){keep("IPC inventory changed");continue;}
         const st=fs.lstatSync(reserved.dataDir);
