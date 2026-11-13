@@ -34,7 +34,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
-import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
+import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "../services/execution-recovery-resolution.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
@@ -1876,6 +1876,59 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(409);
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id))).toEqual([recorded]);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toEqual(originalRun);
+  });
+
+  it("preserves the terminal receipt through obsolete conversation-hold settlement", async () => {
+    const { companyId, sourceIssueId, runId, action, body } = await seedTerminalReconciliation();
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy",
+      resultJson: { conversationContinuation: "continue_conversation_v1" },
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
+      .where(eq(issueRecoveryActions.id, action.id));
+    const originalRun = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const wake = vi.fn(async () => null);
+    const app = createApp(undefined, { recoveryActionEnqueueWakeup: wake });
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    const originalReceipt = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    const originalTask = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    const originalActivity = await db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssueId));
+    expect(originalTask[0]).toMatchObject({ status: "done", conversationAgentId: null });
+    expect(originalReceipt[0]).toMatchObject({ outcome: "owner_completed", evidence: {
+      automaticRecovery: { replay: "blocked", actionOutcome: "unknown" }, continuationDelivery: "terminal",
+    } });
+    await settleUnrecoverableExecutions(db);
+    await deliverReconciledExecutions(db, wake);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id))).toEqual(originalReceipt);
+    const receipt = await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions`).query({ actionId: action.id }).expect(200);
+    expect(receipt.body.action).toMatchObject({ id: action.id, outcome: "owner_completed", evidence: originalReceipt[0]!.evidence });
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id))).toEqual(originalReceipt);
+    expect(await db.select().from(issues).where(eq(issues.id, sourceIssueId))).toEqual(originalTask);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).toEqual(originalRun);
+    expect(await db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssueId))).toEqual(originalActivity);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
+    expect(wake).not.toHaveBeenCalled();
+  });
+
+  it("still settles an obsolete conversation hold without an explicit reconciliation", async () => {
+    const { sourceIssueId, runId, action } = await seedTerminalReconciliation();
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy",
+      resultJson: { conversationContinuation: "continue_conversation_v1" },
+    }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
+      .where(eq(issueRecoveryActions.id, action.id));
+    const originalRun = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const originalTask = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    await settleUnrecoverableExecutions(db);
+    const [settled] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(settled).toMatchObject({ status: "resolved", outcome: "cancelled", evidence: {
+      automaticRecovery: { replay: "conversation_continuation", actionOutcome: "unknown" },
+    } });
+    expect(settled!.evidence).not.toHaveProperty("executionReconciliation");
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).toEqual(originalRun);
+    expect(await db.select().from(issues).where(eq(issues.id, sourceIssueId))).toEqual(originalTask);
+    await settleUnrecoverableExecutions(db);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id))).toEqual([settled]);
   });
 
   it("rejects terminal completion after a same-owner task revision changes", async () => {

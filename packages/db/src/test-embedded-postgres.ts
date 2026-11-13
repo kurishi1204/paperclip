@@ -190,15 +190,16 @@ async function stopEmbeddedPostgresBounded(instance: EmbeddedPostgresInstance | 
       if(child.exitCode===null&&child.signalCode===null) throw new Error("Postgres exit unproven; retain datadir");
     }
     evidence?.ipc.record("exit_observed",{pid:child?.pid,exitCode:child?.exitCode,signalCode:child?.signalCode});
-    await evidence?.ipc.finish();
+    const ipcCleanup = await evidence?.ipc.finish();
+    if(!ipcCleanup || typeof ipcCleanup.dataDirCleanupAllowed!=="boolean") throw new Error("IPC cleanup result missing; retain datadir");
     if(cleanupFn && (!child || child.exitCode!==0 || child.signalCode!==null)) throw new Error("Normal test database exit unproven; retain data");
-    // Only this successfully exited child plus the verified IPC inventory permits
+    // Only this successfully exited child plus explicit whole-inventory permission permits
     // reclaiming its synthetic disposable data. Failed/unknown starts keep data.
-    if(cleanupFn && child?.exitCode===0 && child.signalCode===null){
+    if(cleanupFn && child?.exitCode===0 && child.signalCode===null && ipcCleanup.dataDirCleanupAllowed===true){
       evidence?.ipc.record("data_cleanup_intent",{syntheticOnly:true,processExitCode:child.exitCode});
       cleanupFn();
       evidence?.ipc.record("data_cleanup_complete",{dataDirAbsent:!fs.existsSync(evidence!.dataDir)});
-    } else evidence?.ipc.record("data_retained",{reason:"no normal child exit or failure-investigation path"});
+    } else evidence?.ipc.record("data_retained",{reason:ipcCleanup?.dataDirCleanupAllowed===false?"owned IPC absent; foreign inventory changed; datadir retained":"no normal child exit or failure-investigation path"});
     activeInstances.delete(instance);
   } catch(error) {
     try { evidence?.ipc.record("stop_failed",{error:String(error),pid:child?.pid,exitCode:child?.exitCode,signalCode:child?.signalCode}); } catch(recordError) { throw new AggregateError([error,recordError],"Cleanup and failure receipt both failed; retain datadir"); }

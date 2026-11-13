@@ -361,6 +361,9 @@ export async function settleUnrecoverableExecutions(
   // Keep their evidence and record the policy change in the task's activity log.
   const obsoleteConversationHold = and(
     conversationRecoveryActionPredicate(),
+    // An explicit reconciliation is a durable decision, not an obsolete hold.
+    // Terminal receipts deliberately retain the original blocked replay evidence.
+    sql`not (${issueRecoveryActions.evidence} ? 'executionReconciliation')`,
     or(
       inArray(issueRecoveryActions.status, ["active", "escalated"]),
       sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,

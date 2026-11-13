@@ -1267,8 +1267,14 @@ The transaction records a distinct terminal reconciliation receipt, including th
 resulting issue revision and assignee, while preserving the original failed run
 and automatic recovery evidence. It creates neither a pending continuation nor a
 successor wake. An exact duplicate from the same actor returns that original
-receipt only while the recorded task revision, owner, completion state, request,
-and current gates still match. Conflicting evidence or changed state is rejected.
+receipt only while the recorded task revision, owner, completion state, actor and
+request still match, with no competing recovery action, active execution, queued
+work, dependency, pending interaction, or unfinished review. This readback does not
+repeat the initial PID, coordinator, environment, finalization, or workspace checks;
+it returns the original decision without certifying the provider's current state
+or creating a new effect. Conflicting evidence or changes to those task conditions
+are rejected. Automatic conversation-hold settlement leaves explicit reconciliation
+receipts and their original replay evidence unchanged.
 A missing response is not proof of failure and does not authorize another effect.
 
 Use `GET /api/issues/:id/recovery-actions?actionId=:actionId` to read the exact

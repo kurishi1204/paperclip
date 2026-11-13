@@ -1,3 +1,4 @@
+import { proveNormalOwnedCleanup } from "./test-embedded-postgres-ipc.js";
 import fs from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -23,7 +24,7 @@ type FakeOptions = {
   onError?: (message: unknown) => void;
 };
 
-const ipcFinish=vi.hoisted(()=>vi.fn(async()=>{}));
+const ipcFinish=vi.hoisted(()=>vi.fn(async()=>({dataDirCleanupAllowed:true})));
 vi.mock("./test-embedded-postgres-ipc.js",async()=>({...await vi.importActual<typeof import("./test-embedded-postgres-ipc.js")>("./test-embedded-postgres-ipc.js"),beginTestIpc:()=>({record:()=>{},finish:ipcFinish,snapshot:()=>[]})}));
 const BIND_CONFLICT_LOG = 'could not bind IPv4 address "127.0.0.1": Address already in use';
 
@@ -152,4 +153,36 @@ it("releases an acquired IPC lease when construction throws",async()=>{
   __setEmbeddedPostgresCtorProviderForTests(async()=>Broken);
   try{await expect(startWithRetry("qa-constructor-failure-")).rejects.toThrow("synthetic constructor failure");expect(ipcFinish.mock.calls.length).toBe(before+1);}
   finally{__setEmbeddedPostgresCtorProviderForTests(null);}
+});
+
+
+// No initdb, IPC command, filesystem mutation or process lookup in this fixture.
+function normalOwnedFixture(){
+  const original={id:19,uid:501,cuid:501,key:900,size:56,nattch:9,cpid:31,lpid:31,ctime:10,mode:2432,seq:1};
+  const foreign={...original,id:20,key:901,cpid:32,lpid:32,nattch:19,seq:2};
+  const row=(phase:string,extra:Record<string,unknown>={})=>({phase,ownerPid:100,dataDir:"/synthetic-db",device:1,inode:900,extra});
+  const rows=[row("reserved",{before:[]}),row("initialise_started"),row("initialise_exited"),
+    row("running",{pid:31,postmasterPid:"31\n/synthetic-db\n1\n54329\n\n127.0.0.1\n900 19\nready\n",segments:[original]}),
+    row("stop_requested",{pid:31}),row("exit_observed",{pid:31,exitCode:0,signalCode:null}),
+    row("stopped_inventory",{after:[foreign],newSegments:[foreign],missing:[]})];
+  return {rows,original,foreign,directory:{dev:1,ino:900,uid:501,directory:true,symlink:false}};
+}
+it("separates exact normal child absence from unchanged-host inventory",()=>{
+  const f=normalOwnedFixture(),proof=proveNormalOwnedCleanup(f.rows,[f.foreign],f.directory,true,false);
+  expect(proof.original.id).toBe(19);expect(proof.foreignDelta.newSegments).toEqual([f.foreign]);
+  expect(proof.globalInventoryVerified).toBe(false);expect(proof.dataDirRetained).toBe(true);
+});
+it.each(["remaining","attached","reused_id","reused_key"])("refuses ambiguous own segment: %s",kind=>{
+  const f=normalOwnedFixture();
+  const segment=kind==="remaining"?{...f.original,nattch:0}:kind==="attached"?f.original:
+    kind==="reused_id"?{...f.foreign,id:19,seq:99}:{...f.foreign,key:900};
+  expect(()=>proveNormalOwnedCleanup(f.rows,[segment],f.directory,true,false)).toThrow("owned/reused segment still present");
+});
+it.each(["unknown_exit","other_pid","init_unknown","data_generation","live_child","postmaster_present"])("holds incomplete normal-exit proof: %s",kind=>{
+  const f=normalOwnedFixture();
+  if(kind==="unknown_exit")Object.assign(f.rows[5]!.extra,{exitCode:null});
+  if(kind==="other_pid")Object.assign(f.rows[5]!.extra,{pid:99});
+  if(kind==="init_unknown")f.rows.splice(2,1);
+  if(kind==="data_generation")f.directory.ino++;
+  expect(()=>proveNormalOwnedCleanup(f.rows,[f.foreign],f.directory,kind!=="live_child",kind==="postmaster_present")).toThrow("Owned IPC cleanup unproven");
 });
