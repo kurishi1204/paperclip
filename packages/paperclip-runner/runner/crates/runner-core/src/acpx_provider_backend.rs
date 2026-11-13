@@ -1651,6 +1651,27 @@ impl AcpxCommandExecutor {
             .as_mut()
             .expect("ACPX state remains available after provider termination");
         state.expire_runtime_requests("explicit_cancellation", true)?;
+        // Retain the local interruption in the same atomic snapshot that
+        // clears the active turn. The lifetime fence below still owns cleanup
+        // admission. This is NOT a provider terminal
+        // or evidence that prior tool effects completed; it must not authorize
+        // a restart continuation or turn/input replay.
+        state.push(NormalizedProviderEvent {
+            event_type: "turn.failed".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({
+                "provider": "acpx",
+                "providerTurnId": turn_id,
+                "status": "failed",
+                "error": {
+                    "code": "acpx_turn_stopped_for_suspension",
+                    "recoverable": false,
+                    "providerTerminalObserved": false,
+                    "reportedWorkDisposition": "unknown",
+                    "replayAllowed": false,
+                },
+            }),
+        })?;
         state.active_turn_id = None;
         self.context.provider_turn_id = None;
         // Persist a non-attachable, recoverable boundary before the fallible
