@@ -37,6 +37,7 @@ export async function observeInitializationChild(
   await new Promise<void>((resolve, reject) => {
     const failures: unknown[] = [];
     let spawned = false, exited = false, settled = false, cancelled = false;
+    let signalAttempted = false;
     let pid: number | undefined;
     let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -54,7 +55,9 @@ export async function observeInitializationChild(
     const stopHandle = () => {
       bound();
       // Never look up or signal a PID; only this still-live ChildProcess handle.
-      if (spawned && !exited && child.exitCode === null && child.signalCode === null) {
+      if (!signalAttempted && spawned && !exited && child.exitCode === null && child.signalCode === null) {
+        // kill() can synchronously emit error; latch before sending, never retry.
+        signalAttempted = true;
         try { if (!child.kill("SIGTERM")) failures.push(new Error("Initialization signal not delivered")); }
         catch (error) { failures.push(error); }
       }

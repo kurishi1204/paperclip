@@ -263,6 +263,24 @@ it("bounded cancellation without close is UNKNOWN, never exit evidence",async()=
     expect(f.rows.some(x=>x.phase==="initialise_child_exit"||x.phase==="initialise_child_close")).toBe(false);
   }finally{vi.useRealTimers();}
 });
+it("does not resend a signal after synchronous kill error and retains unknown exit",async()=>{
+  vi.useFakeTimers();
+  try {
+    const f=initFixture(undefined,10);let attempts=0;
+    f.child.kill.mockImplementation(()=>{
+      attempts++;
+      if(attempts<=2)f.child.emit("error",Object.assign(new Error("synthetic signal denied"),{code:"EPERM"}));
+      return false;
+    });
+    const result=f.run();const rejected=expect(result).rejects.toThrow("close unproven");
+    f.child.emit("spawn");f.controller.abort();
+    await vi.advanceTimersByTimeAsync(10);await rejected;
+    expect(f.child.kill).toHaveBeenCalledTimes(1);
+    expect(f.rows.filter(x=>x.phase==="initialise_child_error").map(x=>x.extra.errorCode)).toEqual(["EPERM"]);
+    expect(f.rows.some(x=>x.phase==="initialise_child_exit"||x.phase==="initialise_child_close")).toBe(false);
+    expect(()=>assertInitializationAllowsFinish(f.rows)).toThrow("exit unproven");
+  }finally{vi.useRealTimers();}
+});
 it("keeps original interrupted initialization UNKNOWN even with unchanged inventory",()=>{
   const rows=[{phase:"reserved"},{phase:"host_probe"},{phase:"initialise_started"},{phase:"interrupted",extra:{signal:"SIGTERM"}}];
   expect(()=>assertInitializationAllowsFinish(rows)).toThrow("Initialization exit unproven");
