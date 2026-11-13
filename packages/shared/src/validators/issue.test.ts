@@ -312,6 +312,20 @@ describe("issue validators", () => {
     ).toBe(false);
   });
 
+  it("requires a typed positive source revision only for terminal execution reconciliation", () => {
+    const terminal = { actionId: "11111111-1111-4111-8111-111111111111", outcome: "restored", sourceIssueStatus: "done",
+      executionReconciliation: { runId: "22222222-2222-4222-8222-222222222222", providerStopped: true,
+        actionOutcome: "mixed", outcomeEvidence: "Original receipts establish the observed effects independently." } };
+    for (const expectedSourceRevision of [undefined, null, 0, -1, 1.5, "1", true]) {
+      const parsed = resolveIssueRecoveryActionSchema.safeParse({ ...terminal, expectedSourceRevision });
+      expect(parsed.success).toBe(false);
+      if (!parsed.success) expect(parsed.error.issues.some(issue => issue.path[0] === "expectedSourceRevision")).toBe(true);
+    }
+    expect(resolveIssueRecoveryActionSchema.parse({ ...terminal, expectedSourceRevision: 73 })).toMatchObject({ expectedSourceRevision: 73 });
+    expect(resolveIssueRecoveryActionSchema.parse({ ...terminal, sourceIssueStatus: "todo" })).not.toHaveProperty("expectedSourceRevision");
+    expect(resolveIssueRecoveryActionSchema.parse({ outcome: "restored", sourceIssueStatus: "done" })).not.toHaveProperty("expectedSourceRevision");
+  });
+
   it("allows cancelled recovery resolutions to atomically restore the source issue status", () => {
     expect(
       resolveIssueRecoveryActionSchema.parse({

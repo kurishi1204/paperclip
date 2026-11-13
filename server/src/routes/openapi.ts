@@ -10360,7 +10360,18 @@ registerCurrentRoute({
   method: "get",
   path: "/api/issues/{id}/recovery-actions",
   tags: ["issues"],
-  summary: "List issue recovery actions",
+  summary: "Read active issue recovery or an exact scoped action receipt",
+  query: z.object({ actionId: z.string().guid().optional() }),
+  responses: {
+    200: {
+      ...r.ok(),
+      description: "Without actionId: the existing active-action projection. With actionId: { action } containing the original scoped action read model, including settled actions; no revalidation, state changes, or wake.",
+    },
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
 });
 
 registerCurrentRoute({

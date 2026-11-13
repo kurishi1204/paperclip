@@ -18,6 +18,7 @@ import {
   environmentLeases,
   environments,
   heartbeatRuns,
+  nativeRunFinalizations,
   issueComments,
   issueInboxArchives,
   issueRecoveryActions,
@@ -156,6 +157,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(costEvents);
+    await db.delete(nativeRunFinalizations);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(environments);
@@ -1806,6 +1808,176 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(recorded!.evidence).toMatchObject({ executionReconciliation: { runId }, continuationDelivery: "pending" });
     await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(recorded);
+  });
+
+  async function seedTerminalReconciliation() {
+    const fixture = await seedCompany();
+    const { companyId, coderId, sourceIssueId } = fixture;
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "failed" });
+    await db.update(heartbeatRuns).set({ exitCode: 2, errorCode: "adapter_failed" }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: coderId, cause: "uncertain_external_action", fingerprint: runId,
+      nextAction: "Preserve the stopped execution without replay.",
+      evidence: { runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const [task] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    const body = { actionId: action!.id, outcome: "restored", sourceIssueStatus: "done", expectedSourceRevision: task!.revision,
+      executionReconciliation: { runId, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "The stopped repair made no additional effect; the previously received result is accepted separately." } };
+    return { ...fixture, runId, action: action!, body };
+  }
+
+  it("terminally reconciles a stopped no-replay hold without continuation or rewriting the failed run", async () => {
+    const { companyId, sourceIssueId, coderId, runId, action, body } = await seedTerminalReconciliation();
+    await db.update(heartbeatRuns).set({ nativeIssueId: sourceIssueId }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(nativeRunFinalizations).values({ companyId, issueId: sourceIssueId, runId,
+      phase: "terminal_failure", failureDetail: { replacementDenied: "not_authorized", actionOutcome: "unknown" } });
+    const originalFinalization = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+    const originalRun = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const wake = vi.fn(async () => null);
+    const app = createApp(undefined, { recoveryActionEnqueueWakeup: wake });
+    const response = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    expect(response.body.issue.status).toBe("done");
+    const [task] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(recorded).toMatchObject({ status: "resolved", outcome: "owner_completed", evidence: {
+      automaticRecovery: action.evidence.automaticRecovery,
+      executionReconciliation: { runId, providerStopped: true, actionOutcome: "not_performed" },
+      continuationDelivery: "terminal",
+      terminalReconciliation: { sourceIssueStatus: "done", expectedSourceRevision: body.expectedSourceRevision, issueRevision: task!.revision, assigneeAgentId: coderId },
+    } });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).toEqual(originalRun);
+    expect(await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId))).toEqual(originalFinalization);
+    await deliverReconciledExecutions(db, wake);
+    expect(wake).not.toHaveBeenCalled();
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    const activities = await db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssueId));
+    expect(activities.map(row => row.action)).toContain("issue.recovery_action_resolved");
+    // Read the original durable receipt after a lost response without another POST.
+    const receipt = await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions`).query({ actionId: action.id }).expect(200);
+    expect(receipt.body.action).toMatchObject({ id: action.id, status: "resolved", outcome: "owner_completed", evidence: recorded!.evidence });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id))).toEqual([recorded]);
+    expect(await db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssueId))).toEqual(activities);
+    // An explicit duplicate is idempotent too; GET is the unknown-response path.
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id))).toEqual([recorded]);
+    expect(await db.select().from(issues).where(eq(issues.id, sourceIssueId))).toEqual([task]);
+    expect(await db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssueId))).toEqual(activities);
+    expect(wake).not.toHaveBeenCalled();
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send({
+      ...body, executionReconciliation: { ...body.executionReconciliation, outcomeEvidence: "Different unreceived evidence must not replace the original record." },
+    }).expect(409);
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send({ ...body, sourceIssueStatus: "todo" }).expect(409);
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send({ ...body, expectedSourceRevision: body.expectedSourceRevision + 1 }).expect(409);
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(409);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id))).toEqual([recorded]);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toEqual(originalRun);
+  });
+
+  it("rejects terminal completion after a same-owner task revision changes", async () => {
+    const { sourceIssueId, action, body } = await seedTerminalReconciliation();
+    await db.update(issues).set({ title: "A newly revised fixed work contract", revision: body.expectedSourceRevision + 1 }).where(eq(issues.id, sourceIssueId));
+    const beforeTask = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(409);
+    expect(await db.select().from(issues).where(eq(issues.id, sourceIssueId))).toEqual(beforeTask);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id))).toEqual([action]);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+  });
+
+  it.each([
+    "owner", "source_run", "source_task", "foreign_company", "running_provider", "controller_lease",
+    "checkout", "execution", "queued_run", "scheduled_run", "queued_wake", "dependency", "interaction",
+    "in_review", "human_review", "unfinished_review", "other_recovery", "wrong_settled_outcome",
+    "conflicting_run_evidence", "coordinator", "unfinished_finalizer", "scheduled_finalizer", "environment_lease", "workspace_evidence",
+  ] as const)("terminal reconciliation refuses %s without changing the original hold", async (condition) => {
+    const { companyId, managerId, coderId, sourceIssueId, runId, action, body } = await seedTerminalReconciliation();
+    if (condition === "owner") await db.update(issues).set({ assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+    if (condition === "source_run") body.executionReconciliation.runId = randomUUID();
+    if (condition === "source_task") await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: randomUUID() } }).where(eq(heartbeatRuns.id, runId));
+    if (condition === "foreign_company") {
+      const foreign = await seedCompany();
+      await db.update(heartbeatRuns).set({ companyId: foreign.companyId, agentId: foreign.coderId }).where(eq(heartbeatRuns.id, runId));
+    }
+    if (condition === "running_provider") await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, runId));
+    if (condition === "controller_lease") await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(heartbeatRuns.id, runId));
+    if (condition === "checkout") await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, sourceIssueId));
+    if (condition === "execution") await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, sourceIssueId));
+    if (condition === "queued_run") await seedHeartbeatRun({ companyId, agentId: coderId, runId: randomUUID(), issueId: sourceIssueId, status: "queued" });
+    if (condition === "scheduled_run") await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    if (condition === "queued_wake") await db.insert(agentWakeupRequests).values({ companyId, agentId: coderId, source: "automation", status: "queued", payload: { issueId: sourceIssueId } });
+    if (condition === "dependency") {
+      const [blocker] = await db.insert(issues).values({ companyId, title: "Unresolved prerequisite", status: "todo" }).returning();
+      await db.insert(issueRelations).values({ companyId, issueId: blocker!.id, relatedIssueId: sourceIssueId, type: "blocks" });
+    }
+    if (condition === "interaction") await db.insert(issueThreadInteractions).values({ companyId, issueId: sourceIssueId,
+      kind: "request_confirmation", status: "pending", createdByAgentId: coderId, payload: { version: 1, prompt: "Confirm the result." } });
+    if (condition === "in_review") await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, sourceIssueId));
+    if (condition === "human_review") await db.update(issues).set({ reviewPolicy: "human_only" }).where(eq(issues.id, sourceIssueId));
+    if (condition === "unfinished_review") await db.update(issues).set({ executionState: { status: "pending" } }).where(eq(issues.id, sourceIssueId));
+    if (condition === "other_recovery") await issueRecoveryActionService(db).upsertSourceScoped({ companyId, sourceIssueId,
+      kind: "missing_disposition", ownerType: "board", cause: "successful_run_missing_issue_disposition", fingerprint: "new-hold", nextAction: "Inspect the new hold." });
+    if (condition === "wrong_settled_outcome") await db.update(issueRecoveryActions).set({ outcome: "cancelled" }).where(eq(issueRecoveryActions.id, action.id));
+    if (condition === "conflicting_run_evidence") await db.update(issueRecoveryActions).set({ evidence: { ...action.evidence, sourceRunId: randomUUID() } }).where(eq(issueRecoveryActions.id, action.id));
+    if (condition === "coordinator") {
+      await db.update(heartbeatRuns).set({ nativeIssueId: sourceIssueId }).where(eq(heartbeatRuns.id, runId));
+      await db.insert(nativeRunFinalizations).values({ companyId, issueId: sourceIssueId, runId, phase: "terminal_failure", leaseOwner: "live-coordinator" });
+    }
+    if (condition === "unfinished_finalizer" || condition === "scheduled_finalizer") {
+      await db.update(heartbeatRuns).set({ nativeIssueId: sourceIssueId }).where(eq(heartbeatRuns.id, runId));
+      await db.insert(nativeRunFinalizations).values({ companyId, issueId: sourceIssueId, runId,
+        phase: condition === "unfinished_finalizer" ? "retryable_failure" : "terminal_failure",
+        nextAttemptAt: condition === "scheduled_finalizer" ? new Date(Date.now() + 60_000) : null });
+    }
+    if (condition === "environment_lease") await db.insert(environmentLeases).values({ companyId, issueId: sourceIssueId, heartbeatRunId: runId });
+    if (condition === "workspace_evidence") await db.update(heartbeatRuns).set({ resultJson: { workspaceRestoreFailure: "restore_failed" } }).where(eq(heartbeatRuns.id, runId));
+    const before = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    const beforeTask = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    // Each guard is exercised against the current fixture revision, rather
+    // than passing because a preceding fixture update made the request stale.
+    body.expectedSourceRevision = beforeTask[0]!.revision;
+    const wake = vi.fn(async () => null);
+    await request(createApp(undefined, { recoveryActionEnqueueWakeup: wake })).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send(body).expect(condition === "human_review" ? 403 : 409);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id))).toEqual(before);
+    expect(await db.select().from(issues).where(eq(issues.id, sourceIssueId))).toEqual(beforeTask);
+    expect(wake).not.toHaveBeenCalled();
+  });
+
+  it("reads only the exact scoped recovery action without folding stale state or waking work", async () => {
+    const { companyId, sourceIssueId, action } = await seedTerminalReconciliation();
+    await db.update(issueRecoveryActions).set({ status: "active", outcome: null }).where(eq(issueRecoveryActions.id, action.id));
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssueId));
+    const beforeAction = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    const beforeTask = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    const wake = vi.fn(async () => null);
+    const app = createApp(undefined, { recoveryActionEnqueueWakeup: wake });
+    const receipt = await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions`).query({ actionId: action.id }).expect(200);
+    expect(receipt.body.action).toMatchObject({ id: action.id, status: "active", evidence: action.evidence });
+    await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions`).query({ actionId: randomUUID() }).expect(404);
+    await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions`).query({ actionId: "malformed" }).expect(400);
+    await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions`).query({ actionId: [action.id, action.id] }).expect(400);
+    const [other] = await db.insert(issues).values({ companyId, title: "Another task" }).returning();
+    await request(app).get(`/api/issues/${other!.id}/recovery-actions`).query({ actionId: action.id }).expect(404);
+    const foreign = await seedCompany();
+    await request(app).get(`/api/issues/${foreign.sourceIssueId}/recovery-actions`).query({ actionId: action.id }).expect(404);
+    await request(createApp({ type: "agent", agentId: foreign.coderId, companyId: foreign.companyId, runId: randomUUID(), source: "agent_jwt" }))
+      .get(`/api/issues/${sourceIssueId}/recovery-actions`).query({ actionId: action.id }).expect(404, { error: "Issue not found" });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id))).toEqual(beforeAction);
+    expect(await db.select().from(issues).where(eq(issues.id, sourceIssueId))).toEqual(beforeTask);
+    expect(await db.select().from(activityLog)).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+    expect(wake).not.toHaveBeenCalled();
+  });
+
+  it("terminal reconciliation requires board authority even from the stopped task owner", async () => {
+    const { companyId, coderId, sourceIssueId, body } = await seedTerminalReconciliation();
+    const app = createApp({ type: "agent", agentId: coderId, companyId, runId: randomUUID(), source: "agent_jwt" });
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(403);
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
   });
 
   async function seedReconciledDelivery() {

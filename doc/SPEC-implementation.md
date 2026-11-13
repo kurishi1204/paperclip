@@ -565,6 +565,15 @@ V1 non-terminal liveness rule:
 - active-run output silence is an informational board UI signal at five minutes (`suspicious`) and fifteen minutes (`critical`); it does not create or update issues or recovery actions, comment on or block source work, change assignments, or wake an agent
 - board snooze and continue decisions suppress the run signal until their stored re-arm time; a false-positive decision suppresses it permanently for that run; open legacy evaluation issues remain readable and manually resolvable without automatic refresh
 
+Explicit board execution reconciliation can record an already-produced result as
+`done` on an unchanged blocked task without scheduling a successor. This is a
+source-recovery operation, not a general `blocked -> done` transition or permission
+to bypass a review. It requires the exact recovery action and stopped source run,
+unchanged owner and expected source revision, no live or queued execution, and satisfied dependency, interaction,
+and review gates. The original failed run and automatic no-replay evidence remain
+history; the separately recorded terminal receipt owns no continuation delivery.
+See the terminal reconciliation contract in `doc/execution-semantics.md`.
+
 Detailed ownership, execution, blocker, active-run watchdog, crash-recovery, and non-terminal liveness semantics are documented in `doc/execution-semantics.md`.
 
 For native ordinary tasks, answering a Board comment does not authorize an

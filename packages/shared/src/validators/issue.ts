@@ -591,6 +591,7 @@ export const resolveIssueRecoveryActionSchema = z
       })
       .strict()
       .optional(),
+    expectedSourceRevision: z.number().int().positive().optional(),
     actionId: z.string().guid().optional(),
     outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
     sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
@@ -598,6 +599,11 @@ export const resolveIssueRecoveryActionSchema = z
   })
   .strict()
   .superRefine((value, ctx) => {
+    if (value.sourceIssueStatus === "done" && value.executionReconciliation &&
+        value.expectedSourceRevision === undefined) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Terminal reconciliation requires the verified source revision", path: ["expectedSourceRevision"] });
+    }
+
     if (value.outcome === "restored") {
       if (
         value.sourceIssueStatus !== "todo" &&

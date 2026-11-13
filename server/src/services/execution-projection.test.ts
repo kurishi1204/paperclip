@@ -85,6 +85,33 @@ describe("execution truth projection", () => {
     expect(source.status).toBe("failed");
   });
 
+  it.each([true, false])("projects a terminal receipt without claiming provider success or queued continuation: history=%s", (history) => {
+    const source = run({ id: "old", agentId: "owner", status: "failed", nativeIssueId: "task", errorCode: "adapter_failed" });
+    const action = {
+      sourceIssueId: "task", returnOwnerAgentId: "owner", status: "resolved", outcome: "owner_completed",
+      cause: "uncertain_external_action", nextAction: "Old unknown action instruction",
+      evidence: { runId: "old", ...(history ? { automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } : {}),
+        executionReconciliation: { runId: "old", providerStopped: true }, continuationDelivery: "terminal",
+        terminalReconciliation: { sourceIssueStatus: "done", expectedSourceRevision: 73, issueRevision: 74, assigneeAgentId: "owner" } },
+    };
+    const snapshot = structuredClone(action);
+    expect(projectExecution(source, coordinator({ phase: "terminal_failure" }), [], action, now)).toMatchObject({
+      phase: "failed", label: "Result reconciled; no continuation", cause: "adapter_failed",
+      nextAction: null, retryAt: null, successorRunId: null, recoveryOwner: null,
+      permittedActions: ["inspect_run", "inspect_recovery"],
+    });
+    expect(source.status).toBe("failed");
+    expect(action).toEqual(snapshot);
+    for (const invalid of [
+      { ...action, status: "active" }, { ...action, outcome: "blocked" },
+      { ...action, sourceIssueId: "other" }, { ...action, returnOwnerAgentId: "other" },
+      { ...action, evidence: { ...action.evidence, executionReconciliation: { runId: "other", providerStopped: true } } },
+      { ...action, evidence: { ...action.evidence, terminalReconciliation: { ...action.evidence.terminalReconciliation, sourceIssueStatus: "todo" } } },
+    ]) expect(projectExecution(source, undefined, [], invalid, now)).toMatchObject({
+      phase: "recovery_needed", label: "Terminal receipt needs inspection", successorRunId: null,
+    });
+  });
+
   it("shows a reconciled continuation as queued until its durable delivery is recorded", () => {
     const action = {
       cause: "native_session_retry_exhausted",
