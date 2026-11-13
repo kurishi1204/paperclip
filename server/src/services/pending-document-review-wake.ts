@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+import { readDocumentReviewEvidence } from "./document-review-evidence.js";
 import { and, eq } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, documents, issueDocuments, issueThreadInteractions, type Db } from "@paperclipai/db";
 import type { PendingDocumentReviewBinding, PendingDocumentReviewOrigin } from "../modules/run-dispatch/index.js";
@@ -114,13 +116,19 @@ export async function readCurrentPendingDocumentReviewWake(db: Db, input: {
       (target.revisionNumber != null && target.revisionNumber !== doc.latestRevisionNumber) ||
       !(doc.createdByAgentId || doc.createdByUserId) ||
       doc.createdByAgentId === input.agentId || doc.updatedByAgentId === input.agentId) return null;
+  const supportingDocuments = await readDocumentReviewEvidence(db, {
+    companyId: input.companyId, issueId: input.issueId, reviewerId: input.agentId,
+    payload, lock: input.lock,
+  });
+  if (supportingDocuments === null) return null;
   const binding: PendingDocumentReviewBinding = { companyId: input.companyId, issueId: input.issueId,
     agentId: input.agentId, interactionId: card.id, documentId: doc.id,
-    key: target.key, revisionId: doc.latestRevisionId, revisionNumber: doc.latestRevisionNumber };
+    key: target.key, revisionId: doc.latestRevisionId, revisionNumber: doc.latestRevisionNumber,
+    ...(supportingDocuments.length ? { supportingDocuments } : {}) };
   for (const profile of profiles) {
     const previous = parseObject(profile.binding), previousOrigin = parseObject(profile.origin);
     if (profile.interactionId !== card.id || !origin ||
-        Object.entries(binding).some(([key, value]) => previous[key] !== value) ||
+        !isDeepStrictEqual(previous, binding) ||
         previousOrigin.runId !== origin.runId || previousOrigin.wakeupRequestId !== origin.wakeupRequestId) return null;
   }
   return { binding, origin, interaction: card };

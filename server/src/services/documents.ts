@@ -198,13 +198,19 @@ export function documentService(db: Db) {
       return filterSystemDocuments(rows, options.includeSystem ?? false).map((row) => mapIssueDocumentRow(row, true));
     },
 
-    getIssueDocumentByKey: async (issueId: string, rawKey: string) => {
+    getIssueDocumentByKey: async (issueId: string, rawKey: string,
+      revisionScope?: { companyId: string; documentId: string; revisionId: string },
+    ) => {
       const key = normalizeDocumentKey(rawKey);
       const row = await db
         .select(issueDocumentSelect)
         .from(issueDocuments)
         .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
-        .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, key)))
+        .where(and(eq(issueDocuments.issueId, issueId), eq(issueDocuments.key, key),
+          revisionScope ? eq(issueDocuments.companyId, revisionScope.companyId) : undefined,
+          revisionScope ? eq(documents.companyId, revisionScope.companyId) : undefined,
+          revisionScope ? eq(documents.id, revisionScope.documentId) : undefined,
+          revisionScope ? eq(documents.latestRevisionId, revisionScope.revisionId) : undefined))
         .then((rows) => rows[0] ?? null);
       return row ? mapIssueDocumentRow(row, true) : null;
     },

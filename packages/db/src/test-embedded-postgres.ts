@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import { beginTestIpc, cleanupSavedTestDatadirs } from "./test-embedded-postgres-ipc.js";
+import type { ChildProcess } from "node:child_process";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +20,7 @@ import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native
 export const EMBEDDED_POSTGRES_TEST_TIMEOUT_MS = 90_000;
 
 type EmbeddedPostgresInstance = {
+  process?: ChildProcess;
   initialise(): Promise<void>;
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -30,6 +33,7 @@ type EmbeddedPostgresCtor = new (opts: {
   port: number;
   persistent: boolean;
   initdbFlags?: string[];
+  postgresFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
@@ -64,7 +68,9 @@ type EmbeddedPostgresCtorProvider = () => Promise<EmbeddedPostgresCtor>;
 async function loadEmbeddedPostgresCtor(): Promise<EmbeddedPostgresCtor> {
   const mod = await import("embedded-postgres");
   await prepareEmbeddedPostgresNativeRuntime();
-  return mod.default as EmbeddedPostgresCtor;
+  // Version-bound runtime seam: this shipped implementation exposes its ChildProcess
+  // as a JavaScript property although the declaration marks it private.
+  return mod.default as unknown as EmbeddedPostgresCtor;
 }
 
 let embeddedPostgresCtorProvider: EmbeddedPostgresCtorProvider = loadEmbeddedPostgresCtor;
@@ -114,85 +120,90 @@ async function getAvailablePort(): Promise<number> {
 }
 
 async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
+  const EmbeddedPostgres = await getEmbeddedPostgresCtor();
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix));
   const port = await getAvailablePort();
-  const EmbeddedPostgres = await getEmbeddedPostgresCtor();
+
   // Postgres writes the true reason for a failed start to its output, for
   // example `could not bind IPv4 address "127.0.0.1": Address already in use`.
   // The `start()` rejection carries an empty message, so we capture the output
   // in a bounded buffer and surface it in the thrown error.
   const logBuffer = createEmbeddedPostgresLogBuffer();
-  const instance = new EmbeddedPostgres({
+  const ipc = await beginTestIpc(dataDir);
+  let instance:EmbeddedPostgresInstance;
+  try { instance = new EmbeddedPostgres({
     databaseDir: dataDir,
     user: "paperclip",
     password: "paperclip",
     port,
     persistent: true,
+    postgresFlags: ["-h", "127.0.0.1", "-k", ""],
     initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
     onLog: (message) => logBuffer.append(message),
     onError: (message) => logBuffer.append(message),
-  });
+  }); } catch(error) {
+    const failures:unknown[]=[error];
+    try { ipc.record("constructor_failed",{error:String(error)}); } catch(recordError) { failures.push(recordError); }
+    try { await ipc.finish(); } catch(cleanupError) { failures.push(cleanupError); }
+    throw new AggregateError(failures,`Embedded Postgres constructor failed: ${String(error)}`);
+  }
 
+  instanceEvidence.set(instance,{dataDir,ipc});
+  activeInstances.add(instance);
   return { dataDir, port, instance, getRecentLogs: () => logBuffer.getRecentLogs() };
 }
 
-function cleanupEmbeddedPostgresTestDirs(dataDir: string) {
-  fs.rmSync(dataDir, { recursive: true, force: true });
+function cleanupEmbeddedPostgresTestDir(dataDir: string) {
+  fs.rmSync(dataDir, {recursive:true,force:false});
 }
 
-// Upper bound (ms) on how long we wait for the embedded Postgres cluster to
-// stop gracefully before abandoning the wait and returning from the hook.
-const EMBEDDED_POSTGRES_STOP_TIMEOUT_MS = 5000;
-
-// `embedded-postgres@18.1.0-beta.16` exposes only `stop(): Promise<void>` — no
-// shutdown-mode argument. Internally it SIGINTs the postgres process (already
-// PostgreSQL "fast shutdown") and resolves *only* on the child's `exit` event,
-// with no time bound of its own. Under the loaded serial server shard a slow
-// shutdown checkpoint can push that past vitest's hookTimeout and hang the
-// afterAll hook. So we bound the graceful stop: if it overruns, we stop waiting
-// and return so the hook completes. The SIGINT has already been delivered, so
-// the abandoned process still exits on its own (and again when the runner exits).
-// Errors are swallowed, matching prior behavior.
-//
-// `cleanupFn` (data-dir reclaim) is chained on the raw `stop()` promise, not on
-// the timeout race, so the disposable data dir is removed *only after* `stop()`
-// actually settles — i.e. once the child Postgres process has exited. Removing
-// it on the timeout path would pull the data files out from under a still-running
-// cluster and provoke checkpoint / WAL I/O errors. In the fast path `cleanupFn`
-// has run by the time this resolves; in the timeout path it runs asynchronously
-// once the abandoned process finally exits.
-async function stopEmbeddedPostgresBounded(
-  instance: EmbeddedPostgresInstance | null,
-  cleanupFn?: () => void,
-): Promise<void> {
-  if (!instance) {
-    cleanupFn?.();
-    return;
-  }
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const stopped = instance
-    .stop()
-    .catch(() => {
-      // Swallow shutdown errors — the data dir is reclaimed regardless.
-    })
-    .finally(() => {
-      try {
-        cleanupFn?.();
-      } catch {
-        // Best-effort reclaim; ignore removal errors.
-      }
-    });
+const instanceEvidence = new WeakMap<EmbeddedPostgresInstance, {dataDir:string;ipc:Awaited<ReturnType<typeof beginTestIpc>>}>();
+const activeInstances = new Set<EmbeddedPostgresInstance>();
+let interruption = false;
+for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => {
+  interruption = true;
+  void (async () => {
+    for (const instance of activeInstances) {
+      const evidence=instanceEvidence.get(instance);
+      evidence?.ipc.record("interrupted",{signal,pid:instance.process?.pid,resume:"verify process generation and IPC identity; retain datadir"});
+      if(instance.process) {
+        try { await stopEmbeddedPostgresBounded(instance); }
+        catch(error) { console.error(String(error)); }
+      } else console.error(`Initialization exit unproven; retain ${evidence?.dataDir}`);
+    }
+    process.exit(signal==="SIGINT"?130:143);
+  })();
+});
+const EMBEDDED_POSTGRES_STOP_TIMEOUT_MS = 60000;
+async function stopEmbeddedPostgresBounded(instance: EmbeddedPostgresInstance | null, cleanupFn?:()=>void):Promise<void> {
+  if(!instance) throw new Error("Missing instance: cleanup cannot prove process exit");
+  const evidence=instanceEvidence.get(instance);
+  const child=instance.process;
+  let timer:ReturnType<typeof setTimeout>|undefined;
   try {
-    await Promise.race([
-      stopped,
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, EMBEDDED_POSTGRES_STOP_TIMEOUT_MS);
-        timer.unref?.();
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
+    evidence?.ipc.record("stop_requested",{pid:child?.pid,exitCode:child?.exitCode,signalCode:child?.signalCode});
+    // The library waits forever when stop() is called after its child already exited.
+    if(!child || child.exitCode!==null || child.signalCode!==null) {
+      if(child) instance.process=undefined;
+    } else {
+      await Promise.race([instance.stop(),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error("Postgres stop timeout; retain datadir")),EMBEDDED_POSTGRES_STOP_TIMEOUT_MS);})]);
+      if(child.exitCode===null&&child.signalCode===null) throw new Error("Postgres exit unproven; retain datadir");
+    }
+    evidence?.ipc.record("exit_observed",{pid:child?.pid,exitCode:child?.exitCode,signalCode:child?.signalCode});
+    await evidence?.ipc.finish();
+    if(cleanupFn && (!child || child.exitCode!==0 || child.signalCode!==null)) throw new Error("Normal test database exit unproven; retain data");
+    // Only this successfully exited child plus the verified IPC inventory permits
+    // reclaiming its synthetic disposable data. Failed/unknown starts keep data.
+    if(cleanupFn && child?.exitCode===0 && child.signalCode===null){
+      evidence?.ipc.record("data_cleanup_intent",{syntheticOnly:true,processExitCode:child.exitCode});
+      cleanupFn();
+      evidence?.ipc.record("data_cleanup_complete",{dataDirAbsent:!fs.existsSync(evidence!.dataDir)});
+    } else evidence?.ipc.record("data_retained",{reason:"no normal child exit or failure-investigation path"});
+    activeInstances.delete(instance);
+  } catch(error) {
+    try { evidence?.ipc.record("stop_failed",{error:String(error),pid:child?.pid,exitCode:child?.exitCode,signalCode:child?.signalCode}); } catch(recordError) { throw new AggregateError([error,recordError],"Cleanup and failure receipt both failed; retain datadir"); }
+    throw new Error(`Postgres cleanup failed; retain ${evidence?.dataDir??"unknown datadir"}: ${String(error)}`);
+  } finally { if(timer) clearTimeout(timer); }
 }
 
 // Upper bound on start attempts. `getAvailablePort` uses a check-then-use probe:
@@ -203,8 +214,8 @@ async function stopEmbeddedPostgresBounded(
 const EMBEDDED_POSTGRES_START_MAX_ATTEMPTS = 5;
 
 // Start one embedded Postgres cluster with a bounded retry. Each attempt gets a
-// fresh port and a fresh data directory. On a failed attempt we stop the cluster
-// and remove its data directory before the next attempt. After the last attempt
+// fresh port and a fresh data directory. Only proven port conflicts can retry;
+// failed data and all receipts are retained; verified successful synthetic data is cleaned. After the last attempt
 // we throw with the real Postgres output so the failure is loud and diagnosable.
 async function startEmbeddedPostgresWithRetry(tempDirPrefix: string): Promise<{
   port: number;
@@ -214,21 +225,24 @@ async function startEmbeddedPostgresWithRetry(tempDirPrefix: string): Promise<{
   let lastError = new Error("embedded Postgres startup failed");
 
   for (let attempt = 1; attempt <= EMBEDDED_POSTGRES_START_MAX_ATTEMPTS; attempt += 1) {
+    if(interruption)throw new Error("Test interrupted; no new database start");
     const created = await createEmbeddedPostgresTestInstance(tempDirPrefix);
     try {
+      instanceEvidence.get(created.instance)?.ipc.record("initialise_started");
       await created.instance.initialise();
+      instanceEvidence.get(created.instance)?.ipc.record("initialise_exited");
       await created.instance.start();
+      instanceEvidence.get(created.instance)?.ipc.record("running",{pid:created.instance.process?.pid,spawnfile:created.instance.process?.spawnfile,postmasterPid:created.instance.process?fs.readFileSync(path.join(created.dataDir,"postmaster.pid"),"utf8"):null,segments:instanceEvidence.get(created.instance)?.ipc.snapshot()});
       return { port: created.port, dataDir: created.dataDir, instance: created.instance };
     } catch (error) {
       lastError = formatEmbeddedPostgresError(error, {
         fallbackMessage: "embedded Postgres startup failed",
         recentLogs: created.getRecentLogs(),
       });
-      // Stop the failed cluster and remove its data directory. The next attempt
-      // allocates a fresh port and a fresh data directory.
-      await stopEmbeddedPostgresBounded(created.instance, () =>
-        cleanupEmbeddedPostgresTestDirs(created.dataDir),
-      );
+      // Stop and verify residual IPC before considering another attempt; retain data.
+      await stopEmbeddedPostgresBounded(created.instance);
+      // Only a positively identified port collision permits a fresh attempt.
+      if(!lastError.message.includes("Address already in use") || /shmget|shmat|No space left|Operation not permitted/.test(lastError.message)) throw lastError;
     }
   }
 
@@ -259,7 +273,7 @@ async function probeEmbeddedPostgresSupport(): Promise<EmbeddedPostgresTestSuppo
   } finally {
     if (started) {
       const { dataDir, instance } = started;
-      await stopEmbeddedPostgresBounded(instance, () => cleanupEmbeddedPostgresTestDirs(dataDir));
+      await stopEmbeddedPostgresBounded(instance, () => cleanupEmbeddedPostgresTestDir(dataDir));
     }
   }
 }
@@ -293,11 +307,11 @@ export async function startEmbeddedPostgresTestDatabase(
         // but a queued write on that connection still fires later and finds
         // a null socket.
         await closeRegisteredClients(connectionString);
-        await stopEmbeddedPostgresBounded(instance, () => cleanupEmbeddedPostgresTestDirs(dataDir));
+        await stopEmbeddedPostgresBounded(instance, () => cleanupEmbeddedPostgresTestDir(dataDir));
       },
     };
   } catch (error) {
-    await stopEmbeddedPostgresBounded(instance, () => cleanupEmbeddedPostgresTestDirs(dataDir));
+    await stopEmbeddedPostgresBounded(instance);
     throw new Error(
       `Failed to start embedded PostgreSQL test database: ${
         formatEmbeddedPostgresError(error, {
@@ -307,3 +321,5 @@ export async function startEmbeddedPostgresTestDatabase(
     );
   }
 }
+
+export const cleanupCompletedEmbeddedPostgresTestDatadirs = () => cleanupSavedTestDatadirs(cleanupEmbeddedPostgresTestDir);

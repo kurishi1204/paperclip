@@ -1,4 +1,4 @@
-import { documentReadReceipt } from "./document-read-receipt.js";
+import { documentReadResult } from "./document-read-receipt.js";
 import { readTaskQuestionContext } from "../issue-question-context.js";
 import { isConversation } from "../agent-conversations.js";
 import { setIssueTitle } from "../issue-title.js";
@@ -600,20 +600,20 @@ export class PaperclipRunnerToolAuthority {
         if (this.binding.documentReviewInteractionId && !review) throw forbidden("The fixed document review is no longer available.");
         // Listing is discovery, not a bulk body read. Full bodies can exceed the
         // bounded semantic transport before an agent can discover a document key.
-        const visible = review ? documents.filter(document => document.key === review.binding.key) : documents;
+        const visible = review ? documents.filter(document => [review.binding, ...(review.binding.supportingDocuments ?? [])].some(scope => document.key === scope.key && document.id === scope.documentId && document.latestRevisionId === scope.revisionId)) : documents;
         return { documents: visible.map(({ body: _body, ...metadata }) => metadata) };
       }
       case "read_document": {
-        const review = await this.#assertDocumentReviewKey(input.key);
-        const document = await documentService(this.db).getIssueDocumentByKey(this.binding.issueId, requiredString(input.key));
+        const review = await this.#assertDocumentReviewKey(input);
+        const document = await documentService(this.db).getIssueDocumentByKey(this.binding.issueId, requiredString(input.key), review?.binding);
         if (!document) throw new Error("paperclip_runner_document_not_found");
         if (review && (document.id !== review.binding.documentId || document.latestRevisionId !== review.binding.revisionId)) {
           throw forbidden("The fixed document revision changed before the read completed.");
         }
-        return { document, readReceipt: documentReadReceipt(this.binding, document) };
+        return documentReadResult(this.binding, document, input.range);
       }
       case "list_document_revisions": {
-        const review=await this.#assertDocumentReviewKey(input.key);
+        const review=await this.#assertDocumentReviewKey(input);
         const service=documentService(this.db), key=requiredString(input.key);
         const {limit,cursor}=documentRevisionPage(input);
         // Bound the query itself: a newer revision can arrive after admission
@@ -1100,11 +1100,17 @@ export class PaperclipRunnerToolAuthority {
     return row;
   }
 
-  async #assertDocumentReviewKey(key: unknown) {
+  async #assertDocumentReviewKey(input: Record<string, unknown>) {
     if (!this.binding.documentReviewInteractionId) return;
     const review = await getNativeDocumentReviewAssignment(this.db, { ...this.binding, allowResolved: true });
-    if (!review || key !== review.binding.key) throw forbidden("Read only the fixed document assigned to this review.");
-    return review;
+    if (!review) throw forbidden("Read only the fixed document assigned to this review.");
+    if (Object.keys(input).some(key => !["key", "limit", "cursor", "range"].includes(key))) {
+      throw forbidden("Document read scope comes only from the saved review assignment.");
+    }
+    const scope = [review.binding, ...(review.binding.supportingDocuments ?? [])].find(item => item.key === input.key);
+    if (!scope) throw forbidden("Read only the fixed document or its saved supporting evidence.");
+    // Only read methods receive the selected scope. The verdict target is unchanged.
+    return { ...review, binding: { ...review.binding, ...scope } };
   }
 
   async #resolveReview(value: unknown) {

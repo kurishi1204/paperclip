@@ -10,7 +10,8 @@ import { issueRoutes } from "../routes/issues.js";
 import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
 import { createStorageService } from "../storage/service.js";
 import { releaseNativeRunCheckout } from "../services/native-runtime/native-run-checkout.js";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, companies, createDb, documents, documentRevisions,
@@ -47,8 +48,9 @@ vi.mock("../adapters/index.js", async () => {
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
-if (!support.supported) console.warn("Pending review DB tests unavailable: " + support.reason);
+if (!support.supported) throw new Error("Pending review DB tests unavailable: " + support.reason);
 suite("pending independent document review through real dispatch", () => {
+  const dbEvidence:unknown[]=[];
   let db: ReturnType<typeof createDb>;
   let temp: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | undefined;
   beforeAll(async () => { temp = await startEmbeddedPostgresTestDatabase("paperclip-pending-review-"); db = createDb(temp.connectionString); }, 20000);
@@ -62,7 +64,10 @@ suite("pending independent document review through real dispatch", () => {
       await tx.delete(authUsers);
     });
   });
-  afterAll(async () => { await temp?.cleanup(); });
+  afterAll(async () => {
+    if(process.env.QA_DB_EVIDENCE_OUTPUT) writeFileSync(process.env.QA_DB_EVIDENCE_OUTPUT,JSON.stringify({synthetic:true,evidence:dbEvidence},null,2)+"\n",{mode:0o600});
+    await temp?.cleanup();
+  });
   async function seed() {
     const companyId=randomUUID(), ownerId=randomUUID(), reviewerId=randomUUID(), issueId=randomUUID();
     const documentId=randomUUID(), revisionId=randomUUID(), interactionId=randomUUID(), runId=randomUUID();
@@ -770,4 +775,121 @@ suite("pending independent document review through real dispatch", () => {
     expect(hasServerRecordedNonAssigneeWake({aiConnectionNonAssigneeCommentWake:true})).toBe(true);
     expect(hasServerRecordedNonAssigneeWake({wakeReason:"interaction_pending"})).toBe(false);
   });
+  async function supportingFixture(options: { defect?: string; priorRejections?: boolean; http?: boolean } = {}) {
+    const x = await seed();
+    await db.update(issueThreadInteractions).set({status:options.priorRejections?"rejected":"expired"}).where(eq(issueThreadInteractions.id,x.interactionId));
+    if (options.priorRejections) {
+      const [prior]=await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id,x.interactionId));
+      await db.insert(issueThreadInteractions).values({...prior!,id:randomUUID(),idempotencyKey:null});
+    }
+    const { document: evidence } = await documentsModule.documentService(db).upsertIssueDocument({
+      issueId:x.issueId,key:"root-technical-return",format:"markdown",body:options.http?("あ😀".repeat(75495)+"xxxxxx"):"SYNTHETIC root evidence body",createdByAgentId:options.defect==="self_author"?x.reviewerId:x.ownerId,
+    });
+    const supportingDocuments=[{companyId:x.companyId,issueId:x.issueId,documentId:evidence.id,key:evidence.key,
+      revisionId:evidence.latestRevisionId!,revisionNumber:evidence.latestRevisionNumber}];
+    if (options.defect && ["companyId","issueId","documentId","revisionId"].includes(options.defect))
+      (supportingDocuments[0] as any)[options.defect]=randomUUID();
+    if (options.defect==="duplicate") supportingDocuments.push({...supportingDocuments[0]!});
+    if (options.defect==="unknown_scope") (supportingDocuments[0] as any).scope="all_documents";
+    const input={kind:"request_confirmation" as const,continuationPolicy:"none" as const,resolverPolicy:"not_creator" as const,addresseeAgentId:x.reviewerId,
+      payload:{version:1 as const,prompt:"Synthetic fixed target and supporting evidence",target:x.target,supportingDocuments}};
+    let card:any,httpReadback:any;
+    if(options.http){
+      const responsibleUserId=randomUUID(),authorRun=randomUUID();
+      await db.insert(authUsers).values({id:responsibleUserId,name:"Synthetic HTTP owner",email:`${responsibleUserId}@example.test`,createdAt:new Date(),updatedAt:new Date()});
+      await db.insert(companyMemberships).values({companyId:x.companyId,principalType:"user",principalId:responsibleUserId,membershipRole:"owner",status:"active"});
+      await db.insert(heartbeatRuns).values({id:authorRun,companyId:x.companyId,agentId:x.ownerId,status:"running",invocationSource:"on_demand",responsibleUserId,contextSnapshot:{issueId:x.issueId}});
+      await db.update(issues).set({executionRunId:authorRun}).where(eq(issues.id,x.issueId));
+      const previous=process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      process.env.PAPERCLIP_AGENT_JWT_SECRET="synthetic-supporting-http-secret";
+      const workspace=await mkdtemp(path.join(tmpdir(),"qa-http-"));
+      try {
+        const token=createLocalAgentJwt(x.ownerId,x.companyId,"codex_local",authorRun,responsibleUserId);
+        const app=express();app.use(express.json());app.use(actorMiddleware(db,{deploymentMode:"authenticated"}));
+        app.use("/api",issueRoutes(db,createStorageService(createLocalDiskStorageProvider(path.join(workspace,"storage")))));app.use(errorHandler);
+        const response=await request(app).post(`/api/issues/${x.issueId}/interactions`).set("Authorization",`Bearer ${token}`).set("X-Paperclip-Run-Id",authorRun).send(input);
+        expect(response.status,JSON.stringify(response.body)).toBe(201);card=response.body;
+        const readback=await request(app).get(`/api/issues/${x.issueId}/interactions`).set("Authorization",`Bearer ${token}`).set("X-Paperclip-Run-Id",authorRun);
+        expect(readback.status,JSON.stringify(readback.body)).toBe(200);
+        httpReadback=readback.body.find((row:any)=>row.id===card.id);
+        expect(httpReadback.payload).toEqual(card.payload);expect(card.payload.target).toEqual(input.payload.target);expect(card.payload.supportingDocuments).toEqual(input.payload.supportingDocuments);
+      } finally {if(previous===undefined)delete process.env.PAPERCLIP_AGENT_JWT_SECRET;else process.env.PAPERCLIP_AGENT_JWT_SECRET=previous;await rm(workspace,{recursive:true,force:true});}
+      await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,authorRun));
+    }else card=await issueThreadInteractionService(db).create({id:x.issueId,companyId:x.companyId},input,{agentId:x.ownerId});
+    const [stored]=await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id,card.id));
+    expect(stored!.payload).toMatchObject({target:x.target,supportingDocuments});
+    if(options.http)expect(stored!.payload).toEqual(httpReadback.payload);
+    x.interactionId=card.id as typeof x.interactionId; x.contextSnapshot.interactionId=card.id as typeof x.contextSnapshot.interactionId;
+    await db.update(heartbeatRuns).set({contextSnapshot:x.contextSnapshot}).where(eq(heartbeatRuns.id,x.runId));
+    await db.update(agentWakeupRequests).set({idempotencyKey:`interaction-pending:${card.id}`,
+      payload:{issueId:x.issueId,interactionId:card.id,interactionKind:"request_confirmation"}}).where(eq(agentWakeupRequests.id,x.wakeupRequestId));
+    await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId:x.companyId,runId:x.runId,expectedStatus:"queued",now:new Date() });
+    await db.update(issues).set({executionRunId:x.runId}).where(eq(issues.id,x.issueId));
+    await db.update(heartbeatRuns).set({status:"running",runtimeMode:"native",nativeIssueId:x.issueId}).where(eq(heartbeatRuns.id,x.runId));
+    await db.update(agents).set({adapterType:"paperclip_runner"}).where(eq(agents.id,x.reviewerId));
+    const binding={companyId:x.companyId,issueId:x.issueId,agentId:x.reviewerId,runId:x.runId,documentReviewInteractionId:card.id};
+    return {...x,supportingDocuments,binding,stored,httpReadback,authority:new PaperclipRunnerToolAuthority(db,binding)};
+  }
+  it("supporting evidence persists through producer assignment and both read consumers", async()=>{
+    const x=await supportingFixture();
+    const review=await getNativeDocumentReviewAssignment(db,x.binding);
+    expect(review!.binding.supportingDocuments).toEqual(x.supportingDocuments);
+    expect(review!.binding.documentId).toBe(x.documentId);
+    const read=await x.authority.execute({callId:randomUUID(),tool:"read_document",arguments:{key:"root-technical-return"}}) as any;
+    expect(read.document.body).toBe("SYNTHETIC root evidence body");
+    expect(read.document.latestRevisionId).toBe(x.supportingDocuments[0]!.revisionId);
+    const history=await x.authority.execute({callId:randomUUID(),tool:"list_document_revisions",arguments:{key:"root-technical-return"}}) as any;
+    expect(history.revisions.map((r:any)=>r.id)).toEqual([x.supportingDocuments[0]!.revisionId]);
+    const [run]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,x.runId));
+    expect((run!.runnerProfileJson as any).pendingDocumentReviewAdmission.binding.supportingDocuments).toEqual(x.supportingDocuments);
+    dbEvidence.push({kind:"producer-consumer",stored:x.stored!.payload,assignment:review!.binding,read,history,profile:run!.runnerProfileJson});
+  });
+
+  it("HTTP supporting scope persists completely and assigned consumer reads all fixed UTF8 bytes",async()=>{
+    const x=await supportingFixture({http:true});
+    const assignment=await getNativeDocumentReviewAssignment(db,x.binding);
+    expect(assignment!.binding.supportingDocuments).toEqual(x.supportingDocuments);
+    const body="あ😀".repeat(75495)+"xxxxxx", chunks:string[]=[],receipts:unknown[]=[];
+    const sha=(value:string)=>createHash("sha256").update(value,"utf8").digest("hex");
+    let offset=0;
+    for(;;){
+      const read=await x.authority.execute({callId:randomUUID(),tool:"read_document",arguments:{key:"root-technical-return",range:{revisionId:x.supportingDocuments[0]!.revisionId,offsetBytes:offset,maxBytes:16384}}}) as any;
+      expect(read.range.returnedBytes).toBe(Buffer.byteLength(read.document.body));expect(read.range.chunkSha256).toBe(sha(read.document.body));
+      expect(read.readReceipt.bodySha256).toBe(sha(body));expect(read.readReceipt.bodyBytes).toBe(Buffer.byteLength(body));
+      chunks.push(read.document.body);receipts.push({range:read.range,readReceipt:read.readReceipt});
+      if(read.range.nextOffsetBytes===null)break;expect(read.range.nextOffsetBytes).toBeGreaterThan(offset);offset=read.range.nextOffsetBytes;
+    }
+    expect(chunks.join("")).toBe(body);
+    const history=await x.authority.execute({callId:randomUUID(),tool:"list_document_revisions",arguments:{key:"root-technical-return"}}) as any;
+    expect(history.revisions.map((r:any)=>r.id)).toEqual([x.supportingDocuments[0]!.revisionId]);
+    dbEvidence.push({kind:"authenticated-http-save-readback",stored:x.stored!.payload,httpReadback:x.httpReadback.payload,assignment:assignment!.binding,bytes:Buffer.byteLength(body),sha256:sha(body),reconstructedBytes:Buffer.byteLength(chunks.join("")),reconstructedSha256:sha(chunks.join("")),exactBodyEqual:true,receipts,historyRevisionIds:history.revisions.map((r:any)=>r.id)});
+  });
+
+  it.each(["companyId","issueId","documentId","revisionId","self_author","duplicate","unknown_scope"])(
+    "rejects supporting evidence %s before producer persistence",async defect=>{
+      let caught:any;try{await supportingFixture({defect});}catch(error){caught=error;}
+      if(defect==="unknown_scope")expect(caught?.issues).toEqual([{code:"unrecognized_keys",keys:["scope"],path:["payload","supportingDocuments",0],message:'Unrecognized key: "scope"'}]);
+      else expect(caught?.message).toBe("Supporting documents require exact independent same-issue review revisions");
+      dbEvidence.push({kind:"producer-denied",defect,message:caught.message,status:caught.status});
+      const rows=await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.status,"pending"));
+      expect(rows).toEqual([]);
+    });
+  it("does not substitute a new supporting revision or accept caller scope",async()=>{
+    const x=await supportingFixture();
+    await expect(x.authority.execute({callId:randomUUID(),tool:"read_document",arguments:{key:"root-technical-return",documentId:randomUUID()}}))
+      .rejects.toThrow("saved review assignment");
+    await documentsModule.documentService(db).upsertIssueDocument({issueId:x.issueId,key:"root-technical-return",
+      format:"markdown",body:"SYNTHETIC changed revision",baseRevisionId:x.supportingDocuments[0]!.revisionId,createdByAgentId:x.ownerId});
+    expect(await getNativeDocumentReviewAssignment(db,x.binding)).toBeNull();
+    await expect(x.authority.execute({callId:randomUUID(),tool:"read_document",arguments:{key:"root-technical-return"}})).rejects.toThrow();
+    await expect(x.authority.execute({callId:randomUUID(),tool:"list_document_revisions",arguments:{key:"root-technical-return"}})).rejects.toThrow();
+  });
+  it("creates a fresh review for the same revision after two saved rejected cards",async()=>{
+    const x=await supportingFixture({priorRejections:true});
+    const cards=await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId,x.issueId));
+    expect(cards.filter(card=>card.status==="rejected")).toHaveLength(2);
+    expect(cards.filter(card=>card.status==="pending").map(card=>card.id)).toEqual([x.interactionId]);
+    expect((await getNativeDocumentReviewAssignment(db,x.binding))!.binding.supportingDocuments).toEqual(x.supportingDocuments);
+  });
+
 });
