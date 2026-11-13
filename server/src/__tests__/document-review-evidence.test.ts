@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { createIssueThreadInteractionSchema, requestConfirmationPayloadSchema } from '@paperclipai/shared';
+import { readDocumentReviewEvidence } from '../services/document-review-evidence.js';
 import { documentReadResult } from '../services/native-runtime/document-read-receipt.js';
 import { redactPaperclipSemanticValue } from '../../../packages/paperclip-runner/src/semantic-tools/redaction.js';
 
@@ -24,6 +25,16 @@ describe('fixed supporting evidence contract',()=>{
     expect(read.target).toEqual(request.payload.target);
     if(process.env.QA_SCOPE_OUTPUT) writeFileSync(process.env.QA_SCOPE_OUTPUT,JSON.stringify({synthetic:true,request,parsed,saved,read},null,2)+'\n');
   });
+  it.each(['omitted', 'null', 'same', 'foreign'] as const)(
+    'resolves an empty evidence target issueId consistently: %s', async mode => {
+      const target = { type: 'issue_document' as const, documentId: randomUUID(), key: 'target', revisionId: randomUUID(),
+        ...(mode === 'omitted' ? {} : { issueId: mode === 'null' ? null : mode === 'same' ? binding.issueId : randomUUID() }) };
+      const db = { select: () => { throw new Error('empty evidence must not query the database'); } };
+      const result = await readDocumentReviewEvidence(db as any, { companyId: binding.companyId,
+        issueId: binding.issueId, reviewerId: binding.agentId,
+        payload: { version: 1, prompt: 'Synthetic target issue default', target, supportingDocuments: [] } });
+      expect(result).toEqual(mode === 'foreign' ? null : []);
+    });
   it('delivers all 528471 synthetic UTF8 bytes through bounded ranges and real semantic redaction',()=>{
     const chunks:string[]=[], receipts:unknown[]=[];let offset=0;
     for (;;) {

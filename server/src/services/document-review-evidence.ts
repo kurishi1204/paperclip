@@ -14,7 +14,7 @@ export async function readDocumentReviewEvidence(db: Db, input: {
   const payload = parsed.data;
   if (payload.supportingDocuments === undefined) return [];
   const target = payload.target;
-  if (target?.type !== "issue_document" || target.issueId !== input.issueId ||
+  if (target?.type !== "issue_document" || (target.issueId ?? input.issueId) !== input.issueId ||
       !target.documentId || payload.toolAction || payload.secretProposal) return null;
   const keys = new Set([target.key]), ids = new Set([target.documentId]);
   for (const scope of payload.supportingDocuments) {

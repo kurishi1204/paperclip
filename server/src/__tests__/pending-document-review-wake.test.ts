@@ -775,7 +775,7 @@ suite("pending independent document review through real dispatch", () => {
     expect(hasServerRecordedNonAssigneeWake({aiConnectionNonAssigneeCommentWake:true})).toBe(true);
     expect(hasServerRecordedNonAssigneeWake({wakeReason:"interaction_pending"})).toBe(false);
   });
-  async function supportingFixture(options: { defect?: string; priorRejections?: boolean; http?: boolean } = {}) {
+  async function supportingFixture(options: { defect?: string; priorRejections?: boolean; http?: boolean; targetIssue?: "omitted" | "null" } = {}) {
     const x = await seed();
     await db.update(issueThreadInteractions).set({status:options.priorRejections?"rejected":"expired"}).where(eq(issueThreadInteractions.id,x.interactionId));
     if (options.priorRejections) {
@@ -791,8 +791,11 @@ suite("pending independent document review through real dispatch", () => {
       (supportingDocuments[0] as any)[options.defect]=randomUUID();
     if (options.defect==="duplicate") supportingDocuments.push({...supportingDocuments[0]!});
     if (options.defect==="unknown_scope") (supportingDocuments[0] as any).scope="all_documents";
+    const target: Omit<typeof x.target, "issueId"> & { issueId?: string | null } = { ...x.target };
+    if (options.targetIssue === "omitted") delete target.issueId;
+    else if (options.targetIssue === "null") target.issueId = null;
     const input={kind:"request_confirmation" as const,continuationPolicy:"none" as const,resolverPolicy:"not_creator" as const,addresseeAgentId:x.reviewerId,
-      payload:{version:1 as const,prompt:"Synthetic fixed target and supporting evidence",target:x.target,supportingDocuments}};
+      payload:{version:1 as const,prompt:"Synthetic fixed target and supporting evidence",target,supportingDocuments}};
     let card:any,httpReadback:any;
     if(options.http){
       const responsibleUserId=randomUUID(),authorRun=randomUUID();
@@ -817,7 +820,7 @@ suite("pending independent document review through real dispatch", () => {
       await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,authorRun));
     }else card=await issueThreadInteractionService(db).create({id:x.issueId,companyId:x.companyId},input,{agentId:x.ownerId});
     const [stored]=await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id,card.id));
-    expect(stored!.payload).toMatchObject({target:x.target,supportingDocuments});
+    expect(stored!.payload).toMatchObject({target,supportingDocuments});
     if(options.http)expect(stored!.payload).toEqual(httpReadback.payload);
     x.interactionId=card.id as typeof x.interactionId; x.contextSnapshot.interactionId=card.id as typeof x.contextSnapshot.interactionId;
     await db.update(heartbeatRuns).set({contextSnapshot:x.contextSnapshot}).where(eq(heartbeatRuns.id,x.runId));
@@ -863,6 +866,18 @@ suite("pending independent document review through real dispatch", () => {
     const history=await x.authority.execute({callId:randomUUID(),tool:"list_document_revisions",arguments:{key:"root-technical-return"}}) as any;
     expect(history.revisions.map((r:any)=>r.id)).toEqual([x.supportingDocuments[0]!.revisionId]);
     dbEvidence.push({kind:"authenticated-http-save-readback",stored:x.stored!.payload,httpReadback:x.httpReadback.payload,assignment:assignment!.binding,bytes:Buffer.byteLength(body),sha256:sha(body),reconstructedBytes:Buffer.byteLength(chunks.join("")),reconstructedSha256:sha(chunks.join("")),exactBodyEqual:true,receipts,historyRevisionIds:history.revisions.map((r:any)=>r.id)});
+  });
+
+  it.each(["omitted", "null"] as const)("HTTP supporting evidence accepts target issueId %s", async targetIssue => {
+    const x = await supportingFixture({ http: true, targetIssue });
+    const assignment = await getNativeDocumentReviewAssignment(db, x.binding);
+    expect(assignment!.binding.issueId).toBe(x.issueId);
+    expect(assignment!.binding.supportingDocuments).toEqual(x.supportingDocuments);
+    const read = await x.authority.execute({ callId: randomUUID(), tool: "read_document", arguments: {
+      key: "root-technical-return", range: { revisionId: x.supportingDocuments[0]!.revisionId, offsetBytes: 0, maxBytes: 16384 },
+    } }) as any;
+    expect(read.document.latestRevisionId).toBe(x.supportingDocuments[0]!.revisionId);
+    expect(read.range.returnedBytes).toBeGreaterThan(0);
   });
 
   it.each(["companyId","issueId","documentId","revisionId","self_author","duplicate","unknown_scope"])(
