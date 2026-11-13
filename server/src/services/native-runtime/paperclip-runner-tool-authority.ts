@@ -1,3 +1,4 @@
+import { parseDocumentInclusions, composeIncludedDocuments, assertIncludedDocumentReadback, type InclusionSource } from "./document-inclusion.js";
 import { documentReadResult } from "./document-read-receipt.js";
 import { readTaskQuestionContext } from "../issue-question-context.js";
 import { isConversation } from "../agent-conversations.js";
@@ -58,6 +59,7 @@ import {
   chatConversations,
   companies,
   documentRevisions,
+  documents,
   heartbeatRuns,
   issueApprovals,
   issueExecutionDecisions,
@@ -1198,12 +1200,41 @@ export class PaperclipRunnerToolAuthority {
     const idempotencyKey = requiredString(input.idempotencyKey);
     let publication: Awaited<ReturnType<typeof persistActivity>>["publication"] | null = null;
     const result = await this.#withMutationReceipt("write_document", idempotencyKey, input, async (tx) => {
+      const key = requiredString(input.key);
+      const references = parseDocumentInclusions(input.includeDocuments, key);
+      const sources: InclusionSource[] = [];
+      // #withMutationReceipt already locks the issue. Migration 0313 makes
+      // linked document/link writes serialize on that row. Do not lock document
+      // rows here: a writer can hold one while its trigger waits for this issue.
+      for (const ref of references ?? []) {
+        const [source] = await tx.select({
+          companyId: documents.companyId, issueId: issueDocuments.issueId,
+          documentId: documents.id, key: issueDocuments.key,
+          revisionId: documentRevisions.id, latestRevisionId: documents.latestRevisionId,
+          revisionNumber: documentRevisions.revisionNumber, body: documentRevisions.body,
+          latestBody: documents.latestBody,
+        }).from(issueDocuments)
+          .innerJoin(documents, eq(documents.id, issueDocuments.documentId))
+          .innerJoin(documentRevisions, eq(documentRevisions.documentId, documents.id))
+          .where(and(
+            eq(issueDocuments.companyId, this.binding.companyId), eq(documents.companyId, this.binding.companyId),
+            eq(documentRevisions.companyId, this.binding.companyId), eq(issueDocuments.issueId, this.binding.issueId),
+            eq(issueDocuments.key, ref.key), eq(documents.id, ref.documentId),
+            eq(documentRevisions.id, ref.revisionId), eq(documents.latestRevisionId, ref.revisionId),
+            sql`octet_length(${documentRevisions.body}) = ${ref.bodyBytes}`,
+          ));
+        if (!source) throw new Error("paperclip_runner_document_inclusion_source_unavailable");
+        sources.push(source);
+      }
+      const composition = references ? composeIncludedDocuments(input.body as string, references,
+        references.map(ref => sources.find(source => source.documentId === ref.documentId)!), this.binding) : undefined;
+      const body = composition?.body ?? requiredString(input.body);
       const write = await documentService(tx).upsertIssueDocument({
         issueId: this.binding.issueId,
-        key: requiredString(input.key),
+        key,
         title: requiredString(input.title),
         format: "markdown",
-        body: requiredString(input.body),
+        body,
         baseRevisionId: nullableProviderId(input.baseRevisionId),
         changeSummary: input.changeSummary === null || input.changeSummary === undefined
           ? null
@@ -1211,6 +1242,18 @@ export class PaperclipRunnerToolAuthority {
         createdByAgentId: this.binding.agentId,
         createdByRunId: this.binding.runId,
       });
+      if (composition) {
+        const saved = await documentService(tx).getIssueDocumentByKey(this.binding.issueId, key, {
+          companyId: this.binding.companyId, documentId: write.document.id,
+          revisionId: write.document.latestRevisionId!,
+        });
+        const [revision] = await tx.select({ body: documentRevisions.body }).from(documentRevisions).where(and(
+          eq(documentRevisions.companyId, this.binding.companyId), eq(documentRevisions.documentId, write.document.id),
+          eq(documentRevisions.id, write.document.latestRevisionId!),
+        ));
+        assertIncludedDocumentReadback(body, saved?.body);
+        assertIncludedDocumentReadback(body, revision?.body);
+      }
       const activity = await persistActivity(tx, {
         companyId: this.binding.companyId,
         actorType: "agent",
@@ -1239,6 +1282,9 @@ export class PaperclipRunnerToolAuthority {
         disposition: "applied",
         created: write.created,
         document: write.document,
+        ...(composition ? { inclusionReceipt: { ...composition.manifest,
+          bodyBytes: composition.bodyBytes, bodySha256: composition.bodySha256,
+          documentId: write.document.id, revisionId: write.document.latestRevisionId } } : {}),
         documentHref: `/${encodeURIComponent(target.issuePrefix)}/issues/${encodeURIComponent(target.identifier ?? this.binding.issueId)}#document-${encodeURIComponent(write.document.key)}`,
       };
     });

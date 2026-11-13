@@ -200,7 +200,7 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
     operationId: "write_document",
     title: "Write revisioned document",
     description:
-      "Create or update an active-task document with optimistic revision safety.",
+      "Create or update an active-task document with optimistic revision safety. Before named QA, the author selects all required same-task sources and may supply includeDocuments to embed their exact current revisions in this one document. Selection/completeness remain the author responsibility; byte verification is not QA or adoption.",
     effect: "write",
     allowedModes: WORK_MODES,
     inputSchema: object(
@@ -213,6 +213,46 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
           "Current revision id, or null when creating.",
           240,
         ),
+        includeDocuments: {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "description": "Author-selected same-company, same-task current documents. Obtain fixed IDs and UTF-8 digest from read_document.readReceipt; do not estimate or hash redacted display text. The composed document is limited to 200000 UTF-8 bytes including metadata. Omit to preserve ordinary writes.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "documentId": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+              },
+              "key": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+              },
+              "revisionId": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+              },
+              "bodyBytes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 200000
+              },
+              "bodySha256": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            },
+            "required": [
+              "documentId",
+              "key",
+              "revisionId",
+              "bodyBytes",
+              "bodySha256"
+            ]
+          }
+        },
         changeSummary: nullableText("Optional revision summary."),
       },
       ["idempotencyKey", "key", "title", "body", "baseRevisionId"],
