@@ -466,3 +466,14 @@ test("workspace target evidence is required in every published dependency sectio
     }
   }
 });
+
+
+test("workspace target versions use exact SemVer validation", () => {
+  const pkg = { name: "owner", version: "9.0.0", dependencies: { target: "workspace:*" } };
+  for (const version of ["01.2.3", "1.2.3-a..b", "1.2.3-01", "1.2.3+", "1.2.3\n", "9007199254740992.0.0"]) {
+    assert.throws(() => materializePublishManifest(pkg, { workspaceVersions: { target: version } }), /Missing or invalid workspace target/);
+  }
+  for (const version of ["0.3.1", "1.2.3-alpha.1", "1.2.3-0.1a+build.001", "1.2.3+001"]) {
+    assert.equal(materializePublishManifest(pkg, { workspaceVersions: { target: version } }).dependencies.target, version);
+  }
+});

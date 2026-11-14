@@ -21,6 +21,16 @@ export function readWorkspaceVersions(sourceRoot = repoRoot) {
   return versions;
 }
 
+// Canonical SemVer 2.0.0 grammar: numeric identifiers have no leading zeroes,
+// prerelease identifiers are nonempty, and build identifiers may contain zeroes.
+// Require the entire original string, not a coerced/v-prefixed version.
+function isExactPackageVersion(version) {
+  if (typeof version !== "string" || version.length > 256) return false;
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/.exec(version);
+  return match !== null && match[0] === version &&
+    match.slice(1, 4).every((part) => Number.isSafeInteger(Number(part)));
+}
+
 export function materializePublishManifest(pkg, { workspaceVersions = {} } = {}) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
@@ -39,7 +49,7 @@ export function materializePublishManifest(pkg, { workspaceVersions = {} } = {})
           throw new Error(`Unsupported workspace specifier for ${pkg.name} -> ${name}: ${specifier}`);
         }
         const version = Object.hasOwn(workspaceVersions, name) ? workspaceVersions[name] : undefined;
-        if (typeof version !== "string" || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) {
+        if (!isExactPackageVersion(version)) {
           throw new Error(`Missing or invalid workspace target version for ${pkg.name} -> ${name}`);
         }
         const prefix = range === "*" ? "" : range;
