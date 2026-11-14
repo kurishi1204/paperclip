@@ -330,7 +330,7 @@
       "planning",
       "skill_test"
     ],
-    "description": "Read the current revision of one active-task document. Native server reads include a run-bound readReceipt for the authorized source body before transport redaction. It is a server calculation, not agent reasoning or a QA verdict.",
+    "description": "Read the current revision of one active-task document. Native server reads include a run-bound readReceipt for the authorized source body before transport redaction. It is a server calculation, not agent reasoning or a QA verdict. For complete large documents use range with the fixed revisionId and follow nextOffsetBytes; verify the combined UTF-8 bytes against readReceipt.",
     "effect": "read",
     "inputSchema": {
       "additionalProperties": false,
@@ -626,7 +626,7 @@
       "planning",
       "skill_test"
     ],
-    "description": "Create or update an active-task document with optimistic revision safety.",
+    "description": "Create or update an active-task document with optimistic revision safety. Before named QA, the author selects all required same-task sources and may supply includeDocuments to embed their exact current revisions in this one document. Selection/completeness remain the author responsibility; byte verification is not QA or adoption.",
     "effect": "write",
     "inputSchema": {
       "additionalProperties": false,
@@ -658,6 +658,46 @@
           "maxLength": 240,
           "minLength": 1,
           "type": "string"
+        },
+        "includeDocuments": {
+          "description": "Author-selected same-company, same-task current documents. Obtain fixed IDs and UTF-8 digest from read_document.readReceipt; do not estimate or hash redacted display text. The composed document is limited to 200000 UTF-8 bytes including metadata. Omit to preserve ordinary writes.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "bodyBytes": {
+                "maximum": 200000,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "bodySha256": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "documentId": {
+                "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+                "type": "string"
+              },
+              "key": {
+                "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+                "type": "string"
+              },
+              "revisionId": {
+                "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "documentId",
+              "key",
+              "revisionId",
+              "bodyBytes",
+              "bodySha256"
+            ],
+            "type": "object"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "type": "array"
         },
         "key": {
           "description": "Stable issue-document key.",

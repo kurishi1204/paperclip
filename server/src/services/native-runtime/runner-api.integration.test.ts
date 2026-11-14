@@ -511,6 +511,42 @@ else if(m.id!==undefined) send({id:m.id,result:{}});
     expect((await fixture.snapshot()).comments).toEqual(expect.arrayContaining([expect.objectContaining({ body: "Identity proof", authorAgentId: fixture.agentId, authorUserId: null })]));
   });
 
+  it("creates child tasks after seeding and preserves company numbering", async () => {
+    const fixture = await server.fixture();
+    await expect(fixture.authority.execute({ tool: "create_task", callId: "child", arguments: { title: "Verify release notes", description: "Check before shipping.", assigneeActorId: null, idempotencyKey: "child" } })).resolves.toBeDefined();
+    const children = (await fixture.snapshot()).issues.filter(issue => issue.parentId === fixture.issueId);
+    expect(children).toHaveLength(1);
+    expect(children[0].issueNumber).toBe(3);
+  });
+
+  it("resets fixture data and identities for paired comparisons", async () => {
+    const baseline = await server.fixture({ reset: true, apiToolsEnabled: false });
+    await server.db.update(issues).set({ billingCode: "previous-attempt" }).where(eq(issues.id, baseline.issueId));
+    const treatment = await server.fixture({ reset: true });
+    expect(treatment.companyId).toBe(baseline.companyId);
+    expect(treatment.issueId).toBe(baseline.issueId);
+    expect((await treatment.snapshot()).issues[0].billingCode).toBeNull();
+    const originalTools = (await baseline.authority.definitions()).map(tool => tool.name);
+    const treatmentTools = (await treatment.authority.definitions()).map(tool => tool.name);
+    expect(treatmentTools.filter(name => !originalTools.includes(name))).toEqual(["hire_agent", "search_api", "call_api"]);
+    expect(treatmentTools.filter(name => !["hire_agent", "search_api", "call_api"].includes(String(name)))).toEqual(originalTools);
+  });
+});
+
+// The Darwin test database lease is exclusive for a server's lifetime. Run the
+// local-trusted fixture after the authenticated suite has closed its database.
+describe("runner API source-run questions in local-trusted deployment", () => {
+  const oldSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+  beforeAll(() => { process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID(); });
+  beforeEach(() => {
+    vi.stubEnv("PAPERCLIP_RUNNER_API_TOOLS_ENABLED", undefined);
+    vi.stubEnv("PAPERCLIP_RUNNER_API_TOOLS_COMPANY_IDS", undefined);
+  });
+  afterEach(() => vi.unstubAllEnvs());
+  afterAll(() => {
+    if (oldSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    else process.env.PAPERCLIP_AGENT_JWT_SECRET = oldSecret;
+  });
   it("rejects a stale source-run question over public HTTP and accepts it from the next run", async () => {
     const localTrustedServer = await startRunnerApiTestServer({ deploymentMode: "local_trusted" });
     try {
@@ -616,24 +652,4 @@ else if(m.id!==undefined) send({id:m.id,result:{}});
     }
   });
 
-  it("creates child tasks after seeding and preserves company numbering", async () => {
-    const fixture = await server.fixture();
-    await expect(fixture.authority.execute({ tool: "create_task", callId: "child", arguments: { title: "Verify release notes", description: "Check before shipping.", assigneeActorId: null, idempotencyKey: "child" } })).resolves.toBeDefined();
-    const children = (await fixture.snapshot()).issues.filter(issue => issue.parentId === fixture.issueId);
-    expect(children).toHaveLength(1);
-    expect(children[0].issueNumber).toBe(3);
-  });
-
-  it("resets fixture data and identities for paired comparisons", async () => {
-    const baseline = await server.fixture({ reset: true, apiToolsEnabled: false });
-    await server.db.update(issues).set({ billingCode: "previous-attempt" }).where(eq(issues.id, baseline.issueId));
-    const treatment = await server.fixture({ reset: true });
-    expect(treatment.companyId).toBe(baseline.companyId);
-    expect(treatment.issueId).toBe(baseline.issueId);
-    expect((await treatment.snapshot()).issues[0].billingCode).toBeNull();
-    const originalTools = (await baseline.authority.definitions()).map(tool => tool.name);
-    const treatmentTools = (await treatment.authority.definitions()).map(tool => tool.name);
-    expect(treatmentTools.filter(name => !originalTools.includes(name))).toEqual(["hire_agent", "search_api", "call_api"]);
-    expect(treatmentTools.filter(name => !["hire_agent", "search_api", "call_api"].includes(String(name)))).toEqual(originalTools);
-  });
 });

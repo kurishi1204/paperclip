@@ -616,11 +616,81 @@ fn acpx_failed_settlement_ack_replays_the_same_delivered_event_without_expiry() 
 }
 
 #[test]
+fn acpx_stopped_turn_keeps_a_failed_unknown_history_anchor_before_suspension() {
+    let directory = temporary_directory("stopped-turn-history");
+    let (mut executor, _, request_id, _) =
+        pending_acpx_runtime_request(&directory, "permissions-interactive");
+    let stopped = executor
+        .execute(&command(4, "turn.stop", json!({})))
+        .unwrap();
+    assert_eq!(stopped.result["status"], "stopped");
+    assert_eq!(stopped.result["providerTurnId"], "turn-1");
+    assert_eq!(stopped.result["providerExitConfirmed"], true);
+    let state_path = directory.join("acpx-provider-state.json");
+    let persisted: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(persisted["lifecycle"], "prepared");
+    assert!(persisted["activeTurnId"].is_null());
+    assert_eq!(persisted["providerExitUnconfirmed"], false);
+    let events = executor.retained_events().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event_type, "runtime_request.cancelled");
+    assert_eq!(events[0].payload["requestId"], request_id);
+    assert_eq!(events[0].payload["replayAllowed"], false);
+    assert_eq!(events[1].event_type, "turn.failed");
+    assert_eq!(
+        events[1].payload,
+        json!({
+            "provider":"acpx", "providerTurnId":"turn-1", "status":"failed",
+            "error": {
+                "code":"acpx_turn_stopped_for_suspension", "recoverable":false,
+                "providerTerminalObserved":false, "reportedWorkDisposition":"unknown",
+                "replayAllowed":false,
+            },
+        })
+    );
+    let persisted_events = persisted["pendingEvents"].as_array().unwrap();
+    assert_eq!(persisted_events.len(), events.len());
+    assert_eq!(
+        persisted_events[1]["executorEventId"],
+        events[1].executor_event_id
+    );
+    assert_eq!(persisted_events[1]["payload"], events[1].payload);
+    let before_repeat = fs::read(&state_path).unwrap();
+    assert_eq!(
+        executor
+            .execute(&command(5, "turn.stop", json!({})))
+            .unwrap()
+            .result["status"],
+        "already_settled"
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), before_repeat);
+    assert_eq!(executor.retained_events().unwrap(), events);
+    executor.acknowledge_events(events.len()).unwrap();
+    executor
+        .execute(&command(6, "runner.suspend", json!({})))
+        .unwrap();
+    assert!(executor.retained_events().unwrap().is_empty());
+    let suspended: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(suspended["lifecycle"], "suspended");
+    assert!(suspended["activeTurnId"].is_null());
+    assert!(executor
+        .execute(&command(
+            7,
+            "request.resolve",
+            acpx_runtime_resolution("permissions-interactive", &request_id)
+        ))
+        .is_err());
+    executor.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn acpx_uncommitted_expiry_and_cancellation_cannot_escape_through_poll_or_drain() {
-    for (mode, close) in [
-        ("permissions-wrong-ack", false),
-        ("permissions-interactive", true),
-        ("resolutions", true),
+    for (mode, close_command) in [
+        ("permissions-wrong-ack", None),
+        ("permissions-interactive", Some("session.close")),
+        ("resolutions", Some("session.close")),
+        ("permissions-interactive", Some("turn.stop")),
     ] {
         let directory = temporary_directory("expiry-save-failure");
         let (mut executor, config, request_id, _) = pending_acpx_runtime_request(&directory, mode);
@@ -630,9 +700,9 @@ fn acpx_uncommitted_expiry_and_cancellation_cannot_escape_through_poll_or_drain(
         fs::rename(&state_path, &previous_path).unwrap();
         fs::create_dir(&state_path).unwrap();
         let response = acpx_runtime_resolution(mode, &request_id);
-        let error = if close {
+        let error = if let Some(close_command) = close_command {
             executor
-                .execute(&command(4, "session.close", json!({})))
+                .execute(&command(4, close_command, json!({})))
                 .unwrap_err()
         } else {
             assert!(executor

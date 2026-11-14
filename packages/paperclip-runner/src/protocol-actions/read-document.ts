@@ -1,5 +1,13 @@
 /** Canonical definition and documentation for `read_document`. */
-const readDocumentDescription = "Read the current revision of one active-task document. Native server reads include a run-bound readReceipt for the authorized source body before transport redaction. It is a server calculation, not agent reasoning or a QA verdict.";
+const documentReadRangeSchema = {
+  type: "object", additionalProperties: false,
+  properties: {
+    revisionId: { type: "string", format: "uuid" },
+    offsetBytes: { type: "integer", minimum: 0 },
+    maxBytes: { type: "integer", minimum: 4, maximum: 16384 },
+  }, required: ["revisionId", "offsetBytes", "maxBytes"],
+};
+const readDocumentDescription = "Read the current revision of one active-task document. Native server reads include a run-bound readReceipt for the authorized source body before transport redaction. It is a server calculation, not agent reasoning or a QA verdict. For complete large documents use range with the fixed revisionId and follow nextOffsetBytes; verify the combined UTF-8 bytes against readReceipt.";
 export const readDocumentAction = {
   "id": "read_document",
   "canonical": {
@@ -63,6 +71,7 @@ export const readDocumentAction = {
       "inputSchema": {
         "type": "object",
         "properties": {
+          "range": documentReadRangeSchema,
           "key": {
             "type": "string",
             "description": "Stable issue-document key.",
@@ -100,6 +109,7 @@ export const readDocumentAction = {
       "inputSchema": {
         "type": "object",
         "properties": {
+          "range": documentReadRangeSchema,
           "key": {
             "type": "string",
             "minLength": 1

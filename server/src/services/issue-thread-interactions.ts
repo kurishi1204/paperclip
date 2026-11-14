@@ -1,3 +1,4 @@
+import { readDocumentReviewEvidence } from "./document-review-evidence.js";
 import { enqueueNativeStatusWakeIntent, lockNativeCompletionParent } from "./native-runtime/status-wake-intent.js";
 import { buildIssueBlockersResolvedWakeStateKey, findExistingIssueBlockersResolvedWakeForReadyState } from "./issue-dependency-wakeups.js";
 import { getNativeDocumentReviewAssignment, isNativeDocumentReviewRun } from "./native-runtime/native-document-review-participant.js";
@@ -3917,6 +3918,31 @@ export function issueThreadInteractionService(
               if (existingReview) throw conflict("A pending fixed-document review already exists; reuse its original request", {
                 code: "document_review_already_pending", interactionId: existingReview.id,
               });
+            }
+          }
+          if (data.kind === "request_confirmation" && data.payload.supportingDocuments !== undefined) {
+            if (data.payload.target?.type !== "issue_document")
+              throw unprocessable("Supporting documents require an issue-document review target");
+            // An admitted document reviewer cannot lend another reader a wider scope.
+            if (actor.agentId && actor.runId && await isNativeDocumentReviewRun(tx as unknown as Db, {
+              companyId: issue.companyId, agentId: actor.agentId, runId: actor.runId,
+            })) {
+              const requester = await getNativeDocumentReviewAssignment(tx as unknown as Db, {
+                companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId, runId: actor.runId,
+              });
+              const allowed = requester ? [requester.binding, ...(requester.binding.supportingDocuments ?? [])] : [];
+              const requested = [data.payload.target, ...data.payload.supportingDocuments];
+              if (requested.some(scope => !scope || !allowed.some(pin =>
+                scope.documentId === pin.documentId && scope.key === pin.key && scope.revisionId === pin.revisionId))) {
+                throw unprocessable("Supporting documents exceed the requesting run's saved read scope");
+              }
+            }
+            if (!namedDocumentReview || !data.addresseeAgentId ||
+                await readDocumentReviewEvidence(tx as unknown as Db, {
+                  companyId: issue.companyId, issueId: issue.id, reviewerId: data.addresseeAgentId,
+                  payload: data.payload, lock: true,
+                }) === null) {
+              throw unprocessable("Supporting documents require exact independent same-issue review revisions");
             }
           }
           const [row] = await tx

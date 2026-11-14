@@ -132,6 +132,8 @@ export type StalenessDecision =
 export type PendingDocumentReviewBinding = {
   companyId: string; issueId: string; agentId: string; interactionId: string;
   documentId: string; key: string; revisionId: string; revisionNumber: number;
+  supportingDocuments?: Array<{ companyId: string; issueId: string; documentId: string;
+    key: string; revisionId: string; revisionNumber: number }>;
 };
 
 export type PendingDocumentReviewOrigin = { runId: string; wakeupRequestId: string };

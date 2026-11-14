@@ -1,6 +1,6 @@
 import * as cloudIdentity from "../cloud-runtime-identity.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import {
   activityLog,
@@ -425,7 +425,8 @@ describe("PaperclipRunnerToolAuthority", () => {
           instructions: "Use the assigned workspace and report findings.",
         },
       } as const;
-      const first = await authority.execute(call);
+      expect(authority.definitions().find(tool => tool.name === "write_document")?.inputSchema).toHaveProperty("properties.includeDocuments");
+    const first = await authority.execute(call);
       expect(first).toMatchObject({ ok: true, status: 201, apiOperationId: "POST /api/companies/{companyId}/agent-hires" });
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const [url, request] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -995,6 +996,112 @@ describe("PaperclipRunnerToolAuthority", () => {
         arguments: { ...call.arguments, body: "Conflicting retry." },
       }),
     ).rejects.toThrow("paperclip_runner_tool_idempotency_conflict");
+  });
+
+  it("embeds fixed same-task source bytes and replays the original saved receipt after source changes", async () => {
+    const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+    const svc = documentService(db), key = "inclusion-source", targetKey = "inclusion-check";
+    const body = "  原文\r\n😀\n````\n## Inclusion manifest\n";
+    const ids: string[] = [];
+    try {
+      const initial = await svc.upsertIssueDocument({ issueId, key, title: "Synthetic source", format: "markdown", body, createdByAgentId: agentId });
+      ids.push(initial.document.id);
+      const ref = { key, documentId: initial.document.id, revisionId: initial.document.latestRevisionId,
+        bodyBytes: Buffer.byteLength(body), bodySha256: createHash("sha256").update(body).digest("hex") };
+      const args = { idempotencyKey: "inclusion-save", key: targetKey, title: "Author check", body: " author\r\n", baseRevisionId: null, includeDocuments: [ref] };
+      const first = await authority.execute({ tool: "write_document", callId: "include-first", arguments: args }) as any;
+      ids.push(first.document.id);
+      expect(first.inclusionReceipt).toMatchObject({ schema: "paperclip.document-inclusion/v1", included: [ref], independentQA: "unverified" });
+      const entry = first.inclusionReceipt.included[0];
+      expect(Buffer.from(first.document.body).subarray(entry.startByte, entry.endByte)).toEqual(Buffer.from(body));
+      expect(await svc.getIssueDocumentByKey(issueId, targetKey)).toMatchObject({ body: first.document.body, latestRevisionId: first.document.latestRevisionId });
+      await svc.upsertIssueDocument({ issueId, key, title: "New source", format: "markdown", body: "new source", baseRevisionId: ref.revisionId, createdByAgentId: agentId });
+      const replay = await authority.execute({ tool: "write_document", callId: "include-replay", arguments: args });
+      expect(replay).toEqual(first);
+      expect(await svc.listIssueDocumentRevisions(issueId, targetKey)).toHaveLength(1);
+      await expect(authority.execute({ tool: "write_document", callId: "include-conflict", arguments: { ...args, body: "different" } }))
+        .rejects.toThrow("paperclip_runner_tool_idempotency_conflict");
+      await expect(authority.execute({ tool: "write_document", callId: "include-stale", arguments: { ...args, idempotencyKey: "include-stale", key: "stale-check" } }))
+        .rejects.toThrow("document_inclusion_source_unavailable");
+      expect(await svc.getIssueDocumentByKey(issueId, "stale-check")).toBeNull();
+    } finally { if (ids.length) await db.delete(documents).where(inArray(documents.id, ids)); }
+  });
+
+  it("uses the issue serialization lock without waiting on a concurrent source document row lock", async () => {
+    const svc = documentService(db), key = "inclusion-race-source", ids: string[] = [];
+    let writer: Promise<unknown> | undefined;
+    try {
+      const initial = await svc.upsertIssueDocument({ issueId, key, title: "Source", format: "markdown", body: "original" });
+      ids.push(initial.document.id);
+      let documentLocked!: () => void;
+      let documentLockFailed!: (error: unknown) => void;
+      const locked = new Promise<void>((resolve, reject) => { documentLocked = resolve; documentLockFailed = reject; });
+      await db.transaction(async tx => {
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+        writer = db.transaction(async other => {
+          await other.select({ id: documents.id }).from(documents).where(eq(documents.id, initial.document.id)).for("update");
+          documentLocked();
+          // The normal writer can hold the document row, but migration 0313
+          // prevents its new current body/revision from publishing yet.
+          await documentService(other as unknown as typeof db).upsertIssueDocument({ issueId, key,
+            title: "Updated source", format: "markdown", body: "new source", baseRevisionId: initial.document.latestRevisionId });
+        });
+        // Always consume a writer rejection even if the outer transaction fails.
+        void writer.catch(documentLockFailed);
+        await locked;
+        const authority = new PaperclipRunnerToolAuthority(tx as unknown as typeof db, { companyId, agentId, issueId, runId });
+        const saved = await authority.execute({ tool: "write_document", callId: "race-include", arguments: {
+          idempotencyKey: "race-include", key: "inclusion-race-check", title: "Check", body: "author", baseRevisionId: null,
+          includeDocuments: [{ key, documentId: initial.document.id, revisionId: initial.document.latestRevisionId,
+            bodyBytes: 8, bodySha256: createHash("sha256").update("original").digest("hex") }],
+        } }) as any;
+        ids.push(saved.document.id);
+        expect(saved.inclusionReceipt.included[0].revisionId).toBe(initial.document.latestRevisionId);
+        expect(saved.document.body).toContain("original");
+      });
+      await writer;
+      expect(await svc.getIssueDocumentByKey(issueId, key)).toMatchObject({ body: "new source" });
+    } finally {
+      await writer?.catch(() => undefined);
+      if (ids.length) await db.delete(documents).where(inArray(documents.id, ids));
+    }
+  });
+
+  it("refuses missing, foreign-task/company and wrong digest references before saving a document", async () => {
+    const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+    const svc = documentService(db), otherIssueId = randomUUID(), foreignCompanyId = randomUUID(), foreignIssueId = randomUUID();
+    const ids: string[] = [];
+    await db.insert(companies).values({ id: foreignCompanyId, name: "Synthetic foreign", issuePrefix: "FIC" });
+    await db.insert(issues).values([
+      { id: otherIssueId, companyId, title: "Other Task", status: "todo" },
+      { id: foreignIssueId, companyId: foreignCompanyId, title: "Foreign Task", status: "todo" },
+    ]);
+    try {
+      const refs = [];
+      for (const sourceIssueId of [issueId, otherIssueId, foreignIssueId]) {
+        const source = await svc.upsertIssueDocument({ issueId: sourceIssueId, key: "scoped-source", title: "Synthetic", format: "markdown", body: "source" });
+        ids.push(source.document.id);
+        refs.push({ key: "scoped-source", documentId: source.document.id, revisionId: source.document.latestRevisionId,
+          bodyBytes: 6, bodySha256: createHash("sha256").update("source").digest("hex") });
+      }
+      const attempts = [
+        { ref: { ...refs[0], revisionId: randomUUID() }, error: "source_unavailable" },
+        { ref: refs[1], error: "source_unavailable" }, { ref: refs[2], error: "source_unavailable" },
+        { ref: { ...refs[0], bodySha256: "0".repeat(64) }, error: "digest_mismatch" },
+        { ref: { ...refs[0], bodyBytes: 5 }, error: "source_unavailable" },
+      ];
+      for (const [i, attempt] of attempts.entries()) {
+        const key = `denied-inclusion-${i}`;
+        await expect(authority.execute({ tool: "write_document", callId: key, arguments: {
+          idempotencyKey: key, key, title: "Check", body: "author", baseRevisionId: null, includeDocuments: [attempt.ref],
+        } })).rejects.toThrow(`document_inclusion_${attempt.error}`);
+        expect(await svc.getIssueDocumentByKey(issueId, key)).toBeNull();
+      }
+    } finally {
+      if (ids.length) await db.delete(documents).where(inArray(documents.id, ids));
+      await db.delete(issues).where(inArray(issues.id, [otherIssueId, foreignIssueId]));
+      await db.delete(companies).where(eq(companies.id, foreignCompanyId));
+    }
   });
 
   it("returns the exact accepted plan revision in task context", async () => {

@@ -13,6 +13,7 @@ import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 const text = (v: unknown) => (typeof v === "string" ? v : null);
 const executionRunColumns = {
   id: heartbeatRuns.id,
+  agentId: heartbeatRuns.agentId,
   errorCode: heartbeatRuns.errorCode,
   executionControlDeadlineAt: heartbeatRuns.executionControlDeadlineAt,
   finishedAt: heartbeatRuns.finishedAt,
@@ -40,7 +41,7 @@ type Recovery = Pick<
   "cause" | "nextAction"
 > &
   Partial<
-    Pick<typeof issueRecoveryActions.$inferSelect, "status" | "evidence">
+    Pick<typeof issueRecoveryActions.$inferSelect, "status" | "evidence" | "outcome" | "sourceIssueId" | "returnOwnerAgentId">
   >;
 
 /** Batched reads; list consumers do not perform per-task polling. */
@@ -102,6 +103,9 @@ export async function executionProjectionsForRuns(
     ? await read(async () => db
         .select({
           issueId: issueRecoveryActions.sourceIssueId,
+          sourceIssueId: issueRecoveryActions.sourceIssueId,
+          returnOwnerAgentId: issueRecoveryActions.returnOwnerAgentId,
+          outcome: issueRecoveryActions.outcome,
           cause: issueRecoveryActions.cause,
           nextAction: issueRecoveryActions.nextAction,
           evidence: issueRecoveryActions.evidence,
@@ -189,6 +193,33 @@ export function projectExecution(
   };
   const set = (phase: ExecutionProjection["phase"], label: string) =>
     Object.assign(projection, { phase, label });
+  if (recoveryAction?.evidence?.continuationDelivery === "terminal") {
+    const receipt = recoveryAction.evidence.terminalReconciliation as
+      { sourceIssueStatus?: unknown; expectedSourceRevision?: unknown; issueRevision?: unknown; assigneeAgentId?: unknown } | undefined;
+    const decision = recoveryAction.evidence.executionReconciliation as
+      { runId?: unknown; providerStopped?: unknown } | undefined;
+    const issueId = run.nativeIssueId ?? text(run.contextSnapshot?.issueId);
+    if (recoveryAction.status === "resolved" && recoveryAction.outcome === "owner_completed" &&
+        decision?.runId === run.id && decision.providerStopped === true &&
+        (recoveryAction.evidence.runId ?? recoveryAction.evidence.sourceRunId) === run.id &&
+        issueId && recoveryAction.sourceIssueId === issueId && run.agentId &&
+        recoveryAction.returnOwnerAgentId === run.agentId && receipt?.assigneeAgentId === run.agentId &&
+        receipt.sourceIssueStatus === "done" && Number.isInteger(receipt.expectedSourceRevision) &&
+        Number(receipt.expectedSourceRevision) > 0 && Number.isInteger(receipt.issueRevision) &&
+        Number(receipt.issueRevision) > Number(receipt.expectedSourceRevision) && ["failed", "interrupted", "timed_out", "cancelled"].includes(run.status)) {
+      // This is a historical terminal receipt, not a successful provider run or
+      // a continuation. Keep the original failure and automaticRecovery evidence.
+      projection.nextAction = null;
+      projection.retryAt = null;
+      projection.successorRunId = null;
+      projection.permittedActions.push("inspect_recovery");
+      return set("failed", "Result reconciled; no continuation");
+    }
+    projection.recoveryOwner = "board";
+    projection.nextAction = "Inspect the terminal reconciliation receipt and its source execution.";
+    projection.permittedActions.push("inspect_recovery");
+    return set("recovery_needed", "Terminal receipt needs inspection");
+  }
   if (recoveryAction?.status === "resolved" && recoveryAction.evidence?.automaticRecovery) {
     projection.cause = recoveryAction.cause;
     projection.nextAction = recoveryAction.nextAction;

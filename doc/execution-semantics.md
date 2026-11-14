@@ -1242,6 +1242,54 @@ The board owns the recovery decision, not the source deliverable. Automatic reco
 
 An upgrade may encounter an already-active agent-owned recovery action. Paperclip keeps that record readable and resolvable for compatibility, but periodic reconciliation does not enqueue another takeover wake from it.
 
+#### Record a completed result without restarting the failed execution
+
+The existing recovery-action resolution API accepts an explicit board
+`executionReconciliation` with `sourceIssueStatus: "done"` and `outcome: "restored"`
+for the exact source action, with `expectedSourceRevision` matching the task version
+that was verified. The transaction rejects a changed source revision before
+completion and records both the requested and resulting revisions. An exact
+duplicate must match both. This records an independently verified completed
+result; it does not rerun the failed operation, assign a replacement, or change the
+ordinary issue transition rules. Clients must verify the deliverable and any
+required business acceptance separately before requesting this operation.
+
+The source task must still be blocked and assigned to the stopped run's original
+return owner. Provider termination, coordinator and environment authority,
+workspace evidence, other executions and queued deliveries, dependencies, pending
+interactions, and review requirements are checked under the existing transaction
+and issue lock. A review cannot be advanced with a board override through this
+operation. A settled action is eligible only when it is the unchanged automatic
+blocked/no-replay hold, without another active recovery action or a prior
+reconciliation delivery.
+
+The transaction records a distinct terminal reconciliation receipt, including the
+resulting issue revision and assignee, while preserving the original failed run
+and automatic recovery evidence. It creates neither a pending continuation nor a
+successor wake. An exact duplicate from the same actor returns that original
+receipt only while the recorded task revision, owner, completion state, actor and
+request still match, with no competing recovery action, active execution, queued
+work, dependency, pending interaction, or unfinished review. This readback does not
+repeat the initial PID, coordinator, environment, finalization, or workspace checks;
+it returns the original decision without certifying the provider's current state
+or creating a new effect. Conflicting evidence or changes to those task conditions
+are rejected. Automatic conversation-hold settlement leaves explicit reconciliation
+receipts and their original replay evidence unchanged.
+A missing response is not proof of failure and does not authorize another effect.
+
+Use `GET /api/issues/:id/recovery-actions?actionId=:actionId` to read the exact
+original action after a missing response. This query retains the issue's read
+permissions, binds the action to that issue and company, and does not revalidate,
+reopen, or wake work. Unknown or out-of-scope IDs are rejected. The existing GET
+without `actionId` keeps its active-action projection behavior. A readback must
+match the original request and current task; it does not authorize a new POST.
+
+A completion consumer must bind its own durable request intent and result receipt
+to this action, run, task, revision, actor, and verified deliverable. Setting the
+task to done separately or manufacturing a consumer intent does not establish
+consumer acceptance. Unknown effects stay unknown until supported by original
+evidence; an exit code alone does not establish that an operation had no effect.
+
 Create an issue-backed recovery action only when a separate issue is the right execution object. In that fallback form, the source issue remains visible and is blocked on the recovery issue when blocking is necessary for correctness. The recovery owner must restore a live path, resolve the source issue manually, delegate real follow-up work, or record the reason the signal is a false positive.
 
 ### Human Escalation

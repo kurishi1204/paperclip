@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
+  symlinkSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -13,14 +16,19 @@ import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createRequire } from "node:module";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import childProcess from "node:child_process";
 import { runInNewContext } from "node:vm";
 
 import cliEsbuildConfig from "../cli/esbuild.config.mjs";
 import { bundledCliNpmDependencies } from "./cli-bundled-npm-dependencies.mjs";
 import {
+  preserveBundledEsbuildExecutables,
+  prepareBundledPackage,
+  validateOfflineBundledLock,
   createBundledInstallManifest,
   materializePublishManifest,
+  readWorkspaceVersions,
   selectBundledDependencyPatches,
 } from "./prepare-bundled-package.mjs";
 
@@ -153,7 +161,7 @@ test("published packages preserve the patched embedded-postgres runtime", () => 
 });
 
 test("bundled package staging materializes publishConfig entrypoints", () => {
-  const staged = materializePublishManifest(adapterUtilsPackage);
+  const staged = materializePublishManifest(adapterUtilsPackage, { workspaceVersions: readWorkspaceVersions() });
 
   assert.equal(staged.publishConfig, undefined);
   assert.equal(staged.main, "./dist/index.js");
@@ -166,12 +174,12 @@ test("bundled package staging materializes workspace dependency versions", () =>
     name: "@paperclipai/example",
     version: "2026.723.0",
     dependencies: { exact: "workspace:*", caret: "workspace:^", tilde: "workspace:~" },
-  });
+  }, { workspaceVersions: { exact: "1.2.3", caret: "2.3.4", tilde: "3.4.5" } });
 
   assert.deepEqual(staged.dependencies, {
-    exact: "2026.723.0",
-    caret: "^2026.723.0",
-    tilde: "~2026.723.0",
+    exact: "1.2.3",
+    caret: "^2.3.4",
+    tilde: "~3.4.5",
   });
 });
 
@@ -443,4 +451,167 @@ test("installed ACPX runtime persists and restores optional goal capabilities", 
   assert.deepEqual(JSON.parse(JSON.stringify(helpers.restoredGoalCapability(saved))), goal);
   assert.equal(helpers.persistedGoalCapability({ ...goal, version: 2 }), undefined);
   assert.equal(helpers.persistedGoalCapability({ ...goal, actions: ["set"] }), undefined);
+});
+
+
+test("mixed source SDK resolves the actual shared version without mutating inputs", () => {
+  const sdk = JSON.parse(readFileSync(new URL("../packages/plugins/sdk/package.json", import.meta.url), "utf8"));
+  const versions = readWorkspaceVersions();
+  const before = structuredClone(sdk);
+  const published = materializePublishManifest(sdk, { workspaceVersions: versions });
+  assert.equal(published.dependencies["@paperclipai/shared"], versions["@paperclipai/shared"]);
+  assert.deepEqual(sdk, before);
+});
+
+test("workspace target evidence is required in every published dependency section", () => {
+  for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+    const pkg = { name: "owner", version: "9.0.0", [section]: { target: "workspace:*" } };
+    assert.throws(() => materializePublishManifest(pkg), /Missing or invalid workspace target/);
+    assert.equal(materializePublishManifest(pkg, { workspaceVersions: { target: "1.2.3-beta.1" } })[section].target, "1.2.3-beta.1");
+    for (const value of ["workspace:other@*", "workspace:../other", "workspace:^1.2.3", "workspace:"]) {
+      assert.throws(() => materializePublishManifest({ ...pkg, [section]: { target: value } }, { workspaceVersions: { target: "1.2.3" } }), /Unsupported workspace specifier/);
+    }
+  }
+});
+
+
+test("workspace target versions use exact SemVer validation", () => {
+  const pkg = { name: "owner", version: "9.0.0", dependencies: { target: "workspace:*" } };
+  for (const version of ["01.2.3", "1.2.3-a..b", "1.2.3-01", "1.2.3+", "1.2.3\n", "9007199254740992.0.0"]) {
+    assert.throws(() => materializePublishManifest(pkg, { workspaceVersions: { target: version } }), /Missing or invalid workspace target/);
+  }
+  for (const version of ["0.3.1", "1.2.3-alpha.1", "1.2.3-0.1a+build.001", "1.2.3+001"]) {
+    assert.equal(materializePublishManifest(pkg, { workspaceVersions: { target: version } }).dependencies.target, version);
+  }
+});
+
+
+test("publish executable metadata preserves explicit paths and derives declared source modes", (t) => {
+  const source = mkdtempSync(join(tmpdir(), "publish-executable-"));
+  t.after(() => rmSync(source, { recursive: true, force: true }));
+  mkdirSync(join(source, "dist"));
+  writeFileSync(join(source, "dist/run"), "original bytes");
+  writeFileSync(join(source, "dist/data"), "data");
+  chmodSync(join(source, "dist/run"), 0o755);
+  chmodSync(join(source, "dist/data"), 0o644);
+  const pkg = { name: "owner", version: "1.0.0", files: ["dist"], publishConfig: { main: "./dist/run", executableFiles: ["dist/data"] } };
+  const result = materializePublishManifest(pkg, { sourceDir: source });
+  assert.deepEqual(result.publishConfig, { executableFiles: ["dist/data", "dist/run"] });
+  assert.equal(result.main, "./dist/run");
+  assert.equal(lstatSync(join(source, "dist/data")).mode & 0o777, 0o644);
+  assert.equal(readFileSync(join(source, "dist/run"), "utf8"), "original bytes");
+  assert.deepEqual(materializePublishManifest(pkg).publishConfig, { executableFiles: ["dist/data"] });
+});
+
+test("publish source modes reject missing declarations and symlink or dependency escapes", (t) => {
+  const source = mkdtempSync(join(tmpdir(), "publish-executable-reject-"));
+  t.after(() => rmSync(source, { recursive: true, force: true }));
+  const pkg = { name: "owner", version: "1.0.0", files: ["missing"] };
+  assert.throws(() => materializePublishManifest(pkg, { sourceDir: source }), /ENOENT/);
+  mkdirSync(join(source, "real"));writeFileSync(join(source, "real/run"), "x");
+  symlinkSync(join(source, "real"), join(source, "alias"));
+  for (const entry of ["alias", "alias/run"]) assert.throws(() => materializePublishManifest({ ...pkg, files: [entry] }, { sourceDir: source }), /symlink/);
+  for (const entry of ["../escape", "node_modules/dep/bin", "dist/*", "/absolute"]) assert.throws(() => materializePublishManifest({ ...pkg, files: [entry] }, { sourceDir: source }), /publish path/);
+});
+
+function bundledEsbuildFixture(t) {
+  const root = mkdtempSync(join(tmpdir(), "bundle-esbuild-mode-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const binary = join(root, "node_modules/@esbuild/linux-x64/bin/esbuild");
+  mkdirSync(join(root, "node_modules/esbuild"), { recursive: true });
+  mkdirSync(join(root, "node_modules/@esbuild/linux-x64/bin"), { recursive: true });
+  writeFileSync(binary, "synthetic binary bytes");chmodSync(binary, 0o755);
+  const esbuild = { name: "esbuild", version: "0.28.2", optionalDependencies: { "@esbuild/linux-x64": "0.28.2" }, "esbuild.binaryHashes": { "@esbuild/linux-x64/bin/esbuild": createHash("sha256").update(readFileSync(binary)).digest("hex") } };
+  const manifest = { name: "owner", version: "1.0.0", bundleDependencies: ["acpx"], publishConfig: { executableFiles: ["dist/own"] } };
+  writeFileSync(join(root,"package.json"),JSON.stringify(manifest));
+  writeFileSync(join(root,"node_modules/esbuild/package.json"),JSON.stringify(esbuild));
+  writeFileSync(join(root,"node_modules/@esbuild/linux-x64/package.json"),JSON.stringify({name:"@esbuild/linux-x64",version:"0.28.2"}));
+  return { root, binary, esbuild };
+}
+
+test("bundled esbuild pack metadata binds original hash/version/mode without chmod", (t) => {
+  const {root,binary}=bundledEsbuildFixture(t);const before=readFileSync(binary);
+  assert.deepEqual(preserveBundledEsbuildExecutables(root),["node_modules/@esbuild/linux-x64/bin/esbuild"]);
+  assert.deepEqual(JSON.parse(readFileSync(join(root,"package.json"))).publishConfig.executableFiles,["dist/own","node_modules/@esbuild/linux-x64/bin/esbuild"]);
+  assert.deepEqual(readFileSync(binary),before);assert.equal(lstatSync(binary).mode & 0o777,0o755);
+  preserveBundledEsbuildExecutables(root); // Idempotent metadata, never duplicate paths.
+  assert.equal(JSON.parse(readFileSync(join(root,"package.json"))).publishConfig.executableFiles.length,2);
+});
+
+test("bundled esbuild rejects corrupt, nonexecutable, mismatched and redirected originals before saving", (t) => {
+  const {root,binary,esbuild}=bundledEsbuildFixture(t);const original=readFileSync(join(root,"package.json"));
+  writeFileSync(binary,"corrupt");assert.throws(()=>preserveBundledEsbuildExecutables(root),/hash mismatch/);
+  writeFileSync(binary,"synthetic binary bytes");chmodSync(binary,0o644);assert.throws(()=>preserveBundledEsbuildExecutables(root),/not executable/);chmodSync(binary,0o755);
+  const platform=join(root,"node_modules/@esbuild/linux-x64/package.json");writeFileSync(platform,JSON.stringify({name:"@esbuild/linux-x64",version:"0.28.1"}));assert.throws(()=>preserveBundledEsbuildExecutables(root),/identity mismatch/);writeFileSync(platform,JSON.stringify({name:"@esbuild/linux-x64",version:"0.28.2"}));
+  rmSync(binary);symlinkSync("/missing-esbuild-target",binary);assert.throws(()=>preserveBundledEsbuildExecutables(root),/symlink/);
+  assert.deepEqual(readFileSync(join(root,"package.json")),original);
+  rmSync(binary);writeFileSync(binary,"synthetic binary bytes");chmodSync(binary,0o755);
+  delete esbuild["esbuild.binaryHashes"];writeFileSync(join(root,"node_modules/esbuild/package.json"),JSON.stringify(esbuild));assert.throws(()=>preserveBundledEsbuildExecutables(root),/original binary hashes/);
+  assert.deepEqual(readFileSync(join(root,"package.json")),original);
+});
+
+
+test("offline bundled producer rejects incomplete inputs and occupied destinations before mutation", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "offline-bundle-boundary-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const destination = join(root, "owned");
+  mkdirSync(destination);
+  writeFileSync(join(destination, "sentinel"), "original");
+  const base = { workspaceVersions: {} };
+  assert.throws(() => prepareBundledPackage("/unused", destination, { ...base, offlineLockfile: "lock" }), /requires both/);
+  assert.throws(() => prepareBundledPackage("/unused", destination, { ...base, storeDir: "store" }), /requires both/);
+  assert.throws(() => prepareBundledPackage("/unused", destination, { ...base, offlineLockfile: "lock", storeDir: "store" }), /must not already exist/);
+  assert.equal(readFileSync(join(destination, "sentinel"), "utf8"), "original");
+});
+
+test("bundled CLI rejects unknown and duplicate offline options without falling back to npm", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "offline-bundle-options-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const destination = join(root, "new");
+  const script = new URL("./prepare-bundled-package.mjs", import.meta.url).pathname;
+  for (const args of [["--unknown", "x"], ["--offline-lockfile"], ["--store-dir", "a", "--store-dir", "b"], ["constructor", "x"], ["toString", "x"], ["__proto__", "x"]]) {
+    assert.throws(() => execFileSync(process.execPath, [script, "/unused", destination, ...args], { stdio: "pipe" }), /Unknown, duplicate or incomplete/);
+    assert.equal(existsSync(destination), false);
+  }
+});
+
+
+test("offline producer never removes a destination created after its early check", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "offline-bundle-race-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const source = join(root, "source"), store = join(root, "store");
+  mkdirSync(source); mkdirSync(store); mkdirSync(join(source, "dist"));
+  writeFileSync(join(source, "package.json"), JSON.stringify({ name: "race-fixture", version: "1.0.0", files: ["dist"], dependencies: { fixture: "1.0.0" }, bundleDependencies: ["fixture"] }));
+  const lock = join(root, "lock.yaml");writeFileSync(lock, JSON.stringify({lockfileVersion: "9.0", importers: {".": {dependencies: {fixture: {specifier: "1.0.0", version: "1.0.0"}}}}}));
+  const original = childProcess.execFileSync;
+  try {
+    for (const kind of ["directory", "dangling symlink"]) {
+      const destination = join(root, kind === "directory" ? "directory" : "link");
+      childProcess.execFileSync = (command, args) => {
+        assert.equal(command, "pnpm");assert.deepEqual(args, ["--version"]);
+        if (kind === "directory") { mkdirSync(destination); writeFileSync(join(destination, "sentinel"), "other owner"); }
+        else symlinkSync(join(root, "absent"), destination);
+        return "9.15.4\n";
+      };
+      syncBuiltinESMExports();
+      assert.throws(() => prepareBundledPackage(source, destination, { workspaceVersions: {}, offlineLockfile: lock, storeDir: store }), { code: "EEXIST" });
+      if (kind === "directory") assert.equal(readFileSync(join(destination, "sentinel"), "utf8"), "other owner");
+      else assert.equal(lstatSync(destination).isSymbolicLink(), true);
+    }
+  } finally { childProcess.execFileSync = original; syncBuiltinESMExports(); }
+});
+
+
+test("offline bundle lock rejects extra importers, local references and dependency mismatches", () => {
+  const manifest = { dependencies: { fixture: "1.0.0" } };
+  const original = { lockfileVersion: "9.0", importers: { ".": { dependencies: { fixture: { specifier: "1.0.0", version: "1.0.0" } } } }, snapshots: { "fixture@1.0.0": {} } };
+  const parse = (value) => validateOfflineBundledLock(Buffer.from(JSON.stringify(value)), manifest);
+  assert.equal(parse(original).importers["."].dependencies.fixture.version, "1.0.0");
+  const extra = structuredClone(original);extra.importers.cli = {};assert.throws(() => parse(extra), /exactly one root/);
+  for (const version of ["link:../other", "workspace:*", "file:../../other.tgz"]) {
+    const local = structuredClone(original);local.snapshots["fixture@1.0.0"].dependencies = { other: version };assert.throws(() => parse(local), /external workspace\/local reference/);
+  }
+  const mismatch = structuredClone(original);mismatch.importers["."].dependencies.fixture.specifier = "^1";assert.throws(() => parse(mismatch), /does not match/);
+  assert.throws(() => validateOfflineBundledLock(Buffer.from("importers: {}\nimporters: {}\n"), manifest), /duplicated mapping key/);
+  assert.throws(() => validateOfflineBundledLock(Buffer.from("lockfileVersion: '9.0'\nimporters: &i {'.': {}}\nextra: *i\n"), {}), /aliases/);
 });

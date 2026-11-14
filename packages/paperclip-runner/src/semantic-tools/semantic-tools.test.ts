@@ -43,6 +43,17 @@ async function running(
 }
 
 describe("Capability semantic catalog and authorization", () => {
+  it("refuses included documents in a command-only binding instead of silently discarding them", async () => {
+    const adapter = await running();
+    const dispatcher = new CapabilitySemanticDispatcher(adapter);
+    const before = adapter.snapshot().revision;
+    const result = await dispatcher.dispatch({ runId: OPEN.identity.runId, callId: "unsupported-inclusion",
+      operationId: "write_document", input: { idempotencyKey: "unsupported-inclusion", key: "check", title: "Check",
+        body: "author", baseRevisionId: null, includeDocuments: [{ documentId: "00000000-0000-4000-8000-000000000001",
+          key: "source", revisionId: "00000000-0000-4000-8000-000000000002", bodyBytes: 1, bodySha256: "0".repeat(64) }] } });
+    expect(result.ok).toBe(false);
+    expect(adapter.snapshot().revision).toBe(before);
+  });
   it("updates an existing skill once, rejects a stale version, and denies an ungranted capability", async () => {
     const adapter = await running();
     const dispatcher = new CapabilitySemanticDispatcher(adapter);

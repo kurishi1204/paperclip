@@ -86,6 +86,9 @@ describe("native runtime context files", () => {
   it("distinguishes durable Paperclip documents from requested file deliverables", () => {
     const constraints = nativeTaskConstraints(runtimeInput("/bundle", "AGENTS.md")).join("\n");
     expect(constraints).toContain("Paperclip documents directly with write_document");
+    expect(constraints).toContain("write_document.includeDocuments");
+    expect(constraints).toContain("Selection and completeness remain your responsibility");
+    expect(constraints).toContain("not independent QA or COLO adoption");
     expect(constraints).toContain("unless the user also requests a downloadable file");
     expect(constraints).toContain("register_deliverable");
     expect(constraints).toContain("deliverable:");

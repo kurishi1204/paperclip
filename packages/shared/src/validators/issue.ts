@@ -591,6 +591,7 @@ export const resolveIssueRecoveryActionSchema = z
       })
       .strict()
       .optional(),
+    expectedSourceRevision: z.number().int().positive().optional(),
     actionId: z.string().guid().optional(),
     outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
     sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
@@ -598,6 +599,11 @@ export const resolveIssueRecoveryActionSchema = z
   })
   .strict()
   .superRefine((value, ctx) => {
+    if (value.sourceIssueStatus === "done" && value.executionReconciliation &&
+        value.expectedSourceRevision === undefined) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Terminal reconciliation requires the verified source revision", path: ["expectedSourceRevision"] });
+    }
+
     if (value.outcome === "restored") {
       if (
         value.sourceIssueStatus !== "todo" &&
@@ -1564,6 +1570,11 @@ export const requestConfirmationSecretProposalPayloadSchema = z.object({
   expiresAt: z.string().datetime({ offset: true }),
 });
 
+const requestConfirmationSupportingDocumentSchema = requestConfirmationBoundDocumentSchema.extend({
+  companyId: z.string().guid(),
+  issueId: z.string().guid(),
+}).strict();
+
 export const requestConfirmationPayloadSchema = z.object({
   version: z.literal(1),
   prompt: z.string().trim().min(1).max(1000),
@@ -1582,6 +1593,8 @@ export const requestConfirmationPayloadSchema = z.object({
   detailsMarkdown: z.string().max(20000).nullable().optional(),
   supersedeOnUserComment: z.boolean().optional(),
   target: requestConfirmationTargetSchema.nullable().optional(),
+  // Read authority for evidence, separate from the one review decision target.
+  supportingDocuments: z.array(requestConfirmationSupportingDocumentSchema).optional(),
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
   secretProposal: requestConfirmationSecretProposalPayloadSchema.optional(),
 });

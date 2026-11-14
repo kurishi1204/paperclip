@@ -139,3 +139,5 @@ export const completeTerminatedLocalNativeSessionCleanup = runner.completeTermin
 
 export const bundledRemoteProviderPackManifestPath = runner.bundledRemoteProviderPackManifestPath;
 export const bundledRemoteRunnerBinary = runner.bundledRemoteRunnerBinary;
+
+export const inspectPaperclipSemanticValue = runner.inspectPaperclipSemanticValue;

@@ -4,8 +4,9 @@ import { claimedAdapterType, conversationRecoveryActionPredicate, getConversatio
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, isNotNull, not, or, sql } from "drizzle-orm";
 import {
+  agentWakeupRequests,
   chatActions,
   environmentLeases,
   heartbeatRuns,
@@ -23,6 +24,32 @@ import {
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 
+/** Called under the issue lock; completing recorded work cannot consume a live path. */
+export async function assertTerminalReconciliationIdle(db: Db, task: typeof issues.$inferSelect) {
+  if (task.executionRunId || task.checkoutRunId ||
+      (task.executionPolicy != null && parseIssueExecutionState(task.executionState)?.status !== "completed") ||
+      (task.executionState != null && parseIssueExecutionState(task.executionState)?.status !== "completed")) {
+    throw conflict("Terminal reconciliation cannot bypass execution ownership or an unfinished review.");
+  }
+  const [liveRun] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, task.companyId),
+    or(eq(heartbeatRuns.nativeIssueId, task.id),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${task.id}`,
+      sql`${heartbeatRuns.contextSnapshot}->>'taskId' = ${task.id}`),
+    or(inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+      isNotNull(heartbeatRuns.scheduledRetryAt)),
+  )).limit(1);
+  const [wake] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, task.companyId),
+    inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution", "claimed"]),
+    sql`(${agentWakeupRequests.payload}->>'issueId' = ${task.id}
+      or ${agentWakeupRequests.payload}->>'taskId' = ${task.id}
+      or ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'issueId' = ${task.id}
+      or ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'taskId' = ${task.id})`,
+  )).limit(1);
+  if (liveRun || wake) throw conflict("Terminal reconciliation requires all task execution and queued delivery to be stopped.");
+}
+
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
   db: Db;
@@ -31,9 +58,10 @@ export async function validateExecutionReconciliation(input: {
   agentId: string | null;
   sourceRunId: unknown;
   decision: ExecutionReconciliation | undefined;
+  terminal?: boolean;
 }) {
   const { db, companyId, issueId, agentId, decision } = input;
-  if (!decision || decision.runId !== input.sourceRunId || !agentId) {
+  if (!decision || decision.providerStopped !== true || decision.runId !== input.sourceRunId || !agentId) {
     throw conflict(
       "Reconcile the recorded execution and its action outcomes before continuing this task.",
     );
@@ -71,6 +99,13 @@ export async function validateExecutionReconciliation(input: {
       "The recovery source or task owner changed. Inspect the current execution before continuing.",
     );
   }
+  if (input.terminal) {
+    if (task.status !== "blocked" || run.agentId !== agentId ||
+        (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt.getTime() > Date.now())) {
+      throw conflict("Terminal reconciliation requires the stopped source run and unchanged blocked owner.");
+    }
+    await assertTerminalReconciliationIdle(db, task);
+  }
   if (hasWorkspaceRestoreFailure(run.resultJson) &&
       (!decision.workspaceRepairEvidence || decision.workspaceRepairEvidence.trim().length < 20)) {
     throw conflict("Verify safe workspace staging or repair and record workspaceRepairEvidence before continuing this run.");
@@ -105,6 +140,10 @@ export async function validateExecutionReconciliation(input: {
     throw conflict(
       "This execution still has a coordinator or a linked continuation. Inspect that run first.",
     );
+  if (input.terminal && coordinator &&
+      (!["committed", "terminal_failure"].includes(coordinator.phase) || coordinator.nextAttemptAt)) {
+    throw conflict("Terminal reconciliation requires finalization to be settled without scheduled work.");
+  }
   const leases = await db
     .select({ id: environmentLeases.id })
     .from(environmentLeases)
@@ -141,9 +180,11 @@ export async function markExecutionReconciliation(
   >,
   decision: ExecutionReconciliation,
   actorId: string,
-  deliveryOwner?: { kind: "chat_failed_run_retry"; actionId: string },
+  deliveryOwner?: { kind: "chat_failed_run_retry"; actionId: string }
+    | { kind: "terminal"; expectedSourceRevision: number; issueRevision: number; assigneeAgentId: string },
 ) {
-  if (deliveryOwner) {
+  const terminal = deliveryOwner?.kind === "terminal";
+  if (deliveryOwner?.kind === "chat_failed_run_retry") {
     const [retry] = await db
       .select()
       .from(chatActions)
@@ -165,7 +206,7 @@ export async function markExecutionReconciliation(
       throw conflict("The authorized chat retry owner is no longer valid.");
     }
   }
-  await db
+  if (!terminal) await db
     .update(nativeRunFinalizations)
     .set({
       failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) || ${JSON.stringify({ replacementDenied: "operator_reconciled" })}::jsonb`,
@@ -181,14 +222,18 @@ export async function markExecutionReconciliation(
     .set({
       evidence: {
         ...action.evidence,
-        automaticRecovery: undefined,
+        ...(terminal ? {} : { automaticRecovery: undefined }),
         executionReconciliation: {
           ...decision,
           actorId,
           recordedAt: new Date().toISOString(),
         },
-        continuationDelivery: deliveryOwner ? "delegated" : "pending",
-        ...(deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
+        continuationDelivery: terminal ? "terminal" : deliveryOwner ? "delegated" : "pending",
+        ...(deliveryOwner?.kind === "chat_failed_run_retry" ? { continuationDeliveryOwner: deliveryOwner } : {}),
+        ...(deliveryOwner?.kind === "terminal" ? { terminalReconciliation: {
+          sourceIssueStatus: "done", expectedSourceRevision: deliveryOwner.expectedSourceRevision, issueRevision: deliveryOwner.issueRevision,
+          assigneeAgentId: deliveryOwner.assigneeAgentId,
+        } } : {}),
       },
     })
     .where(
@@ -316,6 +361,9 @@ export async function settleUnrecoverableExecutions(
   // Keep their evidence and record the policy change in the task's activity log.
   const obsoleteConversationHold = and(
     conversationRecoveryActionPredicate(),
+    // An explicit reconciliation is a durable decision, not an obsolete hold.
+    // Terminal receipts deliberately retain the original blocked replay evidence.
+    sql`not (${issueRecoveryActions.evidence} ? 'executionReconciliation')`,
     or(
       inArray(issueRecoveryActions.status, ["active", "escalated"]),
       sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,

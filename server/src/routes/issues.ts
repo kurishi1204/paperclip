@@ -13,6 +13,7 @@ import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions
 import { getExecutionBlocker, getQaPredecessorWaitBlocker } from "../services/execution-blocker.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
+  assertTerminalReconciliationIdle,
   validateExecutionReconciliation,
   markExecutionReconciliation,
 } from "../services/execution-recovery-resolution.js";
@@ -9140,6 +9141,20 @@ export function issueRoutes(
     );
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    if (req.query.actionId !== undefined) {
+      const actionId = req.query.actionId;
+      if (typeof actionId !== "string" || !isUuidLike(actionId)) throw badRequest("Invalid recovery action id");
+      // Exact receipt lookup is read-only, including settled actions. Do not
+      // fold stale actions or admit another execution while reconciling a lost response.
+      const [action] = await db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.id, actionId),
+        eq(issueRecoveryActions.companyId, issue.companyId),
+        eq(issueRecoveryActions.sourceIssueId, issue.id),
+      ));
+      if (!action) throw notFound("Recovery action not found");
+      res.json({ action: issueRecoveryActionReadModel(action) });
+      return;
+    }
     const active = await revalidateActiveSourceRecoveryForRead({
       issue,
       trigger: "read_projection",
@@ -9218,11 +9233,17 @@ export function issueRoutes(
         sourceIssueStatus,
         resolutionNote,
         executionReconciliation,
+        expectedSourceRevision,
       } = req.body;
       if (outcome === "false_positive" || outcome === "cancelled") {
         assertBoard(req);
       }
 
+      const terminalReconciliation = sourceIssueStatus === "done" && executionReconciliation != null;
+      if (terminalReconciliation) {
+        assertBoard(req);
+        if (!actionId || outcome !== "restored") throw conflict("Terminal reconciliation requires the exact recovery action and restored outcome.");
+      }
       const actor = getActorInfo(req);
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
       const postCommitActivityPublications: ActivityPublication[] = [];
@@ -9241,6 +9262,33 @@ export function issueRoutes(
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
 
+        const assertTerminalGates = async () => {
+          await requireRecoverySourceMutationAuthority(req, lockedIssue);
+          await assertTerminalReconciliationIdle(tx as unknown as Db, lockedIssue);
+          if (lockedIssue.reviewPolicy === "human_only" && (!req.actor.userId || req.actor.source === "mcp_oauth")) {
+            throw forbidden("Terminal reconciliation cannot substitute for an authenticated human review.");
+          }
+          await assertIssueReviewVerdictActorAllowed(tx as unknown as Db, {
+            issue: lockedIssue, actor: { type: actor.actorType, id: actor.actorId },
+          });
+          const readiness = await svc.getDependencyReadiness(lockedIssue.id, tx);
+          if (readiness.unresolvedBlockerCount > 0) throw conflict("Resolve task dependencies before terminal reconciliation.");
+          const [pending] = await tx.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+            eq(issueThreadInteractions.companyId, lockedIssue.companyId),
+            eq(issueThreadInteractions.issueId, lockedIssue.id),
+            eq(issueThreadInteractions.status, "pending"), activeIssueInteractionCondition(),
+          )).limit(1);
+          if (pending) throw conflict("Resolve the pending interaction before terminal reconciliation.");
+        };
+        if (terminalReconciliation) {
+          // Bind the recorded action while checking and committing its terminal
+          // receipt; background recovery writers must not replace its evidence.
+          await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+            eq(issueRecoveryActions.id, actionId),
+            eq(issueRecoveryActions.companyId, lockedIssue.companyId),
+            eq(issueRecoveryActions.sourceIssueId, lockedIssue.id),
+          )).for("update");
+        }
         let activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
           lockedIssue.companyId,
           lockedIssue.id,
@@ -9268,6 +9316,26 @@ export function issueRoutes(
               issueRecoveryActionReadModel(settled),
               { source: "recovery_action_resolution" },
             );
+            const terminal = settled.evidence.terminalReconciliation as
+              { sourceIssueStatus?: string; expectedSourceRevision?: number; issueRevision?: number; assigneeAgentId?: string } | undefined;
+            if (terminal) {
+              assertBoard(req);
+              const recorded = settled.evidence.executionReconciliation as Record<string, unknown> | undefined;
+              if (!terminalReconciliation || activeRecoveryAction || settled.status !== "resolved" ||
+                  settled.outcome !== "owner_completed" || lockedIssue.status !== "done" ||
+                  terminal.sourceIssueStatus !== "done" || terminal.expectedSourceRevision !== expectedSourceRevision ||
+                  terminal.issueRevision !== lockedIssue.revision ||
+                  terminal.assigneeAgentId !== lockedIssue.assigneeAgentId ||
+                  settled.returnOwnerAgentId !== lockedIssue.assigneeAgentId ||
+                  recorded?.actorId !== actor.actorId ||
+                  settled.resolutionNote !== (resolutionNote ?? null) ||
+                  !["runId", "providerStopped", "actionOutcome", "outcomeEvidence", "workspaceRepairEvidence"].every(
+                    (key) => recorded?.[key] === executionReconciliation?.[key])) {
+                throw conflict("Terminal reconciliation receipt does not match this request or current task state.");
+              }
+              await assertTerminalGates();
+              return { issue: lockedIssue, recoveryAction: settled, replayed: true };
+            }
             const automatic = settled.evidence.automaticRecovery as
               { replay?: string } | undefined;
             if (automatic?.replay === "blocked" && executionReconciliation) {
@@ -9276,12 +9344,17 @@ export function issueRoutes(
               assertBoard(req);
               if (
                 activeRecoveryAction ||
-                sourceIssueStatus !== "todo" ||
+                (sourceIssueStatus !== "todo" && !terminalReconciliation) ||
                 outcome !== "restored"
               ) {
                 throw conflict(
                   "Verified outcomes must restore this source recovery without replacing another active recovery action.",
                 );
+              }
+              if (terminalReconciliation && (settled.status !== "resolved" || settled.outcome !== "blocked" ||
+                  settled.evidence.executionReconciliation != null || settled.evidence.continuationDelivery != null ||
+                  lockedIssue.status !== "blocked")) {
+                throw conflict("Only the unchanged automatic no-replay hold can be terminally reconciled.");
               }
               const [reopened] = await tx
                 .update(issueRecoveryActions)
@@ -9290,6 +9363,7 @@ export function issueRoutes(
                 .returning();
               activeRecoveryAction = issueRecoveryActionReadModel(reopened!);
             } else {
+              if (terminalReconciliation) throw conflict("This settled action is not an automatic no-replay hold.");
               return {
                 issue: lockedIssue,
                 recoveryAction: settled,
@@ -9310,6 +9384,18 @@ export function issueRoutes(
           activeRecoveryAction,
           { source: "recovery_action_resolution" },
         );
+
+        if (terminalReconciliation) {
+          if (lockedIssue.status !== "blocked" || expectedSourceRevision !== lockedIssue.revision ||
+              !activeRecoveryAction.returnOwnerAgentId ||
+              activeRecoveryAction.returnOwnerAgentId !== lockedIssue.assigneeAgentId ||
+              !requiresExecutionReconciliation(activeRecoveryAction.cause) ||
+              (activeRecoveryAction.evidence.runId != null && activeRecoveryAction.evidence.sourceRunId != null &&
+                activeRecoveryAction.evidence.runId !== activeRecoveryAction.evidence.sourceRunId)) {
+            throw conflict("Terminal reconciliation must match the stopped task owner and execution recovery.");
+          }
+          await assertTerminalGates();
+        }
 
         if (outcome === "restored" && activeRecoveryAction.cause === "native_workspace_sync_out_unsafe_archive") {
           throw conflict("Unsafe workspace export recovers automatically without another provider turn.", { code: "workspace_export_automatic_recovery" });
@@ -9380,7 +9466,7 @@ export function issueRoutes(
         }
 
         if (
-          sourceIssueStatus === "todo" &&
+          (sourceIssueStatus === "todo" || terminalReconciliation) &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
           assertBoard(req);
@@ -9393,6 +9479,7 @@ export function issueRoutes(
               activeRecoveryAction.evidence.runId ??
               activeRecoveryAction.evidence.sourceRunId,
             decision: executionReconciliation,
+            terminal: terminalReconciliation,
           });
         } else if (executionReconciliation) {
           throw conflict(
@@ -9445,7 +9532,7 @@ export function issueRoutes(
           }
         }
 
-        if (executionReconciliation) {
+        if (executionReconciliation && !terminalReconciliation) {
           // The authorized chat retry is the sole durable delivery owner.
           // Never also enqueue a generic successor that lacks chat provenance.
           await markExecutionReconciliation(
@@ -9536,7 +9623,7 @@ export function issueRoutes(
                 agentId: actor.agentId ?? null,
                 userId: actor.actorType === "user" ? actor.actorId : null,
               },
-              allowBoardOverride: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
+              allowBoardOverride: !terminalReconciliation && req.actor.type === "board" && req.actor.source !== "mcp_oauth",
               commentBody: resolutionNote ?? null,
             });
             Object.assign(updateFields, transition.patch);
@@ -9594,6 +9681,15 @@ export function issueRoutes(
                 );
           if (!updatedIssue) throw notFound("Issue not found");
           issue = updatedIssue;
+        }
+
+        if (terminalReconciliation) {
+          if (issue.status !== "done" || issue.assigneeAgentId !== activeRecoveryAction.returnOwnerAgentId) {
+            throw conflict("Terminal reconciliation cannot advance or replace a review workflow.");
+          }
+          await markExecutionReconciliation(tx as unknown as Db, activeRecoveryAction,
+            executionReconciliation, actor.actorId,
+            { kind: "terminal", expectedSourceRevision, issueRevision: issue.revision, assigneeAgentId: issue.assigneeAgentId! });
         }
 
         const recordedOutcome =

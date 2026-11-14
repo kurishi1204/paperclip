@@ -73,7 +73,7 @@ export const writeDocumentAction = {
       "operationId": "write_document",
       "version": 1,
       "title": "Write revisioned document",
-      "description": "Create or update an active-task document with optimistic revision safety.",
+      "description": "Create or update an active-task document with optimistic revision safety. Before named QA, the author selects all required same-task sources and may supply includeDocuments to embed their exact current revisions in this one document. Selection/completeness remain the author responsibility; byte verification is not QA or adoption.",
       "exposure": "always",
       "requiredClaims": [],
       "allowedModes": [
@@ -123,6 +123,46 @@ export const writeDocumentAction = {
             ],
             "description": "Optional revision summary.",
             "maxLength": 20000
+          },
+          "includeDocuments": {
+            "description": "Author-selected same-company, same-task current documents. Obtain fixed IDs and UTF-8 digest from read_document.readReceipt; do not estimate or hash redacted display text. The composed document is limited to 200000 UTF-8 bytes including metadata. Omit to preserve ordinary writes.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "bodyBytes": {
+                  "maximum": 200000,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "bodySha256": {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string"
+                },
+                "documentId": {
+                  "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+                  "type": "string"
+                },
+                "key": {
+                  "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+                  "type": "string"
+                },
+                "revisionId": {
+                  "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "documentId",
+                "key",
+                "revisionId",
+                "bodyBytes",
+                "bodySha256"
+              ],
+              "type": "object"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "type": "array"
           }
         },
         "required": [
@@ -196,8 +236,12 @@ export const writeDocumentAction = {
         "commandId": "example",
         "disposition": "applied",
         "stateRevision": 1,
-        "entityRefs": ["example"],
-        "scheduledWakeIds": ["example"]
+        "entityRefs": [
+          "example"
+        ],
+        "scheduledWakeIds": [
+          "example"
+        ]
       },
       "commandResult": null,
       "authorization": {}
