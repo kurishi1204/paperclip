@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
@@ -21,6 +22,7 @@ import { runInNewContext } from "node:vm";
 import cliEsbuildConfig from "../cli/esbuild.config.mjs";
 import { bundledCliNpmDependencies } from "./cli-bundled-npm-dependencies.mjs";
 import {
+  preserveBundledEsbuildExecutables,
   createBundledInstallManifest,
   materializePublishManifest,
   readWorkspaceVersions,
@@ -507,4 +509,40 @@ test("publish source modes reject missing declarations and symlink or dependency
   symlinkSync(join(source, "real"), join(source, "alias"));
   for (const entry of ["alias", "alias/run"]) assert.throws(() => materializePublishManifest({ ...pkg, files: [entry] }, { sourceDir: source }), /symlink/);
   for (const entry of ["../escape", "node_modules/dep/bin", "dist/*", "/absolute"]) assert.throws(() => materializePublishManifest({ ...pkg, files: [entry] }, { sourceDir: source }), /publish path/);
+});
+
+function bundledEsbuildFixture(t) {
+  const root = mkdtempSync(join(tmpdir(), "bundle-esbuild-mode-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const binary = join(root, "node_modules/@esbuild/linux-x64/bin/esbuild");
+  mkdirSync(join(root, "node_modules/esbuild"), { recursive: true });
+  mkdirSync(join(root, "node_modules/@esbuild/linux-x64/bin"), { recursive: true });
+  writeFileSync(binary, "synthetic binary bytes");chmodSync(binary, 0o755);
+  const esbuild = { name: "esbuild", version: "0.28.2", optionalDependencies: { "@esbuild/linux-x64": "0.28.2" }, "esbuild.binaryHashes": { "@esbuild/linux-x64/bin/esbuild": createHash("sha256").update(readFileSync(binary)).digest("hex") } };
+  const manifest = { name: "owner", version: "1.0.0", bundleDependencies: ["acpx"], publishConfig: { executableFiles: ["dist/own"] } };
+  writeFileSync(join(root,"package.json"),JSON.stringify(manifest));
+  writeFileSync(join(root,"node_modules/esbuild/package.json"),JSON.stringify(esbuild));
+  writeFileSync(join(root,"node_modules/@esbuild/linux-x64/package.json"),JSON.stringify({name:"@esbuild/linux-x64",version:"0.28.2"}));
+  return { root, binary, esbuild };
+}
+
+test("bundled esbuild pack metadata binds original hash/version/mode without chmod", (t) => {
+  const {root,binary}=bundledEsbuildFixture(t);const before=readFileSync(binary);
+  assert.deepEqual(preserveBundledEsbuildExecutables(root),["node_modules/@esbuild/linux-x64/bin/esbuild"]);
+  assert.deepEqual(JSON.parse(readFileSync(join(root,"package.json"))).publishConfig.executableFiles,["dist/own","node_modules/@esbuild/linux-x64/bin/esbuild"]);
+  assert.deepEqual(readFileSync(binary),before);assert.equal(lstatSync(binary).mode & 0o777,0o755);
+  preserveBundledEsbuildExecutables(root); // Idempotent metadata, never duplicate paths.
+  assert.equal(JSON.parse(readFileSync(join(root,"package.json"))).publishConfig.executableFiles.length,2);
+});
+
+test("bundled esbuild rejects corrupt, nonexecutable, mismatched and redirected originals before saving", (t) => {
+  const {root,binary,esbuild}=bundledEsbuildFixture(t);const original=readFileSync(join(root,"package.json"));
+  writeFileSync(binary,"corrupt");assert.throws(()=>preserveBundledEsbuildExecutables(root),/hash mismatch/);
+  writeFileSync(binary,"synthetic binary bytes");chmodSync(binary,0o644);assert.throws(()=>preserveBundledEsbuildExecutables(root),/not executable/);chmodSync(binary,0o755);
+  const platform=join(root,"node_modules/@esbuild/linux-x64/package.json");writeFileSync(platform,JSON.stringify({name:"@esbuild/linux-x64",version:"0.28.1"}));assert.throws(()=>preserveBundledEsbuildExecutables(root),/identity mismatch/);writeFileSync(platform,JSON.stringify({name:"@esbuild/linux-x64",version:"0.28.2"}));
+  rmSync(binary);symlinkSync("/missing-esbuild-target",binary);assert.throws(()=>preserveBundledEsbuildExecutables(root),/symlink/);
+  assert.deepEqual(readFileSync(join(root,"package.json")),original);
+  rmSync(binary);writeFileSync(binary,"synthetic binary bytes");chmodSync(binary,0o755);
+  delete esbuild["esbuild.binaryHashes"];writeFileSync(join(root,"node_modules/esbuild/package.json"),JSON.stringify(esbuild));assert.throws(()=>preserveBundledEsbuildExecutables(root),/original binary hashes/);
+  assert.deepEqual(readFileSync(join(root,"package.json")),original);
 });

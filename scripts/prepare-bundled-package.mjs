@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -215,6 +216,61 @@ export function applyBundledDependencyPatches(destinationDir, bundledDependencie
   }
 }
 
+// pnpm pack normalizes non-bin files, including bundled native executables.
+// This is a separate boundary from source-owned files: only esbuild's declared,
+// installed, version- and hash-bound binaries may receive pack metadata here.
+export function preserveBundledEsbuildExecutables(destinationDir) {
+  const root = realpathSync(destinationDir);
+  function installedFile(relative) {
+    let current = root;
+    for (const part of relative.split("/")) {
+      current = resolve(current, part);
+      if (lstatSync(current).isSymbolicLink()) throw new Error(`Bundled esbuild symlink is not allowed: ${relative}`);
+    }
+    const info = lstatSync(current);
+    if (!info.isFile()) throw new Error(`Bundled esbuild file is not regular: ${relative}`);
+    return { path: current, info };
+  }
+  const esbuildDirectory = resolve(root, "node_modules/esbuild");
+  if (!lstatSync(esbuildDirectory, { throwIfNoEntry: false })) return [];
+  const esbuild = JSON.parse(readFileSync(installedFile("node_modules/esbuild/package.json").path, "utf8"));
+  const hashes = esbuild["esbuild.binaryHashes"];
+  if (esbuild.name !== "esbuild" || !isExactPackageVersion(esbuild.version) || !hashes || typeof hashes !== "object" || Array.isArray(hashes)) {
+    throw new Error("Bundled esbuild requires exact version and original binary hashes");
+  }
+  const executableFiles = [];
+  for (const [name, version] of Object.entries(esbuild.optionalDependencies ?? {})) {
+    if (!/^@esbuild\/[a-z0-9-]+$/.test(name) || version !== esbuild.version) throw new Error(`Unsupported esbuild platform dependency: ${name}`);
+    const relative = `node_modules/${name}`;
+    if (!lstatSync(resolve(root, relative), { throwIfNoEntry: false })) continue; // Other platforms are optional.
+    const platform = JSON.parse(readFileSync(installedFile(`${relative}/package.json`).path, "utf8"));
+    if (platform.name !== name || platform.version !== version) throw new Error(`Bundled esbuild platform identity mismatch: ${name}`);
+    const keys = Object.keys(hashes).filter((key) => key.startsWith(`${name}/`));
+    if (!keys.length) throw new Error(`Missing declared esbuild binary hash: ${name}`);
+    for (const key of keys) {
+      publishRelativePath(key); // Reject traversal, nested node_modules and unknown path syntax.
+      const entry = `node_modules/${key}`;
+      const binary = installedFile(entry);
+      const hash = hashes[key];
+      if (typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash) || createHash("sha256").update(readFileSync(binary.path)).digest("hex") !== hash) {
+        throw new Error(`Bundled esbuild binary hash mismatch: ${key}`);
+      }
+      if (!(binary.info.mode & 0o111)) throw new Error(`Bundled esbuild binary is not executable before pack: ${key}`);
+      executableFiles.push(entry);
+    }
+  }
+  if (!executableFiles.length) throw new Error("No installed executable esbuild platform binary to preserve");
+  const manifestPath = installedFile("package.json").path;
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  if (!(manifest.bundleDependencies ?? manifest.bundledDependencies ?? []).length) throw new Error("Esbuild executable metadata requires a bundled package");
+  const existing = manifest.publishConfig?.executableFiles ?? [];
+  if (!Array.isArray(existing)) throw new Error("publishConfig.executableFiles must be an array");
+  manifest.publishConfig = { ...manifest.publishConfig, executableFiles: [...new Set([...existing, ...executableFiles])].sort() };
+  // No chmod, binary mutation, lifecycle execution or dependency repair.
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  return executableFiles;
+}
+
 export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = repoRoot, workspaceVersions = readWorkspaceVersions(sourceRoot) } = {}) {
   const sourcePackagePath = resolve(sourceDir, "package.json");
   const sourcePackage = JSON.parse(readFileSync(sourcePackagePath, "utf8"));
@@ -290,6 +346,7 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
     writeFileSync(deployedPackagePath, `${JSON.stringify(stagedPackage, null, 2)}\n`);
     rmSync(resolve(destinationDir, "node_modules/@embedded-postgres"), { recursive: true, force: true });
   }
+  preserveBundledEsbuildExecutables(destinationDir);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

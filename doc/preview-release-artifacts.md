@@ -234,3 +234,18 @@ Local verification:
 node --test scripts/cloud-migrator-artifacts.test.mjs
 node scripts/cloud-migrator-artifacts.mjs verify <full-sha>
 ```
+
+
+### Bundled esbuild executable preservation
+
+`prepareBundledPackage` preserves pack metadata for the installed, hoisted
+esbuild platform binary after dependency materialization and patching. Unlike
+source-owned `files`, these paths are owned by the bundled dependency: its
+original `esbuild.binaryHashes`, exact optional dependency version, installed
+package identity, regular non-symlink path and pre-pack executable mode must
+agree. Missing or unsupported evidence fails before writing metadata; no chmod,
+postinstall, download, or arbitrary dependency-mode normalization occurs.
+The normal npm pack consumer retains executable source modes; pnpm pack uses
+the explicit `publishConfig.executableFiles` paths. Packages without bundled
+esbuild keep their prior behavior. This does not qualify other native packages,
+other platform installs, or application startup.
