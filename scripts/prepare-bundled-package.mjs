@@ -303,8 +303,14 @@ export function prepareBundledPackage(sourceDir, destinationDir, {
 
   const publishManifest = materializePublishManifest(sourcePackage, { workspaceVersions, sourceDir });
 
-  rmSync(destinationDir, { recursive: true, force: true });
-  mkdirSync(destinationDir, { recursive: true });
+  if (offlineLock !== undefined) {
+    // Acquire the final path atomically. Never remove a directory or dangling
+    // symlink created after the earlier advisory existence check.
+    mkdirSync(destinationDir);
+  } else {
+    rmSync(destinationDir, { recursive: true, force: true });
+    mkdirSync(destinationDir, { recursive: true });
+  }
   for (const entry of sourcePackage.files ?? []) {
     cpSync(resolve(sourceDir, entry), resolve(destinationDir, entry), { recursive: true });
   }
@@ -386,7 +392,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [sourceDir, destinationDir, ...flags] = process.argv.slice(2);
   const options = {};
   for (let i = 0; i < flags.length; i += 2) {
-    const key = { "--offline-lockfile": "offlineLockfile", "--store-dir": "storeDir" }[flags[i]];
+    const allowed = { "--offline-lockfile": "offlineLockfile", "--store-dir": "storeDir" };
+    const key = Object.hasOwn(allowed, flags[i]) ? allowed[flags[i]] : undefined;
     if (!key || !flags[i + 1] || flags[i + 1].startsWith("--") || Object.hasOwn(options, key)) {
       throw new Error(`Unknown, duplicate or incomplete bundle option: ${flags[i]}`);
     }

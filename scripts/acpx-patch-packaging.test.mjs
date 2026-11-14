@@ -16,7 +16,8 @@ import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createRequire } from "node:module";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import childProcess from "node:child_process";
 import { runInNewContext } from "node:vm";
 
 import cliEsbuildConfig from "../cli/esbuild.config.mjs";
@@ -567,8 +568,34 @@ test("bundled CLI rejects unknown and duplicate offline options without falling 
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const destination = join(root, "new");
   const script = new URL("./prepare-bundled-package.mjs", import.meta.url).pathname;
-  for (const args of [["--unknown", "x"], ["--offline-lockfile"], ["--store-dir", "a", "--store-dir", "b"]]) {
+  for (const args of [["--unknown", "x"], ["--offline-lockfile"], ["--store-dir", "a", "--store-dir", "b"], ["constructor", "x"], ["toString", "x"], ["__proto__", "x"]]) {
     assert.throws(() => execFileSync(process.execPath, [script, "/unused", destination, ...args], { stdio: "pipe" }), /Unknown, duplicate or incomplete/);
     assert.equal(existsSync(destination), false);
   }
+});
+
+
+test("offline producer never removes a destination created after its early check", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "offline-bundle-race-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const source = join(root, "source"), store = join(root, "store");
+  mkdirSync(source); mkdirSync(store); mkdirSync(join(source, "dist"));
+  writeFileSync(join(source, "package.json"), JSON.stringify({ name: "race-fixture", version: "1.0.0", files: ["dist"], dependencies: { fixture: "1.0.0" }, bundleDependencies: ["fixture"] }));
+  const lock = join(root, "lock.yaml");writeFileSync(lock, "lockfileVersion: '9.0'\n");
+  const original = childProcess.execFileSync;
+  try {
+    for (const kind of ["directory", "dangling symlink"]) {
+      const destination = join(root, kind === "directory" ? "directory" : "link");
+      childProcess.execFileSync = (command, args) => {
+        assert.equal(command, "pnpm");assert.deepEqual(args, ["--version"]);
+        if (kind === "directory") { mkdirSync(destination); writeFileSync(join(destination, "sentinel"), "other owner"); }
+        else symlinkSync(join(root, "absent"), destination);
+        return "9.15.4\n";
+      };
+      syncBuiltinESMExports();
+      assert.throws(() => prepareBundledPackage(source, destination, { workspaceVersions: {}, offlineLockfile: lock, storeDir: store }), { code: "EEXIST" });
+      if (kind === "directory") assert.equal(readFileSync(join(destination, "sentinel"), "utf8"), "other owner");
+      else assert.equal(lstatSync(destination).isSymbolicLink(), true);
+    }
+  } finally { childProcess.execFileSync = original; syncBuiltinESMExports(); }
 });
