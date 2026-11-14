@@ -51,11 +51,15 @@ for (const path of [assets, consumer, cache]) mkdirSync(path, { mode: 0o755 });
 writeFileSync(join(consumer, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
 for (const [index, name] of [...needed].entries()) {
  const { dir, manifest } = packages.get(name); const staged = join(root, `source-${index}`); const target = join(root, `package-${index}`); mkdirSync(staged);
+ const stagedFiles = [];
  for (const file of manifest.files ?? ['dist']) {
-  const skills = file === 'skills' && !existsSync(join(repo,dir,file));
+  const skills = file === 'skills' && ['server', 'packages/adapters/claude-local', 'packages/adapters/codex-local'].includes(dir);
+  // Match release.sh; absent optional skills are omitted, not supplied elsewhere.
+  if (file === 'skills' && !skills && !existsSync(join(repo,dir,file))) continue;
   cpSync(skills ? join(repo,'skills') : join(repo,dir,file), join(staged,file), { recursive: true });
+  stagedFiles.push(file);
  }
- const releaseManifest = { ...manifest, version: releaseVersion };
+ const releaseManifest = { ...manifest, version: releaseVersion, files: stagedFiles };
  writeFileSync(join(staged,'package.json'), JSON.stringify(releaseManifest));
  if ((manifest.bundleDependencies ?? manifest.bundledDependencies ?? []).length) prepareBundledPackage(staged,target,{ workspaceVersions });
  else { cpSync(staged,target,{recursive:true}); writeFileSync(join(target,'package.json'),JSON.stringify(materializePublishManifest(releaseManifest, { workspaceVersions, sourceDir: staged }))); }

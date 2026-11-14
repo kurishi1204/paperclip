@@ -40,14 +40,17 @@ try {
     const { dir, manifest } = packages.get(name);
     const target = join(root, `package-${index}`); mkdirSync(target);
     const stagedSource = join(root, `source-${index}`); mkdirSync(stagedSource);
+    const stagedFiles = [];
     for (const file of manifest.files ?? ['dist']) {
       // release.sh stages runtime skills into these public packages before pack.
-      const releaseSkills = file === 'skills' && !existsSync(join(repo, dir, file));
-      // Missing common skills use the same original root assets as release staging;
-      // package-specific skills remain owned by their package.
+      const releaseSkills = file === 'skills' && ['server', 'packages/adapters/claude-local', 'packages/adapters/codex-local'].includes(dir);
+      // Preserve release.sh's three supply targets and npm's optional omission.
+      // The strict collector sees only files actually staged, never fabricated skills.
+      if (file === 'skills' && !releaseSkills && !existsSync(join(repo, dir, file))) continue;
       cpSync(releaseSkills ? join(repo, 'skills') : join(repo, dir, file), join(stagedSource, file), { recursive: true });
+      stagedFiles.push(file);
     }
-    const releaseManifest = { ...manifest, version: releaseVersion };
+    const releaseManifest = { ...manifest, version: releaseVersion, files: stagedFiles };
     writeFileSync(join(stagedSource, 'package.json'), JSON.stringify(releaseManifest));
     if ((manifest.bundleDependencies ?? manifest.bundledDependencies ?? []).length) {
       prepareBundledPackage(stagedSource, target, { workspaceVersions });
