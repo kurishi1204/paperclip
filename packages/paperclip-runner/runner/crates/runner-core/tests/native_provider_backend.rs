@@ -673,15 +673,13 @@ fn acpx_stopped_turn_keeps_a_failed_unknown_history_anchor_before_suspension() {
     let suspended: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     assert_eq!(suspended["lifecycle"], "suspended");
     assert!(suspended["activeTurnId"].is_null());
-    assert!(
-        executor
-            .execute(&command(
-                7,
-                "request.resolve",
-                acpx_runtime_resolution("permissions-interactive", &request_id)
-            ))
-            .is_err()
-    );
+    assert!(executor
+        .execute(&command(
+            7,
+            "request.resolve",
+            acpx_runtime_resolution("permissions-interactive", &request_id)
+        ))
+        .is_err());
     executor.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
 }
