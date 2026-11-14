@@ -42,10 +42,9 @@ try {
     const stagedSource = join(root, `source-${index}`); mkdirSync(stagedSource);
     for (const file of manifest.files ?? ['dist']) {
       // release.sh stages runtime skills into these public packages before pack.
-      const releaseSkills = file === 'skills' && ['server', 'packages/adapters/claude-local', 'packages/adapters/codex-local'].includes(dir);
-      // Other adapters declare an optional skills directory that npm pack omits
-      // when absent. Do not fabricate extra release payloads for those adapters.
-      if (file === 'skills' && !releaseSkills && !existsSync(join(repo, dir, file))) continue;
+      const releaseSkills = file === 'skills' && !existsSync(join(repo, dir, file));
+      // Missing common skills use the same original root assets as release staging;
+      // package-specific skills remain owned by their package.
       cpSync(releaseSkills ? join(repo, 'skills') : join(repo, dir, file), join(stagedSource, file), { recursive: true });
     }
     const releaseManifest = { ...manifest, version: releaseVersion };
@@ -54,7 +53,7 @@ try {
       prepareBundledPackage(stagedSource, target, { workspaceVersions });
     } else {
       cpSync(stagedSource, target, { recursive: true });
-      writeFileSync(join(target, 'package.json'), JSON.stringify(materializePublishManifest(releaseManifest, { workspaceVersions })));
+      writeFileSync(join(target, 'package.json'), JSON.stringify(materializePublishManifest(releaseManifest, { workspaceVersions, sourceDir: stagedSource })));
     }
     run('npm', ['pack', '--ignore-scripts', '--pack-destination', root], target);
     const packed = readdirSync(root).filter(f => f.endsWith('.tgz') && !tarballs.includes(join(root, f)));

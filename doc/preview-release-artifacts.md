@@ -28,6 +28,14 @@ complete temporary release closure must pass that closure's explicit versions.
 The ordinary release script already versions public packages together before
 packaging. Preview packages already carry exact non-workspace versions.
 
+When a caller has the original payload directory, pass `sourceDir` to the same
+materializer. Its declared literal `files` are required to exist; source-owned
+regular files with executable bits are recorded as `publishConfig.executableFiles`
+for pnpm pack. Explicit executable metadata is preserved. No files are chmodded,
+symlinks and path escapes are rejected, and `node_modules` is not traversed.
+Bundled dependency executable fidelity remains a separate boundary. Generated
+metadata does not execute skills, binaries, lifecycle hooks, or the application.
+
 A local registry-free consumer can install same-source package tarballs through
 pnpm file dependencies/overrides and an independently generated frozen lock.
 Such a consumer must preserve actual versions and tarball provenance; it must not

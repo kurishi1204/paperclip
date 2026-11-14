@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -31,7 +31,48 @@ function isExactPackageVersion(version) {
     match.slice(1, 4).every((part) => Number.isSafeInteger(Number(part)));
 }
 
-export function materializePublishManifest(pkg, { workspaceVersions = {} } = {}) {
+function publishRelativePath(value) {
+  if (typeof value !== "string" || !value || value.includes("\\") || value.includes("\0") ||
+      value.startsWith("/") || /^[A-Za-z]:/.test(value) || /[*?\[\]{}!]/.test(value)) {
+    throw new Error(`Expected a literal relative publish path: ${value}`);
+  }
+  const parts = value.replace(/^\.\//, "").split("/");
+  if (parts.some((part) => !part || part === "." || part === ".." || part === "node_modules")) {
+    throw new Error(`Unsafe publish path: ${value}`);
+  }
+  return parts.join("/");
+}
+
+function sourcePublishExecutableFiles(pkg, sourceDir, explicit) {
+  const root = realpathSync(sourceDir);
+  const executable = new Set();
+  function inspect(relative) {
+    // Check every component: a nested declared path must not bypass a symlink.
+    let current = root;
+    for (const part of relative.split("/")) {
+      current = resolve(current, part);
+      if (lstatSync(current).isSymbolicLink()) throw new Error(`Publish source symlink is not allowed: ${relative}`);
+    }
+    return lstatSync(current);
+  }
+  function walk(relative) {
+    publishRelativePath(relative);
+    const info = inspect(relative);
+    if (info.isDirectory()) {
+      for (const name of readdirSync(resolve(root, relative)).sort()) walk(`${relative}/${name}`);
+    } else if (info.isFile()) {
+      if (info.mode & 0o111) executable.add(relative);
+    } else throw new Error(`Publish source is not a regular file or directory: ${relative}`);
+  }
+  if (!Array.isArray(pkg.files)) throw new Error(`${pkg.name} must declare files for executable metadata`);
+  for (const entry of pkg.files) walk(publishRelativePath(entry));
+  for (const entry of explicit) {
+    if (!inspect(entry).isFile()) throw new Error(`Explicit executable is not a regular source file: ${entry}`);
+  }
+  return executable;
+}
+
+export function materializePublishManifest(pkg, { workspaceVersions = {}, sourceDir } = {}) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
 
@@ -58,7 +99,14 @@ export function materializePublishManifest(pkg, { workspaceVersions = {} } = {})
     );
   }
 
+  const configuredExecutableFiles = publishConfig.executableFiles ?? [];
+  if (!Array.isArray(configuredExecutableFiles)) throw new Error("publishConfig.executableFiles must be an array");
+  const executableFiles = new Set(configuredExecutableFiles.map(publishRelativePath));
+  if (sourceDir !== undefined) {
+    for (const entry of sourcePublishExecutableFiles(pkg, sourceDir, executableFiles)) executableFiles.add(entry);
+  }
   delete publishManifest.publishConfig;
+  if (executableFiles.size) publishManifest.publishConfig = { executableFiles: [...executableFiles].sort() };
   return publishManifest;
 }
 
@@ -176,7 +224,7 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
     throw new Error(`${sourcePackage.name} does not declare bundled dependencies`);
   }
 
-  const publishManifest = materializePublishManifest(sourcePackage, { workspaceVersions });
+  const publishManifest = materializePublishManifest(sourcePackage, { workspaceVersions, sourceDir });
 
   rmSync(destinationDir, { recursive: true, force: true });
   mkdirSync(destinationDir, { recursive: true });

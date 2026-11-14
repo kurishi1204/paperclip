@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
+  symlinkSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -476,4 +478,33 @@ test("workspace target versions use exact SemVer validation", () => {
   for (const version of ["0.3.1", "1.2.3-alpha.1", "1.2.3-0.1a+build.001", "1.2.3+001"]) {
     assert.equal(materializePublishManifest(pkg, { workspaceVersions: { target: version } }).dependencies.target, version);
   }
+});
+
+
+test("publish executable metadata preserves explicit paths and derives declared source modes", (t) => {
+  const source = mkdtempSync(join(tmpdir(), "publish-executable-"));
+  t.after(() => rmSync(source, { recursive: true, force: true }));
+  mkdirSync(join(source, "dist"));
+  writeFileSync(join(source, "dist/run"), "original bytes");
+  writeFileSync(join(source, "dist/data"), "data");
+  chmodSync(join(source, "dist/run"), 0o755);
+  chmodSync(join(source, "dist/data"), 0o644);
+  const pkg = { name: "owner", version: "1.0.0", files: ["dist"], publishConfig: { main: "./dist/run", executableFiles: ["dist/data"] } };
+  const result = materializePublishManifest(pkg, { sourceDir: source });
+  assert.deepEqual(result.publishConfig, { executableFiles: ["dist/data", "dist/run"] });
+  assert.equal(result.main, "./dist/run");
+  assert.equal(lstatSync(join(source, "dist/data")).mode & 0o777, 0o644);
+  assert.equal(readFileSync(join(source, "dist/run"), "utf8"), "original bytes");
+  assert.deepEqual(materializePublishManifest(pkg).publishConfig, { executableFiles: ["dist/data"] });
+});
+
+test("publish source modes reject missing declarations and symlink or dependency escapes", (t) => {
+  const source = mkdtempSync(join(tmpdir(), "publish-executable-reject-"));
+  t.after(() => rmSync(source, { recursive: true, force: true }));
+  const pkg = { name: "owner", version: "1.0.0", files: ["missing"] };
+  assert.throws(() => materializePublishManifest(pkg, { sourceDir: source }), /ENOENT/);
+  mkdirSync(join(source, "real"));writeFileSync(join(source, "real/run"), "x");
+  symlinkSync(join(source, "real"), join(source, "alias"));
+  for (const entry of ["alias", "alias/run"]) assert.throws(() => materializePublishManifest({ ...pkg, files: [entry] }, { sourceDir: source }), /symlink/);
+  for (const entry of ["../escape", "node_modules/dep/bin", "dist/*", "/absolute"]) assert.throws(() => materializePublishManifest({ ...pkg, files: [entry] }, { sourceDir: source }), /publish path/);
 });
