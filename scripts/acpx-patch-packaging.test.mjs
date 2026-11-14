@@ -25,6 +25,7 @@ import { bundledCliNpmDependencies } from "./cli-bundled-npm-dependencies.mjs";
 import {
   preserveBundledEsbuildExecutables,
   prepareBundledPackage,
+  validateOfflineBundledLock,
   createBundledInstallManifest,
   materializePublishManifest,
   readWorkspaceVersions,
@@ -581,7 +582,7 @@ test("offline producer never removes a destination created after its early check
   const source = join(root, "source"), store = join(root, "store");
   mkdirSync(source); mkdirSync(store); mkdirSync(join(source, "dist"));
   writeFileSync(join(source, "package.json"), JSON.stringify({ name: "race-fixture", version: "1.0.0", files: ["dist"], dependencies: { fixture: "1.0.0" }, bundleDependencies: ["fixture"] }));
-  const lock = join(root, "lock.yaml");writeFileSync(lock, "lockfileVersion: '9.0'\n");
+  const lock = join(root, "lock.yaml");writeFileSync(lock, JSON.stringify({lockfileVersion: "9.0", importers: {".": {dependencies: {fixture: {specifier: "1.0.0", version: "1.0.0"}}}}}));
   const original = childProcess.execFileSync;
   try {
     for (const kind of ["directory", "dangling symlink"]) {
@@ -598,4 +599,19 @@ test("offline producer never removes a destination created after its early check
       else assert.equal(lstatSync(destination).isSymbolicLink(), true);
     }
   } finally { childProcess.execFileSync = original; syncBuiltinESMExports(); }
+});
+
+
+test("offline bundle lock rejects extra importers, local references and dependency mismatches", () => {
+  const manifest = { dependencies: { fixture: "1.0.0" } };
+  const original = { lockfileVersion: "9.0", importers: { ".": { dependencies: { fixture: { specifier: "1.0.0", version: "1.0.0" } } } }, snapshots: { "fixture@1.0.0": {} } };
+  const parse = (value) => validateOfflineBundledLock(Buffer.from(JSON.stringify(value)), manifest);
+  assert.equal(parse(original).importers["."].dependencies.fixture.version, "1.0.0");
+  const extra = structuredClone(original);extra.importers.cli = {};assert.throws(() => parse(extra), /exactly one root/);
+  for (const version of ["link:../other", "workspace:*", "file:../../other.tgz"]) {
+    const local = structuredClone(original);local.snapshots["fixture@1.0.0"].dependencies = { other: version };assert.throws(() => parse(local), /external workspace\/local reference/);
+  }
+  const mismatch = structuredClone(original);mismatch.importers["."].dependencies.fixture.specifier = "^1";assert.throws(() => parse(mismatch), /does not match/);
+  assert.throws(() => validateOfflineBundledLock(Buffer.from("importers: {}\nimporters: {}\n"), manifest), /duplicated mapping key/);
+  assert.throws(() => validateOfflineBundledLock(Buffer.from("lockfileVersion: '9.0'\nimporters: &i {'.': {}}\nextra: *i\n"), {}), /aliases/);
 });

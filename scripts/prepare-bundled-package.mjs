@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
+import { load as loadYaml, JSON_SCHEMA } from "js-yaml";
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -271,6 +272,40 @@ export function preserveBundledEsbuildExecutables(destinationDir) {
   return executableFiles;
 }
 
+// Parse the complete pnpm lock before acquiring a destination or installing.
+export function validateOfflineBundledLock(bytes, installManifest) {
+  const lock = loadYaml(bytes.toString("utf8"), { schema: JSON_SCHEMA });
+  const record = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+  if (!record(lock) || !["9", "9.0"].includes(String(lock.lockfileVersion)) ||
+      !record(lock.importers) || Object.keys(lock.importers).length !== 1 || !Object.hasOwn(lock.importers, ".") ||
+      !record(lock.importers["."])) throw new Error("Offline bundle lock must have exactly one root importer");
+  const seen = new Set();
+  function inspect(value) {
+    if (typeof value === "string" && /(?:^|[@(\s])(?:workspace|link|file):/.test(value)) {
+      throw new Error("Offline bundle lock contains an external workspace/local reference");
+    }
+    if (value !== null && typeof value === "object") {
+      if (seen.has(value)) throw new Error("Offline bundle lock aliases must not form cycles or shared objects");
+      seen.add(value);
+      for (const [key, child] of Object.entries(value)) { inspect(key); inspect(child); }
+    }
+  }
+  inspect(lock);
+  const importer = lock.importers["."];
+  for (const key of Object.keys(importer)) {
+    if (!["dependencies", "optionalDependencies", "devDependencies"].includes(key)) throw new Error(`Unsupported bundle importer field: ${key}`);
+  }
+  for (const section of ["dependencies", "optionalDependencies", "devDependencies"]) {
+    const expected = installManifest[section] ?? {};
+    const actual = importer[section] ?? {};
+    if (!record(actual) || JSON.stringify(Object.keys(actual).sort()) !== JSON.stringify(Object.keys(expected).sort()) ||
+        Object.entries(expected).some(([name, specifier]) => actual[name]?.specifier !== specifier || typeof actual[name]?.version !== "string")) {
+      throw new Error(`Offline bundle lock importer does not match ${section}`);
+    }
+  }
+  return lock;
+}
+
 export function prepareBundledPackage(sourceDir, destinationDir, {
   sourceRoot = repoRoot,
   workspaceVersions = readWorkspaceVersions(sourceRoot),
@@ -302,6 +337,8 @@ export function prepareBundledPackage(sourceDir, destinationDir, {
   }
 
   const publishManifest = materializePublishManifest(sourcePackage, { workspaceVersions, sourceDir });
+  const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
+  if (offlineLock !== undefined) validateOfflineBundledLock(offlineLock, installManifest);
 
   if (offlineLock !== undefined) {
     // Acquire the final path atomically. Never remove a directory or dangling
@@ -320,7 +357,6 @@ export function prepareBundledPackage(sourceDir, destinationDir, {
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
   writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 
   if (offlineLock !== undefined) {
