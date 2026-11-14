@@ -271,7 +271,28 @@ export function preserveBundledEsbuildExecutables(destinationDir) {
   return executableFiles;
 }
 
-export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = repoRoot, workspaceVersions = readWorkspaceVersions(sourceRoot) } = {}) {
+export function prepareBundledPackage(sourceDir, destinationDir, {
+  sourceRoot = repoRoot,
+  workspaceVersions = readWorkspaceVersions(sourceRoot),
+  offlineLockfile,
+  storeDir,
+} = {}) {
+  // Opt-in local distribution mode: never fall back to online npm on failure.
+  // Read the external lock before creating the destination; pnpm checks that
+  // its importer matches the restricted bundled install manifest below.
+  let offlineLock;
+  if (offlineLockfile !== undefined || storeDir !== undefined) {
+    if (typeof offlineLockfile !== "string" || !offlineLockfile || typeof storeDir !== "string" || !storeDir) {
+      throw new Error("Offline bundling requires both offlineLockfile and storeDir");
+    }
+    const rootPackage = JSON.parse(readFileSync(resolve(sourceRoot, "package.json"), "utf8"));
+    if (rootPackage.packageManager !== "pnpm@9.15.4") throw new Error("Offline bundling requires source packageManager pnpm@9.15.4");
+    if (existsSync(destinationDir)) throw new Error("Offline bundle destination must not already exist");
+    if (!lstatSync(offlineLockfile).isFile() || !lstatSync(storeDir).isDirectory()) throw new Error("Offline lock/store must be an existing regular file/directory");
+    offlineLock = readFileSync(offlineLockfile);
+    const version = execFileSync("pnpm", ["--version"], { encoding: "utf8" }).trim();
+    if (version !== "9.15.4") throw new Error(`Expected pnpm 9.15.4, received ${version}`);
+  }
   const sourcePackagePath = resolve(sourceDir, "package.json");
   const sourcePackage = JSON.parse(readFileSync(sourcePackagePath, "utf8"));
   const bundledDependencies = sourcePackage.bundleDependencies ?? sourcePackage.bundledDependencies ?? [];
@@ -296,11 +317,23 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
   writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 
-  execFileSync(
-    "npm",
-    ["install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"],
-    { cwd: destinationDir, stdio: "inherit" },
-  );
+  if (offlineLock !== undefined) {
+    const lockPath = resolve(destinationDir, "pnpm-lock.yaml");
+    writeFileSync(lockPath, offlineLock);
+    execFileSync("pnpm", [
+      "install", "--ignore-workspace", "--offline", "--frozen-lockfile",
+      "--ignore-scripts", "--ignore-pnpmfile", "--prod",
+      "--config.node-linker=hoisted", "--config.auto-install-peers=false",
+      "--store-dir", resolve(storeDir),
+    ], { cwd: destinationDir, stdio: "inherit" });
+    if (!readFileSync(lockPath).equals(offlineLock)) throw new Error("Frozen bundle lock changed during install");
+  } else {
+    execFileSync(
+      "npm",
+      ["install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"],
+      { cwd: destinationDir, stdio: "inherit" },
+    );
+  }
   writeFileSync(deployedPackagePath, `${JSON.stringify(publishManifest, null, 2)}\n`);
   applyBundledDependencyPatches(destinationDir, bundledDependencies, sourceRoot);
 
@@ -350,10 +383,18 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const [sourceDir, destinationDir] = process.argv.slice(2);
+  const [sourceDir, destinationDir, ...flags] = process.argv.slice(2);
+  const options = {};
+  for (let i = 0; i < flags.length; i += 2) {
+    const key = { "--offline-lockfile": "offlineLockfile", "--store-dir": "storeDir" }[flags[i]];
+    if (!key || !flags[i + 1] || flags[i + 1].startsWith("--") || Object.hasOwn(options, key)) {
+      throw new Error(`Unknown, duplicate or incomplete bundle option: ${flags[i]}`);
+    }
+    options[key] = resolve(flags[i + 1]);
+  }
   if (!sourceDir || !destinationDir) {
-    console.error("Usage: prepare-bundled-package.mjs <source-dir> <destination-dir>");
+    console.error("Usage: prepare-bundled-package.mjs <source-dir> <destination-dir> [--offline-lockfile <lockfile> --store-dir <store>]");
     process.exit(1);
   }
-  prepareBundledPackage(resolve(sourceDir), resolve(destinationDir));
+  prepareBundledPackage(resolve(sourceDir), resolve(destinationDir), options);
 }

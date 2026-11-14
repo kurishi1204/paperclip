@@ -23,6 +23,7 @@ import cliEsbuildConfig from "../cli/esbuild.config.mjs";
 import { bundledCliNpmDependencies } from "./cli-bundled-npm-dependencies.mjs";
 import {
   preserveBundledEsbuildExecutables,
+  prepareBundledPackage,
   createBundledInstallManifest,
   materializePublishManifest,
   readWorkspaceVersions,
@@ -545,4 +546,29 @@ test("bundled esbuild rejects corrupt, nonexecutable, mismatched and redirected 
   rmSync(binary);writeFileSync(binary,"synthetic binary bytes");chmodSync(binary,0o755);
   delete esbuild["esbuild.binaryHashes"];writeFileSync(join(root,"node_modules/esbuild/package.json"),JSON.stringify(esbuild));assert.throws(()=>preserveBundledEsbuildExecutables(root),/original binary hashes/);
   assert.deepEqual(readFileSync(join(root,"package.json")),original);
+});
+
+
+test("offline bundled producer rejects incomplete inputs and occupied destinations before mutation", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "offline-bundle-boundary-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const destination = join(root, "owned");
+  mkdirSync(destination);
+  writeFileSync(join(destination, "sentinel"), "original");
+  const base = { workspaceVersions: {} };
+  assert.throws(() => prepareBundledPackage("/unused", destination, { ...base, offlineLockfile: "lock" }), /requires both/);
+  assert.throws(() => prepareBundledPackage("/unused", destination, { ...base, storeDir: "store" }), /requires both/);
+  assert.throws(() => prepareBundledPackage("/unused", destination, { ...base, offlineLockfile: "lock", storeDir: "store" }), /must not already exist/);
+  assert.equal(readFileSync(join(destination, "sentinel"), "utf8"), "original");
+});
+
+test("bundled CLI rejects unknown and duplicate offline options without falling back to npm", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "offline-bundle-options-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const destination = join(root, "new");
+  const script = new URL("./prepare-bundled-package.mjs", import.meta.url).pathname;
+  for (const args of [["--unknown", "x"], ["--offline-lockfile"], ["--store-dir", "a", "--store-dir", "b"]]) {
+    assert.throws(() => execFileSync(process.execPath, [script, "/unused", destination, ...args], { stdio: "pipe" }), /Unknown, duplicate or incomplete/);
+    assert.equal(existsSync(destination), false);
+  }
 });
