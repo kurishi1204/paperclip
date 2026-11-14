@@ -7,7 +7,21 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
-export function materializePublishManifest(pkg) {
+// Read target versions from the release package inventory, never from the owner.
+export function readWorkspaceVersions(sourceRoot = repoRoot) {
+  const entries = JSON.parse(readFileSync(resolve(sourceRoot, "scripts/release-package-manifest.json"), "utf8"));
+  const versions = {};
+  for (const { dir, name } of entries) {
+    const target = JSON.parse(readFileSync(resolve(sourceRoot, dir, "package.json"), "utf8"));
+    if (target.name !== name || Object.hasOwn(versions, name)) {
+      throw new Error(`Workspace package identity mismatch or duplicate: ${name}`);
+    }
+    versions[name] = target.version;
+  }
+  return versions;
+}
+
+export function materializePublishManifest(pkg, { workspaceVersions = {} } = {}) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
 
@@ -21,8 +35,15 @@ export function materializePublishManifest(pkg) {
       Object.entries(publishManifest[section]).map(([name, specifier]) => {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
-        const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${pkg.version}`];
+        if (!["*", "^", "~"].includes(range)) {
+          throw new Error(`Unsupported workspace specifier for ${pkg.name} -> ${name}: ${specifier}`);
+        }
+        const version = Object.hasOwn(workspaceVersions, name) ? workspaceVersions[name] : undefined;
+        if (typeof version !== "string" || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) {
+          throw new Error(`Missing or invalid workspace target version for ${pkg.name} -> ${name}`);
+        }
+        const prefix = range === "*" ? "" : range;
+        return [name, `${prefix}${version}`];
       }),
     );
   }
@@ -136,7 +157,7 @@ export function applyBundledDependencyPatches(destinationDir, bundledDependencie
   }
 }
 
-export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = repoRoot } = {}) {
+export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = repoRoot, workspaceVersions = readWorkspaceVersions(sourceRoot) } = {}) {
   const sourcePackagePath = resolve(sourceDir, "package.json");
   const sourcePackage = JSON.parse(readFileSync(sourcePackagePath, "utf8"));
   const bundledDependencies = sourcePackage.bundleDependencies ?? sourcePackage.bundledDependencies ?? [];
@@ -144,6 +165,8 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   if (bundledDependencies.length === 0) {
     throw new Error(`${sourcePackage.name} does not declare bundled dependencies`);
   }
+
+  const publishManifest = materializePublishManifest(sourcePackage, { workspaceVersions });
 
   rmSync(destinationDir, { recursive: true, force: true });
   mkdirSync(destinationDir, { recursive: true });
@@ -156,7 +179,6 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  const publishManifest = materializePublishManifest(sourcePackage);
   const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
   writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 

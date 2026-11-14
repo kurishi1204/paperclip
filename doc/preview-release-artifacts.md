@@ -15,6 +15,27 @@ dispatch `release.yml`, `docker.yml`, `refresh-lockfile.yml`, or
 `cloud-migrator-artifacts.yml` in this fork: none is registered here. Their
 retained definitions do not provide npm, image-registry, or AWS publication.
 
+## Local packaging version inputs
+
+`materializePublishManifest(pkg, { workspaceVersions })` resolves `workspace:*`,
+`workspace:^`, and `workspace:~` against the named target package version. The
+owner package version is not a fallback: a mixed SDK/shared checkout may have
+independent versions. Missing targets and unsupported workspace syntax (including
+aliases, paths, or explicit ranges) fail before bundled staging removes its
+output directory. Callers can read the original release inventory with
+`readWorkspaceVersions(sourceRoot)`; consumers that deliberately version a
+complete temporary release closure must pass that closure's explicit versions.
+The ordinary release script already versions public packages together before
+packaging. Preview packages already carry exact non-workspace versions.
+
+A local registry-free consumer can install same-source package tarballs through
+pnpm file dependencies/overrides and an independently generated frozen lock.
+Such a consumer must preserve actual versions and tarball provenance; it must not
+replace a missing local package with a registry package or infer deployment from
+`--help`. Dependency lifecycle scripts and native/runtime qualification remain
+separate from manifest generation. This is local preparation, not an additional
+fork publication route.
+
 ## Upstream reference contract
 
 Everything below describes the canonical `paperclipai/paperclip` infrastructure,

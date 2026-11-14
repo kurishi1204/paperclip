@@ -42,6 +42,7 @@ function visit(name) {
  for (const [dependency, version] of Object.entries({...entry.manifest.dependencies, ...entry.manifest.optionalDependencies})) if (version.startsWith('workspace:') || dependency === '@paperclipai/server' && name === 'paperclipai') visit(dependency);
 }
 visit('paperclipai');
+  const workspaceVersions = Object.fromEntries([...needed].map(name => [name, releaseVersion]));
 // Run after the candidate build, including its required standalone adapters.
 for (const name of needed) assert.ok(existsSync(join(repo, packages.get(name).dir, 'dist')), `Missing built public package ${name}`);
 run('bash', [join(repo, 'scripts/prepare-server-ui-dist.sh')], repo);
@@ -57,8 +58,8 @@ for (const [index, name] of [...needed].entries()) {
  }
  const releaseManifest = { ...manifest, version: releaseVersion };
  writeFileSync(join(staged,'package.json'), JSON.stringify(releaseManifest));
- if ((manifest.bundleDependencies ?? manifest.bundledDependencies ?? []).length) prepareBundledPackage(staged,target);
- else { cpSync(staged,target,{recursive:true}); writeFileSync(join(target,'package.json'),JSON.stringify(materializePublishManifest(releaseManifest))); }
+ if ((manifest.bundleDependencies ?? manifest.bundledDependencies ?? []).length) prepareBundledPackage(staged,target,{ workspaceVersions });
+ else { cpSync(staged,target,{recursive:true}); writeFileSync(join(target,'package.json'),JSON.stringify(materializePublishManifest(releaseManifest, { workspaceVersions }))); }
  run('npm',['pack','--ignore-scripts','--pack-destination',assets],target);
  console.log(`Packed ${name}`);
 }

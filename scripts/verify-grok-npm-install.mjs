@@ -30,6 +30,7 @@ try {
     }
   }
   visit('@paperclipai/server');
+  const workspaceVersions = Object.fromEntries([...needed].map(name => [name, releaseVersion]));
   // Match release.sh's unified versioning in temporary staging directories.
   // Source manifests remain untouched, including independently versioned SDKs.
   run(process.execPath, [join(repo, 'scripts/build-standalone-public-packages.mjs')], repo);
@@ -50,10 +51,10 @@ try {
     const releaseManifest = { ...manifest, version: releaseVersion };
     writeFileSync(join(stagedSource, 'package.json'), JSON.stringify(releaseManifest));
     if ((manifest.bundleDependencies ?? manifest.bundledDependencies ?? []).length) {
-      prepareBundledPackage(stagedSource, target);
+      prepareBundledPackage(stagedSource, target, { workspaceVersions });
     } else {
       cpSync(stagedSource, target, { recursive: true });
-      writeFileSync(join(target, 'package.json'), JSON.stringify(materializePublishManifest(releaseManifest)));
+      writeFileSync(join(target, 'package.json'), JSON.stringify(materializePublishManifest(releaseManifest, { workspaceVersions })));
     }
     run('npm', ['pack', '--ignore-scripts', '--pack-destination', root], target);
     const packed = readdirSync(root).filter(f => f.endsWith('.tgz') && !tarballs.includes(join(root, f)));

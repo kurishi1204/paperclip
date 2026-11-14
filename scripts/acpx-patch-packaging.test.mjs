@@ -21,6 +21,7 @@ import { bundledCliNpmDependencies } from "./cli-bundled-npm-dependencies.mjs";
 import {
   createBundledInstallManifest,
   materializePublishManifest,
+  readWorkspaceVersions,
   selectBundledDependencyPatches,
 } from "./prepare-bundled-package.mjs";
 
@@ -153,7 +154,7 @@ test("published packages preserve the patched embedded-postgres runtime", () => 
 });
 
 test("bundled package staging materializes publishConfig entrypoints", () => {
-  const staged = materializePublishManifest(adapterUtilsPackage);
+  const staged = materializePublishManifest(adapterUtilsPackage, { workspaceVersions: readWorkspaceVersions() });
 
   assert.equal(staged.publishConfig, undefined);
   assert.equal(staged.main, "./dist/index.js");
@@ -166,12 +167,12 @@ test("bundled package staging materializes workspace dependency versions", () =>
     name: "@paperclipai/example",
     version: "2026.723.0",
     dependencies: { exact: "workspace:*", caret: "workspace:^", tilde: "workspace:~" },
-  });
+  }, { workspaceVersions: { exact: "1.2.3", caret: "2.3.4", tilde: "3.4.5" } });
 
   assert.deepEqual(staged.dependencies, {
-    exact: "2026.723.0",
-    caret: "^2026.723.0",
-    tilde: "~2026.723.0",
+    exact: "1.2.3",
+    caret: "^2.3.4",
+    tilde: "~3.4.5",
   });
 });
 
@@ -443,4 +444,25 @@ test("installed ACPX runtime persists and restores optional goal capabilities", 
   assert.deepEqual(JSON.parse(JSON.stringify(helpers.restoredGoalCapability(saved))), goal);
   assert.equal(helpers.persistedGoalCapability({ ...goal, version: 2 }), undefined);
   assert.equal(helpers.persistedGoalCapability({ ...goal, actions: ["set"] }), undefined);
+});
+
+
+test("mixed source SDK resolves the actual shared version without mutating inputs", () => {
+  const sdk = JSON.parse(readFileSync(new URL("../packages/plugins/sdk/package.json", import.meta.url), "utf8"));
+  const versions = readWorkspaceVersions();
+  const before = structuredClone(sdk);
+  const published = materializePublishManifest(sdk, { workspaceVersions: versions });
+  assert.equal(published.dependencies["@paperclipai/shared"], versions["@paperclipai/shared"]);
+  assert.deepEqual(sdk, before);
+});
+
+test("workspace target evidence is required in every published dependency section", () => {
+  for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+    const pkg = { name: "owner", version: "9.0.0", [section]: { target: "workspace:*" } };
+    assert.throws(() => materializePublishManifest(pkg), /Missing or invalid workspace target/);
+    assert.equal(materializePublishManifest(pkg, { workspaceVersions: { target: "1.2.3-beta.1" } })[section].target, "1.2.3-beta.1");
+    for (const value of ["workspace:other@*", "workspace:../other", "workspace:^1.2.3", "workspace:"]) {
+      assert.throws(() => materializePublishManifest({ ...pkg, [section]: { target: value } }, { workspaceVersions: { target: "1.2.3" } }), /Unsupported workspace specifier/);
+    }
+  }
 });
