@@ -1,4 +1,4 @@
-import { hasDocumentReturn, readDocumentReturnPacket, readCurrentDocumentReturnWake, readDocumentReturnDelivery } from "../document-return-wake.js";
+import { readIssueDocumentReturnFollowthrough, hasDocumentReturn, readDocumentReturnPacket, readCurrentDocumentReturnWake, readDocumentReturnDelivery } from "../document-return-wake.js";
 import { consumeDocumentReturn, documentReturnBody, documentReturnKey } from "../document-return-contract.js";
 import { parseDocumentInclusions, composeIncludedDocuments, assertIncludedDocumentReadback, type InclusionSource } from "./document-inclusion.js";
 import { documentReadResult } from "./document-read-receipt.js";
@@ -570,6 +570,7 @@ export class PaperclipRunnerToolAuthority {
           acceptedPlan: await this.#acceptedPlan(context.run.contextSnapshot),
           sourcePlanApproval: await handoffPlanContext(this.db, context.issue),
           childReviewOutcomes: await childReviewOutcomes(this.db, this.binding.companyId, this.binding.issueId),
+          documentReturnFollowthrough: await readIssueDocumentReturnFollowthrough(this.db, this.binding),
           ...(hasDocumentReturn(context.run.contextSnapshot) ? {
             documentReturn: await readDocumentReturnPacket(this.db, { ...this.binding, contextSnapshot: record(context.run.contextSnapshot) }),
           } : {}),

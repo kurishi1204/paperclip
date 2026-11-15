@@ -1,4 +1,4 @@
-import {commitDocumentReturn,documentReturnGate,isDocumentReturnContext} from "../services/document-return-contract.js";
+import {assessDocumentReturn,commitDocumentReturn,documentReturnGate,isDocumentReturnContext} from "../services/document-return-contract.js";
 import { describe, expect, it } from "vitest";
 import { bindDocumentReturn, consumeDocumentReturn, documentReturnBody, documentReturnKey, type DocumentReturnFacts, type DocumentReturnDelivery, documentReturnRunMatches } from "../services/document-return-contract.js";
 import { allowsIssueInteractionWake } from "../modules/run-dispatch/domain/wake-context.js";
@@ -87,7 +87,10 @@ describe("bounded server admission and original return commit consumer",()=>{
   const port={binding:b,expected:b,runId:id(30),readDelivery:async()=>delivery,
     append:async(body:string)=>{expect(body).toBe(comment.body);writes++;return comment},
     saveReceipt:async(key:string,receipt:Record<string,unknown>)=>{saves++;expect(key).toBe(documentReturnKey(b));
-      const r=receipt.result as any;delivery={state:"committed",binding:r.documentReturn,comment,runId:id(30),acknowledgment:r.documentReturnAck}}};
+      const r=receipt.result as any;delivery={state:"committed",binding:r.documentReturn,comment,runId:id(30),acknowledgment:r.documentReturnAck};
+      expect(r.documentReturnEvaluation).toEqual(assessDocumentReturn({expected:b,current:b,delivery}));
+      expect(r.documentReturnEvaluation).toMatchObject({eventKey:documentReturnKey(b),state:"company_receipt_unconfirmed",
+        companyAccepted:false,knowledgeAdopted:false,recurrenceEffectiveness:"unverified",authorizesEffect:false})}};
   expect(await commitDocumentReturn(port)).toMatchObject({disposition:"applied",companyAccepted:false});
   expect(await commitDocumentReturn(port)).toMatchObject({state:"already_returned",maySend:false});
   expect({writes,saves}).toEqual({writes:1,saves:1});
@@ -109,3 +112,12 @@ describe("bounded server admission and original return commit consumer",()=>{
 });
 
 it("does not promote the original plan confirmation into document return authority",()=>{const f=facts();(f.interaction.payload as any).target.key="plan";f.document!.key="plan";expect(bindDocumentReturn(f,id(3))).toBeNull();});
+
+it("keeps missing, unknown and mismatched return evidence distinct without granting replay",()=>{
+ const {b}=ready();const assess=(delivery:DocumentReturnDelivery)=>assessDocumentReturn({expected:b,current:b,delivery});
+ const pending=assess({state:"not_started"});expect(pending).toMatchObject({state:"return_unperformed",eventKey:documentReturnKey(b),authorizesEffect:false});
+ expect(assess({state:"not_started"})).toEqual(pending);
+ expect(assess({state:"unknown"})).toMatchObject({state:"held",reason:"document_return_outcome_unknown",evidence:null});
+ expect(assessDocumentReturn({expected:{...b,revisionId:id(99)},current:b,delivery:{state:"not_started"}}))
+  .toMatchObject({state:"held",eventKey:null,nextActorId:null,evidence:null});
+});

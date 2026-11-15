@@ -102,6 +102,32 @@ export function consumeDocumentReturn(input: {
     dependenciesReady:input.dependenciesReady,companyAccepted:false as const};
 }
 
+/** Evaluate the actual fixed return evidence at the existing commit/read boundary.
+ * Re-reading the event keeps its identity. A stored comment is not company
+ * acceptance, knowledge adoption or evidence that the next job improved. */
+export function assessDocumentReturn(input: {
+  expected: unknown; current: DocumentReturnBinding | null; delivery: DocumentReturnDelivery;
+}) {
+  const packet = consumeDocumentReturn({...input, operation:"return", dependenciesReady:false});
+  const b = input.current;
+  return {
+    schema:"paperclip.document-return-evaluation.v1" as const,
+    eventKey:b && sameDocumentReturn(input.expected,b) ? documentReturnKey(b) : null,
+    state:packet.state === "ready" ? "return_unperformed" as const
+      : packet.state === "already_returned" ? "company_receipt_unconfirmed" as const
+      : "held" as const,
+    reason:packet.state === "rejected" ? packet.reason : null,
+    evidence:packet.state === "already_returned" ? {commentId:packet.commentId,
+      interactionId:b!.interactionId, revisionId:b!.revisionId, reviewerId:b!.reviewerId,
+      reviewRunId:b!.reviewRunId, sourceRunId:b!.sourceRunId} : null,
+    nextActorId:b && sameDocumentReturn(input.expected,b) ? b.authorId : null,
+    companyAccepted:false as const, knowledgeAdopted:false as const,
+    recurrenceEffectiveness:"unverified" as const,
+    // This projection never authorizes sending, retrying or resuming a run.
+    authorizesEffect:false as const,
+  };
+}
+
 /** Ordinary queue records precede native preparation; only the claim boundary
  * accepts that exact original shape. Tools/execution still require native binding. */
 export function documentReturnRunMatches(run: {
@@ -153,6 +179,8 @@ export async function commitDocumentReturn(port: {
   await port.saveReceipt(packet.idempotencyKey,{operationId:"report_progress",
     input:{body:packet.body,idempotencyKey:packet.idempotencyKey},
     result:{commentId:comment.id,documentReturn:port.binding,
-      documentReturnAck:{...acknowledgment,scope:"durable_storage_only"},companyAccepted:false}});
+      documentReturnAck:{...acknowledgment,scope:"durable_storage_only"},companyAccepted:false,
+      documentReturnEvaluation:assessDocumentReturn({expected:port.expected,current:port.binding,
+        delivery:{state:"committed",binding:port.binding,comment,runId:port.runId,acknowledgment}})}});
   return {...checked,disposition:"applied" as const};
 }

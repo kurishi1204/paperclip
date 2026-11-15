@@ -1,3 +1,4 @@
+import { collectDocumentReturnSupervision, readIssueDocumentReturnFollowthrough } from "./document-return-wake.js";
 import { createHash } from "node:crypto";
 import { and, asc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -18,6 +19,7 @@ import {
 import type { IssueWatchdog, IssueWatchdogSummary } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import { parseObject } from "../adapters/utils.js";
+import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { issueService } from "./issues.js";
@@ -1540,12 +1542,20 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       },
     });
 
-    const context = watchdogWakeContext({
+    // Enrich only an already-authorized existing watchdog handoff. This read
+    // never enables a watchdog, changes classification or schedules recovery.
+    const documentReturnFollowthrough = await Promise.all(classification.stoppedLeaves
+      .filter(leaf => leaf.assigneeAgentId !== null)
+      .map(leaf => readIssueDocumentReturnFollowthrough(db, {
+        companyId:watchdog.companyId,issueId:leaf.issueId,agentId:leaf.assigneeAgentId!,
+      })));
+    const context = {...watchdogWakeContext({
       watchdog,
       watchdogIssue,
       sourceIssue,
       classification,
-    });
+    })};
+    Object.assign(context.taskWatchdog, {documentReturnFollowthrough});
     const wake = deps.enqueueWakeup
       ? await deps.enqueueWakeup(watchdog.watchdogAgentId, {
         source: "automation",
@@ -1744,7 +1754,24 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         );
         rows = rows.filter((row) => eligibleIssueIds.has(row.issueId));
       }
+      // Assess every already-watched issue, including live/reviewed branches.
+      // No classifier, wake admission, watchdog setting or fingerprint changes.
+      const followthroughTargets = [];
+      for (const row of rows) {
+        const subtree = await loadWatchdogSubtreeIssues(row.companyId, row.issueId);
+        for (const issue of subtree) {
+          followthroughTargets.push({companyId:row.companyId,issueId:issue.id,agentId:issue.assigneeAgentId});
+        }
+      }
+      const documentReturnSupervision = await collectDocumentReturnSupervision(db, followthroughTargets);
+      // Publish before effectful reconciliation: a later failure must not erase
+      // the read-only assessment. Original errors still propagate unchanged.
+      if (documentReturnSupervision.attentionRequired) {
+        logger.warn({ documentReturnSupervision },
+          "document-return supervision requires attention; read-only, no retry authority");
+      }
       const result = {
+        documentReturnSupervision,
         checked: 0,
         triggered: 0,
         live: 0,

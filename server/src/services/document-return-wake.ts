@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, issueThreadInteractions, issues, documents, documentRevisions, issueDocuments, issueComments, type Db } from "@paperclipai/db";
-import { bindDocumentReturn, consumeDocumentReturn, documentReturnKey, sameDocumentReturn, type DocumentReturnBinding, type DocumentReturnDelivery, documentReturnRunMatches } from "./document-return-contract.js";
+import { assessDocumentReturn, bindDocumentReturn, consumeDocumentReturn, documentReturnKey, sameDocumentReturn, type DocumentReturnBinding, type DocumentReturnDelivery, documentReturnRunMatches } from "./document-return-contract.js";
 const object = (v: unknown): Record<string, unknown> => v && typeof v === "object" && !Array.isArray(v) ? v as Record<string,unknown> : {};
 
 /** Read-only adapter. Caller must hold the ordinary issue/run locks when admitting
@@ -100,6 +100,98 @@ export async function readDocumentReturnDelivery(db:Db,b:DocumentReturnBinding,r
 export async function readDocumentReturnPacket(db:Db,input:Parameters<typeof readCurrentDocumentReturnWake>[1]) {
   const b=await readCurrentDocumentReturnWake(db,input);
   if (!b || !input.runId) return null;
-  return consumeDocumentReturn({expected:input.contextSnapshot.documentReturn,current:b,
-    delivery:await readDocumentReturnDelivery(db,b,input.runId),operation:"return",dependenciesReady:false});
+  const facts={expected:input.contextSnapshot.documentReturn,current:b,
+    delivery:await readDocumentReturnDelivery(db,b,input.runId)};
+  return {...consumeDocumentReturn({...facts,operation:"return",dependenciesReady:false}),
+    evaluation:assessDocumentReturn(facts)};
+}
+
+/** Supervisor/owner read model, never an admission or a recovery command.
+ * Uses original accepted interactions and exact queue/terminal storage receipts;
+ * no wake absence, elapsed time or stored projection can grant retry authority. */
+export async function readIssueDocumentReturnFollowthrough(db:Db,input:{
+  companyId:string;issueId:string;agentId:string;
+}) {
+  const cards=await db.select().from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.companyId,input.companyId),eq(issueThreadInteractions.issueId,input.issueId),
+    eq(issueThreadInteractions.kind,"request_confirmation"),eq(issueThreadInteractions.status,"accepted")));
+  const events=[];
+  for(const card of cards) {
+    const target=object(object(card.payload).target);
+    if(target.type!=="issue_document" || target.key==="plan" || !card.addresseeAgentId || card.addresseeUserId) continue;
+    const b=await readDocumentReturnBinding(db,{...input,interactionId:card.id});
+    const base={interactionId:card.id,revisionId:typeof target.revisionId==="string"?target.revisionId:null,
+      eventKey:b?documentReturnKey(b):null,nextActorId:b?b.authorId:null,
+      authorizesEffect:false as const,mayResend:false as const,companyAccepted:false as const,
+      knowledgeAdopted:false as const,effectiveness:"unverified" as const};
+    if(!b){events.push({...base,state:"held",reason:"fixed_document_binding_invalid"});continue;}
+    const wakes=await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId,b.companyId),eq(agentWakeupRequests.agentId,b.authorId),
+      eq(agentWakeupRequests.idempotencyKey,`interaction:${b.interactionId}:accepted`)));
+    if(wakes.length===0){events.push({...base,state:"held",reason:"no_original_return_admission"});continue;}
+    const wake=wakes[0];
+    if(wakes.length!==1 || wake.requestedByActorType!=="agent" || wake.requestedByActorId!==b.reviewerId ||
+      !sameDocumentReturn(object(wake.payload).documentReturn,b)){
+      events.push({...base,state:"held",reason:"original_wake_binding_conflict"});continue;
+    }
+    if(!wake.runId){
+      const pending=["queued","deferred_issue_execution"].includes(wake.status);
+      events.push({...base,wakeupId:wake.id,wakeStatus:wake.status,state:pending?"handoff_pending":"held",
+        reason:pending?"recorded_wake_without_run":"terminal_or_unknown_wake_without_run"});continue;
+    }
+    const [run]=await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,wake.runId),
+      eq(heartbeatRuns.companyId,b.companyId),eq(heartbeatRuns.agentId,b.authorId)));
+    if(!run || run.wakeupRequestId!==wake.id || run.retryOfRunId ||
+      object(run.contextSnapshot).issueId!==b.issueId || !sameDocumentReturn(object(run.contextSnapshot).documentReturn,b)){
+      events.push({...base,wakeupId:wake.id,state:"held",reason:"original_run_binding_conflict"});continue;
+    }
+    const delivery=await readDocumentReturnDelivery(db,b,run.id);
+    const evaluated=assessDocumentReturn({expected:b,current:b,delivery});
+    const saved=evaluated.state==="company_receipt_unconfirmed";
+    const active=["queued","running"].includes(run.status) && ["queued","claimed"].includes(wake.status);
+    events.push({...base,wakeupId:wake.id,runId:run.id,runStatus:run.status,wakeStatus:wake.status,
+      state:saved?"effect_unconfirmed":active && delivery.state==="not_started"?"processing":"held",
+      reason:saved?"exact_return_saved_company_ACK_not_bound":active && delivery.state==="not_started"?"original_run_active":evaluated.reason??"terminal_without_exact_return_receipt",
+      evidenceSaved:saved,evaluation:evaluated});
+  }
+  return {schema:"paperclip.document-return-followthrough.v1" as const,companyId:input.companyId,issueId:input.issueId,
+    events,coverage:"accepted_named_document_QA_only" as const,
+    // No matching event is not proof of no business, approval or permissions.
+    absence:events.length===0?"no_matching_QA_event" as const:null,
+    deadline:null,stale:"not_configured" as const,authorizesEffect:false as const};
+}
+
+/** Periodic read-only assessment for the already configured watchdog scope.
+ * Missing evidence is visible without requiring the ordinary stop classifier to
+ * trigger a wake. This result neither schedules work nor acknowledges delivery.
+ * Time-based staleness is deliberately unconfigured; binding is re-read now. */
+export async function collectDocumentReturnSupervision(db:Db, targets: readonly {
+  companyId:string;issueId:string;agentId:string|null;
+}[]) {
+  const observations: {
+    companyId:string;issueId:string;state:"readable"|"unreadable"|"owner_unavailable";
+    assessment?:Awaited<ReturnType<typeof readIssueDocumentReturnFollowthrough>>;
+  }[]=[];
+  const seen=new Set<string>();
+  for(const target of targets) {
+    const key=JSON.stringify([target.companyId,target.issueId]);
+    if(seen.has(key)) continue;
+    seen.add(key);
+    if(!target.agentId) {
+      observations.push({companyId:target.companyId,issueId:target.issueId,state:"owner_unavailable"});
+      continue;
+    }
+    try {
+      const assessment=await readIssueDocumentReturnFollowthrough(db,{...target,agentId:target.agentId});
+      observations.push({companyId:target.companyId,issueId:target.issueId,state:"readable",assessment});
+    } catch {
+      // Do not leak DB diagnostics or misreport a failed read as zero events.
+      observations.push({companyId:target.companyId,issueId:target.issueId,state:"unreadable"});
+    }
+  }
+  return {schema:"paperclip.document-return-supervision.v1" as const,
+    observations,attentionRequired:observations.some(o=>o.state!=="readable" ||
+      o.assessment!.events.some(e=>e.state!=="processing")),
+    coverage:observations.length===0?"no_watched_issues" as const:"configured_watchdog_scope_only" as const,
+    deadline:null,stale:"not_configured" as const,authorizesEffect:false as const,mayResend:false as const};
 }
