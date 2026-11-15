@@ -336,6 +336,7 @@ export class CapabilitySemanticDispatcher {
           expectedVersionId: requiredString(input.expectedVersionId), markdown: requiredString(input.markdown) };
         break;
       case "write_document":
+        if (input.append !== undefined) throw new Error("document_append_requires_native_tool_authority");
         if (input.includeDocuments !== undefined) {
           throw new Error("document_inclusion_requires_native_tool_authority");
         }

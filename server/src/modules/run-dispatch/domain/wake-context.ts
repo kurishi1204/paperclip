@@ -85,6 +85,9 @@ export function allowsIssueInteractionWake(
   contextSnapshot: Record<string, unknown> | null | undefined,
   allowedWakeReasons: ReadonlySet<string>,
 ): boolean {
+  // A fixed QA return is not a comment alias. A forged/mixed context must not
+  // borrow comment admission while its dedicated authority is being checked.
+  if (contextSnapshot && Object.hasOwn(contextSnapshot, "documentReturn")) return false;
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (!wakeReason || !allowedWakeReasons.has(wakeReason)) return false;
   return Boolean(deriveCommentId(contextSnapshot));

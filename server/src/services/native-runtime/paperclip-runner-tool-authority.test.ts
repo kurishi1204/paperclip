@@ -998,6 +998,47 @@ describe("PaperclipRunnerToolAuthority", () => {
     ).rejects.toThrow("paperclip_runner_tool_idempotency_conflict");
   });
 
+  it("appends a raw suffix through the native writer with persisted digest and replay safety", async () => {
+    const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+    const svc = documentService(db), key = "append-synthetic";
+    const body = "  合成元本文😀e\u0301\r\n旧一語を保持\n".repeat(1800);
+    const append = "\r\n## 追加\n空白とliteral \\n を保持  \n";
+    const initial = await authority.execute({ tool: "write_document", callId: "append-create",
+      arguments: { idempotencyKey: "append-create", key, title: "Synthetic", body, baseRevisionId: null } }) as any;
+    try {
+      const input = { idempotencyKey: "append-save", key, title: "Synthetic", append,
+        baseRevisionId: initial.document.latestRevisionId };
+      const saved = await authority.execute({ tool: "write_document", callId: "append-first", arguments: input }) as any;
+      const expected = Buffer.concat([Buffer.from(initial.document.body), Buffer.from(append)]);
+      expect(Buffer.from(saved.document.body)).toEqual(expected);
+      expect(saved.document.id).toBe(initial.document.id);
+      expect((await svc.getIssueDocumentByKey(issueId, key))!.body).toBe(expected.toString());
+      const digest = await svc.getIssueDocumentRevisionDigest({ companyId, issueId, key,
+        revisionId: saved.document.latestRevisionId });
+      expect(digest).toMatchObject({ bodyBytes: expected.length,
+        bodySha256: createHash("sha256").update(expected).digest("hex") });
+      expect(saved.appendReceipt).toMatchObject({ ...digest, mode: "append", baseRevisionId: input.baseRevisionId,
+        appendedBytes: Buffer.byteLength(append) });
+      expect(await authority.execute({ tool: "write_document", callId: "append-replay", arguments: input })).toEqual(saved);
+      expect(await svc.listIssueDocumentRevisions(issueId, key)).toHaveLength(2);
+      await expect(authority.execute({ tool: "write_document", callId: "append-conflict",
+        arguments: { ...input, append: "different" } })).rejects.toThrow("idempotency_conflict");
+      await expect(authority.execute({ tool: "write_document", callId: "append-stale",
+        arguments: { ...input, idempotencyKey: "append-stale" } })).rejects.toThrow("updated by someone else");
+      await expect(authority.execute({ tool: "write_document", callId: "append-ambiguous",
+        arguments: { ...input, idempotencyKey: "append-ambiguous", body: "rewrite" } })).rejects.toThrow();
+      await expect(authority.execute({ tool: "write_document", callId: "append-missing",
+        arguments: { ...input, idempotencyKey: "append-missing", key: "append-absent" } })).rejects.toThrow("does not exist");
+      await expect(authority.execute({ tool: "write_document", callId: "append-limit",
+        arguments: { ...input, idempotencyKey: "append-limit", baseRevisionId: saved.document.latestRevisionId,
+          append: "😀".repeat(50_000) } })).rejects.toThrow("200000 UTF-8 bytes");
+      await db.update(documents).set({ lockedAt: new Date() }).where(eq(documents.id, initial.document.id));
+      await expect(authority.execute({ tool: "write_document", callId: "append-locked",
+        arguments: { ...input, idempotencyKey: "append-locked", baseRevisionId: saved.document.latestRevisionId } })).rejects.toThrow("locked");
+      expect(await svc.listIssueDocumentRevisions(issueId, key)).toHaveLength(2);
+    } finally { await db.delete(documents).where(eq(documents.id, initial.document.id)); }
+  });
+
   it("embeds fixed same-task source bytes and replays the original saved receipt after source changes", async () => {
     const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
     const svc = documentService(db), key = "inclusion-source", targetKey = "inclusion-check";

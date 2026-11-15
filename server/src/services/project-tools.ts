@@ -6,7 +6,9 @@ import { badRequest } from "../errors.js";
 export const PROJECT_TOOL_NAMES = ["create_project", "list_project_repositories", "list_projects"];
 export { SELF_TASK_DOCUMENT_CONTEXT_KEY } from "./self-task-document-runtime.js";
 const readSelfTaskSchema = z.object({ key: issueDocumentKeySchema, revisionId: z.string().uuid().optional() }).strict();
-const writeSelfTaskSchema = upsertIssueDocumentSchema.extend({
+const writeSelfTaskSchema = upsertIssueDocumentSchema.safeExtend({
+  body: upsertIssueDocumentSchema.shape.body.unwrap(),
+  append: z.never().optional(),
   key: issueDocumentKeySchema,
   documentId: z.string().uuid().nullable(),
   baseRevisionId: z.string().uuid().nullable(),

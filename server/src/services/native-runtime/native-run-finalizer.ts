@@ -1,3 +1,4 @@
+import { hasDocumentReturn } from "../document-return-wake.js";
 import { isNativePlanWaitResult, readNativePlanWait } from "./native-plan-wait.js";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
 import { hasPendingNativeChildCompletion } from "./native-child-completion-delivery.js";
@@ -1308,6 +1309,7 @@ export async function finalizeNativeRun(input: {
     const hasPendingChildCompletion = !reviewContext && !isDocumentReview &&
       await hasPendingNativeChildCompletion(input.db, childCompletionRecipient);
     const proposedDecision = resolveNativeFinalizerStatus({
+      fixedDocumentReturn: hasDocumentReturn(run.contextSnapshot),
       planWaitAuthorized: planWait !== null,
       hasPendingChildCompletion,
       providerModelRejected: providerFailure?.errorCode === "native_provider_model_rejected" && ownsProviderFailureDecision,

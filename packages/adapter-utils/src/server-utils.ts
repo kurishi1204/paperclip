@@ -856,6 +856,7 @@ type PaperclipWakePayload = {
   // Experimental: write user-interaction content in ASD-STE100 Simplified
   // Technical English with brief decision context.
   simplifiedEnglishInteractions: boolean;
+  documentReturn: boolean;
   dependencyBlockedInteraction: boolean;
   treeHoldInteraction: boolean;
   activeTreeHold: PaperclipWakeTreeHoldSummary | null;
@@ -1916,6 +1917,7 @@ export function normalizePaperclipWakePayload(
       payload.simplifiedEnglishInteractions,
       false,
     ),
+    documentReturn: Object.hasOwn(payload, "documentReturn"),
     dependencyBlockedInteraction: asBoolean(
       payload.dependencyBlockedInteraction,
       false,
@@ -2705,6 +2707,9 @@ function renderPaperclipWakePromptBody(
     lines.push(
       "- interaction language (experimental): write every user interaction you post (request_confirmation, ask_user_questions, suggest_tasks, checkbox prompts and options, and any other content rendered inside an interaction block) in ASD-STE100 Simplified Technical English. In each interaction, briefly tell the user what information they need to make the decision and what happens for each choice. This applies only to interaction content — write your thinking, comments, documents, and other responses in your usual style.",
     );
+  }
+  if (normalized.documentReturn) {
+    lines.push("- fixed document return: read get_task_context.documentReturn; use only its exact body and idempotencyKey with report_progress. A storage acknowledgment is not company acceptance. Do not execute deliverable work, change the document, remove blockers, or invent a comment ID.");
   }
   if (normalized.dependencyBlockedInteraction) {
     lines.push("- dependency-blocked interaction: yes");

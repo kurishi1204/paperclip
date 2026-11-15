@@ -1,3 +1,4 @@
+import { hasDocumentReturn, readCurrentDocumentReturnWake } from "../document-return-wake.js";
 import { CURSOR_DISTRIBUTION_PINS, QUALIFIED_ACPX_PROFILES, QUALIFIED_ACPX_VERSION } from "../../vendor/paperclip-runner/index.js";
 import { isProviderMode } from "../../vendor/paperclip-runner/index.js";
 import { bundledRemoteProviderPackManifestPath, bundledRemoteRunnerBinary } from "../../vendor/paperclip-runner/index.js";
@@ -7358,6 +7359,9 @@ export async function executePaperclipNativeSession(input: {
     },
   ) => Promise<unknown>;
 }): Promise<AdapterExecutionResult> {
+  const [returnScope]=await input.db.select({contextSnapshot:heartbeatRuns.contextSnapshot}).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.id,input.execution.binding.runId),eq(heartbeatRuns.companyId,input.execution.binding.companyId)));
+  if (hasDocumentReturn(returnScope?.contextSnapshot)) throw new Error("document_return_server_executor_only");
   const agentKeyId = input.runnerEnvironment?.PAPERCLIP_AGENT_KEY_ID;
   if (agentKeyId) {
     // Recovered pre-upgrade inputs also need the current public identity marker
@@ -10883,6 +10887,10 @@ async function createRunnerdBackendWithinSessionClaim(
   if (isDocumentReview && !documentReview) {
     throw new Error("native_document_review_assignment_no_longer_available");
   }
+  const documentReturn = hasDocumentReturn(reviewRun?.contextSnapshot);
+  if (documentReturn && !await readCurrentDocumentReturnWake(input.db, {
+    ...input.execution.binding, contextSnapshot: reviewRun?.contextSnapshot ?? {},
+  })) throw new Error("native_document_return_binding_no_longer_available");
   const nativeReview = readNativeReviewAssignmentContext(reviewRun?.contextSnapshot);
   if (nativeReview && !await getNativeReviewAssignment(input.db, {
     ...input.execution.binding, contextSnapshot: nativeReview,
@@ -10904,7 +10912,7 @@ async function createRunnerdBackendWithinSessionClaim(
   if (relayAssignedMcp && hasAssignedMcp && !assignedGatewayPublicId) {
     throw new Error("assigned native MCP gateway path is invalid");
   }
-  const assignedMcpTools = relayAssignedMcp && !nativeReview && !documentReview && assignedMcpUrl && assignedMcpToken
+  const assignedMcpTools = relayAssignedMcp && !nativeReview && !documentReview && !documentReturn && assignedMcpUrl && assignedMcpToken
     ? await createAssignedMcpTools({
         gateway: getAssignedMcpGateway(input.db),
         gatewayPublicId: assignedGatewayPublicId!,
@@ -10913,6 +10921,7 @@ async function createRunnerdBackendWithinSessionClaim(
       })
     : undefined;
   const authority = new PaperclipRunnerToolAuthority(input.db, {
+    documentReturn,
     ...(nativeReview ? { nativeReview } : {}),
     ...(documentReview ? { documentReviewInteractionId: documentReview.interaction.id } : {}),
     connectorAssignments: connectorAssignments.filter((assignment) => pinnedSkills.has(assignment.skillKey)),

@@ -1964,3 +1964,23 @@ This receipt is not an agent's own calculation, a provider attestation, a QA
 verdict, or proof that the agent understood the document. A reviewer must still
 check the content and the requested revision. The existing persisted-revision
 digest API remains separate and unchanged. No read permission is added.
+
+
+### Exact append through the document writer
+
+Native `write_document` and the issue-document PUT route accept `append` instead
+of `body`, with the exact current `baseRevisionId`. The suffix is nonempty raw
+Unicode text (no NUL or isolated surrogate); it is not trimmed, normalized, or
+joined with an implicit newline. The server locks the owning issue before reading
+the base and stores the old body followed by that suffix in the same transaction.
+The complete append result must fit 200,000 UTF-8 bytes. Existing full replacement
+limits and normalization are unchanged. Missing, stale, or locked documents fail;
+append never takes the locked-document create-new fallback.
+
+`body` and `append` are exclusive. Append cannot include `includeDocuments`;
+fixed source inclusion remains a separate replacement feature. Native append
+returns an `appendReceipt` (version 1) with the exact base revision, suffix byte
+count, and original persisted-revision digest/readback. It uses the existing
+company/actor/task binding and mutation idempotency receipt; it does not authorize
+replaying an unknown result. Self-task and mock scenario writers remain replacement
+only and reject append. This is a storage receipt, not provider or business proof.

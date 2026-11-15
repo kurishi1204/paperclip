@@ -165,6 +165,23 @@ describe("agent auth middleware", () => {
   const originalTtl = process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS;
   const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
 
+  it("bounded return JWT and API-key run cannot reach any HTTP route",async()=>{
+    const agentId=randomUUID(),companyId=randomUUID(),runId=randomUUID();
+    for (const kind of ["jwt","key"] as const) {
+      const token=kind === "jwt" ? createLocalAgentJwt(agentId,companyId,"paperclip_runner",runId)! : "bounded-key";
+      const {db}=createDbState({agent:{id:agentId,companyId},
+        ...(kind === "key" ? {agentKey:{id:randomUUID(),agentId,companyId,keyHash:hashToken(token)}}:{}),
+        run:{id:runId,companyId,agentId,contextSnapshot:{documentReturn:{malformed:true}}}});
+      for(const method of ["GET","POST","PATCH","DELETE"]) {
+        const req={method,originalUrl:"/api/issues/any",header:(key:string)=>key==="authorization" ? `Bearer ${token}` : key==="x-paperclip-run-id" ? runId : undefined};
+        let error:any;
+        await actorMiddleware(db,{deploymentMode:"authenticated",resolveSession:async()=>null})(req as any,{} as any,(e?:unknown)=>{error=e});
+        expect(error?.status).toBe(403);
+        expect(error?.details?.code).toBe("document_return_server_executor_only");
+      }
+    }
+  });
+
   beforeEach(() => {
     process.env.PAPERCLIP_AGENT_JWT_SECRET = "auth-middleware-secret";
     process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS = "3600";

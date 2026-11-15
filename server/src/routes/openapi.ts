@@ -453,6 +453,7 @@ function zodToOpenApiSchema(schema: z.ZodTypeAny): JsonSchema {
     return jsonSchema;
   }
 
+  if (typeName === "never") return { not: {} };
   if (typeName === "boolean") return { type: "boolean" };
   if (typeName === "date") return { type: "string", format: "date-time" };
   if (typeName === "any" || typeName === "unknown") return {};
@@ -4361,7 +4362,15 @@ registry.registerPath({
   summary: "Upsert an issue document",
   request: {
     params: z.object({ id: z.string(), key: z.string() }),
-    body: jsonBody(upsertIssueDocumentSchema),
+    body: jsonBody(z.union([
+      upsertIssueDocumentSchema.safeExtend({
+        body: upsertIssueDocumentSchema.shape.body.unwrap(), append: z.never().optional(),
+      }),
+      upsertIssueDocumentSchema.safeExtend({
+        body: z.never().optional(), append: upsertIssueDocumentSchema.shape.append.unwrap(),
+        baseRevisionId: z.string().guid(),
+      }),
+    ])),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });

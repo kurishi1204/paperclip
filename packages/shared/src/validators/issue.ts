@@ -2230,9 +2230,18 @@ export const issueDocumentFormatSchema = z.enum(ISSUE_DOCUMENT_FORMATS);
 export const upsertIssueDocumentSchema = z.object({
   title: z.string().trim().max(200).nullable().optional(),
   format: issueDocumentFormatSchema,
-  body: multilineTextSchema.pipe(z.string().max(524288)),
+  body: multilineTextSchema.pipe(z.string().max(524288)).optional(),
+  append: z.string().min(1).max(200_000).regex(/^[^\u0000\uD800-\uDFFF]*$/u, "Append must be valid Unicode text without NUL").optional(),
+  includeDocuments: z.never().optional(),
   changeSummary: z.string().trim().max(500).nullable().optional(),
   baseRevisionId: z.string().guid().nullable().optional(),
+}).superRefine((input, ctx) => {
+  if ((input.body !== undefined) === (input.append !== undefined)) {
+    ctx.addIssue({ code: "custom", message: "Supply exactly one of body or append", path: ["append"] });
+  }
+  if (input.append !== undefined && !input.baseRevisionId) {
+    ctx.addIssue({ code: "custom", message: "Append requires the exact baseRevisionId", path: ["baseRevisionId"] });
+  }
 });
 
 export const restoreIssueDocumentRevisionSchema = z.object({});

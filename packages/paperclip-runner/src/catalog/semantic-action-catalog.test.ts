@@ -182,3 +182,16 @@ describe("semantic action catalog", () => {
     }
   });
 });
+
+
+it("advertises exact append on both native document tool schemas", () => {
+  const ajv = new Ajv2020({ allErrors: true, allowUnionTypes: true, strict: true });
+  for (const schema of [writeDocumentAction.live.descriptor.inputSchema, paperclipSemanticAction("write_document")!.inputSchema]) {
+    const validate = ajv.compile(schema);
+    const input = { idempotencyKey: "append-1", key: "report", title: "Report",
+      baseRevisionId: "00000000-0000-4000-8000-000000000111", append: "\r\n追加😀" };
+    expect(validate(input), JSON.stringify(validate.errors)).toBe(true);
+    for (const changes of [{ body: "ambiguous" }, { includeDocuments: [] }, { baseRevisionId: null },
+      { baseRevisionId: "invalid" }, { append: "" }]) expect(validate({ ...input, ...changes })).toBe(false);
+  }
+});

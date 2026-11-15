@@ -1,3 +1,4 @@
+import { hasDocumentReturn, readDocumentReturnPacket } from "../document-return-wake.js";
 import { activeIssueInteractionCondition, ordinaryQuestionCondition } from "../issue-question-context.js";
 import { validateNativeDeliverableEvidence } from "./native-deliverable-feedback.js";
 import { findAutomaticCompletionReviews } from "./automatic-completion-reviews.js";
@@ -75,6 +76,14 @@ export async function nativeCompletionFeedback(
     )
     .then((rows) => rows[0]);
   if (!issue) throw new Error("Completion task no longer exists.");
+  if (hasDocumentReturn(run.contextSnapshot)) {
+    const packet = await readDocumentReturnPacket(db, { companyId:run.companyId,issueId:issue.id,
+      agentId:run.agentId,runId:run.id,contextSnapshot:run.contextSnapshot ?? {} });
+    if (result.reportedWorkDisposition !== "blocked" && packet?.state !== "already_returned") {
+      throw new Error("The fixed return has no matching committed comment acknowledgment; do not claim delivery or replay an unknown outcome.");
+    }
+    return "Fixed return result recorded. Task state, blockers and company/user acceptance are unchanged.";
+  }
   if (await isNativeDocumentReviewRun(db, {...run,runId:run.id})) {
     const review = await getNativeDocumentReviewAssignment(db, { companyId:run.companyId, issueId:issue.id, agentId:run.agentId, runId:run.id, allowResolved:true });
     if (!review) throw new Error("The fixed document review is no longer available to this run.");

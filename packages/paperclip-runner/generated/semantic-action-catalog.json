@@ -630,7 +630,45 @@
     "effect": "write",
     "inputSchema": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "append": {
+              "not": {}
+            },
+            "body": {}
+          },
+          "required": [
+            "body"
+          ]
+        },
+        {
+          "properties": {
+            "append": {},
+            "baseRevisionId": {
+              "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+              "type": "string"
+            },
+            "body": {
+              "not": {}
+            },
+            "includeDocuments": {
+              "not": {}
+            }
+          },
+          "required": [
+            "append",
+            "baseRevisionId"
+          ]
+        }
+      ],
       "properties": {
+        "append": {
+          "description": "Raw suffix; exact baseRevisionId required. No body/includeDocuments; total <=200000 UTF-8 bytes.",
+          "maxLength": 200000,
+          "minLength": 1,
+          "type": "string"
+        },
         "baseRevisionId": {
           "description": "Current revision id, or null when creating.",
           "maxLength": 240,
@@ -716,7 +754,6 @@
         "idempotencyKey",
         "key",
         "title",
-        "body",
         "baseRevisionId"
       ],
       "type": "object"

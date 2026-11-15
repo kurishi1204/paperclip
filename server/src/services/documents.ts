@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, lt } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, lt } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { documentRevisions, documents, issueDocuments, issues } from "@paperclipai/db";
+import { documentRevisions, documents, issueDocuments, issues, pipelineCaseDocuments } from "@paperclipai/db";
 import { isSystemIssueDocumentKey, issueDocumentKeySchema, type IssueDocumentRevisionDigest, type SystemIssueDocumentKey } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
@@ -148,6 +148,37 @@ function assertIssueDocumentKeyWritable(key: string, options?: IssueDocumentWrit
   }
 }
 
+/** Caller holds the case row in its transaction before resolving shared owners. */
+export async function lockPipelineCaseDocumentOwners(
+  tx: Pick<Db, "select">,
+  input: { companyId: string; caseId: string; key: string; additionalIssueIds?: string[] },
+): Promise<Set<string>> {
+  const readLinks = () => tx.select({ documentId: issueDocuments.documentId,
+    issueId: issueDocuments.issueId, companyId: issueDocuments.companyId })
+    .from(pipelineCaseDocuments)
+    .innerJoin(issueDocuments, eq(issueDocuments.documentId, pipelineCaseDocuments.documentId))
+    .where(and(eq(pipelineCaseDocuments.companyId, input.companyId),
+      eq(pipelineCaseDocuments.caseId, input.caseId), eq(pipelineCaseDocuments.key, input.key)))
+    .orderBy(asc(issueDocuments.issueId));
+  const links = await readLinks();
+  if (links.some(link => link.companyId !== input.companyId)) {
+    throw conflict("Shared document owner company changed");
+  }
+  const ownerIds = [...new Set([...links.map(link => link.issueId), ...(input.additionalIssueIds ?? [])])].sort();
+  if (ownerIds.length) {
+    const locked = await tx.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.companyId, input.companyId), inArray(issues.id, ownerIds)))
+      .orderBy(asc(issues.id)).for("update");
+    if (locked.length !== ownerIds.length) throw conflict("Shared document owner unavailable");
+  }
+  // A concurrent issue deletion or relink may have completed while we waited.
+  // Never acquire a newly discovered owner after a document/link write.
+  if (JSON.stringify(await readLinks()) !== JSON.stringify(links)) {
+    throw conflict("Shared document owner changed; read the current document again");
+  }
+  return new Set(ownerIds);
+}
+
 export function documentService(db: Db) {
   const filterSystemDocuments = <T extends { key: string }>(rows: T[], includeSystem: boolean) =>
     includeSystem ? rows : rows.filter((row) => !isSystemIssueDocumentKey(row.key));
@@ -291,7 +322,8 @@ export function documentService(db: Db) {
       key: string;
       title?: string | null;
       format: string;
-      body: string;
+      body?: string;
+      append?: string;
       changeSummary?: string | null;
       baseRevisionId?: string | null;
       createdByAgentId?: string | null;
@@ -300,6 +332,12 @@ export function documentService(db: Db) {
       sourceTrust?: typeof documents.$inferInsert.sourceTrust;
       lockedDocumentStrategy?: "conflict" | "create_new_document";
     }, options?: IssueDocumentWriteOptions) => {
+      const appending = input.append !== undefined;
+      if ((input.body !== undefined) === appending ||
+          (appending && (typeof input.append !== "string" || input.append.length === 0 || /[\u0000\uD800-\uDFFF]/u.test(input.append) ||
+            !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(input.baseRevisionId ?? "")))) {
+        throw unprocessable("Supply body or nonempty append with an exact baseRevisionId");
+      }
       const key = normalizeDocumentKey(input.key);
       assertIssueDocumentKeyWritable(key, options);
       const issue = await db
@@ -313,7 +351,12 @@ export function documentService(db: Db) {
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         try {
           return await db.transaction(async (tx) => {
+          // Document/link triggers use this same issue lock; acquire it before reading the base.
+          const [lockedIssue] = await tx.select({ id: issues.id }).from(issues)
+            .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("update");
+          if (!lockedIssue) throw notFound("Issue not found");
           const now = new Date();
+          let body = input.body ?? "";
           const existing = await tx
             .select({
               id: documents.id,
@@ -338,12 +381,13 @@ export function documentService(db: Db) {
             })
             .from(issueDocuments)
             .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
-            .where(and(eq(issueDocuments.issueId, issue.id), eq(issueDocuments.key, key)))
+            .where(and(eq(issueDocuments.issueId, issue.id), eq(issueDocuments.key, key),
+              eq(issueDocuments.companyId, issue.companyId), eq(documents.companyId, issue.companyId)))
             .then((rows) => rows[0] ?? null);
 
           if (existing) {
             if (existing.lockedAt) {
-              if (input.lockedDocumentStrategy === "create_new_document") {
+              if (!appending && input.lockedDocumentStrategy === "create_new_document") {
                 const issueDocumentKeys = await tx
                   .select({ key: issueDocuments.key })
                   .from(issueDocuments)
@@ -356,7 +400,7 @@ export function documentService(db: Db) {
                     companyId: issue.companyId,
                     title: input.title ?? null,
                     format: input.format,
-                    latestBody: input.body,
+                    latestBody: body,
                     latestRevisionId: null,
                     latestRevisionNumber: 1,
                     createdByAgentId: input.createdByAgentId ?? null,
@@ -380,7 +424,7 @@ export function documentService(db: Db) {
                     revisionNumber: 1,
                     title: input.title ?? null,
                     format: input.format,
-                    body: input.body,
+                    body,
                     changeSummary: input.changeSummary ?? null,
                     createdByAgentId: input.createdByAgentId ?? null,
                     createdByUserId: input.createdByUserId ?? null,
@@ -451,6 +495,12 @@ export function documentService(db: Db) {
               });
             }
 
+            if (appending) {
+              body = existing.latestBody + input.append!;
+              if (Buffer.byteLength(body, "utf8") > 200_000) {
+                throw unprocessable("Appended document exceeds 200000 UTF-8 bytes");
+              }
+            }
             const nextRevisionNumber = existing.latestRevisionNumber + 1;
             const [revision] = await tx
               .insert(documentRevisions)
@@ -460,7 +510,7 @@ export function documentService(db: Db) {
                 revisionNumber: nextRevisionNumber,
                 title: input.title ?? null,
                 format: input.format,
-                body: input.body,
+                body,
                 changeSummary: input.changeSummary ?? null,
                 createdByAgentId: input.createdByAgentId ?? null,
                 createdByUserId: input.createdByUserId ?? null,
@@ -474,7 +524,7 @@ export function documentService(db: Db) {
               .set({
                 title: input.title ?? null,
                 format: input.format,
-                latestBody: input.body,
+                latestBody: body,
                 latestRevisionId: revision.id,
                 latestRevisionNumber: nextRevisionNumber,
                 updatedByAgentId: input.createdByAgentId ?? null,
@@ -495,7 +545,7 @@ export function documentService(db: Db) {
                 ...existing,
                 title: input.title ?? null,
                 format: input.format,
-                body: input.body,
+                body,
                 latestRevisionId: revision.id,
                 latestRevisionNumber: nextRevisionNumber,
                 updatedByAgentId: input.createdByAgentId ?? null,
@@ -509,7 +559,7 @@ export function documentService(db: Db) {
             };
           }
 
-          if (input.baseRevisionId) {
+          if (appending || input.baseRevisionId) {
             throw conflict("Document does not exist yet", { key });
           }
 
@@ -519,7 +569,7 @@ export function documentService(db: Db) {
               companyId: issue.companyId,
               title: input.title ?? null,
               format: input.format,
-              latestBody: input.body,
+              latestBody: body,
               latestRevisionId: null,
               latestRevisionNumber: 1,
               createdByAgentId: input.createdByAgentId ?? null,
@@ -543,7 +593,7 @@ export function documentService(db: Db) {
               revisionNumber: 1,
               title: input.title ?? null,
               format: input.format,
-              body: input.body,
+              body,
               changeSummary: input.changeSummary ?? null,
               createdByAgentId: input.createdByAgentId ?? null,
               createdByUserId: input.createdByUserId ?? null,
@@ -683,6 +733,9 @@ export function documentService(db: Db) {
       const key = normalizeDocumentKey(input.key);
       assertIssueDocumentKeyWritable(key, options);
       return db.transaction(async (tx) => {
+        // Match upsert and the issue revision trigger: owner before document.
+        await tx.select({ id: issues.id }).from(issues)
+          .where(eq(issues.id, input.issueId)).for("update");
         const existing = await tx
           .select(issueDocumentSelect)
           .from(issueDocuments)
@@ -783,6 +836,9 @@ export function documentService(db: Db) {
     }) => {
       const key = normalizeDocumentKey(input.key);
       return db.transaction(async (tx) => {
+        // Match upsert and the issue revision trigger: owner before document.
+        await tx.select({ id: issues.id }).from(issues)
+          .where(eq(issues.id, input.issueId)).for("update");
         const existing = await tx
           .select(issueDocumentSelect)
           .from(issueDocuments)
@@ -830,6 +886,9 @@ export function documentService(db: Db) {
     unlockIssueDocument: async (issueId: string, rawKey: string) => {
       const key = normalizeDocumentKey(rawKey);
       return db.transaction(async (tx) => {
+        // Match upsert and the issue revision trigger: owner before document.
+        await tx.select({ id: issues.id }).from(issues)
+          .where(eq(issues.id, issueId)).for("update");
         const existing = await tx
           .select(issueDocumentSelect)
           .from(issueDocuments)
@@ -878,6 +937,9 @@ export function documentService(db: Db) {
       const key = normalizeDocumentKey(rawKey);
       assertIssueDocumentKeyWritable(key, options);
       return db.transaction(async (tx) => {
+        // Match upsert and the issue revision trigger: owner before document.
+        await tx.select({ id: issues.id }).from(issues)
+          .where(eq(issues.id, issueId)).for("update");
         const existing = await tx
           .select(issueDocumentSelect)
           .from(issueDocuments)

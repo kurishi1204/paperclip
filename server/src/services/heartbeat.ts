@@ -1,3 +1,5 @@
+import { executeDocumentReturn } from "./document-return-executor.js";
+import { hasDocumentReturn, readCurrentDocumentReturnWake } from "./document-return-wake.js";
 import {captureCommanderHermesClaim,completeCommanderHermesResult,pendingCommanderResultHandoffs} from "./commander-result.js";
 import { commanderReservesTodo,commanderPolicySchema, admissionMatches, commanderPrompt, parseCommanderSelection, type CommanderAdmission, type CommanderPolicy } from "./commander-cycle.js";
 import { activeIssueInteractionCondition, TASK_QUESTION_GUIDANCE } from "./issue-question-context.js";
@@ -8405,6 +8407,7 @@ export async function buildPaperclipWakePayload(input: {
       input.contextSnapshot[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY] ===
       true,
     simplifiedEnglishInteractions: input.simplifiedEnglishInteractions === true,
+    ...(hasDocumentReturn(input.contextSnapshot) ? { documentReturn: input.contextSnapshot.documentReturn } : {}),
     dependencyBlockedInteraction:
       input.contextSnapshot.dependencyBlockedInteraction === true,
     treeHoldInteraction: input.contextSnapshot.treeHoldInteraction === true,
@@ -13154,6 +13157,17 @@ export function heartbeatService(
       else ${JSON.stringify(patch.resultJson)}::jsonb end` };
   }
 
+  function publishCommittedRunStatus(
+    updated: typeof heartbeatRuns.$inferSelect,
+    previousStatus: string | null,
+    failureReport?: RunFailureReportOptions,
+  ) {
+    publishLiveEvent({companyId:updated.companyId,type:"heartbeat.run.status",
+      payload:buildHeartbeatRunStatusLiveEventPayload(updated)});
+    publishRunLifecyclePluginEvent(updated);
+    emitTerminalAgentTaskRun(updated,previousStatus,failureReport);
+  }
+
   async function setRunStatus(
     runId: string,
     status: string,
@@ -13223,13 +13237,7 @@ export function heartbeatService(
       : await persist(db);
 
     if (updated) {
-      publishLiveEvent({
-        companyId: updated.companyId,
-        type: "heartbeat.run.status",
-        payload: buildHeartbeatRunStatusLiveEventPayload(updated),
-      });
-      publishRunLifecyclePluginEvent(updated);
-      emitTerminalAgentTaskRun(updated, previousStatus?.status ?? null);
+      publishCommittedRunStatus(updated, previousStatus?.status ?? null);
     }
 
     return updated;
@@ -13330,13 +13338,7 @@ export function heartbeatService(
             });
 
     if (updated) {
-      publishLiveEvent({
-        companyId: updated.companyId,
-        type: "heartbeat.run.status",
-        payload: buildHeartbeatRunStatusLiveEventPayload(updated),
-      });
-      publishRunLifecyclePluginEvent(updated);
-      emitTerminalAgentTaskRun(updated, previousStatus?.status ?? null, failureReport);
+      publishCommittedRunStatus(updated, previousStatus?.status ?? null, failureReport);
       return { run: updated, updated: true as const };
     }
 
@@ -15707,6 +15709,9 @@ export function heartbeatService(
       delayMs?: number;
     },
   ) {
+    if (hasDocumentReturn(run.contextSnapshot)) return {outcome:"not_scheduled" as const,
+      errorCode:"document_return_replay_hold",reason:"Read the original return receipt; never retry through a provider.",
+      issueId:readNonEmptyString(run.contextSnapshot?.issueId)};
     const reviewRetryProfile = pendingDocumentReviewRetryProfile(run.runnerProfileJson);
     if (reviewRetryProfile === null || (Object.keys(reviewRetryProfile).length > 0 &&
         parseObject(run.resultJson?.executionRecovery).providerWorkStarted !== false)) {
@@ -17769,7 +17774,7 @@ export function heartbeatService(
     // A committed QA decision owns recovery of a never-started return. Do not
     // turn a claim-time gate into an unrelated old-session continuation.
     const claimCancellation = {
-      suppressImmediateRecovery: Boolean(parseObject(run.contextSnapshot).qaDecisionId),
+      suppressImmediateRecovery: hasDocumentReturn(run.contextSnapshot) || Boolean(parseObject(run.contextSnapshot).qaDecisionId),
       suppressQueueAdvance: true,
     };
     const agent = await getAgent(run.agentId);
@@ -17894,9 +17899,17 @@ export function heartbeatService(
       const pendingDocumentReview = await isCurrentPendingDocumentReviewWake(db, {
         companyId: run.companyId, issueId, agentId: run.agentId, runId: run.id, contextSnapshot: context,
       });
+      const documentReturnBinding = hasDocumentReturn(context) ? await readCurrentDocumentReturnWake(db, {
+        phase: "claim", companyId: run.companyId, issueId, agentId: run.agentId, runId: run.id, contextSnapshot: context,
+      }) : null;
+      if (hasDocumentReturn(context) && !documentReturnBinding) {
+        // Reject stale/unknown return evidence before provider work. In
+        // particular do not fall back to an unrelated ordinary comment wake.
+        throw new Error("document_return_binding_no_longer_current");
+      }
       if (
         unresolvedBlockerCount > 0 &&
-        !pendingDocumentReview &&
+        !pendingDocumentReview && !documentReturnBinding &&
         !allowsIssueInteractionWake(
           context,
           ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
@@ -18048,6 +18061,15 @@ export function heartbeatService(
             !["committed", "applied", "terminal_failure"].includes(finalization.phase)))) {
           return { ownsIssue, blocked: true };
         }
+      }
+      if (hasDocumentReturn(context)) {
+        const binding=await readCurrentDocumentReturnWake(tx,{phase:"claim",companyId:run.companyId,
+          issueId:issueId!,agentId:run.agentId,runId:run.id,contextSnapshot:context});
+        if (!binding || !ownsIssue || (owner?.checkoutRunId && owner.checkoutRunId!==run.id)) {
+          throw new Error("document_return_claim_not_authorized");
+        }
+        await tx.update(heartbeatRuns).set({runnerProfileJson:sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) ||
+          ${JSON.stringify({documentReturnAdmission:binding})}::jsonb`}).where(eq(heartbeatRuns.id,run.id));
       }
       return { ownsIssue, blocked: false };
     }
@@ -21325,6 +21347,41 @@ export function heartbeatService(
       }
       run = claimed;
       markQaObservationClaimed(qaObservation, run);
+    }
+
+    if (hasDocumentReturn(run.contextSnapshot)) {
+      // Consume before environment/credentials/workspace/provider preparation.
+      // This is a metadata return, never an ordinary agent continuation.
+      try {
+        const issueId=readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+        if (!issueId) throw new Error("document_return_issue_missing");
+        const committed=await executeDocumentReturn(db,{companyId:run.companyId,issueId,agentId:run.agentId,runId:run.id});
+        // The executor commits comment, ACK and terminal row together. Publish
+        // the original lifecycle only after that commit, without a second write.
+        publishCommittedRunStatus(committed.terminalRun,run.status);
+        await setWakeupStatus(run.wakeupRequestId,"completed",{finishedAt:new Date()});
+      } catch (error) {
+        // Keep committed receipts if settlement/readback failed. Never schedule
+        // a new return or enter any adapter after this bounded branch.
+        const current=await getRun(run.id);
+        if (current?.status === "running") await setRunStatusIfRunning(run.id,"failed",{
+          finishedAt:new Date(),error:"Fixed document return did not complete; inspect the original receipt",errorCode:"document_return_held",
+          resultJson:{...parseObject(current.resultJson),documentReturnHeld:true,documentReturnOutcome:"unknown",
+            executionRecovery:{kind:"bootstrap",providerWorkStarted:false}}});
+        if (current?.status === "succeeded") {
+          // A post-commit wake/publication failure cannot mean the comment was
+          // not sent. Preserve terminal storage evidence and prohibit replay.
+          logger.error({err:error,runId:run.id},"Fixed document return committed; post-commit delivery is unconfirmed");
+        } else {
+          await setWakeupStatus(run.wakeupRequestId,"failed",{finishedAt:new Date(),error:"Fixed document return requires receipt reconciliation"});
+        }
+      }
+      const settled=await getRun(run.id);
+      if (settled && isHeartbeatRunTerminalStatus(settled.status)) {
+        await releaseIssueExecutionAndPromote(settled,{suppressImmediateRecovery:true});
+        await finalizeAgentStatus(run.agentId,settled.status);
+      }
+      return;
     }
 
     const qaClaimPreparation = parseObject(parseObject(run.runnerProfileJson).qaClaimPreparation);
@@ -29876,10 +29933,18 @@ export function heartbeatService(
             companyId: issue.companyId, issueId: issue.id, agentId,
             contextSnapshot: enrichedContextSnapshot, lock: true,
           });
+          const documentReturnBinding = hasDocumentReturn(enrichedContextSnapshot) ? await readCurrentDocumentReturnWake(tx as unknown as Db, {
+            companyId: issue.companyId, issueId: issue.id, agentId,
+            contextSnapshot: enrichedContextSnapshot,
+            request: { requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null, payload },
+          }) : null;
+          if (hasDocumentReturn(enrichedContextSnapshot) && !documentReturnBinding) throw new Error("document_return_binding_not_authorized");
           const blockedInteractionWake =
             dependencyReadiness &&
             !dependencyReadiness.isDependencyReady &&
-            (pendingDocumentReview || allowsIssueInteractionWake(
+            (documentReturnBinding || pendingDocumentReview || allowsIssueInteractionWake(
               enrichedContextSnapshot,
               ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
             ));

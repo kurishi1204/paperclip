@@ -28,8 +28,8 @@ describe("issue validators", () => {
       addIssueCommentSchema.parse(request),
       upsertIssueDocumentSchema.parse({ ...request, format: "markdown" }),
     ]) {
-      expect(Buffer.from(parsed.body, "utf8")).toEqual(Buffer.from(body, "utf8"));
-      expect(JSON.parse(parsed.body.split("\n")[2]!)).toEqual(payload);
+      expect(Buffer.from(parsed.body!, "utf8")).toEqual(Buffer.from(body, "utf8"));
+      expect(JSON.parse(parsed.body!.split("\n")[2]!)).toEqual(payload);
     }
   });
 
@@ -689,5 +689,24 @@ describe("issue validators", () => {
     });
 
     expect(parsed.success).toBe(false);
+  });
+});
+
+
+describe("exact server document append input", () => {
+  const revision = "00000000-0000-4000-8000-000000000111";
+  it("accepts a raw suffix without normalizing literal escapes or UTF-8 text", () => {
+    const append = "  追記😀e\u0301\r\n末尾\\n\n";
+    expect(upsertIssueDocumentSchema.parse({ format: "markdown", append, baseRevisionId: revision }))
+      .toEqual({ format: "markdown", append, baseRevisionId: revision });
+  });
+  it("rejects missing/stale-shaped/ambiguous append input without changing replace", () => {
+    for (const input of [{}, { append: "x" }, { append: "x", baseRevisionId: null },
+      { append: "x", baseRevisionId: "invalid" }, { append: "" },
+      { append: "\u0000", baseRevisionId: revision }, { append: "\uD800", baseRevisionId: revision }, { append: "x", body: "old", baseRevisionId: revision },
+      { append: "x", baseRevisionId: revision, includeDocuments: [] }]) {
+      expect(upsertIssueDocumentSchema.safeParse({ format: "markdown", ...input }).success).toBe(false);
+    }
+    expect(upsertIssueDocumentSchema.parse({ format: "markdown", body: "replace" }).body).toBe("replace");
   });
 });

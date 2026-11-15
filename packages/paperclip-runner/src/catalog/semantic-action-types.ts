@@ -60,6 +60,7 @@ export interface PaperclipJsonSchema {
   readonly additionalProperties?: boolean | PaperclipJsonSchema;
   readonly items?: PaperclipJsonSchema;
   readonly enum?: readonly PaperclipJsonValue[];
+  readonly not?: PaperclipJsonSchema;
   readonly oneOf?: readonly PaperclipJsonSchema[];
   readonly anyOf?: readonly PaperclipJsonSchema[];
   readonly minimum?: number;

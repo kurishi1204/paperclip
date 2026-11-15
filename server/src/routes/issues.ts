@@ -1,3 +1,4 @@
+import { prepareDocumentReturnWake } from "../services/document-return-wake.js";
 import {prepareCommanderAdmission} from "../services/commander-admission.js";
 import {commanderAdmissionDigest,prepareCommanderAdmissionSchema,commanderPolicySchema} from "../services/commander-cycle.js";
 import { activeIssueInteractionCondition, readTaskQuestionContext } from "../services/issue-question-context.js";
@@ -2754,6 +2755,18 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       publication.idempotencyKey ===
       `interaction:${input.interaction.id}:${publication.endpointId}`,
   );
+  // Carry the server-read fixed target across the ordinary wake boundary.
+  // This does not manufacture a comment or relax dependency/pause admission.
+  const returnPreparation = await prepareDocumentReturnWake(input.db, {
+    companyId: input.issue.companyId, issueId: input.issue.id,
+    agentId: input.issue.assigneeAgentId, interactionId: input.interaction.id,
+  });
+  if (returnPreparation.kind === "held") {
+    logger.warn({ issueId: input.issue.id, interactionId: input.interaction.id, reason: returnPreparation.reason },
+      "Fixed document return held; ordinary continuation was not substituted");
+    return;
+  }
+  const documentReturn = returnPreparation.kind === "ready" ? returnPreparation.binding : null;
   await input.heartbeat
     .wakeup(input.issue.assigneeAgentId, {
       source: "automation",
@@ -2761,6 +2774,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       reason: "issue_commented",
       payload: {
         issueId: input.issue.id,
+        ...(documentReturn ? { documentReturn } : {}),
         interactionId: input.interaction.id,
         interactionKind: input.interaction.kind,
         interactionStatus: input.interaction.status,
@@ -2781,12 +2795,13 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       idempotencyKey:
         input.idempotencyKey ??
         `interaction:${input.interaction.id}:${input.interaction.status}`,
-      allowRunCoalescing: !hasExternalPromptBinding,
+      allowRunCoalescing: !hasExternalPromptBinding && !documentReturn,
       requestedByActorType: input.actor.actorType,
       requestedByActorId: input.actor.actorId,
       contextSnapshot: {
         issueId: input.issue.id,
         taskId: input.issue.id,
+        ...(documentReturn ? { documentReturn } : {}),
         interactionId: input.interaction.id,
         interactionKind: input.interaction.kind,
         interactionStatus: input.interaction.status,
@@ -10447,7 +10462,7 @@ export function issueRoutes(
         const referenceSummaryBefore = await issueReferenceService(executor).listIssueReferenceSummary(issue.id);
         const result = await documentService(executor).upsertIssueDocument({
           issueId: issue.id, key, title: req.body.title ?? null, format: req.body.format,
-          body: req.body.body, changeSummary: req.body.changeSummary ?? null,
+          body: req.body.body, append: req.body.append, changeSummary: req.body.changeSummary ?? null,
           baseRevisionId: req.body.baseRevisionId ?? null,
           createdByAgentId: actor.agentId ?? null,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -10491,7 +10506,7 @@ export function issueRoutes(
         key: keyParsed.data,
         title: req.body.title ?? null,
         format: req.body.format,
-        body: req.body.body,
+        body: req.body.body, append: req.body.append,
         changeSummary: req.body.changeSummary ?? null,
         baseRevisionId: req.body.baseRevisionId ?? null,
         createdByAgentId: actor.agentId ?? null,
@@ -11384,6 +11399,12 @@ export function issueRoutes(
               .returning({ id: issueComments.id });
           }
           if (req.body.sourceArtifactKind === "document") {
+            await tx.select({ id: issueRows.id }).from(issueRows)
+              .where(and(eq(issueRows.id, issue.id), eq(issueRows.companyId, issue.companyId))).for("update");
+            const [linked] = await tx.select({ id: issueDocuments.id }).from(issueDocuments)
+              .where(and(eq(issueDocuments.issueId, issue.id), eq(issueDocuments.companyId, issue.companyId),
+                eq(issueDocuments.documentId, req.body.sourceArtifactId))).limit(1);
+            if (!linked) return [];
             return tx
               .update(documents)
               .set(markPromoted)

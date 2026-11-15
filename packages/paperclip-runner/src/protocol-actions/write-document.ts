@@ -26,7 +26,7 @@ export const writeDocumentAction = {
   },
   "documentation": {
     "title": "Write revisioned document",
-    "description": "Create or update an active-task document with optimistic revision safety.",
+    "description": "Create or update an active-task document with optimistic revision safety. For append-only edits, send append instead of body with the exact baseRevisionId; never recreate the old body.",
     "note": null
   },
   "examples": {
@@ -73,7 +73,7 @@ export const writeDocumentAction = {
       "operationId": "write_document",
       "version": 1,
       "title": "Write revisioned document",
-      "description": "Create or update an active-task document with optimistic revision safety. Before named QA, the author selects all required same-task sources and may supply includeDocuments to embed their exact current revisions in this one document. Selection/completeness remain the author responsibility; byte verification is not QA or adoption.",
+      "description": "Create or update an active-task document with optimistic revision safety. Before named QA, the author selects all required same-task sources and may supply includeDocuments to embed their exact current revisions in this one document. Selection/completeness remain the author responsibility; byte verification is not QA or adoption. Use append instead of body to preserve the server-held base verbatim; exact baseRevisionId required, no includeDocuments, resulting maximum 200000 UTF-8 bytes.",
       "exposure": "always",
       "requiredClaims": [],
       "allowedModes": [
@@ -163,16 +163,47 @@ export const writeDocumentAction = {
             "maxItems": 20,
             "minItems": 1,
             "type": "array"
+          },
+          "append": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200000,
+            "description": "Raw suffix only; server preserves all current UTF-8 text, no inserted separator. Requires exact baseRevisionId; cannot combine with body/includeDocuments. Result limited to 200000 UTF-8 bytes."
           }
         },
         "required": [
           "idempotencyKey",
           "key",
           "title",
-          "body",
           "baseRevisionId"
         ],
-        "additionalProperties": false
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "properties": {
+              "body": {},
+              "append": { "not": {} }
+            },
+            "required": [
+              "body"
+            ]
+          },
+          {
+            "properties": {
+              "append": {},
+              "body": { "not": {} },
+              "includeDocuments": { "not": {} },
+              "baseRevisionId": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+              }
+            },
+            "required": [
+              "append",
+              "baseRevisionId"
+            ]
+          }
+        ]
       },
       "outputSchema": {
         "type": "object",

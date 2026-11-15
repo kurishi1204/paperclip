@@ -1,3 +1,4 @@
+import {hasDocumentReturn,readCurrentDocumentReturnWake} from "../../../services/document-return-wake.js";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { readCurrentPendingDocumentReviewWake, hasPendingDocumentReviewAdmission } from "../../../services/pending-document-review-wake.js";
 import { getExecutionBlocker, isIndependentQaDocumentEpisode } from "../../../services/execution-blocker.js";
@@ -1001,6 +1002,12 @@ export function createPostgresRunDispatchAdapter(
       now,
       tx,
     );
+    if (hasDocumentReturn(contextSnapshot) && !await readCurrentDocumentReturnWake(tx,{
+      phase:run.status === "queued" ? "claim" : "server",companyId:run.companyId,issueId,
+      agentId:run.agentId,runId:run.id,contextSnapshot})) {
+      return {issueId,facts,decision:{stale:true as const,errorCode:"interaction_review_stale" as const,
+        reason:"Fixed document return is no longer current",details:{issueId}}};
+    }
     const recordedReview = readNonEmptyString(parseObject(parseObject(run.runnerProfileJson).pendingDocumentReviewAdmission).interactionId);
     if (hasPendingDocumentReviewAdmission(run.runnerProfileJson) && (!facts.pendingDocumentReview ||
         recordedReview !== readNonEmptyString(contextSnapshot.interactionId))) {

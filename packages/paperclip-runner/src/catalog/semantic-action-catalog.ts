@@ -203,12 +203,13 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
       "Create or update an active-task document with optimistic revision safety. Before named QA, the author selects all required same-task sources and may supply includeDocuments to embed their exact current revisions in this one document. Selection/completeness remain the author responsibility; byte verification is not QA or adoption.",
     effect: "write",
     allowedModes: WORK_MODES,
-    inputSchema: object(
+    inputSchema: { ...object(
       {
         ...idempotency,
         key: text("Stable issue-document key.", 120),
         title: text("Document title.", 300),
         body: text("Markdown document body.", 200_000),
+        append: text("Raw suffix; exact baseRevisionId required. No body/includeDocuments; total <=200000 UTF-8 bytes.", 200_000),
         baseRevisionId: nullableText(
           "Current revision id, or null when creating.",
           240,
@@ -255,8 +256,8 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
         },
         changeSummary: nullableText("Optional revision summary."),
       },
-      ["idempotencyKey", "key", "title", "body", "baseRevisionId"],
-    ),
+      ["idempotencyKey", "key", "title", "baseRevisionId"],
+    ), oneOf: [{"properties": {"body": {}, "append": { "not": {} }}, "required": ["body"]}, {"properties": {"append": {}, "body": { "not": {} }, "includeDocuments": { "not": {} }, "baseRevisionId": {"type": "string", "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"}}, "required": ["append", "baseRevisionId"]}] },
     outputSchema: operationReceipt,
   }),
   descriptor({

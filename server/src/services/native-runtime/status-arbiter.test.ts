@@ -743,3 +743,10 @@ describe("native status authority", () => {
   });
 
 });
+
+describe("fixed reviewed-document return is not task completion",()=>{
+ it.each(["blocked","in_progress","in_review"] as const)("preserves %s after a successful bounded return",priorIssueStatus=>{
+  expect(arbitrate({priorIssueStatus,fixedDocumentReturn:true})).toMatchObject({statusAction:"preserve",toStatus:priorIssueStatus,
+   reasonCode:"fixed_document_return_preserves_task",effects:[{kind:"release_checkout"}]});
+ });
+});
