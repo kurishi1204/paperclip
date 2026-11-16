@@ -1,4 +1,4 @@
-import { collectDocumentReturnSupervision, readIssueDocumentReturnFollowthrough } from "./document-return-wake.js";
+import { collectDocumentReturnSupervision } from "./document-return-wake.js";
 import { createHash } from "node:crypto";
 import { and, asc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -1504,6 +1504,30 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       };
     }
 
+    // Finish supplemental observation and publish any failure before the first
+    // durable trigger/review write. A failed read cannot strand a saved trigger
+    // before enqueue. Existing open/unknown handoffs above remain non-replayable.
+    const documentReturnSupervision = await collectDocumentReturnSupervision(db,
+      classification.stoppedLeaves
+        .filter(leaf => leaf.assigneeAgentId !== null)
+        .map(leaf => ({ companyId: watchdog.companyId, issueId: leaf.issueId, agentId: leaf.assigneeAgentId! })),
+    );
+    const documentReturnFollowthrough = documentReturnSupervision.observations.map(observation => {
+      if (observation.state === "readable" && observation.assessment) return observation.assessment;
+      if (observation.state !== "unreadable") throw new Error("Unexpected document-return handoff observation");
+      return {
+        schema: "paperclip.document-return-unreadable.v1" as const,
+        companyId: observation.companyId,
+        issueId: observation.issueId,
+        authorizesEffect: false as const,
+        mayResend: false as const,
+      };
+    });
+    if (documentReturnSupervision.attentionRequired) {
+      logger.warn({ documentReturnSupervision },
+        "document-return supervision requires attention; read-only, no retry authority");
+    }
+
     const watchdogIssue = await ensureReusableWatchdogIssue({
       watchdog,
       sourceIssue,
@@ -1542,13 +1566,6 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       },
     });
 
-    // Enrich only an already-authorized existing watchdog handoff. This read
-    // never enables a watchdog, changes classification or schedules recovery.
-    const documentReturnFollowthrough = await Promise.all(classification.stoppedLeaves
-      .filter(leaf => leaf.assigneeAgentId !== null)
-      .map(leaf => readIssueDocumentReturnFollowthrough(db, {
-        companyId:watchdog.companyId,issueId:leaf.issueId,agentId:leaf.assigneeAgentId!,
-      })));
     const context = {...watchdogWakeContext({
       watchdog,
       watchdogIssue,

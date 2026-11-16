@@ -343,7 +343,7 @@ export type PaperclipWakeTaskWatchdogContext = {
   capabilities: PaperclipWakeTaskWatchdogCapabilities | null;
   documentReturnFollowthrough: {
     state: "not_supplied" | "readable" | "invalid";
-    issues: Array<{issueId:string; events:Array<{eventKey:string|null;state:string;reason:string|null}>}>;
+    issues: Array<{issueId:string; state:"readable"|"unreadable"; events:Array<{eventKey:string|null;state:string;reason:string|null}>}>;
   };
 };
 
@@ -1599,6 +1599,13 @@ function normalizePaperclipWakeTaskWatchdog(
     if(!Array.isArray(rows)) followthrough.state="invalid";
     else for(const raw of rows) {
       const r=parseObject(raw);
+      if(r.schema==="paperclip.document-return-unreadable.v1") {
+        if(r.authorizesEffect!==false || r.mayResend!==false ||
+          typeof r.companyId!=="string" || !uuid.test(r.companyId) ||
+          typeof r.issueId!=="string" || !uuid.test(r.issueId)) {followthrough.state="invalid";break;}
+        followthrough.issues.push({issueId:r.issueId,state:"unreadable",events:[]});
+        continue;
+      }
       if(r.schema!=="paperclip.document-return-followthrough.v1" || r.authorizesEffect!==false ||
         typeof r.issueId!=="string" || !uuid.test(r.issueId) || !Array.isArray(r.events)) {followthrough.state="invalid";break;}
       const events=[];
@@ -1611,7 +1618,7 @@ function normalizePaperclipWakeTaskWatchdog(
         events.push({eventKey:e.eventKey as string|null,state:e.state as string,reason:e.reason as string|null});
       }
       if(followthrough.state==="invalid") break;
-      followthrough.issues.push({issueId:r.issueId,events});
+      followthrough.issues.push({issueId:r.issueId,state:"readable",events});
     }
     if(followthrough.state==="invalid") followthrough.issues=[];
   }
