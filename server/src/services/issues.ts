@@ -12088,7 +12088,8 @@ export function issueService(db: Db) {
         const anchor = await db
           .select({
             id: issueComments.id,
-            createdAt: issueComments.createdAt,
+            // Preserve PostgreSQL sub-millisecond precision across the cursor read.
+            createdAt: sql<string>`${issueComments.createdAt}::text`,
           })
           .from(issueComments)
           .where(
@@ -12100,10 +12101,8 @@ export function issueService(db: Db) {
           .then((rows) => rows[0] ?? null);
 
         if (!anchor) return [];
-        const anchorCreatedAt =
-          anchor.createdAt instanceof Date
-            ? anchor.createdAt
-            : new Date(String(anchor.createdAt));
+        // Compare as timestamptz in PostgreSQL, never through a JavaScript Date.
+        const anchorCreatedAt = sql`${anchor.createdAt}::timestamptz`;
         conditions.push(
           order === "asc"
             ? or(
@@ -12135,6 +12134,8 @@ export function issueService(db: Db) {
         );
 
       const comments = limit ? await query.limit(limit) : await query;
+      // An empty authorized comment result needs no username/attribution work.
+      if (comments.length === 0) return [];
       const { censorUsernameInLogs } = await instanceSettings.getGeneral();
       const projectedComments = await projectHistoricalRunComments(comments);
       const enrichedComments =
