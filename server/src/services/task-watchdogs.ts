@@ -1757,13 +1757,27 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       // Assess every already-watched issue, including live/reviewed branches.
       // No classifier, wake admission, watchdog setting or fingerprint changes.
       const followthroughTargets = [];
+      const unreadableTargets: Array<{ companyId: string; issueId: string; state: "unreadable" }> = [];
       for (const row of rows) {
-        const subtree = await loadWatchdogSubtreeIssues(row.companyId, row.issueId);
+        let subtree: Awaited<ReturnType<typeof loadWatchdogSubtreeIssues>>;
+        try {
+          subtree = await loadWatchdogSubtreeIssues(row.companyId, row.issueId);
+        } catch {
+          // Enumeration is part of read-only supervision, not admission for the
+          // original reconciliation. Publish the failure before evaluating rows.
+          unreadableTargets.push({ companyId: row.companyId, issueId: row.issueId, state: "unreadable" });
+          continue;
+        }
         for (const issue of subtree) {
-          followthroughTargets.push({companyId:row.companyId,issueId:issue.id,agentId:issue.assigneeAgentId});
+          followthroughTargets.push({ companyId: row.companyId, issueId: issue.id, agentId: issue.assigneeAgentId });
         }
       }
       const documentReturnSupervision = await collectDocumentReturnSupervision(db, followthroughTargets);
+      if (unreadableTargets.length > 0) {
+        documentReturnSupervision.observations.push(...unreadableTargets);
+        documentReturnSupervision.attentionRequired = true;
+        documentReturnSupervision.coverage = "configured_watchdog_scope_only";
+      }
       // Publish before effectful reconciliation: a later failure must not erase
       // the read-only assessment. Original errors still propagate unchanged.
       if (documentReturnSupervision.attentionRequired) {

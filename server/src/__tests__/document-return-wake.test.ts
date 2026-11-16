@@ -166,3 +166,40 @@ it("publishes the collected warning before a later original reconciliation failu
   expect.objectContaining({attentionRequired:true,authorizesEffect:false,mayResend:false})}),
   "document-return supervision requires attention; read-only, no retry authority");
 });
+
+describe("supervision target enumeration preserves original reconciliation",()=>{
+ it.each([false,true])("keeps the original skipped return and exact reads when target enumeration fails=%s",async(fails)=>{
+  effects.log.mockReset();
+  const wd={companyId:id(1),issueId:id(2),watchdogIssueId:id(30),lastObservedFingerprint:"original-fingerprint"};
+  // Original path reads terminal review first, then the inapplicable source.
+  const p=port([[wd],[],[]]);
+  const execute=vi.fn(async()=>{if(fails)throw new Error("private subtree diagnostic");return []});
+  const db={...p.db,execute} as unknown as Db;
+  const result=await taskWatchdogService(db).reconcileTaskWatchdogs();
+  expect(result).toMatchObject({checked:1,triggered:0,live:0,pendingFirstRun:0,alreadyReviewed:0,skipped:1,watchdogIssueIds:[]});
+  expect(p.used()).toBe(3);expect(execute).toHaveBeenCalledTimes(1);
+  if(fails){
+   expect(result.documentReturnSupervision).toMatchObject({observations:[{companyId:id(1),issueId:id(2),state:"unreadable"}],
+    coverage:"configured_watchdog_scope_only",attentionRequired:true,authorizesEffect:false,mayResend:false});
+   expect(effects.log).toHaveBeenCalledExactlyOnceWith({documentReturnSupervision:result.documentReturnSupervision},
+    "document-return supervision requires attention; read-only, no retry authority");
+   expect(JSON.stringify(result)).not.toContain("private subtree diagnostic");
+  }else{expect(effects.log).not.toHaveBeenCalled();}
+ });
+ it("reports target failure then propagates the exact original error without retry",async()=>{
+  effects.log.mockReset();const original=new Error("original terminal-review failure");
+  const wd={companyId:id(1),issueId:id(2),watchdogIssueId:id(30),lastObservedFingerprint:"fp"};
+  const p=port([[wd]]);let selects=0;
+  const db={select(){if(selects++>0)throw original;return p.db.select()},execute:vi.fn(async()=>{throw new Error("enumeration failed")})} as unknown as Db;
+  await expect(taskWatchdogService(db).reconcileTaskWatchdogs()).rejects.toBe(original);
+  expect(selects).toBe(2);expect(db.execute).toHaveBeenCalledTimes(1);expect(effects.log).toHaveBeenCalledTimes(1);
+ });
+ it("does not continue original effects when the unreadable warning cannot be published",async()=>{
+  effects.log.mockReset();const failure=new Error("warning unavailable");effects.log.mockImplementationOnce(()=>{throw failure});
+  const p=port([[{companyId:id(1),issueId:id(2),watchdogIssueId:null}]]);
+  const db={...p.db,execute:vi.fn(async()=>{throw new Error("enumeration failed")})} as unknown as Db;
+  await expect(taskWatchdogService(db).reconcileTaskWatchdogs()).rejects.toBe(failure);
+  expect(p.used()).toBe(1);expect(db.execute).toHaveBeenCalledTimes(1);expect(effects.log).toHaveBeenCalledTimes(1);
+  effects.log.mockReset();
+ });
+});
