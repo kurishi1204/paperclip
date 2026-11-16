@@ -6621,7 +6621,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     try {
       return !(await adoptedRunner.isAlive());
     } catch {
-      return true;
+      // Identity observation failed; no positive exit fact was obtained.
+      // The adopted-runner watcher reports this as identity-unverifiable.
+      return false;
     }
   }
 

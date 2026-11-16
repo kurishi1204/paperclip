@@ -352,18 +352,19 @@ async function verifiedRecoveryProcessIsAlive(input: {
   try {
     process.kill(input.pid, 0);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException | undefined)?.code !== "EPERM")
-      return false;
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ESRCH") return false;
+    if (code !== "EPERM") throw error;
   }
-  try {
-    const observed = await readProcessStartedAt(input.pid);
-    return (
-      observed !== null &&
-      new Date(observed).getTime() === new Date(input.startedAt).getTime()
-    );
-  } catch {
-    return false;
+  // A failed identity probe does not prove the adopted runner exited. Preserve
+  // that rejection for the transport's identity-unverifiable failure path.
+  const observed = await readProcessStartedAt(input.pid);
+  if (observed === null) {
+    throw new Error("Native runner process start time is unavailable.");
   }
+  return (
+    new Date(observed).getTime() === new Date(input.startedAt).getTime()
+  );
 }
 
 async function signalVerifiedRecoveryProcess(
