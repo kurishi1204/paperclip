@@ -24870,7 +24870,7 @@ export function heartbeatService(
           const nativeReviewContext = readNativeReviewAssignmentContext(context);
           const nativeReview = nativeReviewContext ? await getNativeReviewAssignment(db, {
             companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id,
-            contextSnapshot: nativeReviewContext,
+            contextSnapshot: context,
           }) : null;
           if (nativeReviewContext && !nativeReview) throw new Error("native_review_assignment_no_longer_available");
           const documentReview = hasPendingDocumentReviewAdmission(run.runnerProfileJson)

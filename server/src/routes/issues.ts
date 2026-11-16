@@ -352,6 +352,7 @@ import {
   type IssueThreadInteractionResolverRestriction,
 } from "../services/issue-thread-interaction-resolution.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
+import { requestNativeReviewReturn, requestNativeReviewReturnSchema } from "../services/native-runtime/native-review-return.js";
 import {
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
@@ -16790,6 +16791,28 @@ export function issueRoutes(
       }
 
       res.status(201).json(interaction);
+    },
+  );
+
+  router.post(
+    "/issues/:id/interactions/:interactionId/request-reviewer-return",
+    validate(requestNativeReviewReturnSchema),
+    async (req, res) => {
+      assertBoard(req);
+      const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+      if (!issue) return;
+      if (req.actor.type !== "board" || !req.actor.userId) throw forbidden("Authenticated board user required");
+      const receipt = await requestNativeReviewReturn(db, {
+        companyId: issue.companyId, issueId: issue.id,
+        interactionId: req.params.interactionId as string, userId: req.actor.userId,
+        expected: req.body,
+        authorizeReviewer: async (agentId) => {
+          const decision = await access.decide({ actor: req.actor, action: "agent:wake",
+            resource: { type: "agent", companyId: issue.companyId, agentId } });
+          if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+        },
+      });
+      res.status(202).json(receipt);
     },
   );
 

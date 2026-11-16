@@ -309,12 +309,149 @@ async function resolveMockInteraction(
 }
 
 describe("issue thread interaction routes", () => {
+  // Drive the real route callback, assignment reader and durable wake writer.
+  // Only row IO is replaced; no socket or DB boots. The original audit writer runs.
+  async function reviewerReturn(fault?: string) {
+    const companyId = "47f6674e-962a-42b0-8e8d-62320d7e9c4e";
+    const issueId = "ca8953d2-d554-462f-ba22-2a66179f80c8";
+    const reviewer = "802edc4b-1e79-46a1-ad9e-8e88e2e2dea5";
+    const cardId = "eb456c69-3fb4-4640-a355-fafa1ff90fd9";
+    const decisionId = "9b928a7f-f098-43f3-a1cb-8e93c9d97539";
+    const sourceId = "e558d243-d48b-4a50-a7f2-0d1733698ac1";
+    const previousId = "662309b4-bf5c-4919-b20f-d5aa9c5a3d63";
+    const context = { nativeReviewInteractionId: cardId, nativeReviewDecisionId: decisionId };
+    const policy = { stages: [{ type: "review", approvalsNeeded: 1,
+      participants: [{ type: "agent", agentId: reviewer }] }] };
+    const issue = createIssue({ id: issueId, companyId, status: "in_review", revision: 384,
+      statusVersion: 7, lastStatusDecisionId: decisionId, executionPolicy: policy,
+      executionRunId: null, checkoutRunId: null });
+    const card = { id: cardId, companyId, issueId, kind: "request_confirmation", status: "pending",
+      sourceRunId: sourceId, addresseeAgentId: reviewer, addresseeUserId: null,
+      effectiveResolverPolicy: "anyone", resolverPolicyProvenance: "inherited",
+      payload: { version: 1, target: { type: "custom", key: "native_completion_review", revisionId: decisionId } } };
+    const decision = { id: decisionId, companyId, issueId, runId: sourceId,
+      applicationState: "applied", decisionJson: { projectedStatusVersion: 7 } };
+    const agent = { id: reviewer, companyId, status: "idle", reportsTo: null, name: "QA" };
+    const sourceRun = { id: sourceId, companyId, nativeIssueId: issueId, agentId: ASSIGNEE_AGENT_ID };
+    const previous = { id: previousId, companyId, nativeIssueId: issueId, agentId: reviewer,
+      runtimeMode: "native", status: "succeeded", exitCode: 0, signal: null,
+      startedAt: new Date(1000), createdAt: new Date(900), finishedAt: new Date(2000),
+      wakeupRequestId: RUN_1, contextSnapshot: context };
+    const finalization = { phase: "committed", failureCode: null, leaseOwner: null, recoveryState: null };
+    if (fault === "changed") issue.revision = 385;
+    if (fault === "locked") issue.executionRunId = RUN_2;
+    if (fault === "other reviewer") card.addresseeAgentId = CREATED_AGENT_ID;
+    if (fault === "unknown") previous.exitCode = null as any;
+    if (fault === "finalizing") finalization.phase = "terminal_failure";
+    const originalIntent = { id: RUN_2, status: "coalesced", runId: previousId,
+      reason: "native_completion_review", idempotencyKey: `native-review:${cardId}`,
+      requestedByActorType: "system", requestedByActorId: "native-status-committer" };
+    const effect = { payload: { interactionId: cardId, ownerAgentId: reviewer, reviewerWakeId: RUN_2 },
+      deliveryState: fault === "effect unknown" ? "pending" : "delivered", deliveredAt: new Date(1000) };
+    const { getTableName } = await import("drizzle-orm");
+    const rows: Record<string, any[][]> = {
+      issues: [[issue], [issue]], issue_thread_interactions: [[card], [card]], agents: [[agent], [agent]],
+      status_decisions: [[decision]], heartbeat_runs: [[sourceRun], [previous], fault === "successor" ? [{ id: RUN_9 }] : []],
+      native_run_finalizations: [[finalization]], status_decision_effects: [[effect]],
+      agent_wakeup_requests: [fault === "duplicate" ? [{ id: RUN_3, status: "failed", runId: null }] : [],
+        [originalIntent], [{ id: RUN_1, status: "completed", runId: previousId }],
+        fault === "pending" ? [{ id: RUN_9 }] : [], []],
+      instance_settings: [[{ id: RUN_9, general: { censorUsernameInLogs: false }, experimental: {} }]],
+    };
+    const inserted: any[] = [];
+    const audit: any[] = [];
+    const locks: string[] = [];
+    let read = 0;
+    const tx = {
+      select: () => {
+        const index = read++;
+        let values: any[];
+        const query: any = { from: (table: any) => {
+          const name = getTableName(table);
+          const next = rows[name]?.shift();
+          if (!next) throw new Error(`Unexpected SELECT from ${name}`);
+          values = next; return query;
+        }, where: () => query, limit: () => query,
+          for: (mode: string) => { locks.push(`${index}:${mode}`); return query; },
+          then: (resolve: any, reject: any) => Promise.resolve(values).then(resolve, reject) };
+        return query;
+      },
+      insert: (table: any) => ({ values: (value: any) => {
+        const name = getTableName(table);
+        if (name === "agent_wakeup_requests") inserted.push(value);
+        else if (name === "activity_log") audit.push(value);
+        else throw new Error(`Unexpected INSERT into ${name}`);
+        return {
+        returning: async () => [{ id: RUN_3 }],
+      }; } }),
+    };
+    mockDbTransaction.mockImplementation(async (callback: any) => callback(tx));
+    mockIssueService.getById.mockResolvedValue(issue);
+    if (fault === "permission") mockAccessDecide.mockResolvedValue({ allowed: false,
+      action: "agent:wake", reason: "deny", explanation: "Not authorized" });
+    const [{ issueRoutes }, { errorHandler }] = await loadAppModules();
+    const router = issueRoutes(mockDb as any, {} as any);
+    const route = router.stack.find((entry: any) => entry.route?.path === "/issues/:id/interactions/:interactionId/request-reviewer-return")?.route;
+    const res: any = { statusCode: 200, status(code: number) { this.statusCode = code; return this; },
+      json(body: unknown) { this.body = body; return this; }, headersSent: false };
+    if (!route) { res.status(404).json({ error: "No original reviewer return route" }); return { res, inserted, locks, audit }; }
+    const req: any = { method: "POST", path: route.path, headers: {}, params: { id: issueId, interactionId: cardId },
+      actor: fault === "agent actor" ? { type: "agent", agentId: reviewer, companyId, runId: previousId }
+        : { type: "board", userId: "owner", source: "session", companyIds: [companyId], isInstanceAdmin: false },
+      body: { expectedIssueRevision: 384, expectedDecisionId: decisionId, previousReviewerRunId: previousId } };
+    try {
+      // Schema middleware and the original route callback, without app.listen.
+      for (const layer of route.stack) await layer.handle(req, res, (err: unknown) => { if (err) throw err; });
+    } catch (error) { res.caught = String(error); errorHandler(error as any, req, res, () => {}); }
+    return { res, inserted, locks, audit };
+  }
+
+  it("reviewer return uses the original route and outbox without replaying the delivered effect", async () => {
+    const { res, inserted, locks, audit } = await reviewerReturn();
+    expect(res.statusCode, JSON.stringify({ body: res.body, caught: res.caught })).toBe(202);
+    expect(res.body).toMatchObject({ status: "queued", automaticRetry: false });
+    expect(inserted).toHaveLength(1);
+    expect(inserted[0]).toMatchObject({ requestedByActorId: "native-status-committer",
+      reason: "native_completion_review", idempotencyKey: "native-review-return:eb456c69-3fb4-4640-a355-fafa1ff90fd9",
+      payload: { _paperclipWakeContext: { forceFreshSession: true,
+        nativeReviewInteractionId: "eb456c69-3fb4-4640-a355-fafa1ff90fd9",
+        nativeReviewDecisionId: "9b928a7f-f098-43f3-a1cb-8e93c9d97539" } } });
+    expect(locks).toEqual(["0:update", "1:update"]);
+    expect(audit).toHaveLength(1);
+    expect(audit[0]).toMatchObject({ action: "issue.native_review_return_requested", actorType: "user", actorId: "owner" });
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    expect(mockInteractionService.acceptInteraction).not.toHaveBeenCalled();
+    expect(mockInteractionService.rejectInteraction).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["changed", "Issue changed or has an execution owner"],
+    ["locked", "Issue changed or has an execution owner"],
+    ["other reviewer", "Reviewer is no longer designated by the current policy"],
+    ["unknown", "Previous reviewer execution is not positively completed"],
+    ["finalizing", "Previous reviewer finalization is not settled"],
+    ["effect unknown", "Original review delivery is not proved"],
+    ["duplicate", "Reviewer return already recorded; inspect its receipt"],
+    ["successor", "A later execution or unresolved delivery must be received first"],
+    ["pending", "A later execution or unresolved delivery must be received first"],
+    ["permission", "Not authorized"],
+    ["agent actor", "Board access required"],
+  ])("reviewer return stops %s before delivery", async (fault, reason) => {
+    const { res, inserted, audit } = await reviewerReturn(fault);
+    expect([403, 409]).toContain(res.statusCode);
+    expect(res.body.error).toBe(reason);
+    expect(inserted).toEqual([]);
+    expect(audit).toEqual([]);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     vi.doUnmock("../services/index.js");
+    vi.doUnmock("../services/activity-log.js");
     registerModuleMocks();
     // Every mock here is a vi.hoisted() singleton. All 70+ tests share it.
     // A queued mockResolvedValueOnce() value can outlive its own test and

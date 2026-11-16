@@ -9,6 +9,7 @@ import {
 import { and, eq, isNull, or } from "drizzle-orm";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { canonicalizeStoredResolverPolicy } from "../issue-thread-interaction-resolution.js";
+import { nativeSha256 } from "./canonical.js";
 
 export type NativeReviewAssignmentContext = {
   nativeReviewInteractionId: string;
@@ -171,6 +172,16 @@ export async function getNativeReviewAssignment(
     eq(statusDecisions.issueId, input.issueId),
   )).limit(1).then((rows) => rows[0] ?? null);
   if (!interaction || !decision) return null;
+  // Return requests keep the original assignment, but must not survive a
+  // policy/card replacement between the owner request and normal delivery.
+  const returnProof = (input.contextSnapshot as Record<string, unknown>)?.nativeReviewReturn;
+  if (returnProof !== undefined) {
+    if (!returnProof || typeof returnProof !== "object") return null;
+    const proof = returnProof as Record<string, unknown>;
+    if (typeof proof.previousRunId !== "string"
+      || proof.policySha256 !== nativeSha256(issue.executionPolicy)
+      || proof.interactionPayloadSha256 !== nativeSha256(interaction.payload)) return null;
+  }
   const sourceRun = await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.id, decision.runId),
     eq(heartbeatRuns.companyId, input.companyId),
