@@ -1513,6 +1513,11 @@ function RequestConfirmationResolution({
   const staleTarget = interaction.result?.staleTarget ?? null;
 
   if (interaction.status === "accepted") {
+    const reviewReason = interaction.result?.reason ? (
+      <div className="rounded-sm border-l-2 border-border px-3 py-2 text-sm leading-6">
+        <MarkdownBody>{interaction.result.reason}</MarkdownBody>
+      </div>
+    ) : null;
     const resumeFailure = requestConfirmationResumeFailure(interaction);
     if (resumeFailure) {
       return (
@@ -1521,6 +1526,7 @@ function RequestConfirmationResolution({
             <span className="font-medium">Confirmed</span>
             <RequestConfirmationTargetChip interaction={interaction} target={target} />
           </div>
+          {reviewReason}
           <div className="rounded-sm border border-amber-500/60 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-100">
             <div className="text-(length:--text-micro) font-semibold uppercase tracking-(--tracking-eyebrow) text-amber-700">
               Agent resume failed
@@ -1540,9 +1546,12 @@ function RequestConfirmationResolution({
       );
     }
     return (
-      <div className="flex flex-wrap items-center gap-2 text-sm leading-6 text-foreground">
-        <span className="font-medium">Confirmed</span>
-        <RequestConfirmationTargetChip interaction={interaction} target={target} />
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center gap-2 text-sm leading-6 text-foreground">
+          <span className="font-medium">Confirmed</span>
+          <RequestConfirmationTargetChip interaction={interaction} target={target} />
+        </div>
+        {reviewReason}
       </div>
     );
   }
@@ -2758,6 +2767,11 @@ function RequestCheckboxConfirmationResolution({
           </span>
           <RequestConfirmationTargetChip interaction={interaction} target={target} />
         </div>
+        {interaction.result?.reason ? (
+          <div className="rounded-sm border-l-2 border-border px-3 py-2 text-sm leading-6">
+            <MarkdownBody>{interaction.result.reason}</MarkdownBody>
+          </div>
+        ) : null}
         {visibleLabels.length > 0 ? (
           <div className="flex flex-wrap gap-1.5">
             {visibleLabels.map((label, index) => (

@@ -2309,6 +2309,7 @@ export function issueThreadInteractionService(
           result: {
             version: 1,
             outcome: "accepted",
+            ...(args.input.reason ? { reason: args.input.reason } : {}),
             ...(selectedOptionIds ? { selectedOptionIds } : {}),
           },
           resolvedByAgentId: args.actor.agentId ?? null,
@@ -4114,6 +4115,9 @@ export function issueThreadInteractionService(
         interactionId,
       });
       await assertInteractionResolutionAllowed(db, current, actor);
+      if (data.reason != null && current.kind !== "request_confirmation" && current.kind !== "request_checkbox_confirmation") {
+        throw unprocessable("Acceptance reasons are supported only for confirmation reviews.");
+      }
       switch (current.kind) {
         case "suggest_tasks":
           // Accepting suggest_tasks only creates follow-up issues; it does not
@@ -4182,6 +4186,7 @@ export function issueThreadInteractionService(
       input: AcceptIssueThreadInteraction,
       actor: InteractionActor,
     ) => {
+      if (input.reason != null) throw unprocessable("Acceptance reasons are supported only for confirmation reviews.");
       assertIssueOpenForInteractionResolution(issue);
       const current = await db
         .select()

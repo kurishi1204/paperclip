@@ -189,11 +189,12 @@ suite("pending independent document review through real dispatch", () => {
         expect(response.status,JSON.stringify(response.body)).toBe(200);
         return new Response(JSON.stringify(response.body),{status:response.status});
       }));
-      expect(await x.authority.execute({ tool:"resolve_review", callId:"verdict", arguments:{decision:"accept"} }))
+      const reason = "Read the same fixed document revision.\nContract scope accepted; production remains unaccepted.";
+      expect(await x.authority.execute({ tool:"resolve_review", callId:"verdict", arguments:{decision:"accept",reason} }))
         .toMatchObject({interactionId:x.interactionId,status:"accepted"});
       expect(await nativeCompletionFeedback(db,x.runId,report)).toContain("report cannot override");
       expect(await getNativeDocumentReviewAssignment(db,{...x.binding,allowResolved:true}))
-        .toMatchObject({interaction:{status:"accepted",resolvedByRunId:x.runId,resolvedByAgentId:x.reviewerId}});
+        .toMatchObject({interaction:{status:"accepted",resolvedByRunId:x.runId,resolvedByAgentId:x.reviewerId,result:{reason}}});
       const [task] = await db.select().from(issues).where(eq(issues.id,x.issueId));
       expect(task).toMatchObject({assigneeAgentId:x.ownerId,status:"blocked"});
       const { arbitrateNativeStatus } = await import("../services/native-runtime/status-arbiter.js");

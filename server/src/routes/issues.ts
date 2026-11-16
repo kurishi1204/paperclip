@@ -16754,6 +16754,7 @@ export function issueRoutes(
         current.kind === "request_confirmation" &&
         current.payload.toolAction
       ) {
+        if (req.body.reason != null) throw unprocessable("Acceptance reasons are supported only for standard confirmation reviews.");
         if (!opts.approveToolActionRequest)
           throw unprocessable("Tool review resolution is unavailable");
         await opts.approveToolActionRequest({

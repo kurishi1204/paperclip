@@ -2079,6 +2079,8 @@ export type CreateIssueThreadInteractionInput = z.input<
 
 export const acceptIssueThreadInteractionSchema = z
   .object({
+    // Optional confirmation-review rationale uses the existing stored result contract.
+    reason: requestConfirmationResultSchema.shape.reason,
     rememberAction: z.boolean().optional(),
     selectedClientKeys: z
       .array(z.string().trim().min(1).max(120))

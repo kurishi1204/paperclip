@@ -436,6 +436,23 @@ describe("IssueThreadInteractionCard", () => {
     expect(host.textContent).not.toContain("Questions expired by comment");
   });
 
+  it("renders accepted confirmation rationale without changing the accepted verdict", () => {
+    const reason = "Read the assigned fixed revision.\nThe document contract is satisfied; production is still unaccepted.";
+    const host = renderCard({ interaction: { ...pendingRequestConfirmationInteraction,
+      status: "accepted", result: { version: 1, outcome: "accepted", reason } } });
+    expect(host.textContent).toContain("Confirmed");
+    expect(host.textContent).toContain("Read the assigned fixed revision.");
+    expect(host.textContent).toContain("production is still unaccepted");
+    expect(host.textContent).not.toContain("Declined");
+  });
+
+  it("renders accepted checkbox confirmation rationale with the selected outcome", () => {
+    const host = renderCard({ interaction: { ...pendingRequestCheckboxConfirmationInteraction,
+      status: "accepted", result: { version: 1, outcome: "accepted", selectedOptionIds: [], reason: "The fixed selection was reviewed." } } });
+    expect(host.textContent).toContain("Confirmed with no options selected");
+    expect(host.textContent).toContain("The fixed selection was reviewed.");
+  });
+
   it("renders withdrawn confirmations with the withdraw reason", () => {
     const host = renderCard({
       interaction: {

@@ -537,6 +537,16 @@ describe("issue thread interaction schemas", () => {
     }
   });
 
+  it("preserves an acceptance rationale through the input and existing stored-result schema", () => {
+    const reason = "Read the assigned fixed revision.\nThe requested contract is satisfied; production remains unaccepted.";
+    const input = acceptIssueThreadInteractionSchema.parse({ reason });
+    expect(input).toEqual({ reason });
+    expect(requestConfirmationResultSchema.parse({ version: 1, outcome: "accepted", reason: input.reason }))
+      .toEqual({ version: 1, outcome: "accepted", reason });
+    expect(acceptIssueThreadInteractionSchema.parse({})).toEqual({});
+    expect(acceptIssueThreadInteractionSchema.safeParse({ reason: "x".repeat(4001) }).success).toBe(false);
+  });
+
   it("accepts empty checkbox selections and rejects duplicate selected option ids", () => {
     expect(acceptIssueThreadInteractionSchema.parse({ selectedOptionIds: [] })).toEqual({
       selectedOptionIds: [],
