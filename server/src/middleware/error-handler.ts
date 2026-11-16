@@ -14,6 +14,28 @@ import {
 } from "./redact-sensitive.js";
 import { recordResponsibleUserDenialOnActiveRun } from "../services/responsible-user-denial-run-outcomes.js";
 
+export interface IssueMutationFailure {
+  issueId: string;
+  issueMutationStopId: string;
+  runCancellation: { runId: string; observedStatus: "cancelled"; evidence: "cancelRun_return" };
+  assignmentWrite: "not_attempted" | "outcome_unknown";
+  lastObservedOwnership: {
+    source: "request_read" | "locked_before_update";
+    revision: number;
+    statusVersion: number;
+    assigneeAgentId: string | null;
+    assigneeUserId: string | null;
+  };
+  currentOwnership: "unverified";
+  automaticRetry: false;
+  nextAction: "read_issue_and_run_before_owner_decision";
+}
+
+// Scoped to this response; this is neither a durable receipt nor replay authority.
+export function recordIssueMutationFailure(res: Response, failure: IssueMutationFailure) {
+  res.locals.issueMutationFailure = failure;
+}
+
 export interface ErrorContext {
   error: {
     message: string;
@@ -128,6 +150,9 @@ export function errorHandler(
   res: Response,
   _next: NextFunction,
 ) {
+  const issueMutation = res.locals?.issueMutationFailure as IssueMutationFailure | undefined;
+  const mutationResponse = issueMutation && !isSecretSensitiveHttpRequest(req.method, req.originalUrl)
+    ? { issueMutation, details: { issueMutation } } : {};
   if (err instanceof HttpError) {
     const details =
       err.details &&
@@ -152,7 +177,10 @@ export function errorHandler(
     ]).has(typeof details?.code === "string" ? details.code : "");
     const responseDetailsValue = sanitizeSecretSensitiveResponse(
       req,
-      err.details,
+      issueMutation && !isSecretSensitiveHttpRequest(req.method, req.originalUrl)
+        && (err.details == null || typeof err.details === "object" && !Array.isArray(err.details))
+        ? { ...(err.details as Record<string, unknown> | null | undefined), issueMutation }
+        : err.details,
     );
     const responseDetails =
       responseDetailsValue &&
@@ -185,6 +213,7 @@ export function errorHandler(
       secretSensitiveServerError
         ? { error: "Internal server error" }
         : {
+            ...mutationResponse,
             error: sanitizeSecretSensitiveResponse(req, err.message),
             ...(typeof responseDetails?.code === "string"
               ? { code: responseDetails.code }
@@ -230,6 +259,7 @@ export function errorHandler(
   const zodIssues = readZodIssues(err);
   if (zodIssues) {
     res.status(400).json({
+      ...mutationResponse,
       error: "Validation error",
       details: sanitizeSecretSensitiveResponse(req, zodIssues),
     });
@@ -244,7 +274,7 @@ export function errorHandler(
     "status" in err && err.status === 400 &&
     "type" in err && err.type === "entity.parse.failed"
   ) {
-    res.status(400).json({ error: "Invalid JSON body" });
+    res.status(400).json({ ...mutationResponse, error: "Invalid JSON body" });
     return;
   }
 
@@ -283,6 +313,7 @@ export function errorHandler(
   reportCrash(reportableError);
 
   res.status(500).json({
+    ...mutationResponse,
     error: "Internal server error",
     ...(shouldExposeTrustedCloudTenantImportError(req)
       ? { message: rootError.message }

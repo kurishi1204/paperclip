@@ -134,6 +134,7 @@ vi.mock("../services/index.js", () => ({
 }));
 
 import { errorHandler } from "../middleware/index.js";
+import { HttpError } from "../errors.js";
 import { issueRoutes } from "../routes/issues.js";
 
 type Actor = Record<string, unknown>;
@@ -506,4 +507,67 @@ describe("reserved work contract raw updates through original PATCH, no HTTP", (
   await executeRaw({ adapterConfig: { unrelated: "old" } }, next);
   expect(mockIssueService.update.mock.calls.at(-1)![1].assigneeAdapterOverrides).toEqual(next);
  });
+});
+
+
+describe("assignment failure response after modeled cancellation, no HTTP", () => {
+  async function invoke(mode: "locked-rejection" | "update-unknown" | "preflight" | "locked-other-owner") {
+    const runId = "55555555-5555-4555-8555-555555555555";
+    const existing = makeIssue({ description: "Current brief.", revision: 36, statusVersion: 8, executionRunId: runId, checkoutRunId: runId });
+    const locked = { ...existing, revision: 37,
+      description: mode === "locked-rejection" ? "Concurrent brief." : existing.description,
+      assigneeAgentId: mode === "locked-other-owner" ? PAUSED_AGENT_ID : existing.assigneeAgentId,
+    };
+    const run = { id: runId, companyId: existing.companyId, agentId: AGENT_ACTOR_ID, status: "running", nativeIssueId: existing.id, contextSnapshot: { issueId: existing.id } };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.getByIdForUpdate.mockResolvedValue(locked);
+    mockHeartbeatService.getRun.mockResolvedValue(run as any);
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(run as any);
+    mockHeartbeatService.cancelRun.mockReset();
+    mockHeartbeatService.cancelRun.mockImplementation(async (_id, _reason, options) => ({ ...run, status: "cancelled", resultJson: options?.resultJson }) as any);
+    const originalError = new Error("private database failure, commit outcome unknown");
+    mockIssueService.update.mockReset(); mockIssueService.update.mockRejectedValue(originalError);
+    mockHeartbeatService.wakeup.mockClear(); mockIssueService.getByIdForUpdate.mockClear();
+    const router = issueRoutes(stubDb() as any, {} as any);
+    const layer = (router as any).stack.find((l: any) => l.route?.path === "/issues/:id" && l.route.methods.patch);
+    const { updateIssueSchema } = await import("@paperclipai/shared");
+    const body = updateIssueSchema.parse({ assigneeAgentId: IDLE_AGENT_ID, workRequirements: { requiredOperations: mode === "preflight" ? ["issue_document_write"] : ["web_search", "final_response"], deliverable: "research" } });
+    const req: any = { params: { id: existing.id }, body, actor: boardActor(), headers: {}, method: "PATCH", path: `/issues/${existing.id}`, originalUrl: `/api/issues/${existing.id}`, get: () => undefined };
+    const res: any = { status: vi.fn().mockReturnThis(), json: vi.fn().mockReturnThis(), on: vi.fn(), once: vi.fn(), locals: {} };
+    let caught: unknown;
+    try { await layer.route.stack.at(-1).handle(req, res, () => {}); } catch (err) { caught = err; errorHandler(err, req, res, () => {}); }
+    return { caught, originalError, existing, locked, res, payload: res.json.mock.calls.at(-1)?.[0] };
+  }
+  it("reports confirmed cancellation and locked ownership without claiming assignment or replay", async () => {
+    const result = await invoke("locked-rejection");
+    expect(result.caught).toBeInstanceOf(HttpError);
+    expect(result.res.status).toHaveBeenCalledWith(409);
+    expect(result.payload).toMatchObject({ code: "assignment_work_contract_invalid", issueMutation: {
+      issueId: result.existing.id, assignmentWrite: "not_attempted", currentOwnership: "unverified", automaticRetry: false,
+      runCancellation: { runId: "55555555-5555-4555-8555-555555555555", observedStatus: "cancelled", evidence: "cancelRun_return" },
+      lastObservedOwnership: { source: "locked_before_update", revision: 37, assigneeAgentId: AGENT_ACTOR_ID },
+    } });
+    expect(result.payload.issueMutation.issueMutationStopId).toBe(mockHeartbeatService.cancelRun.mock.calls[0][2]?.resultJson?.issueMutationStopId);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.update).not.toHaveBeenCalled(); expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+  it("keeps an update/commit exception unknown, preserves original error and masks private message", async () => {
+    const result = await invoke("update-unknown");
+    expect(result.caught).toBe(result.originalError);
+    expect(result.res.status).toHaveBeenCalledWith(500);
+    expect(result.payload).toMatchObject({ error: "Internal server error", issueMutation: { assignmentWrite: "outcome_unknown", currentOwnership: "unverified", automaticRetry: false } });
+    expect(JSON.stringify(result.payload)).not.toContain("private database failure");
+    expect(mockIssueService.update).toHaveBeenCalledTimes(1); expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+  it("reports concurrent owner only as last locked observation", async () => {
+    const result = await invoke("locked-other-owner");
+    expect(result.payload.issueMutation).toMatchObject({ assignmentWrite: "not_attempted", currentOwnership: "unverified", lastObservedOwnership: { assigneeAgentId: PAUSED_AGENT_ID, revision: 37 } });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+  it("does not invent a cancellation receipt for a preflight rejection", async () => {
+    const result = await invoke("preflight");
+    expect(result.payload).toMatchObject({ code: "agent_work_requirements_unavailable" });
+    expect(result.payload).not.toHaveProperty("issueMutation");
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
 });

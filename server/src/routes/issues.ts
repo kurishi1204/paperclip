@@ -1,3 +1,4 @@
+import { recordIssueMutationFailure } from "../middleware/error-handler.js";
 import { prepareDocumentReturnWake } from "../services/document-return-wake.js";
 import { assertAssignableAgent, assertAssignmentWorkRequirementsPreserved, assignmentWorkSourcePin, hasAssignmentWorkRequirements, prepareAssignmentWorkRequirements } from "../services/agent-assignability.js";
 import {prepareCommanderAdmission} from "../services/commander-admission.js";
@@ -14074,6 +14075,15 @@ export function issueRoutes(
       // Only this request may finish a mutation that intentionally stops its
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
+      let reassignmentCancelledRunId: string | null = null;
+      let assignmentUpdateStarted = false;
+      let lastAssignmentOwnership = {
+        source: "request_read" as "request_read" | "locked_before_update",
+        revision: existing.revision,
+        statusVersion: existing.statusVersion,
+        assigneeAgentId: existing.assigneeAgentId,
+        assigneeUserId: existing.assigneeUserId,
+      };
       if (!boardReviewExpected && !formalApprovalExpected && req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
         const ownershipChange = {
           companyId: existing.companyId,
@@ -14117,6 +14127,7 @@ export function issueRoutes(
             );
           }
           interruptedRunId = cancelled.id;
+          reassignmentCancelledRunId = cancelled.id;
         }
       }
 
@@ -14207,6 +14218,7 @@ export function issueRoutes(
       const shouldCollectTerminalIssueActions =
         updateFields.status === "done" || updateFields.status === "cancelled";
       const updateIssue = (tx?: Parameters<typeof svc.update>[2]) => {
+        assignmentUpdateStarted = true;
         if (tx) {
           if (shouldCollectCompletionPublication) {
             return svc.update(
@@ -14387,6 +14399,13 @@ export function issueRoutes(
             }
             if (preparedWorkAssignment) {
               const locked = await svc.getByIdForUpdate(id, tx);
+              if (locked?.companyId === existing.companyId) {
+                lastAssignmentOwnership = {
+                  source: "locked_before_update", revision: locked.revision,
+                  statusVersion: locked.statusVersion,
+                  assigneeAgentId: locked.assigneeAgentId, assigneeUserId: locked.assigneeUserId,
+                };
+              }
               if (!locked || locked.companyId !== existing.companyId ||
                   locked.assigneeAgentId !== existing.assigneeAgentId ||
                   locked.assigneeUserId !== existing.assigneeUserId) {
@@ -14511,6 +14530,18 @@ export function issueRoutes(
           issue = await updateIssue();
         }
       } catch (err) {
+        if (reassignmentCancelledRunId) {
+          recordIssueMutationFailure(res, {
+            issueId: existing.id,
+            issueMutationStopId,
+            runCancellation: { runId: reassignmentCancelledRunId, observedStatus: "cancelled", evidence: "cancelRun_return" },
+            assignmentWrite: assignmentUpdateStarted ? "outcome_unknown" : "not_attempted",
+            lastObservedOwnership: lastAssignmentOwnership,
+            currentOwnership: "unverified",
+            automaticRetry: false,
+            nextAction: "read_issue_and_run_before_owner_decision",
+          });
+        }
         if (err instanceof HttpError && err.status === 422) {
           logger.warn(
             {
