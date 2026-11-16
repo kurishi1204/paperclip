@@ -127,6 +127,7 @@ import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
 import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
+import { parseNativeRunReceiptReadbackQuery, readNativeRunReceiptReadback } from "../services/native-runtime/native-run-receipt-readback.js";
 import { agentTaskAssignmentOptedOut } from "../services/agent-permissions.js";
 import { agentContinuityControls } from "../services/agent-continuity-controls.js";
 import { agentContinuityControlsPatchSchema } from "@paperclipai/shared";
@@ -7228,13 +7229,30 @@ export function agentRoutes(
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
     if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
+    const receiptOptions = parseNativeRunReceiptReadbackQuery(req.query);
+    let receiptReadback: Awaited<ReturnType<typeof readNativeRunReceiptReadback>> | undefined;
+    if (receiptOptions) {
+      // This opt-in receipt view is narrower than the existing telemetry view.
+      // Neither an agent key nor an operator/admin bypass is company ownership.
+      const membership = req.actor.type === "board" && req.actor.userId
+        ? await access.getMembership(run.companyId, "user", req.actor.userId)
+        : null;
+      if (membership?.status !== "active" || membership.membershipRole !== "owner") {
+        res.status(403).json({ error: "Native run receipt readback requires the active company owner" });
+        return;
+      }
+      if (run.runtimeMode !== "native" || !run.nativeIssueId) {
+        throw conflict("Native run receipt readback is unavailable for this run");
+      }
+      receiptReadback = await readNativeRunReceiptReadback(db, run, receiptOptions.expectedCanonicalSha256);
+    }
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
     res.json(await runRedactions.redactForRun(
       run.companyId,
       run.id,
       redactCurrentUserValue(
-        { ...decoratedRun, execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+        { ...decoratedRun, ...(receiptReadback ? { receiptReadback } : {}), execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
         await getCurrentUserRedactionOptions(),
       ),
     ));

@@ -9,6 +9,7 @@ import type {
 } from "@paperclipai/shared";
 import { tenantSessionRecovery } from "@/lib/tenant-session-recovery";
 import { api, type RequestOptions } from "./client";
+import type { NativeRunReceiptReadback } from "./heartbeat-receipts";
 
 export interface RunLivenessFields {
   livenessState: HeartbeatRun["livenessState"];
@@ -133,6 +134,11 @@ export const heartbeatsApi = {
     );
   },
   get: (runId: string) => api.get<HeartbeatRun>(`/heartbeat-runs/${runId}`),
+  receiptReadback: (runId: string, options?: RequestOptions) =>
+    api.get<HeartbeatRun & { receiptReadback?: NativeRunReceiptReadback }>(
+      `/heartbeat-runs/${encodeURIComponent(runId)}?receiptReadback=1`,
+      options,
+    ),
   events: (runId: string, afterSeq = 0, limit = 200, options?: RequestOptions) =>
     api.get<HeartbeatRunEvent[]>(
       `/heartbeat-runs/${runId}/events?afterSeq=${encodeURIComponent(String(afterSeq))}&limit=${encodeURIComponent(String(limit))}`,
