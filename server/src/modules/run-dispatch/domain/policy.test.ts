@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { assignmentWorkCompatibility, assignmentWorkSourcePin } from "../../../services/agent-assignability.js";
+import { assignmentWorkCompatibility, assignmentWorkSourcePin, prepareAssignmentWorkRequirements } from "../../../services/agent-assignability.js";
 import { updateIssueSchema } from "@paperclipai/shared";
 
 // The compatibility decision is pure. Assignment DB helpers are not invoked.
@@ -578,6 +578,33 @@ describe("explicit assignment work requirements at both dispatch gates", () => {
     const changed = { ...patched, description: "The requested source content changed." };
     expect(assignmentWorkCompatibility({ issue: changed, agent })).toMatchObject({ kind: "blocked",
       block: { errorCode: "assignment_work_contract_invalid", details: { invalidFields: ["sourceBriefSha256"] } } });
+  });
+
+  it("consumes explicit owner input from the normal issue update and pins the brief on the server", () => {
+    const request = { assigneeAgentId: agent.id, status: "todo", workRequirements: {
+      requiredOperations: ["issue_document_write"], deliverable: "saved_issue_document",
+    } };
+    const parsed = updateIssueSchema.parse(request);
+    expect(parsed).toEqual(request);
+    const prepared = prepareAssignmentWorkRequirements({ ...issue, assigneeAdapterOverrides: {
+      useProjectWorkspace: true, adapterConfig: { unchangedSetting: "keep" },
+    } }, parsed.workRequirements!);
+    expect(prepared.assigneeAdapterOverrides).toMatchObject({ useProjectWorkspace: true, adapterConfig: {
+      unchangedSetting: "keep", paperclipWorkRequirements: {
+        companyId: issue.companyId, issueId: issue.id, sourceBriefSha256: assignmentWorkSourcePin(issue),
+        requiredOperations: request.workRequirements.requiredOperations,
+      },
+    } });
+    expect(checkBoth(assignmentWorkCompatibility({ issue: prepared, agent }))).toMatchObject({
+      initial: { stale: true, errorCode: "agent_work_requirements_unavailable" },
+      retry: { allowed: false, errorCode: "agent_work_requirements_unavailable" },
+    });
+    const research = prepareAssignmentWorkRequirements(issue, { requiredOperations: ["web_search", "final_response"], deliverable: "research_response" });
+    expect(checkBoth(assignmentWorkCompatibility({ issue: research, agent }))).toEqual({ initial: { stale: false }, retry: { allowed: true } });
+    for (const workRequirements of [{ requiredOperations: [], deliverable: "document" },
+      { requiredOperations: ["web_search"], deliverable: "document", sourceBriefSha256: "caller-must-not-supply-pins" }]) {
+      expect(updateIssueSchema.safeParse({ ...request, workRequirements }).success).toBe(false);
+    }
   });
 
   it("does not silently fall back when an explicit contract is malformed or from another source", () => {

@@ -68,7 +68,7 @@ function conflictDetails(input: {
   };
 }
 
-async function getAgent(db: Db, agentId: string): Promise<AssignabilityAgent | null> {
+async function getAgent(db: Db, agentId: string): Promise<(AssignabilityAgent & { adapterType: string; adapterConfig: unknown }) | null> {
   return db
     .select({
       id: agents.id,
@@ -76,6 +76,8 @@ async function getAgent(db: Db, agentId: string): Promise<AssignabilityAgent | n
       name: agents.name,
       status: agents.status,
       reportsTo: agents.reportsTo,
+      adapterType: agents.adapterType,
+      adapterConfig: agents.adapterConfig,
     })
     .from(agents)
     .where(eq(agents.id, agentId))
@@ -106,7 +108,7 @@ export async function assertAssignableAgent(
   db: Db,
   companyId: string,
   agentId: string | null | undefined,
-  options: { kind?: AgentAssignmentKind } = {},
+  options: { kind?: AgentAssignmentKind; work?: AssignmentWorkIssue } = {},
 ) {
   if (!agentId) return;
   const kind = options.kind ?? "work";
@@ -126,7 +128,18 @@ export async function assertAssignableAgent(
     reportsTo: entry.reportsTo,
   }));
 
-  if (eligibility.assignable) return;
+  if (eligibility.assignable) {
+    if (options.work) {
+      const compatibility = assignmentWorkCompatibility({ issue: options.work, agent: assignee });
+      if (compatibility.kind === "blocked") {
+        throw conflict(compatibility.block.reason, {
+          code: compatibility.block.errorCode,
+          ...compatibility.block.details,
+        });
+      }
+    }
+    return;
+  }
 
   if (eligibility.assignabilityReason === "pending_approval") {
     throw conflict(assignmentMessage(kind, "pending_approval"), conflictDetails({
@@ -199,8 +212,50 @@ export function assignmentWorkSourcePin(issue: { title: string; description: str
   return createHash("sha256").update(JSON.stringify({ title: issue.title, description: issue.description })).digest("hex");
 }
 
+export type AssignmentWorkIssue = {
+  id: string; companyId: string; assigneeAgentId: string | null;
+  title: string; description: string | null; assigneeAdapterOverrides?: unknown;
+};
+
+function assignmentWorkConfig(issue: AssignmentWorkIssue): Record<string, unknown> {
+  const overrides = issue.assigneeAdapterOverrides;
+  if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) return {};
+  const config = (overrides as Record<string, unknown>).adapterConfig;
+  return config && typeof config === "object" && !Array.isArray(config) ? config as Record<string, unknown> : {};
+}
+
+/** Presence is distinct from validity: an explicit null/broken contract still checks. */
+export function hasAssignmentWorkRequirements(issue: AssignmentWorkIssue): boolean {
+  return Object.hasOwn(assignmentWorkConfig(issue), "paperclipWorkRequirements");
+}
+
+/** Ordinary issue-update producer: the owner supplies meaning, the server supplies
+ * identity. The resulting contract is the same persisted contract dispatch reads. */
+export function prepareAssignmentWorkRequirements(
+  issue: AssignmentWorkIssue,
+  requirements: { requiredOperations: string[]; deliverable: string },
+) {
+  const object = (value: unknown): Record<string, unknown> =>
+    value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const overrides = object(issue.assigneeAdapterOverrides);
+  return { ...issue, assigneeAdapterOverrides: {
+    ...overrides,
+    adapterConfig: {
+      ...object(overrides.adapterConfig),
+      paperclipWorkRequirements: {
+        schema: "paperclip.work-requirements.v1",
+        companyId: issue.companyId,
+        issueId: issue.id,
+        sourceBriefSha256: assignmentWorkSourcePin(issue),
+        requiredOperations: [...requirements.requiredOperations],
+        deliverable: requirements.deliverable,
+      },
+    },
+  } };
+}
+
 export function assignmentWorkCompatibility(input: {
-  issue: { id: string; companyId: string; assigneeAgentId: string | null; title: string; description: string | null; assigneeAdapterOverrides?: unknown };
+  issue: AssignmentWorkIssue;
   agent: { id: string; adapterType: string; adapterConfig?: unknown };
   operatorBoundedAgentId?: string;
 }): AssignmentWorkCompatibility {
@@ -208,9 +263,8 @@ export function assignmentWorkCompatibility(input: {
   if (input.issue.assigneeAgentId !== input.agent.id) return { kind: "unclassified", reason: "not_assigned_executor" };
   const object = (value: unknown): Record<string, unknown> =>
     value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-  const overrides = object(input.issue.assigneeAdapterOverrides);
-  const config = object(overrides.adapterConfig);
-  if (!Object.hasOwn(config, "paperclipWorkRequirements")) return { kind: "unclassified", reason: "not_supplied" };
+  const config = assignmentWorkConfig(input.issue);
+  if (!hasAssignmentWorkRequirements(input.issue)) return { kind: "unclassified", reason: "not_supplied" };
   const raw = config.paperclipWorkRequirements;
   const contract = object(raw);
   const operations = contract.requiredOperations;

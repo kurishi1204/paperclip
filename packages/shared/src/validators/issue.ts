@@ -904,6 +904,15 @@ export const updateIssueSchema = objectWithoutDefaults(
   .partial()
   .extend({
     expectedRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    /** The assigning owner states required operations; the server pins the current brief.
+     * Omission leaves the work unclassified. This never grants adapter capabilities. */
+    workRequirements: z.object({
+      requiredOperations: z.array(z.string().trim().min(1)).min(1)
+        .refine((operations) => new Set(operations).size === operations.length, {
+          message: "Required operations must be unique",
+        }),
+      deliverable: z.string().trim().min(1),
+    }).strict().optional(),
     requestDepth: issueRequestDepthInputSchema.optional(),
     assigneeAgentId: z.string().trim().min(1).optional().nullable(),
     comment: multilineTextSchema.pipe(z.string().min(1)).optional(),

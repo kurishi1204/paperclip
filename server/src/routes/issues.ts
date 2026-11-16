@@ -1,4 +1,5 @@
 import { prepareDocumentReturnWake } from "../services/document-return-wake.js";
+import { assertAssignableAgent, assignmentWorkSourcePin, hasAssignmentWorkRequirements, prepareAssignmentWorkRequirements } from "../services/agent-assignability.js";
 import {prepareCommanderAdmission} from "../services/commander-admission.js";
 import {commanderAdmissionDigest,prepareCommanderAdmissionSchema,commanderPolicySchema} from "../services/commander-cycle.js";
 import { activeIssueInteractionCondition, readTaskQuestionContext } from "../services/issue-question-context.js";
@@ -13358,7 +13359,7 @@ export function issueRoutes(
       }
       // MCP task changes cannot stop a run or implicitly decide a pending review.
       const mcpParticipationChange = req.actor.source === "mcp_oauth" &&
-        ["status", "assigneeAgentId", "assigneeUserId", "blockedByIssueIds", "parentId", "projectId"].some(key => req.body[key] !== undefined);
+        ["status", "assigneeAgentId", "assigneeUserId", "blockedByIssueIds", "parentId", "projectId", "workRequirements"].some(key => req.body[key] !== undefined);
       if (mcpParticipationChange) await assertMcpTaskParticipation(db, existing);
 
       assertNoAgentHostWorkspaceCommandMutation(
@@ -13413,6 +13414,7 @@ export function issueRoutes(
         : null;
       const {
         comment: commentBody,
+        workRequirements,
         commentClientRequestId,
         attachmentIds: commentAttachmentIds,
         reviewInteractionId: requestedReviewInteractionId,
@@ -14004,8 +14006,15 @@ export function issueRoutes(
           code: "interaction_response_queued",
         });
       }
-      if (assigneeWillChange && !transition.workflowControlledAssignment) {
-        if (!isAgentReturningIssueToCreator) {
+      if (workRequirements !== undefined && (
+        !nextAssigneeAgentId || existing.conversationAgentId || transition.workflowControlledAssignment ||
+        (updateFields.status ?? existing.status) === "in_review" ||
+        updateFields.assigneeAdapterOverrides !== undefined
+      )) {
+        throw unprocessable("Work requirements need a normal agent work assignment and cannot be combined with raw adapter overrides");
+      }
+      if ((assigneeWillChange || workRequirements !== undefined) && !transition.workflowControlledAssignment) {
+        if (!isAgentReturningIssueToCreator || workRequirements !== undefined) {
           await assertCanAssignTasks(req, existing.companyId, {
             issueId: existing.id,
             projectId: await resolveAssignmentProjectId({
@@ -14024,6 +14033,36 @@ export function issueRoutes(
             assigneeAgentId: nextAssigneeAgentId,
             assigneeUserId: nextAssigneeUserId,
           });
+        }
+      }
+
+      const prepareWorkAssignment = (current: NonNullable<typeof existing>) => {
+        const work = {
+          ...current,
+          assigneeAgentId: nextAssigneeAgentId,
+          title: updateFields.title === undefined ? current.title : updateFields.title,
+          description: updateFields.description === undefined ? current.description : updateFields.description,
+          assigneeAdapterOverrides: workRequirements === undefined && updateFields.assigneeAdapterOverrides !== undefined
+            ? updateFields.assigneeAdapterOverrides : current.assigneeAdapterOverrides,
+        };
+        return workRequirements === undefined ? work : prepareAssignmentWorkRequirements(work, workRequirements);
+      };
+      // Subsequent ordinary reassignments consume the already-persisted contract too.
+      // Workflow reviewers and the fixed server document-return path are separate work.
+      const nextWorkAssignment = nextAssigneeAgentId && !transition.workflowControlledAssignment &&
+        !existing.conversationAgentId && (updateFields.status ?? existing.status) !== "in_review" &&
+        (assigneeWillChange || workRequirements !== undefined)
+          ? prepareWorkAssignment(existing) : null;
+      // No contract means the original unclassified assignment path, with no new gate.
+      const preparedWorkAssignment = nextWorkAssignment && hasAssignmentWorkRequirements(nextWorkAssignment)
+        ? nextWorkAssignment : null;
+      if (preparedWorkAssignment) {
+        // Fail before goal stopping, run cancellation, ownership mutation or wake.
+        await assertAssignableAgent(db, existing.companyId, nextAssigneeAgentId, {
+          kind: "work", work: preparedWorkAssignment,
+        });
+        if (workRequirements !== undefined) {
+          updateFields.assigneeAdapterOverrides = preparedWorkAssignment.assigneeAdapterOverrides;
         }
       }
 
@@ -14321,6 +14360,7 @@ export function issueRoutes(
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
+        Boolean(preparedWorkAssignment) ||
         Boolean(commentAttachmentIds?.length) ||
         commentWithAdapterOverrides ||
         Boolean(decision) ||
@@ -14331,6 +14371,30 @@ export function issueRoutes(
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
+            if (preparedWorkAssignment) {
+              const locked = await svc.getByIdForUpdate(id, tx);
+              if (!locked || locked.companyId !== existing.companyId ||
+                  locked.assigneeAgentId !== existing.assigneeAgentId ||
+                  locked.assigneeUserId !== existing.assigneeUserId) {
+                throw conflict("Assignment changed before the work requirements could be saved", { code: "assignment_work_contract_invalid" });
+              }
+              const lockedWorkAssignment = prepareWorkAssignment(locked);
+              if (assignmentWorkSourcePin(lockedWorkAssignment) !== assignmentWorkSourcePin(preparedWorkAssignment)) {
+                throw conflict("The source brief changed; the assigning owner must confirm the required operations again", {
+                  code: "assignment_work_contract_invalid",
+                  expectedSourceBriefSha256: assignmentWorkSourcePin(lockedWorkAssignment),
+                  suppliedSourceBriefSha256: assignmentWorkSourcePin(preparedWorkAssignment),
+                });
+              }
+              await assertAssignableAgent(tx as unknown as Db, locked.companyId, nextAssigneeAgentId, {
+                kind: "work", work: lockedWorkAssignment,
+              });
+              // Merge the currently locked overrides, preserving unrelated configuration.
+              if (workRequirements !== undefined) {
+                issueUpdateData.assigneeAdapterOverrides = lockedWorkAssignment.assigneeAdapterOverrides;
+                updateFields.assigneeAdapterOverrides = lockedWorkAssignment.assigneeAdapterOverrides;
+              }
+            }
             if (selfTaskReviewExpected) await withSelfTaskDocument(req, res, true, async (locked, executor) => {
               const expected = selfTaskReviewExpected;
               if (locked.revision !== expected.revision || locked.statusVersion !== expected.statusVersion ||
