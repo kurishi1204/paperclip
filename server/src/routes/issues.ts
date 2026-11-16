@@ -1,5 +1,5 @@
 import { prepareDocumentReturnWake } from "../services/document-return-wake.js";
-import { assertAssignableAgent, assignmentWorkSourcePin, hasAssignmentWorkRequirements, prepareAssignmentWorkRequirements } from "../services/agent-assignability.js";
+import { assertAssignableAgent, assertAssignmentWorkRequirementsPreserved, assignmentWorkSourcePin, hasAssignmentWorkRequirements, prepareAssignmentWorkRequirements } from "../services/agent-assignability.js";
 import {prepareCommanderAdmission} from "../services/commander-admission.js";
 import {commanderAdmissionDigest,prepareCommanderAdmissionSchema,commanderPolicySchema} from "../services/commander-cycle.js";
 import { activeIssueInteractionCondition, readTaskQuestionContext } from "../services/issue-question-context.js";
@@ -13431,6 +13431,11 @@ export function issueRoutes(
         boardReviewExpected: _boardReviewExpected,
         ...updateFields
       } = req.body;
+      const rawWorkOverridesRequested = updateFields.assigneeAdapterOverrides !== undefined;
+      if (rawWorkOverridesRequested) {
+        // Reject before any separately requested interrupt/ownership effects.
+        assertAssignmentWorkRequirementsPreserved(existing, updateFields.assigneeAdapterOverrides);
+      }
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
         throw unprocessable("Send conversation messages through the comments endpoint with a clientRequestId");
       }
@@ -14360,7 +14365,7 @@ export function issueRoutes(
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
-        Boolean(preparedWorkAssignment) ||
+        rawWorkOverridesRequested || Boolean(preparedWorkAssignment) ||
         Boolean(commentAttachmentIds?.length) ||
         commentWithAdapterOverrides ||
         Boolean(decision) ||
@@ -14371,6 +14376,15 @@ export function issueRoutes(
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
+            if (rawWorkOverridesRequested) {
+              const locked = await svc.getByIdForUpdate(id, tx);
+              if (!locked || locked.companyId !== existing.companyId) {
+                throw conflict("Issue changed before adapter overrides could be saved", { code: "assignment_work_contract_invalid" });
+              }
+              // A concurrent authorized producer may have installed or changed
+              // the contract since preflight. Do not erase its committed value.
+              assertAssignmentWorkRequirementsPreserved(locked, issueUpdateData.assigneeAdapterOverrides);
+            }
             if (preparedWorkAssignment) {
               const locked = await svc.getByIdForUpdate(id, tx);
               if (!locked || locked.companyId !== existing.companyId ||

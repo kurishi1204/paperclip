@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents } from "@paperclipai/db";
@@ -227,6 +228,25 @@ function assignmentWorkConfig(issue: AssignmentWorkIssue): Record<string, unknow
 /** Presence is distinct from validity: an explicit null/broken contract still checks. */
 export function hasAssignmentWorkRequirements(issue: AssignmentWorkIssue): boolean {
   return Object.hasOwn(assignmentWorkConfig(issue), "paperclipWorkRequirements");
+}
+
+/** Raw adapter configuration is not an alternate work-requirements producer.
+ * Compare presence as well as value so deletion/null/creation cannot silently
+ * turn an explicit contract into an unclassified legacy assignment. */
+export function assertAssignmentWorkRequirementsPreserved(
+  current: AssignmentWorkIssue,
+  nextOverrides: unknown,
+): void {
+  const proposed = { ...current, assigneeAdapterOverrides: nextOverrides };
+  const currentConfig = assignmentWorkConfig(current);
+  const proposedConfig = assignmentWorkConfig(proposed);
+  if (hasAssignmentWorkRequirements(current) !== hasAssignmentWorkRequirements(proposed) ||
+      !isDeepStrictEqual(currentConfig.paperclipWorkRequirements, proposedConfig.paperclipWorkRequirements)) {
+    throw conflict("Raw adapter overrides cannot create, replace or remove work requirements; use the authorized workRequirements input", {
+      code: "assignment_work_contract_invalid",
+      issueId: current.id,
+    });
+  }
 }
 
 /** Ordinary issue-update producer: the owner supplies meaning, the server supplies
