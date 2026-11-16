@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents } from "@paperclipai/db";
@@ -168,4 +169,83 @@ export async function assertAssignableAgent(
         ? firstInvalidAncestor.id
         : null,
   }));
+}
+
+/** Company owners decide what the work needs. This mechanical handoff contract
+ * carries that decision; task titles, prose and agent names are not classifiers.
+ * It is optional metadata on the existing per-issue adapter override, never a
+ * grant of tools or authority. Dispatch always reads the persisted issue. */
+export type AssignmentWorkBlock = {
+  errorCode: "assignment_work_contract_invalid" | "agent_work_requirements_unavailable";
+  reason: string;
+  details: Record<string, unknown>;
+};
+export type AssignmentWorkCompatibility =
+  | { kind: "unclassified"; reason: "not_supplied" | "not_assigned_executor" | "adapter_capabilities_not_declared" }
+  | { kind: "compatible" }
+  | { kind: "blocked"; block: AssignmentWorkBlock };
+
+export function isBoundedResearchAgent(agent: {
+  id: string; adapterType: string; adapterConfig?: unknown;
+}, operatorBoundedAgentId: string | undefined = process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID): boolean {
+  const config = agent.adapterConfig && typeof agent.adapterConfig === "object" && !Array.isArray(agent.adapterConfig)
+    ? agent.adapterConfig as Record<string, unknown> : {};
+  return agent.adapterType === "hermes_local" &&
+    (agent.id === operatorBoundedAgentId || config.boundedExecution === true);
+}
+
+/** Stable across assignment/status/metadata writes; pins only the source brief. */
+export function assignmentWorkSourcePin(issue: { title: string; description: string | null }): string {
+  return createHash("sha256").update(JSON.stringify({ title: issue.title, description: issue.description })).digest("hex");
+}
+
+export function assignmentWorkCompatibility(input: {
+  issue: { id: string; companyId: string; assigneeAgentId: string | null; title: string; description: string | null; assigneeAdapterOverrides?: unknown };
+  agent: { id: string; adapterType: string; adapterConfig?: unknown };
+  operatorBoundedAgentId?: string;
+}): AssignmentWorkCompatibility {
+  // Match the runtime override owner: reviewer/coordinator work is a different operation.
+  if (input.issue.assigneeAgentId !== input.agent.id) return { kind: "unclassified", reason: "not_assigned_executor" };
+  const object = (value: unknown): Record<string, unknown> =>
+    value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const overrides = object(input.issue.assigneeAdapterOverrides);
+  const config = object(overrides.adapterConfig);
+  if (!Object.hasOwn(config, "paperclipWorkRequirements")) return { kind: "unclassified", reason: "not_supplied" };
+  const raw = config.paperclipWorkRequirements;
+  const contract = object(raw);
+  const operations = contract.requiredOperations;
+  const problems: string[] = [];
+  if (contract.schema !== "paperclip.work-requirements.v1") problems.push("schema");
+  if (contract.companyId !== input.issue.companyId) problems.push("companyId");
+  if (contract.issueId !== input.issue.id) problems.push("issueId");
+  if (contract.sourceBriefSha256 !== assignmentWorkSourcePin(input.issue)) problems.push("sourceBriefSha256");
+  if (Object.keys(contract).some(key => !["schema", "companyId", "issueId", "sourceBriefSha256", "requiredOperations", "deliverable"].includes(key))) problems.push("unknown_fields");
+  if (typeof contract.deliverable !== "string" || !contract.deliverable.trim()) problems.push("deliverable");
+  if (!Array.isArray(operations) || operations.length === 0 ||
+      operations.some(operation => typeof operation !== "string" || !operation.trim()) ||
+      new Set(operations).size !== operations.length) problems.push("requiredOperations");
+  if (problems.length) return { kind: "blocked", block: {
+    errorCode: "assignment_work_contract_invalid",
+    reason: "Assignment work contract is invalid or no longer matches the issue. The existing sender must correct the contract before execution.",
+    details: { issueId: input.issue.id, invalidFields: problems, expectedSourceBriefSha256: assignmentWorkSourcePin(input.issue),
+      suppliedSourceBriefSha256: typeof contract.sourceBriefSha256 === "string" ? contract.sourceBriefSha256 : null },
+  } };
+  // The operator pin cannot be disabled by an issue override. Other adapters
+  // have no verified operation declaration here: leave them unclassified.
+  const effectiveConfig = { ...object(input.agent.adapterConfig), ...config };
+  if (!isBoundedResearchAgent({ ...input.agent, adapterConfig: effectiveConfig }, input.operatorBoundedAgentId)) {
+    return { kind: "unclassified", reason: "adapter_capabilities_not_declared" };
+  }
+  // This is the bounded adapter's actual closed tool/result surface, not a
+  // vocabulary for inferring a task's intent from its wording.
+  const supported = new Set(["web_search", "final_response"]);
+  const unavailableOperations = (operations as string[]).filter(operation => !supported.has(operation));
+  if (!unavailableOperations.length) return { kind: "compatible" };
+  return { kind: "blocked", block: {
+    errorCode: "agent_work_requirements_unavailable",
+    reason: "The assigned web-only research worker cannot perform the explicit required operations. The existing sender must use the approved capable owner or record the missing assignment decision; do not retry this worker.",
+    details: { issueId: input.issue.id, sourceBriefSha256: contract.sourceBriefSha256, agentId: input.agent.id,
+      requiredOperations: operations, unavailableOperations, deliverable: contract.deliverable,
+      supportedOperations: [...supported], classification: "explicit_requirement_mismatch" },
+  } };
 }

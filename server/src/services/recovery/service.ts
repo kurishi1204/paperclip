@@ -1,3 +1,4 @@
+import { isBoundedResearchAgent } from "../agent-assignability.js";
 import { hasSelfTaskDocumentReplayHold } from "../self-task-document-runtime.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { hasCommittedNativePlanWait } from "../native-runtime/native-plan-wait.js";
@@ -3950,9 +3951,7 @@ export function recoveryService(
     // Bounded Hermes can verify public web evidence, but cannot mutate company
     // state. Leave the missing disposition visible instead of scheduling a
     // repair that its sealed tool surface cannot perform.
-    if (ownerAgent?.adapterType === "hermes_local" &&
-      (parseObject(ownerAgent.adapterConfig).boundedExecution === true ||
-        process.env.PAPERCLIP_HERMES_BOUNDED_AGENT_ID === ownerAgent.id)) {
+    if (ownerAgent && isBoundedResearchAgent(ownerAgent)) {
       const escalated = await escalateDispositionRepair({
         issue: current,
         latestRun,
