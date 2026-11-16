@@ -587,13 +587,10 @@ function noopTaskWatchdogService(): TaskWatchdogService {
       // Preserve that absence as a failure instead of fabricating an empty one.
       throw unprocessable("Task watchdog service is unavailable");
     },
-    reconcileForIssueAndAncestors: async () => ({
-      checked: 0,
-      triggered: 0,
-      pendingFirstRun: 0,
-      skipped: 0,
-      watchdogIssueIds: [],
-    }),
+    reconcileForIssueAndAncestors: async () => {
+      // No dispatcher is available here; do not report a healthy empty sweep.
+      throw unprocessable("Task watchdog service is unavailable");
+    },
     revalidateMutationScope: async () => ({
       allowed: true,
       classification: {

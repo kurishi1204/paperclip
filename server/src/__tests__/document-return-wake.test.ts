@@ -1,12 +1,13 @@
 import {normalizePaperclipWakePayload,renderPaperclipWakePrompt} from "../../../packages/adapter-utils/src/server-utils.js";
 import {executeDocumentReturn} from "../services/document-return-executor.js";
+import {PgDialect} from "drizzle-orm/pg-core";
 import {getTableName} from "drizzle-orm";
-const effects=vi.hoisted(()=>({append:vi.fn(),create:vi.fn(),pause:vi.fn(),blocker:vi.fn(),log:vi.fn()}));
-vi.mock("../services/issues.js",()=>({issueService:()=>({addComment:effects.append,create:effects.create})}));
+const effects=vi.hoisted(()=>({append:vi.fn(),create:vi.fn(),pause:vi.fn(),blocker:vi.fn(),log:vi.fn(),info:vi.fn()}));
+vi.mock("../services/issues.js",()=>({executeIssuePostCommitActions:vi.fn(),issueService:()=>({addComment:effects.append,create:effects.create})}));
 vi.mock("../services/issue-tree-control.js",()=>({issueTreeControlService:()=>({getActivePauseHoldGate:effects.pause})}));
 vi.mock("../services/execution-blocker.js",()=>({getExecutionBlocker:effects.blocker}));
-vi.mock("../middleware/logger.js",()=>({logger:{warn:effects.log}}));
-vi.mock("../services/activity-log.js",()=>({logActivity:vi.fn()}));
+vi.mock("../middleware/logger.js",()=>({logger:{warn:effects.log,info:effects.info}}));
+vi.mock("../services/activity-log.js",()=>({logActivity:vi.fn(),publishActivity:vi.fn()}));
 import {taskWatchdogService} from "../services/task-watchdogs.js";
 import {describe,it,expect,vi} from "vitest";
 import type {Db} from "@paperclipai/db";
@@ -209,26 +210,49 @@ describe("supervision target enumeration preserves original reconciliation",()=>
 /** Original effectful caller over owned in-memory rows, not an embedded DB.
  * Only the supplemental full-row interaction read can fail; classifier reads
  * still describe an old, assigned, stopped leaf eligible for its normal wake. */
-function stoppedWatchdogPort(readFails = true, enqueueError?: Error) {
+function stoppedWatchdogPort(readFails = true, enqueueError?: Error, faults: {commitFails?: boolean; beforeClaim?: boolean; insertFails?: boolean; unknownWriteError?: Error; pauseEnqueue?: Promise<void>} = {}) {
  const trace:string[]=[];
  const issue={id:id(2),companyId:id(1),status:"blocked",originKind:"issue",identifier:"SYN-2",title:"Synthetic stopped leaf",
   parentId:null,assigneeAgentId:id(3),assigneeUserId:null,createdAt:new Date("2020-01-01"),updatedAt:new Date("2020-01-01")};
  const wd:any={id:id(70),companyId:id(1),issueId:id(2),watchdogAgentId:id(71),status:"active",watchdogIssueId:null,
   lastObservedFingerprint:null,lastReviewedFingerprint:null,lastObservedStopSnapshot:null,lastReviewedStopSnapshot:null,triggerCount:0};
  let review:any=null,issueReads=0,executeReads=0;
- const writes:any[]=[];
- effects.log.mockReset();effects.log.mockImplementation(()=>trace.push("warning"));
+ const writes:any[]=[],wakes:any[]=[],runs:any[]=[];
+ const dialect=new PgDialect();
+ function matching(rows:any[],condition:any){
+  if(!condition)return rows;
+  const query=dialect.sqlToQuery(condition), text=query.sql, params=query.params;
+  // Interpret the real production predicates for the owned row port. Unknown
+  // comparison forms fail the fixture rather than silently matching all rows.
+  const column=(name:string)=>name.replace(/_([a-z])/g,(_,c)=>c.toUpperCase());
+  return rows.filter(row=>{
+   for(const m of text.matchAll(/"(?:agent_wakeup_requests|issue_watchdogs)"\."(\w+)" = \$(\d+)/g))
+    if(row[column(m[1])]!==params[Number(m[2])-1])return false;
+   for(const m of text.matchAll(/"(?:agent_wakeup_requests|issue_watchdogs)"\."(\w+)" in \(([^)]+)\)/g)){
+    const values=[...m[2].matchAll(/\$(\d+)/g)].map(x=>params[Number(x[1])-1]);
+    if(!values.includes(row[column(m[1])]))return false;
+   }
+   for(const m of text.matchAll(/"(?:agent_wakeup_requests|issue_watchdogs)"\."(\w+)" is null/g))
+    if(row[column(m[1])]!=null)return false;
+   return true;
+  });
+ }
+ let txTail=Promise.resolve();
+
+ effects.log.mockReset();effects.log.mockImplementation(()=>trace.push("warning"));effects.info.mockReset();
  effects.create.mockReset();effects.create.mockImplementation(async(_company,input)=>{
   trace.push("create-review");review={...input,id:id(72),companyId:id(1)};writes.push({create:review});return review;
  });
  effects.append.mockReset();effects.append.mockImplementation(async()=>{trace.push("comment");writes.push({comment:true});return {id:id(73)}});
  const db:any={
   select(columns?:unknown){
-   let table="";
-   const q:any={from:(t:any)=>{table=getTableName(t);return q},where:()=>q,innerJoin:()=>q,orderBy:()=>q,limit:()=>q,groupBy:()=>q,
+   let table="",condition:any;
+   const q:any={for:()=>q,from:(t:any)=>{table=getTableName(t);return q},where:(c:any)=>{condition=c;return q},innerJoin:()=>q,orderBy:()=>q,limit:()=>q,groupBy:()=>q,
     then:(ok:any,bad:any)=>Promise.resolve().then(()=>{
      trace.push(`read:${table}:${columns?"projection":"full"}`);
-     if(table==="issue_watchdogs")return [wd];
+     if(table==="issue_watchdogs")return matching([wd],condition);
+     if(table==="agent_wakeup_requests")return matching(wakes,condition);
+     if(table==="heartbeat_runs")return runs;
      if(table==="issues"){
       if(columns)return [];
       const index=issueReads++;
@@ -241,14 +265,37 @@ function stoppedWatchdogPort(readFails = true, enqueueError?: Error) {
     }).then(ok,bad)};return q;
   },
   execute:async()=>++executeReads%2===1?[{id:issue.id}]:[issue],
-  update(table:any){return {set(value:any){return {where(){
-   trace.push("write:"+getTableName(table));writes.push(value);Object.assign(wd,value);
-   return {then:(ok:any,bad:any)=>Promise.resolve(undefined).then(ok,bad),returning:async()=>[wd]};
+  transaction:async(fn:any)=>{
+   const previous=txTail;let release!:()=>void;txTail=new Promise<void>(r=>release=r);await previous;
+   const saved={wd:{...wd},review:review?{...review}:null,wakes:wakes.map(w=>({...w})),writes:writes.length};
+   try{const result=await fn(db);if(faults.commitFails)throw new Error("commit failed");return result}
+   catch(error){for(const k of Object.keys(wd))delete wd[k];Object.assign(wd,saved.wd);review=saved.review;wakes.splice(0,wakes.length,...saved.wakes);writes.length=saved.writes;throw error}
+   finally{release()}
+  },
+  insert(table:any){expect(getTableName(table)).toBe("agent_wakeup_requests");return {values(value:any){return {returning:async()=>{
+   if(faults.insertFails)throw new Error("outbox insert failed");
+   const row={...value,id:id(80+wakes.length),runId:null};wakes.push(row);trace.push("save-intent");writes.push({intent:row.id});return [row];
   }}}}},
+  update(table:any){return {set(value:any){return {where(condition:any){
+   let completed=false,result:any[]=[];
+   const execute=()=>{if(completed)return result;completed=true;
+    if(getTableName(table)==="agent_wakeup_requests" && value.status==="watchdog_dispatching" && faults.beforeClaim)throw new Error("before claim interruption");
+     if(getTableName(table)==="agent_wakeup_requests" && value.status==="watchdog_unknown" && faults.unknownWriteError)throw faults.unknownWriteError;
+    const targets=matching(getTableName(table)==="issue_watchdogs"?[wd]:wakes,condition);
+    for(const row of targets){trace.push("write:"+getTableName(table));writes.push(value);Object.assign(row,value)}
+    result=targets;return result;
+   };
+   return {then:(ok:any,bad:any)=>Promise.resolve().then(execute).then(ok,bad),returning:async()=>execute()};
+  }}}}},
+
  };
- const enqueue=vi.fn(async()=>{trace.push("enqueue");if(enqueueError)throw enqueueError;return {id:id(74)}});
+ const enqueue=vi.fn(async(agent:any,options:any)=>{
+  trace.push("enqueue");if(faults.pauseEnqueue)await faults.pauseEnqueue;if(enqueueError)throw enqueueError;
+  wakes.push({id:id(90),companyId:id(1),agentId:agent,...options,status:"queued",runId:id(74)});
+  runs.push({id:id(74),companyId:id(1),agentId:agent,status:"queued"});return {id:id(74)};
+ });
  const service=taskWatchdogService(db,{enqueueWakeup:enqueue});
- return {trace,writes,wd,enqueue,run:()=>{issueReads=0;executeReads=0;return service.reconcileForIssueAndAncestors(id(1),id(2))}};
+ return {trace,writes,wd,wakes,runs,enqueue,faults,run:()=>{issueReads=0;executeReads=0;return service.reconcileForIssueAndAncestors(id(1),id(2))}};
 }
 
 describe("stopped watchdog supplemental handoff before durable trigger",()=>{
@@ -268,7 +315,7 @@ describe("stopped watchdog supplemental handoff before durable trigger",()=>{
   expect(renderPaperclipWakePrompt(wake.payload)).toContain("never retry or admission authority");
   const before=p.writes.length;
   expect(await p.run()).toMatchObject({checked:1,triggered:0});
-  expect(p.writes).toHaveLength(before);expect(p.enqueue).toHaveBeenCalledTimes(1);
+  expect(p.writes.slice(before).some(w=>w.lastTriggeredAt || w.create || w.intent || w.comment)).toBe(false);expect(p.enqueue).toHaveBeenCalledTimes(1);
  });
  it("propagates unavailable warning before creating a review or saving any trigger",async()=>{
   const p=stoppedWatchdogPort(),failure=new Error("warning unavailable");effects.log.mockImplementation(()=>{throw failure});
@@ -287,5 +334,75 @@ describe("stopped watchdog supplemental handoff before durable trigger",()=>{
   expect(normalizePaperclipWakePayload(payload(marker))?.taskWatchdog?.documentReturnFollowthrough).toMatchObject({state:"readable",issues:[{state:"unreadable"}]});
   for(const invalid of [{...marker,mayResend:true},{...marker,authorizesEffect:true},{...marker,issueId:"bad"}])
    expect(normalizePaperclipWakePayload(payload(invalid))?.taskWatchdog?.documentReturnFollowthrough).toEqual({state:"invalid",issues:[]});
+ });
+});
+
+
+describe("durable watchdog handoff through original reconciliation",()=>{
+ it.each(["insertFails","commitFails"] as const)("rolls back the trigger and review when %s",async fault=>{
+  const p=stoppedWatchdogPort(false,undefined,{[fault]:true});
+  await expect(p.run()).rejects.toThrow(fault==="insertFails"?"outbox insert failed":"commit failed");
+  expect(p.writes).toEqual([]);expect(p.wakes).toEqual([]);expect(p.wd.watchdogIssueId).toBeNull();expect(p.enqueue).not.toHaveBeenCalled();
+ });
+ it("resumes a committed pending handoff on the existing sweep without re-creating the trigger",async()=>{
+  const p=stoppedWatchdogPort(false,undefined,{beforeClaim:true});
+  await expect(p.run()).rejects.toThrow("before claim interruption");
+  expect(p.wakes).toHaveLength(1);expect(p.wakes[0].status).toBe("watchdog_pending");expect(p.enqueue).not.toHaveBeenCalled();
+  const triggers=p.writes.filter(w=>w.lastTriggeredAt).length;p.faults.beforeClaim=false;
+  const result=await p.run();expect(result).toMatchObject({triggered:0,handoffDelivery:[{state:"accepted:queued",runId:id(74)}]});
+  expect(p.enqueue).toHaveBeenCalledTimes(1);expect(p.writes.filter(w=>w.lastTriggeredAt)).toHaveLength(triggers);
+  p.runs[0].status="running";expect((await p.run()).handoffDelivery).toMatchObject([{state:"running"}]);
+ });
+ it("claims one pending row across competing sweeps, without relying on the task_watchdog key",async()=>{
+  const p=stoppedWatchdogPort(false,undefined,{beforeClaim:true});await expect(p.run()).rejects.toThrow();p.faults.beforeClaim=false;
+  let release!:()=>void;p.faults.pauseEnqueue=new Promise<void>(r=>release=r);
+  const first=p.run();while(!p.enqueue.mock.calls.length)await new Promise(r=>setTimeout(r,0));
+  await p.run();expect(p.enqueue).toHaveBeenCalledTimes(1);release();await first;
+  expect(p.wakes.filter(w=>w.requestedByActorId==="task-watchdog-outbox-v1")).toHaveLength(1);
+ });
+ it("preserves a claimed crash and a historical trigger without synthesizing delivery",async()=>{
+  const p=stoppedWatchdogPort(false,undefined,{beforeClaim:true});await expect(p.run()).rejects.toThrow();p.faults.beforeClaim=false;
+  p.wakes[0].status="watchdog_dispatching";
+  expect((await p.run()).handoffDelivery).toMatchObject([{state:"outcome_unknown"}]);expect(p.enqueue).not.toHaveBeenCalled();
+  p.wakes.length=0;expect(await p.run()).toMatchObject({triggered:0,handoffDelivery:[]});expect(p.enqueue).not.toHaveBeenCalled();
+ });
+ it("holds a persisted pending intent when its owner disables the watchdog",async()=>{
+  const p=stoppedWatchdogPort(false,undefined,{beforeClaim:true});await expect(p.run()).rejects.toThrow();p.faults.beforeClaim=false;p.wd.status="disabled";
+  expect((await p.run()).handoffDelivery).toMatchObject([{state:"held:watchdog_disabled"}]);expect(p.enqueue).not.toHaveBeenCalled();expect(p.wakes[0].status).toBe("watchdog_pending");
+ });
+});
+
+
+describe("watchdog handoff observations reach existing consumers",()=>{
+ it("publishes accepted and running observations even when the caller discards the reconcile return",async()=>{
+  const p=stoppedWatchdogPort(false,undefined,{beforeClaim:true});await expect(p.run()).rejects.toThrow();p.faults.beforeClaim=false;
+  await p.run();expect(effects.info).toHaveBeenCalledWith({handoff:expect.objectContaining({state:"accepted:queued",runId:id(74)}),mayResend:false},"watchdog handoff receipt observed");
+  p.runs[0].status="running";await p.run();expect(effects.info).toHaveBeenLastCalledWith({handoff:expect.objectContaining({state:"running"}),mayResend:false},"watchdog handoff receipt observed");
+ });
+ it.each(["disabled","owner_changed"])("persists and publishes %s without calling enqueue",async condition=>{
+  const p=stoppedWatchdogPort(false,undefined,{beforeClaim:true});await expect(p.run()).rejects.toThrow();p.faults.beforeClaim=false;
+  if(condition==="disabled")p.wd.status="disabled";else p.wd.watchdogAgentId=id(99);
+  await p.run();expect(p.enqueue).not.toHaveBeenCalled();expect(p.wakes[0].error).toBe(`watchdog_${condition}`);
+  expect(effects.log).toHaveBeenCalledWith({handoff:expect.objectContaining({state:`held:watchdog_${condition}`}),mayResend:false},"watchdog handoff held");
+ });
+ it("fails visibly if the observation outlet is unavailable without replaying the accepted effect",async()=>{
+  const p=stoppedWatchdogPort(false),failure=new Error("observation outlet unavailable");effects.info.mockImplementation(()=>{throw failure});
+  await expect(p.run()).rejects.toBe(failure);expect(p.enqueue).toHaveBeenCalledTimes(1);expect(p.wakes[0].status).toBe("watchdog_accepted");
+  effects.info.mockReset();await p.run();expect(p.enqueue).toHaveBeenCalledTimes(1);
+ });
+});
+
+
+describe("original handoff exception survives secondary failures",()=>{
+ it.each(["record","warning","both"])("retains the original error and non-retryable claim on %s failure",async fault=>{
+  const original=new Error("original admission outcome unknown"),secondary=new Error("outcome record unavailable"),warning=new Error("warning unavailable");
+  const p=stoppedWatchdogPort(false,original,{unknownWriteError:fault==="warning"?undefined:secondary});
+  if(fault!=="record")effects.log.mockImplementation(()=>{throw warning});
+  await expect(p.run()).rejects.toBe(original);expect(p.enqueue).toHaveBeenCalledTimes(1);
+  expect(p.wakes[0].status).toBe(fault==="warning"?"watchdog_unknown":"watchdog_dispatching");
+  expect(effects.log).toHaveBeenCalledWith({err:original,outcomeRecordError:fault==="warning"?undefined:secondary,
+   handoffRequestId:p.wakes[0].id,state:"outcome_unknown",mayResend:false},"watchdog handoff requires attention; original delivery is not retried");
+  effects.log.mockReset();p.faults.unknownWriteError=undefined;
+  expect((await p.run()).handoffDelivery).toMatchObject([{state:"outcome_unknown"}]);expect(p.enqueue).toHaveBeenCalledTimes(1);
  });
 });

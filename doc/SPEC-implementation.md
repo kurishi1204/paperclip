@@ -905,6 +905,27 @@ Within the watched subtree, a watchdog run may perform only mutations that resto
 
 Every watchdog-triggered mutation must write activity with the watchdog id, source issue id, watchdog issue id when present, run id, and stop fingerprint. Mutations still use the normal status-transition, blocker, assignment, budget, and company-boundary guards.
 
+### Durable watchdog handoff
+
+New stopped-subtree triggers persist their reusable review, trigger activity, and
+`agent_wakeup_requests` delivery intent in one transaction under the watchdog row
+lock. The existing reconciliation calls inspect these versioned intents; no new
+scheduler or retry authority is implied. `watchdog_pending` means not yet claimed.
+A conditional update from pending to `watchdog_dispatching` permits one normal
+admission call, still subject to the existing pause, owner, dependency and budget
+gates. A task-watchdog fingerprint key alone is not a concurrency fence.
+
+After claim, a throw or missing/ambiguous receipt is outcome-unknown, never an
+expired lease eligible for another call. A later sweep can link an exact saved
+company/agent/request-actor/key/issue receipt and its run; it cannot resend it.
+Reconciliation returns pending, accepted, running, held, finished, or unknown
+observations and warns for unknown delivery. Legacy triggers without the versioned
+intent remain untouched. A process crash between claim and admission requires
+original-result recovery or a separate authorized disposition; this change does
+not promise automatic recovery of that unknown window. Offline/stopped reconcilers
+cannot deliver or observe pending work. Non-DB tests do not establish PostgreSQL
+atomicity, live delivery, company QA, or business acceptance.
+
 ### Atomic recovery batch
 
 A watchdog run may submit an atomic recovery batch of at most 3 mutations drawn from the allowed-mutation list above, validated against the stop fingerprint that run observed. The server applies the batch all-or-nothing: if the subtree's stop fingerprint changed between observation and application — the subtree went live concurrently — the entire remainder of the batch is aborted and the staleness is recorded as evidence on the reusable watchdog issue. The batch is single-shot per watchdog run. This replaces the exactly-one-fresh-write model: the stale-guard's purpose (never mutate a subtree that concurrently went live) is preserved by fingerprint validation on the whole batch rather than by capping the run at one write, so a restoration that needs both a state-restoring `PATCH` and an explanatory comment cannot forfeit the restoration by ordering the comment first.
