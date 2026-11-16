@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { HeartbeatRun } from "@paperclipai/shared";
 import { heartbeatsApi } from "../api/heartbeats";
@@ -67,11 +68,13 @@ function TechnicalRow({ label, value }: { label: string; value: string | number 
 }
 
 /** Only allowlisted metadata belongs here; never spread a Run or raw result into the view. */
-export function RunReceiptReadbackView({ run, receipt, pending, error }: {
+export function RunReceiptReadbackView({ run, receipt, pending, error, detailsOpen, onDetailsToggle }: {
   run: RunScope;
   receipt?: NativeRunReceiptReadback | null;
   pending?: boolean;
   error?: unknown;
+  detailsOpen?: boolean;
+  onDetailsToggle?: (open: boolean) => void;
 }) {
   // A failed authorization/read never leaves previously fetched owner metadata visible.
   const current = !error && receipt && receiptMatchesRun(receipt, run) ? receipt : null;
@@ -99,7 +102,7 @@ export function RunReceiptReadbackView({ run, receipt, pending, error }: {
           {!current.authority.environmentLeases.complete && <dd className="text-muted-foreground">保持資源の記録は全体未確認です。</dd>}</div>
       </dl>
       <p className="text-xs text-muted-foreground">ここで確認できるのは技術上の保存・処理記録です。会社担当は、対象版のQA・採否と返却先の実受領を元の記録で確認してください。</p>
-      <details className="text-xs"><summary className="cursor-pointer text-muted-foreground">照合に使う技術記録</summary>
+      <details className="text-xs" open={detailsOpen} onToggle={event => onDetailsToggle?.(event.currentTarget.open)}><summary className="cursor-pointer text-muted-foreground">照合に使う技術記録</summary>
         <div className="pt-3 space-y-3">
           <dl className="space-y-2"><TechnicalRow label="Run" value={current.scope.runId} /><TechnicalRow label="照合状態" value={current.comparison.state} />
             <TechnicalRow label="終了処理" value={current.finalization.record?.phase} /><TechnicalRow label="終了処理の試行" value={current.finalization.record?.attempt} />
@@ -124,7 +127,9 @@ function ReceiptUnavailable({ children }: { children: React.ReactNode }) {
   </section>;
 }
 
-function OwnerReceiptReadback({ run, viewerScope }: { run: RunScope; viewerScope: string }) {
+function OwnerReceiptReadback({ run, viewerScope, detailsOpen, onDetailsToggle }: {
+  run: RunScope; viewerScope: string; detailsOpen: boolean; onDetailsToggle: (open: boolean) => void;
+}) {
   const query = useQuery({
     queryKey: queryKeys.runReceiptReadback(run.companyId, run.id, run.status, viewerScope),
     queryFn: ({ signal }) => heartbeatsApi.receiptReadback(run.id, { signal }),
@@ -134,13 +139,23 @@ function OwnerReceiptReadback({ run, viewerScope }: { run: RunScope; viewerScope
     refetchOnWindowFocus: false,
   });
   // Remounts must obtain a fresh authorized response before showing cached data.
-  return <RunReceiptReadbackView run={run}
+  return <RunReceiptReadbackView run={run} detailsOpen={detailsOpen} onDetailsToggle={onDetailsToggle}
     receipt={query.isFetchedAfterMount && !query.isFetching ? query.data?.receiptReadback : null}
     pending={query.isPending || query.isFetching} error={query.error} />;
 }
 
 export function RunReceiptReadback({ run }: { run: RunScope }) {
   const identity = useAccountIdentity();
+  // Presentation state is local to this viewer/company/Run, never to a cached receipt.
+  return <ScopedRunReceiptReadback key={JSON.stringify([identity.userId, run.companyId, run.id, run.agentId])}
+    run={run} identity={identity} />;
+}
+
+function ScopedRunReceiptReadback({ run, identity }: {
+  run: RunScope; identity: ReturnType<typeof useAccountIdentity>;
+}) {
+  // Keep only disclosure intent while the permission gate removes private metadata.
+  const [disclosure, setDisclosure] = useState<{ viewerScope: string; open: boolean } | null>(null);
   const supported = run.runtimeMode === "native" && typeof run.nativeIssueId === "string" && run.nativeIssueId.length > 0;
   const unsupported = (typeof run.runtimeMode === "string" && run.runtimeMode !== "native")
     || (run.runtimeMode === "native" && run.nativeIssueId === null);
@@ -170,5 +185,7 @@ export function RunReceiptReadback({ run }: { run: RunScope }) {
     && membership.status === "active" && membership.membershipRole === "owner");
   if (!owner) return <ReceiptUnavailable>この受領記録は会社所有者だけが確認できます。保存結果は未確認です。</ReceiptUnavailable>;
   const viewerScope = JSON.stringify([identity.userId, viewer.userId, viewer.source, viewer.keyId]);
-  return <OwnerReceiptReadback key={viewerScope} run={run} viewerScope={viewerScope} />;
+  return <OwnerReceiptReadback key={viewerScope} run={run} viewerScope={viewerScope}
+    detailsOpen={disclosure?.viewerScope === viewerScope && disclosure.open}
+    onDetailsToggle={open => setDisclosure({ viewerScope, open })} />;
 }

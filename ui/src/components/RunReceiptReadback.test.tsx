@@ -1,14 +1,15 @@
 // @vitest-environment jsdom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, focusManager } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NativeRunReceiptReadback } from "../api/heartbeat-receipts";
+import { queryKeys } from "../lib/queryKeys";
 import { ApiError } from "../api/client";
 import { RunReceiptReadback, RunReceiptReadbackView } from "./RunReceiptReadback";
 
 declare module "vitest" {
-  interface TaskMeta { renderedHTML?: string }
+  interface TaskMeta { renderedHTML?: string; disclosureStages?: Record<string, string> }
 }
 
 const read = vi.hoisted(() => vi.fn());
@@ -53,6 +54,79 @@ afterEach(async ({ task }) => {
 });
 
 describe("Run receipt readback", () => {
+  it.each(["denied", "failed"])("hides an opened receipt when permission refresh is %s", async (outcome) => {
+    read.mockResolvedValue({ receiptReadback: fixture() });
+    const client = new QueryClient();
+    const el = await render(<QueryClientProvider client={client}><RunReceiptReadback run={run} /></QueryClientProvider>);
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+    await act(async () => { const details = el.querySelector("details")!; details.open = true; details.dispatchEvent(new Event("toggle")); });
+    expect(el.querySelector("details")?.open).toBe(true);
+    access.mockRejectedValueOnce(outcome === "denied" ? new ApiError("private", 403, {}) : new Error("private"));
+    await act(async () => { await client.refetchQueries({ queryKey: queryKeys.runReceiptViewerAccess(identity.userId) }); });
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+    expect(access).toHaveBeenCalledTimes(2); expect(read).toHaveBeenCalledTimes(1);
+    expect(el.textContent).not.toContain("saved-result"); expect(el.querySelector("details")).toBeNull();
+    client.clear();
+  });
+  it.each(["viewer", "company", "run"])("resets opened disclosure on %s switch without displaying old metadata", async (scope) => {
+    let currentRun = run;
+    const receiptForRun = () => ({ ...fixture(), scope: { ...fixture().scope, companyId: currentRun.companyId, runId: currentRun.id },
+      results: { ...fixture().results, rows: [{ ...fixture().results.rows[0], id: "new-result" }] } });
+    read.mockResolvedValueOnce({ receiptReadback: fixture() });
+    const client = new QueryClient();
+    const element = () => <QueryClientProvider client={client}><RunReceiptReadback run={currentRun} /></QueryClientProvider>;
+    const settle = () => act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+    const el = await render(element()); await settle();
+    await act(async () => { const details = el.querySelector("details")!; details.open = true; details.dispatchEvent(new Event("toggle")); });
+    expect(el.querySelector("details")?.open).toBe(true);
+    if (scope === "viewer") identity.userId = "owner-b";
+    if (scope === "company") currentRun = { ...run, companyId: "company-2" };
+    if (scope === "run") currentRun = { ...run, id: "run-2" };
+    let finishAccess!: (value: ReturnType<typeof ownerAccess>) => void;
+    access.mockImplementationOnce(() => new Promise(resolve => { finishAccess = resolve; }));
+    read.mockResolvedValueOnce({ receiptReadback: receiptForRun() });
+    await act(async () => root!.render(element())); await settle();
+    expect(el.textContent).not.toContain("saved-result"); expect(el.querySelector("details")).toBeNull();
+    const accessForRun = { ...ownerAccess(), memberships: [{ companyId: currentRun.companyId, status: "active", membershipRole: "owner" }] };
+    await act(async () => finishAccess(accessForRun)); await settle();
+    expect(el.textContent).toContain("new-result"); expect(el.textContent).not.toContain("saved-result");
+    expect(el.querySelector("details")?.open).toBe(false);
+    // Returning to a previous scope also starts closed and obtains fresh permission/data.
+    identity.userId = "owner-a"; currentRun = run;
+    access.mockResolvedValueOnce(ownerAccess()); read.mockResolvedValueOnce({ receiptReadback: fixture() });
+    await act(async () => root!.render(element())); await settle();
+    expect(el.querySelector("details")?.open).toBe(false);
+    client.clear();
+  });
+
+  it("preserves opened technical details across stale permission focus refresh", async ({ task }) => {
+    read.mockResolvedValue({ receiptReadback: fixture() });
+    const client = new QueryClient({ defaultOptions: { queries: { staleTime: 30_000, refetchOnWindowFocus: true } } });
+    const el = await render(<QueryClientProvider client={client}><RunReceiptReadback run={run} /></QueryClientProvider>);
+    const settle = () => act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+    await settle();
+    const details = el.querySelector("details")!;
+    await act(async () => { details.open = true; details.dispatchEvent(new Event("toggle")); });
+    expect(details.open).toBe(true);
+    task.meta.disclosureStages = { before: el.outerHTML };
+    let finishAccess!: (value: ReturnType<typeof ownerAccess>) => void;
+    access.mockImplementationOnce(() => new Promise(resolve => { finishAccess = resolve; }));
+    client.setQueryData(queryKeys.runReceiptViewerAccess(identity.userId), ownerAccess(), { updatedAt: Date.now() - 31_000 });
+    await act(async () => { focusManager.setFocused(false); focusManager.setFocused(true); });
+    await settle();
+    expect(access).toHaveBeenCalledTimes(2);
+    expect(el.textContent).not.toContain("saved-result");
+    expect(el.querySelector("details")).toBeNull();
+    task.meta.disclosureStages.pending = el.outerHTML;
+    await act(async () => { finishAccess(ownerAccess()); });
+    await settle();
+    task.meta.disclosureStages.refreshed = el.outerHTML;
+    expect(el.querySelector("details")?.open).toBe(true);
+    expect(el.textContent).toContain("saved-result");
+    expect(read).toHaveBeenCalledTimes(2);
+    client.clear(); focusManager.setFocused(undefined);
+  });
+
   it("keeps a saved accepted result visible beside a failed company Run without business acceptance", async () => {
     const receipt = { ...fixture(), resultJson: "PRIVATE-BODY-MUST-NOT-RENDER" };
     const el = await render(<RunReceiptReadbackView run={run} receipt={receipt} />);
