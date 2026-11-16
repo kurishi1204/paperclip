@@ -92,9 +92,12 @@ async function readLinkedDocuments(
  */
 export async function readNativeCompletionDocumentRevisions(
   db: Db,
-  input: { companyId: string; issueId: string },
+  input: { companyId: string; issueId: string; requireComplete?: boolean },
 ): Promise<RequestConfirmationBoundDocument[]> {
-  return (await readLinkedDocuments(db, input)).flatMap((row) =>
+  const linked = await readLinkedDocuments(db, input);
+  if (input.requireComplete && linked.some(row => !row.revisionId))
+    throw conflict("A submitted document has no current revision");
+  return linked.flatMap((row) =>
     row.revisionId
       ? [{ documentId: row.documentId, key: row.key, revisionId: row.revisionId, revisionNumber: row.revisionNumber }]
       : []);
@@ -228,6 +231,13 @@ export async function assertNativeCompletionDocumentBindingCurrent(
   // resolver keeps the existing audience rules (addressee, human_only) and may
   // judge documents they wrote; a system actor keeps its own existing rules.
   const agentId = input.actor.agentId;
+  await assertNativeCompletionDocumentAuthorsIndependent(db, input.companyId, bound, agentId);
+}
+
+/** Shared by acceptance and the owner-only policy preparation entry. */
+export async function assertNativeCompletionDocumentAuthorsIndependent(
+  db: Db, companyId: string, bound: RequestConfirmationBoundDocument[], agentId?: string | null,
+) {
   if (bound.length === 0 || !agentId) return;
 
   const boundNumber = new Map(bound.map((entry) => [entry.documentId, entry.revisionNumber]));
@@ -243,12 +253,12 @@ export async function assertNativeCompletionDocumentBindingCurrent(
       heartbeatRuns,
       and(
         eq(heartbeatRuns.id, documentRevisions.createdByRunId),
-        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.companyId, companyId),
       ),
     )
     .where(
       and(
-        eq(documentRevisions.companyId, input.companyId),
+        eq(documentRevisions.companyId, companyId),
         inArray(documentRevisions.documentId, [...boundNumber.keys()]),
       ),
     );

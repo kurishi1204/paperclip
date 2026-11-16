@@ -35,6 +35,24 @@ function facts(overrides: object = {}): NativeReviewAssignmentFacts {
 }
 
 describe("native review participant", () => {
+  it.each([true, false])("retained pending card requires current policy designation: %s", async designated => {
+    const f = facts();
+    const policy = { mode: "normal", stages: [{ type: "review", approvalsNeeded: 1,
+      participants: [{ type: "agent", agentId: designated ? f.agentId : "99999999-9999-4999-8999-999999999999" }] }] };
+    const issue = { id: f.issueId, companyId: f.companyId, status: f.issueStatus,
+      statusVersion: f.issueStatusVersion, lastStatusDecisionId: f.issueLastStatusDecisionId,
+      assigneeAgentId: f.issueAssigneeAgentId, executionPolicy: policy };
+    const agent = { id: f.agentId, companyId: f.companyId, name: "reviewer", status: "idle", reportsTo: null };
+    const rows = [[issue], [agent], [f.interaction], [f.decision], [f.sourceRun], [agent]];
+    const db: any = { select: () => {
+      const values = rows.shift();
+      const query: any = { from: () => query, where: () => query, limit: () => query,
+        then: (ok: any, no: any) => Promise.resolve(values).then(ok, no) }; return query;
+    } };
+    const assignment = await getNativeReviewAssignment(db, { companyId: f.companyId, issueId: f.issueId,
+      agentId: f.agentId, contextSnapshot: ids });
+    expect(assignment !== null).toBe(designated);
+  });
   it.each(["same", "policy changed", "card changed", "malformed"])("rechecks reviewer return proof at original delivery: %s", async change => {
     const f = facts();
     const policy = { stages: [{ type: "review", participants: [{ type: "agent", agentId: f.agentId }] }] };

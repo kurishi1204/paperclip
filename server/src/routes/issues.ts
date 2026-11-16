@@ -353,6 +353,7 @@ import {
 } from "../services/issue-thread-interaction-resolution.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
 import { requestNativeReviewReturn, requestNativeReviewReturnSchema } from "../services/native-runtime/native-review-return.js";
+import { amendNativeReviewPolicy, nativeReviewPolicySchema } from "../services/native-runtime/native-review-policy.js";
 import {
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
@@ -16793,6 +16794,16 @@ export function issueRoutes(
       res.status(201).json(interaction);
     },
   );
+
+  router.post("/issues/:id/native-review-policy", validate(nativeReviewPolicySchema), async (req, res) => {
+    assertBoard(req);
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue) return;
+    if (req.actor.type !== "board" || !req.actor.userId || req.actor.source !== "session")
+      throw forbidden("Authenticated company owner session required");
+    res.json(await amendNativeReviewPolicy(db, { companyId: issue.companyId, issueId: issue.id,
+      userId: req.actor.userId, expected: req.body }));
+  });
 
   router.post(
     "/issues/:id/interactions/:interactionId/request-reviewer-return",

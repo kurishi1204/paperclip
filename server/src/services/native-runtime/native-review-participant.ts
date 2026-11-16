@@ -10,6 +10,7 @@ import { and, eq, isNull, or } from "drizzle-orm";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { canonicalizeStoredResolverPolicy } from "../issue-thread-interaction-resolution.js";
 import { nativeSha256 } from "./canonical.js";
+import { issueExecutionPolicySchema } from "@paperclipai/shared";
 
 export type NativeReviewAssignmentContext = {
   nativeReviewInteractionId: string;
@@ -161,6 +162,10 @@ export async function getNativeReviewAssignment(
     eq(agents.companyId, input.companyId), eq(agents.id, input.agentId),
   )).limit(1).then((rows) => rows[0] ?? null);
   if (!issue || !agent) return null;
+  // A policy-only owner amendment preserves old cards for audit, but cannot
+  // leave the removed participant entitled to act on a still-pending card.
+  // Resolved-run finish retains its original attribution below.
+  const currentPolicy = issue.executionPolicy == null ? null : issueExecutionPolicySchema.safeParse(issue.executionPolicy);
   const interaction = await db.select().from(issueThreadInteractions).where(and(
     eq(issueThreadInteractions.id, context.nativeReviewInteractionId),
     eq(issueThreadInteractions.companyId, input.companyId),
@@ -172,6 +177,9 @@ export async function getNativeReviewAssignment(
     eq(statusDecisions.issueId, input.issueId),
   )).limit(1).then((rows) => rows[0] ?? null);
   if (!interaction || !decision) return null;
+  if (interaction.status === "pending" && currentPolicy
+    && (!currentPolicy.success || !currentPolicy.data.stages.some(stage =>
+      stage.participants.some(participant => participant.type === "agent" && participant.agentId === input.agentId)))) return null;
   // Return requests keep the original assignment, but must not survive a
   // policy/card replacement between the owner request and normal delivery.
   const returnProof = (input.contextSnapshot as Record<string, unknown>)?.nativeReviewReturn;
