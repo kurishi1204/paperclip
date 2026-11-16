@@ -3,7 +3,8 @@ import type { Db } from "@paperclipai/db";
 import { documents, issueDocuments, issues } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, type SourceTrustMetadata } from "@paperclipai/shared";
 import { documentService } from "./documents.js";
-import { recordSystemSummaryRevision } from "./system-document-provenance.js";
+import { conflict } from "../errors.js";
+import { readSystemSummaryRevisions, recordSystemSummaryRevision } from "./system-document-provenance.js";
 import { summarizeRunErrorForModel } from "./heartbeat-run-summary.js";
 
 export { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY };
@@ -258,8 +259,12 @@ export async function refreshIssueContinuationSummary(input: {
   agent: AgentSummaryInput;
 }) {
   const { db, issueId, run, agent } = input;
-  const [issue, existing] = await Promise.all([
-    db
+  return await db.transaction(async (tx) => {
+    const connection = tx as unknown as Db;
+    // Share the issue serialization point with document writes and review
+    // binding. Qualify the current revision under this lock, not a stale read
+    // from before the transaction. The document service retains its base CAS.
+    const [issue] = await connection
       .select({
         id: issues.id,
         companyId: issues.companyId,
@@ -272,19 +277,32 @@ export async function refreshIssueContinuationSummary(input: {
       })
       .from(issues)
       .where(eq(issues.id, issueId))
-      .then((rows) => rows[0] ?? null),
-    getIssueContinuationSummaryDocument(db, issueId),
-  ]);
-
-  if (!issue || issue.conversationAgentId) return null;
-  const body = buildContinuationSummaryMarkdown({
-    issue,
-    run,
-    agent,
-    previousSummaryBody: existing?.body ?? null,
-  });
-  return await db.transaction(async (tx) => {
-    const connection = tx as unknown as Db;
+      .for("update");
+    if (!issue || issue.conversationAgentId) return null;
+    const existing = await getIssueContinuationSummaryDocument(connection, issueId);
+    if (existing) {
+      const revisionId = existing.latestRevisionId;
+      const proven = revisionId
+        ? await readSystemSummaryRevisions(connection, issue.companyId, issueId, [revisionId])
+        : new Set<string>();
+      // A legacy/imported revision is submitted evidence in the completion
+      // binding contract. An internal refresh must not overwrite it or stamp
+      // it retroactively as bookkeeping. Heartbeat reports this typed failure
+      // through its existing warning path; genuine review guards stay intact.
+      if (!revisionId || !proven.has(revisionId)) {
+        throw conflict("Continuation summary provenance is unverified; preserve the existing document.", {
+          code: "continuation_summary_provenance_unverified",
+          issueId,
+          revisionId,
+        });
+      }
+    }
+    const body = buildContinuationSummaryMarkdown({
+      issue,
+      run,
+      agent,
+      previousSummaryBody: existing?.body ?? null,
+    });
     const result = await documentService(connection).upsertIssueDocument({
       issueId,
       key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,

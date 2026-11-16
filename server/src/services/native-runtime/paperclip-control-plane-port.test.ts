@@ -1815,7 +1815,7 @@ describe("PaperclipControlPlanePort conformance", () => {
       await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
     });
 
-    it("binds a continuation summary whose current revision is not a system refresh", async () => {
+    it("preserves and binds a continuation summary whose current revision is not a system refresh", async () => {
       const f = await submitForReview([], "agent", async (issueId) => {
         // An ordinary legacy writer could forge the exact text marker and its own
         // run ID. Those client-controlled values are not server provenance.
@@ -1832,12 +1832,14 @@ describe("PaperclipControlPlanePort conformance", () => {
       });
       expect((f.card.payload as { target: { boundDocuments: unknown[] } }).target.boundDocuments)
         .toEqual([expect.objectContaining({ key: "continuation-summary" })]);
-      await refreshIssueContinuationSummary({ db, issueId: f.issueId,
-        run: { id: f.runId, status: "succeeded", error: null }, agent: { id: identity.agentId, name: "Native conformance", adapterType: "codex_local" } });
-      const stale = await f.accept();
-      expect(stale.status).toBe(409);
-      expect(stale.body).toMatchObject({ code: "native_completion_review_documents_stale" });
-      await expect(f.state()).resolves.toEqual({ issue: "in_review", card: "pending" });
+      const original = await f.docs.getIssueDocumentByKey(f.issueId, "continuation-summary");
+      await expect(refreshIssueContinuationSummary({ db, issueId: f.issueId,
+        run: { id: f.runId, status: "succeeded", error: null }, agent: { id: identity.agentId, name: "Native conformance", adapterType: "codex_local" } }))
+        .rejects.toMatchObject({ status: 409, details: { code: "continuation_summary_provenance_unverified" } });
+      expect(await f.docs.getIssueDocumentByKey(f.issueId, "continuation-summary")).toEqual(original);
+      const accepted = await f.accept();
+      expect(accepted.status, accepted.text).toBe(200);
+      await expect(f.state()).resolves.toEqual({ issue: "done", card: "accepted" });
     });
 
     it("does not let the ordinary activity API forge system document provenance", async () => {
