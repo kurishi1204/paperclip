@@ -1,12 +1,17 @@
 import { useQuery } from "@tanstack/react-query";
 import type { HeartbeatRun } from "@paperclipai/shared";
 import { heartbeatsApi } from "../api/heartbeats";
-import { ApiError } from "../api/client";
+import { ApiError, detachInflightGet } from "../api/client";
+import { accessApi } from "../api/access";
+import { useAccountIdentity } from "../api/companies-query";
 import type { NativeRunReceiptReadback } from "../api/heartbeat-receipts";
 import { queryKeys } from "../lib/queryKeys";
 import { formatDateTime } from "../lib/utils";
 
-type RunScope = Pick<HeartbeatRun, "id" | "companyId" | "agentId" | "status">;
+type RunScope = Pick<HeartbeatRun, "id" | "companyId" | "agentId" | "status"> & {
+  // Older Run responses/types omit these server-owned fields: absence stays unknown.
+  runtimeMode?: unknown; nativeIssueId?: unknown;
+};
 
 function receiptMatchesRun(receipt: NativeRunReceiptReadback, run: RunScope): boolean {
   return receipt.schema === "paperclip.native-run-receipt-readback.v1"
@@ -68,7 +73,8 @@ export function RunReceiptReadbackView({ run, receipt, pending, error }: {
   pending?: boolean;
   error?: unknown;
 }) {
-  const current = receipt && receiptMatchesRun(receipt, run) ? receipt : null;
+  // A failed authorization/read never leaves previously fetched owner metadata visible.
+  const current = !error && receipt && receiptMatchesRun(receipt, run) ? receipt : null;
   const denied = error instanceof ApiError && error.status === 403;
   return <section aria-label="保存結果と会社への返却" className="rounded-lg border border-border p-4 space-y-3 text-sm">
     <h3 className="font-medium">保存結果と会社への返却</h3>
@@ -111,12 +117,58 @@ export function RunReceiptReadbackView({ run, receipt, pending, error }: {
   </section>;
 }
 
-export function RunReceiptReadback({ run }: { run: RunScope }) {
+function ReceiptUnavailable({ children }: { children: React.ReactNode }) {
+  return <section aria-label="保存結果と会社への返却" className="rounded-lg border border-border p-4 space-y-3 text-sm">
+    <h3 className="font-medium">保存結果と会社への返却</h3>
+    <p className="text-muted-foreground">{children}</p>
+  </section>;
+}
+
+function OwnerReceiptReadback({ run, viewerScope }: { run: RunScope; viewerScope: string }) {
   const query = useQuery({
-    queryKey: queryKeys.runReceiptReadback(run.id, run.status),
+    queryKey: queryKeys.runReceiptReadback(run.companyId, run.id, run.status, viewerScope),
     queryFn: ({ signal }) => heartbeatsApi.receiptReadback(run.id, { signal }),
     retry: false,
+    gcTime: 0,
+    refetchOnMount: "always",
     refetchOnWindowFocus: false,
   });
-  return <RunReceiptReadbackView run={run} receipt={query.data?.receiptReadback} pending={query.isPending} error={query.error} />;
+  // Remounts must obtain a fresh authorized response before showing cached data.
+  return <RunReceiptReadbackView run={run}
+    receipt={query.isFetchedAfterMount && !query.isFetching ? query.data?.receiptReadback : null}
+    pending={query.isPending || query.isFetching} error={query.error} />;
+}
+
+export function RunReceiptReadback({ run }: { run: RunScope }) {
+  const identity = useAccountIdentity();
+  const supported = run.runtimeMode === "native" && typeof run.nativeIssueId === "string" && run.nativeIssueId.length > 0;
+  const unsupported = (typeof run.runtimeMode === "string" && run.runtimeMode !== "native")
+    || (run.runtimeMode === "native" && run.nativeIssueId === null);
+  const access = useQuery({
+    queryKey: queryKeys.runReceiptViewerAccess(identity.userId),
+    queryFn: () => {
+      // The shared client coalesces by URL, not account. Do not join an old viewer's request.
+      detachInflightGet("/cli-auth/me");
+      return accessApi.getCurrentBoardAccess();
+    },
+    enabled: supported && identity.settled && !identity.failed,
+    retry: false,
+    gcTime: 0,
+    refetchOnMount: "always",
+  });
+  if (unsupported) return <ReceiptUnavailable>このRunはnative受領記録の表示対象外です。結果が存在しないという意味ではありません。</ReceiptUnavailable>;
+  if (!supported) return <ReceiptUnavailable>このRunのnative実行情報は未確認です。保存結果が存在しないという意味ではありません。</ReceiptUnavailable>;
+  if (!identity.settled || identity.failed || access.isError || !access.isFetchedAfterMount || access.isFetching || !access.data) {
+    return <ReceiptUnavailable>閲覧者と会社所有者の権限を確認できていません。保存結果は未確認です。</ReceiptUnavailable>;
+  }
+  const viewer = access.data;
+  // local_implicit/admin is not an owner grant. Even a local board needs the exact membership.
+  const identityMatches = identity.userId !== null ? viewer.userId === identity.userId
+    : viewer.source === "local_implicit" && viewer.userId === "local-board";
+  if (!identityMatches || !viewer.userId) return <ReceiptUnavailable>閲覧者の認証文脈が一致しません。保存結果は未確認です。</ReceiptUnavailable>;
+  const owner = viewer.memberships?.some((membership) => membership.companyId === run.companyId
+    && membership.status === "active" && membership.membershipRole === "owner");
+  if (!owner) return <ReceiptUnavailable>この受領記録は会社所有者だけが確認できます。保存結果は未確認です。</ReceiptUnavailable>;
+  const viewerScope = JSON.stringify([identity.userId, viewer.userId, viewer.source, viewer.keyId]);
+  return <OwnerReceiptReadback key={viewerScope} run={run} viewerScope={viewerScope} />;
 }

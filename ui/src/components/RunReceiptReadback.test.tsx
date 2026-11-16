@@ -2,15 +2,31 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NativeRunReceiptReadback } from "../api/heartbeat-receipts";
 import { ApiError } from "../api/client";
 import { RunReceiptReadback, RunReceiptReadbackView } from "./RunReceiptReadback";
 
+declare module "vitest" {
+  interface TaskMeta { renderedHTML?: string }
+}
+
 const read = vi.hoisted(() => vi.fn());
+const access = vi.hoisted(() => vi.fn());
+const identity = vi.hoisted(() => ({ userId: "owner-a" as string | null, settled: true, failed: false }));
+vi.mock("../api/companies-query", () => ({ useAccountIdentity: () => identity }));
+vi.mock("../api/access", () => ({ accessApi: { getCurrentBoardAccess: access } }));
+function ownerAccess(userId = identity.userId ?? "local-board", role = "owner") {
+  return { userId, source: identity.userId ? "session" : "local_implicit", keyId: null,
+    isInstanceAdmin: false, memberships: [{ companyId: run.companyId, status: "active", membershipRole: role }] };
+}
+beforeEach(() => {
+  identity.userId = "owner-a"; identity.settled = true; identity.failed = false;
+  access.mockImplementation(async () => ownerAccess());
+});
 vi.mock("../api/heartbeats", () => ({ heartbeatsApi: { receiptReadback: read } }));
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-const run = { id: "run-1", companyId: "company-1", agentId: "agent-1", status: "failed" as const };
+const run = { id: "run-1", companyId: "company-1", agentId: "agent-1", status: "failed" as const, runtimeMode: "native" as const, nativeIssueId: "task-1" };
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
 function fixture(): NativeRunReceiptReadback {
@@ -30,9 +46,10 @@ async function render(element: React.ReactNode) {
   await act(async () => { root!.render(element); });
   return container;
 }
-afterEach(async () => {
+afterEach(async ({ task }) => {
+  if (container) task.meta.renderedHTML = container.outerHTML;
   if (root) await act(async () => root!.unmount());
-  root = undefined; container?.remove(); container = undefined; vi.clearAllMocks();
+  root = undefined; container?.remove(); container = undefined; vi.resetAllMocks();
 });
 
 describe("Run receipt readback", () => {
@@ -83,10 +100,74 @@ describe("Run receipt readback", () => {
     read.mockResolvedValue({ receiptReadback: fixture() });
     const client = new QueryClient({ defaultOptions: { queries: { gcTime: 0 } } });
     const el = await render(<QueryClientProvider client={client}><RunReceiptReadback run={run} /></QueryClientProvider>);
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 40)); });
     expect(read).toHaveBeenCalledTimes(1);
     expect(read).toHaveBeenCalledWith(run.id, { signal: expect.any(AbortSignal) });
     expect(el.textContent).toContain("結果の受領記録が保存されています");
     client.clear();
   });
+  it.each([401, 403, 404, 409])("hides cached owner metadata after refusal %s", async (status) => {
+    const el = await render(<RunReceiptReadbackView run={run} receipt={fixture()} error={new ApiError("private", status, {})} />);
+    expect(el.textContent).not.toContain("saved-result");
+    expect(el.textContent).not.toContain("結果の受領記録が保存されています");
+  });
+  it("distinguishes unsupported Runs without requesting receipt metadata", async () => {
+    read.mockResolvedValue({ receiptReadback: fixture() });
+    const client = new QueryClient();
+    const el = await render(<QueryClientProvider client={client}><RunReceiptReadback run={{ ...run, runtimeMode: "adapter" }} /></QueryClientProvider>);
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+    expect(el.textContent).toContain("表示対象外");
+    expect(read).not.toHaveBeenCalled(); client.clear();
+  });
+  it("does not infer ownership from admin or local implicit authority", async () => {
+    access.mockResolvedValue({ ...ownerAccess("owner-a", "admin"), isInstanceAdmin: true });
+    read.mockResolvedValue({ receiptReadback: fixture() });
+    const client = new QueryClient();
+    const el = await render(<QueryClientProvider client={client}><RunReceiptReadback run={run} /></QueryClientProvider>);
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+    expect(el.textContent).toContain("会社所有者だけ"); expect(read).not.toHaveBeenCalled(); client.clear();
+  });
+  it("never displays the previous viewer's receipt while the next viewer is unresolved", async () => {
+    read.mockResolvedValue({ receiptReadback: fixture() });
+    const client = new QueryClient();
+    const element = () => <QueryClientProvider client={client}><RunReceiptReadback run={run} /></QueryClientProvider>;
+    const el = await render(element());
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+    expect(el.textContent).toContain("saved-result");
+    identity.userId = "owner-b"; access.mockImplementation(() => new Promise(() => {}));
+    await act(async () => root!.render(element()));
+    expect(el.textContent).not.toContain("saved-result");
+    expect(read).toHaveBeenCalledTimes(1); client.clear();
+  });
+  it("does not retry a rejected owner read and hides its old cached data", async () => {
+    read.mockRejectedValue(new ApiError("private", 403, {}));
+    const client = new QueryClient();
+    const el = await render(<QueryClientProvider client={client}><RunReceiptReadback run={run} /></QueryClientProvider>);
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 60)); });
+    expect(read).toHaveBeenCalledTimes(1); expect(el.textContent).toContain("会社所有者だけ");
+    expect(el.textContent).not.toContain("saved-result"); client.clear();
+  });
+
+  it("does not share an in-flight actual GET between viewers", async () => {
+    const actual = await vi.importActual<typeof import("../api/heartbeats")>("../api/heartbeats");
+    const pending: Array<(response: Response) => void> = [];
+    const fetchMock = vi.fn(() => new Promise<Response>(resolve => pending.push(resolve)));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const first = actual.heartbeatsApi.receiptReadback(run.id);
+      const second = actual.heartbeatsApi.receiptReadback(run.id);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      pending[0](new Response(JSON.stringify({ receiptReadback: { ...fixture(), observedAtUTC: "viewer-a" } }), { status: 200, headers: { "content-type": "application/json" } }));
+      pending[1](new Response(JSON.stringify({ receiptReadback: { ...fixture(), observedAtUTC: "viewer-b" } }), { status: 200, headers: { "content-type": "application/json" } }));
+      expect((await first).receiptReadback?.observedAtUTC).toBe("viewer-a");
+      expect((await second).receiptReadback?.observedAtUTC).toBe("viewer-b");
+    } finally { vi.unstubAllGlobals(); }
+  });
+  it("leaves omitted native fields unknown rather than declaring an unsupported Run", async () => {
+    const client = new QueryClient();
+    const el = await render(<QueryClientProvider client={client}><RunReceiptReadback run={{ ...run, runtimeMode: undefined, nativeIssueId: undefined }} /></QueryClientProvider>);
+    expect(el.textContent).toContain("native実行情報は未確認");
+    expect(read).not.toHaveBeenCalled(); client.clear();
+  });
+
 });
