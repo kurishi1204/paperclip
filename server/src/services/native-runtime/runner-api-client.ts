@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { IssueMutationFailure } from "../../middleware/error-handler.js";
 import { badRequest, forbidden, unprocessable } from "../../errors.js";
 import { runnerApiOperation, type RunnerApiOperation } from "./runner-api-catalog.js";
 import { captureRunnerApiResponse, type RunnerApiResponseBody } from "./runner-api-response.js";
@@ -9,6 +10,32 @@ import { RunnerApiResponseLimitError, RunnerApiResponseCleanupError, RUNNER_API_
 export const RUNNER_API_MAX_BYTES = 10 * 1024 * 1024;
 export const RUNNER_API_INLINE_BYTES = 24 * 1024;
 export const RUNNER_API_TIMEOUT_MS = 30_000;
+// Same request-local contract emitted by the issue PATCH failure outlet.
+// This classifies uncertainty only; it grants no retry or reassignment authority.
+const unknownAssignmentWriteSchema = z.object({
+  issueId: z.string(),
+  issueMutationStopId: z.string(),
+  runCancellation: z.object({
+    runId: z.string(), observedStatus: z.literal("cancelled"), evidence: z.literal("cancelRun_return"),
+  }),
+  assignmentWrite: z.literal("outcome_unknown"),
+  lastObservedOwnership: z.object({
+    source: z.enum(["request_read", "locked_before_update"]), revision: z.number(), statusVersion: z.number(),
+    assigneeAgentId: z.string().nullable(), assigneeUserId: z.string().nullable(),
+  }),
+  currentOwnership: z.literal("unverified"),
+  automaticRetry: z.literal(false),
+  nextAction: z.literal("read_issue_and_run_before_owner_decision"),
+}) satisfies z.ZodType<IssueMutationFailure>;
+
+function hasUnknownAssignmentWrite(operation: RunnerApiOperation, data: unknown): boolean {
+  if (operation.operationId !== "PATCH /api/issues/{id}" || !data || typeof data !== "object" || Array.isArray(data)) return false;
+  const body = data as Record<string, unknown>;
+  const details = body.details && typeof body.details === "object" && !Array.isArray(body.details)
+    ? body.details as Record<string, unknown> : {};
+  return [body.issueMutation, details.issueMutation].some(value => unknownAssignmentWriteSchema.safeParse(value).success);
+}
+
 const fileSchema = z.object({
   field: z.string().min(1).max(200).optional(),
   artifactId: z.string().min(1).optional(),
@@ -300,7 +327,13 @@ export async function executeRunnerApi(input: RunnerApiCall, context: RunnerApiC
     }
     const text = bytes.toString("utf8");
     if (/json/i.test(type)) {
-      try { return { ...base, data: JSON.parse(text) as unknown }; }
+      try {
+        const data: unknown = JSON.parse(text);
+        return { ...base, ...(!response.ok && hasUnknownAssignmentWrite(operation, data) ? {
+          outcome: "unknown", automaticRetry: false,
+          guidance: "The cancellation call returned cancelled; the assignment update outcome is unknown. Do not automatically retry; read the issue and run before an owner decides.",
+        } : {}), data };
+      }
       catch { return { ...base, ok: false, error: "invalid_json_response", data: text, ...(mutation ? uncertainty : {}) }; }
     }
     return { ...base, data: text };
