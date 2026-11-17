@@ -44,7 +44,7 @@ import type {
   DurableRecoveryIdentity,
 } from "../contracts/durable-recovery.js";
 import type { NativeRunIdentity, NativeTurnControlCapabilities } from "../contracts/types.js";
-import type { PrpEvent } from "../protocol/replay-contract.js";
+import { validatePrpEvent, type PrpEvent } from "../protocol/replay-contract.js";
 import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
 import type {
   HarnessRuntimeRequestResolution,
@@ -1127,6 +1127,54 @@ export function bridgedCodexQuestionParams(
   };
 }
 
+/** Host-owned child completion only. This is not provider/checkpoint settlement. */
+export interface OwnedRunnerProcessExitReceipt {
+  identity: Readonly<DurableRecoveryIdentity>;
+  pid: number;
+  processGroupId: number;
+  startedAt: string;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  observedAt: string;
+}
+
+type OwnedRunnerProcessStart = { pid: number; processGroupId: number; startedAt: string };
+
+function createOwnedProcessExitPublisher(receive?: (receipt: OwnedRunnerProcessExitReceipt) => Promise<void>) {
+  const attempts = new WeakMap<RunnerProcessHandle, Promise<void>>();
+  return (handle: RunnerProcessHandle, identity: DurableRecoveryIdentity | null,
+    started: OwnedRunnerProcessStart | null): Promise<void> => {
+    if (!receive) return Promise.resolve();
+    const prior = attempts.get(handle);
+    if (prior) return prior;
+    // Freeze the source authority before waiting. A later carrier must not
+    // supply a missing identity or overwrite this owner's receipt.
+    const binding = identity && { runnerInstanceId: identity.runnerInstanceId,
+      environmentLeaseId: identity.environmentLeaseId, runId: identity.runId,
+      normalizedSessionId: identity.normalizedSessionId, turnId: identity.turnId, itemId: identity.itemId };
+    const processIdentity = started && { ...started };
+    const attempt = Promise.resolve().then(async () => {
+      if (!binding || !processIdentity || handle.child.pid !== processIdentity.pid ||
+          handle.processGroupId !== processIdentity.processGroupId || processIdentity.pid <= 1 ||
+          processIdentity.processGroupId !== processIdentity.pid ||
+          !Number.isFinite(Date.parse(processIdentity.startedAt)) ||
+          Object.values(binding).some(value => typeof value !== "string" || !value)) {
+        throw new Error("native_owned_process_exit_unverified");
+      }
+      const result = await handle.completion;
+      if ((result.code === null && result.signal === null) ||
+          handle.child.exitCode !== result.code || (handle.child.signalCode ?? null) !== result.signal) {
+        throw new Error("native_owned_process_exit_unverified");
+      }
+      await receive(Object.freeze({ identity: Object.freeze(binding), ...processIdentity,
+        exitCode: result.code, signal: result.signal, observedAt: new Date().toISOString() }));
+    });
+    // A callback whose outcome is unknown is never resent by close/retry.
+    attempts.set(handle, attempt);
+    return attempt;
+  };
+}
+
 export interface CapabilityRunnerdProcessEvidence {
   runnerPid: number | null;
   runnerProcessGroupId: number | null;
@@ -1225,6 +1273,8 @@ export interface CapabilityRunnerdCodexTransportOptions {
   turnStartTimeoutMs?: number;
   onDiagnostic?: (message: string) => void;
   onEvidence?: (evidence: Readonly<CapabilityRunnerdProcessEvidence>) => void;
+  /** Optional durable host receipt; only an exact owned child can produce it. */
+  onOwnedProcessExit?: (receipt: OwnedRunnerProcessExitReceipt) => Promise<void>;
   /** Persist process ownership immediately after spawn, before waiting for
    * provider bootstrap or activating a deferred PRP registration. */
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
@@ -1989,6 +2039,22 @@ export function readRunnerdArtifactBinding(runnerBinaryPath: string): {
   return approvedRunnerArtifact(runnerBinaryPath);
 }
 
+/** Exact technical identity of an admitted handler; no input/result body. */
+export interface StoppedToolExecutionCall {
+  readonly callId: string;
+  readonly operationId: string;
+  readonly sourceEventId: string;
+  readonly sourceEventType: string;
+  readonly inputDigest: string;
+  readonly correlation: Readonly<{ runId: string; normalizedSessionId: string; turnId: string; itemId: string }>;
+}
+
+/** Trusted embedding adapter around its process-local opaque stop receipt. */
+export interface StoppedToolExecutionAssertions {
+  assertCallsStopped(calls: readonly StoppedToolExecutionCall[]): void;
+  assertCurrent(): void;
+}
+
 export interface RetainedRunnerdCleanupProof {
   readonly binding: Readonly<NativeRunIdentity>;
   readonly identity: Readonly<DurableRecoveryIdentity>;
@@ -1997,6 +2063,8 @@ export interface RetainedRunnerdCleanupProof {
   readonly activationDirectory: string;
   readonly sourceFingerprint: string;
   readonly settledFingerprint: string;
+  /** Physical retirement only: these original outcomes remain UNKNOWN and are never replayed. */
+  readonly unsettledToolCalls?: readonly StoppedToolExecutionCall[];
 }
 
 /** Content-free evidence for this controller's exact child handle. A launch
@@ -2033,6 +2101,8 @@ export type RetainedRunnerdMaintenanceEpochReceipt = {
 );
 
 const retainedRunnerdCleanupProofs = new WeakMap<object, readonly number[]>();
+const alreadySettledCleanupProofs = new WeakSet<object>();
+const stoppedToolExecutionProofs = new WeakMap<object, StoppedToolExecutionAssertions>();
 const retainedMaintenanceOperations = new Map<string, Set<Promise<unknown>>>();
 const activeMaintenanceRoots = new Set<string>();
 
@@ -2216,6 +2286,7 @@ function assertMaintenanceBinding(
   identity: DurableRecoveryIdentity,
   providerSessionId: string,
   allowRestoringOpen = false,
+  allowStoppedToolOutcomes = false,
 ) {
   if (
     !recoveryIdentityMatches(record(state.control.identity), identity) ||
@@ -2229,8 +2300,7 @@ function assertMaintenanceBinding(
     !Array.isArray(state.provider.queuedEvents) ||
     !Array.isArray(state.control.commands) ||
     !Array.isArray(state.control.committedEvents) ||
-    Object.keys(record(record(state.provider.toolBridge).pending)).length !==
-      0 ||
+    (!allowStoppedToolOutcomes && Object.keys(record(record(state.provider.toolBridge).pending)).length !== 0) ||
     state.provider.ambiguousTurnStartPending === true ||
     !(
       allowRestoringOpen
@@ -2239,6 +2309,147 @@ function assertMaintenanceBinding(
     ).includes(String(state.provider.lifecycle))
   )
     throw maintenanceDenied();
+}
+
+/** Validate an already-completed source authority; never deliver a command or tool. */
+function assertAlreadySettledState(state: ReturnType<typeof readMaintenanceState>, identity: DurableRecoveryIdentity,
+  providerSessionId: string, stoppedTools?: StoppedToolExecutionAssertions): readonly StoppedToolExecutionCall[] {
+  assertMaintenanceBinding(state, identity, providerSessionId, true, stoppedTools !== undefined);
+  const bridge = record(state.provider.toolBridge);
+  if (state.control.schema !== "paperclip.runner.durable.control-plane-state.v1" ||
+      state.runner.lifecycle !== "suspended" || state.runner.pendingTerminalDelivery != null ||
+      state.runner.pendingProviderCleanup != null || state.provider.startupAttempt != null ||
+      state.provider.activeProviderTurnId != null || !["prepared", "session_open"].includes(String(state.provider.lifecycle)) ||
+      !bridge.pending || typeof bridge.pending !== "object" || Array.isArray(bridge.pending) ||
+      (!stoppedTools && Object.keys(bridge.pending).length !== 0) || (state.runner.outbox as unknown[]).length !== 0 ||
+      (state.provider.pendingEvents as unknown[]).length !== 0 || (state.provider.queuedEvents as unknown[]).length !== 0)
+    throw maintenanceDenied();
+  const commands = (state.control.commands as unknown[]).map(record);
+  const completed = (command: Record<string, unknown>) => {
+    const result = record(record(state.runner.processedCommands)[String(command.commandId)]);
+    const wire = { schema: command.schema, commandId: command.commandId, controllerSeq: command.controllerSeq,
+      type: command.type, issuedAt: command.issuedAt, deadlineAt: command.deadlineAt ?? null,
+      precondition: command.precondition ?? null, payload: command.payload };
+    return command.status === "completed" && result.status === "completed" &&
+      result.commandId === command.commandId && result.commandType === command.type &&
+      result.controllerSeq === command.controllerSeq && commandDigest(command.result) === commandDigest(result) &&
+      record(state.runner.processedCommandFingerprints)[String(command.commandId)] === commandDigest(wire).slice(7);
+  };
+  const suspend = commands.filter(command => command.type === "runner.suspend").at(-1);
+  const drain = commands.filter(command => command.type === "runner.drain").at(-1);
+  if (!suspend || !drain || !completed(suspend) || !completed(drain) ||
+      record(record(suspend.result).result).status !== "completed" ||
+      record(record(drain.result).result).retainedEventsDrained !== true ||
+      typeof suspend.controllerSeq !== "number" || typeof drain.controllerSeq !== "number" ||
+      drain.controllerSeq >= suspend.controllerSeq || suspend.controllerSeq !== state.runner.lastControllerCommandSeq ||
+      commands.some(command => command.status !== "completed")) throw maintenanceDenied();
+  const entries = state.control.committedEvents as unknown[];
+  const inputs = new Map<string, Record<string, unknown>>();
+  const inputEvents = new Map<string, Record<string, unknown>>();
+  const results = new Map<string, Record<string, unknown>>();
+  const executions = new Map<string, Record<string, unknown>>();
+  const completedExecutions = new Map<string, Record<string, unknown>>();
+  let sourceSeq = 0;
+  for (const entry of entries) {
+    const event = record(record(record(entry).envelope).payload);
+    if (!validatePrpEvent(event).ok || event.sourceKind !== "runner" || event.sourceInstanceId !== identity.runnerInstanceId ||
+        event.runId !== identity.runId || event.normalizedSessionId !== identity.normalizedSessionId ||
+        event.sourceSeq !== ++sourceSeq) throw maintenanceDenied();
+    const payload = record(event.payload);
+    const kind = String(event.eventType);
+    if (["runtime.input.requested", "runtime_request.created"].includes(kind)) throw maintenanceDenied();
+    if (["semantic_tool.input", "mcp_app.tool_input", "semantic_tool.result", "mcp_app.tool_result", "semantic_tool.reconciled"].includes(kind)) {
+      const semantic = record(payload.semantic_tool);
+      const correlation = record(semantic.correlation);
+      if (correlation.runId !== identity.runId || correlation.normalizedSessionId !== identity.normalizedSessionId ||
+          correlation.turnId !== identity.turnId || correlation.itemId !== identity.itemId ||
+          typeof semantic.callId !== "string" || typeof semantic.operationId !== "string") throw maintenanceDenied();
+      const key = semantic.callId;
+      const map = semantic.phase === "input" ? inputs : results;
+      if (map.has(key)) throw maintenanceDenied();
+      map.set(key, semantic);
+      if (semantic.phase === "input") {
+        const committed = record(entry);
+        if (committed.sourceEventId !== event.sourceEventId || committed.eventType !== event.eventType) throw maintenanceDenied();
+        inputEvents.set(key, event);
+      }
+    }
+    if (kind === "tool.execution.started" || kind === "tool.execution.completed") {
+      if (typeof payload.executionId !== "string") throw maintenanceDenied();
+      const map = kind === "tool.execution.started" ? executions : completedExecutions;
+      if (map.has(payload.executionId) || (kind === "tool.execution.completed" && payload.status === "running")) throw maintenanceDenied();
+      map.set(payload.executionId, payload);
+    }
+  }
+  if (sourceSeq !== state.control.ackedSourceSeq || sourceSeq !== state.runner.ackedSourceSeq ||
+      sourceSeq + 1 !== state.runner.nextSourceSeq) throw maintenanceDenied();
+  const unknownOutcomes: StoppedToolExecutionCall[] = [];
+  for (const [callId, input] of inputs) {
+    const result = results.get(callId);
+    const event = inputEvents.get(callId)!;
+    // Same immutable settlement binding as core.unsettledSemanticInput:
+    // a semantic result event by itself never proves its original delivery.
+    const commandId = `command_tool_${createHash("sha256").update(`${identity.runId}\0${callId}`).digest("hex").slice(0, 32)}`;
+    const matches = commands.filter(command => command.commandId === commandId);
+    const command = matches[0];
+    const payload = record(command?.payload);
+    const receipt = record(command?.result);
+    const delivery = record(receipt.result);
+    const expectedCorrelation = { runId: identity.runId, normalizedSessionId: identity.normalizedSessionId,
+      turnId: identity.turnId, itemId: identity.itemId };
+    const exactCommand = matches.length === 1 && command?.type === "semantic_tool.result" && completed(command) &&
+      receipt.commandId === commandId && receipt.controllerSeq === command.controllerSeq &&
+      receipt.commandType === command.type && ["delivered", "settled_after_turn", "duplicate"].includes(String(delivery.status)) &&
+      delivery.callId === callId && payload.callId === callId && payload.operationId === input.operationId &&
+      payload.sourceEventId === event.sourceEventId && payload.sourceEventType === event.eventType &&
+      commandDigest(payload.correlation) === commandDigest(expectedCorrelation) &&
+      commandDigest(input.correlation) === commandDigest(expectedCorrelation) &&
+      (payload.inputDigest === undefined ? commandDigest(payload.input) === commandDigest(input.input)
+        : payload.inputDigest === commandDigest(input.input).slice(7) &&
+          (payload.input === undefined || commandDigest(payload.input) === commandDigest(input.input)));
+    const immutableConflict = (command !== undefined && !exactCommand) ||
+      (result !== undefined && (result.operationId !== input.operationId ||
+        commandDigest(result.correlation) !== commandDigest(input.correlation)));
+    if (immutableConflict) throw new Error("native_cleanup_tool_settlement_unverified");
+    if (!result || !exactCommand) {
+      const correlation = record(input.correlation);
+      if (typeof input.operationId !== "string" || typeof event.sourceEventId !== "string" ||
+          typeof event.eventType !== "string" || commandDigest(correlation) !== commandDigest(expectedCorrelation)) throw maintenanceDenied();
+      const unknown = Object.freeze({ callId, operationId: input.operationId, sourceEventId: event.sourceEventId,
+        sourceEventType: event.eventType, inputDigest: commandDigest(input.input).slice(7),
+        correlation: Object.freeze(expectedCorrelation) });
+      if (!stoppedTools) {
+        const error = new Error("native_cleanup_tool_settlement_unverified");
+        Object.assign(error, { unsettledToolCalls: [unknown] });
+        throw error;
+      }
+      unknownOutcomes.push(unknown);
+    }
+  }
+  if ([...results.keys()].some(callId => !inputs.has(callId))) throw maintenanceDenied();
+  for (const [executionId, input] of executions) {
+    const result = completedExecutions.get(executionId);
+    if (!result) {
+      // The same exact dynamic call may stop without a delivered business
+      // result. Only its original server handler's fenced stop receipt can
+      // establish physical quiescence; the journal entry remains untouched.
+      if (input.transport !== "dynamic" || !unknownOutcomes.some(call => call.callId === executionId && call.operationId === input.name))
+        throw new Error("native_cleanup_tool_settlement_unverified");
+    } else if (result.transport !== input.transport || result.operation !== input.operation || result.name !== input.name) throw maintenanceDenied();
+  }
+  if ([...completedExecutions.keys()].some(executionId => !executions.has(executionId))) throw maintenanceDenied();
+  for (const [callId, value] of Object.entries(bridge.pending)) {
+    const pending = record(value);
+    const unknown = unknownOutcomes.find(call => call.callId === callId);
+    if (!unknown || pending.callId !== callId || pending.operationId !== unknown.operationId ||
+        commandDigest(pending.input).slice(7) !== unknown.inputDigest) throw maintenanceDenied();
+  }
+  if (unknownOutcomes.length) {
+    stoppedTools!.assertCurrent();
+    stoppedTools!.assertCallsStopped(Object.freeze(unknownOutcomes));
+    stoppedTools!.assertCurrent();
+  }
+  return Object.freeze(unknownOutcomes);
 }
 
 /** A proof cannot be manufactured by JSON or reused after the activated
@@ -2250,7 +2461,11 @@ export function retainedRunnerdCleanupProofIsCurrent(
   if (!pids || !pids.every(maintenanceProcessAbsent)) return false;
   try {
     const state = readMaintenanceState(proof.activationDirectory);
-    assertMaintenanceBinding(state, proof.identity, proof.providerSessionId);
+    if (alreadySettledCleanupProofs.has(proof)) {
+      const unknown = assertAlreadySettledState(state, proof.identity, proof.providerSessionId, stoppedToolExecutionProofs.get(proof));
+      if (commandDigest(unknown) !== commandDigest(proof.unsettledToolCalls ?? [])) return false;
+    }
+    else assertMaintenanceBinding(state, proof.identity, proof.providerSessionId);
     return (
       state.fingerprint === proof.settledFingerprint &&
       state.runner.lifecycle === "suspended" &&
@@ -2268,6 +2483,8 @@ export function retainedRunnerdCleanupProofIsCurrent(
  * durable recovery lease, original-source proof, and atomic activation. */
 export interface RetainedRunnerdMaintenanceInput {
   requestId: string;
+  /** Explicit no-launch lane; embedding owner must recheck its live retained owner and durable lease. */
+  alreadySettledNoLaunch?: { authorizeOwnerAndLease: () => Promise<void>; stoppedToolExecutions?: StoppedToolExecutionAssertions };
   binding: NativeRunIdentity;
   identity: DurableRecoveryIdentity;
   backend: { kind: string; name: string };
@@ -2305,21 +2522,62 @@ async function settleRetainedRunnerdSessionOwned(
   input: RetainedRunnerdMaintenanceInput,
 ): Promise<RetainedRunnerdCleanupProof> {
   const root = resolve(input.stateDirectory);
+  if (input.alreadySettledNoLaunch !== undefined && (!input.alreadySettledNoLaunch ||
+      typeof input.alreadySettledNoLaunch.authorizeOwnerAndLease !== "function")) throw maintenanceDenied();
   if (
     !input.requestId ||
     input.requestId.length > 160 ||
     /[\x00-\x1f]/.test(input.requestId) ||
     retainedMaintenanceOperations.has(root) ||
-    root === resolve(input.activationDirectory) ||
+    (!input.alreadySettledNoLaunch && root === resolve(input.activationDirectory)) ||
     input.binding.runId !== input.identity.runId ||
     input.binding.sessionId !== input.identity.normalizedSessionId ||
     !input.providerSessionId
   )
     throw maintenanceDenied();
   const initial = readMaintenanceState(root);
-  assertMaintenanceBinding(initial, input.identity, input.providerSessionId);
+  assertMaintenanceBinding(initial, input.identity, input.providerSessionId, input.alreadySettledNoLaunch !== undefined,
+    input.alreadySettledNoLaunch?.stoppedToolExecutions !== undefined);
   if (initial.fingerprint !== input.sourceFingerprint)
     throw maintenanceDenied();
+  if (input.alreadySettledNoLaunch) {
+    if (root !== resolve(input.activationDirectory)) throw maintenanceDenied();
+    input.signal?.throwIfAborted();
+    const assertions = input.alreadySettledNoLaunch.stoppedToolExecutions;
+    if (assertions && (typeof assertions.assertCurrent !== "function" || typeof assertions.assertCallsStopped !== "function")) throw maintenanceDenied();
+    const stoppedTools = assertions && Object.freeze({ assertCurrent: assertions.assertCurrent.bind(assertions),
+      assertCallsStopped: assertions.assertCallsStopped.bind(assertions) });
+    assertAlreadySettledState(initial, input.identity, input.providerSessionId, stoppedTools);
+    const pids = [input.originalRunnerPid, input.originalProviderPid];
+    if (new Set(pids).size !== 2 || !pids.every(maintenanceProcessAbsent)) throw maintenanceDenied();
+    // These original callbacks own the DB lease/current retained session. A
+    // completed file is not permission to clear a guessed or later owner.
+    const authorize = async () => {
+      input.signal?.throwIfAborted();
+      const operation = input.authorize().then(() => input.alreadySettledNoLaunch!.authorizeOwnerAndLease());
+      const retained = retainedMaintenanceOperations.get(root) ?? new Set<Promise<unknown>>();
+      retainedMaintenanceOperations.set(root, retained); retained.add(operation);
+      const release = () => { retained.delete(operation); if (!retained.size && retainedMaintenanceOperations.get(root) === retained) retainedMaintenanceOperations.delete(root); };
+      void operation.then(release, release);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try { await Promise.race([operation, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(maintenanceDenied()), 30_000); })]); }
+      finally { if (timer) clearTimeout(timer); }
+      input.signal?.throwIfAborted();
+    };
+    await authorize();
+    const current = readMaintenanceState(root);
+    if (current.fingerprint !== initial.fingerprint || !pids.every(maintenanceProcessAbsent)) throw maintenanceDenied();
+    const unknown = assertAlreadySettledState(current, input.identity, input.providerSessionId, stoppedTools);
+    await authorize();
+    if (readMaintenanceState(root).fingerprint !== current.fingerprint || !pids.every(maintenanceProcessAbsent)) throw maintenanceDenied();
+    const proof = Object.freeze({ binding: Object.freeze({ ...input.binding }), identity: Object.freeze({ ...input.identity }),
+      backend: Object.freeze({ ...input.backend }), providerSessionId: input.providerSessionId, activationDirectory: root,
+      sourceFingerprint: current.fingerprint, settledFingerprint: current.fingerprint,
+      ...(unknown.length ? { unsettledToolCalls: unknown } : {}) });
+    retainedRunnerdCleanupProofs.set(proof, Object.freeze(pids)); alreadySettledCleanupProofs.add(proof);
+    if (unknown.length) stoppedToolExecutionProofs.set(proof, stoppedTools!);
+    return proof;
+  }
   const originalCommands = initial.control.commands as Array<
     Record<string, unknown>
   >;
@@ -3494,6 +3752,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   });
   #core: DurablePrpControlPlane | null = null;
   #handle: RunnerProcessHandle | null = null;
+  readonly #ownedProcessStarts = new WeakMap<RunnerProcessHandle, OwnedRunnerProcessStart>();
+  readonly #ownedProcessIdentities = new WeakMap<RunnerProcessHandle, DurableRecoveryIdentity>();
+  readonly #publishOwnedExit: ReturnType<typeof createOwnedProcessExitPublisher>;
   #adoptedRunnerMonitor: NodeJS.Timeout | null = null;
   #adoptedRunnerAuthenticated = false;
   #pump: NodeJS.Timeout | null = null;
@@ -3558,6 +3819,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   readonly #bridgedRuntimeInputs = new Map<string, { durableTurnId: string; permission?: boolean }>();
 
   constructor(readonly options: CapabilityRunnerdCodexTransportOptions) {
+    this.#publishOwnedExit = createOwnedProcessExitPublisher(options.onOwnedProcessExit);
     if (options.acpxMode !== undefined && options.provider !== "acpx") {
       throw new Error("acpxMode requires the ACPX provider");
     }
@@ -4160,7 +4422,19 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     };
   }
 
-  async #publishSpawnedProcess(handle: RunnerProcessHandle): Promise<void> {
+  async #publishSpawnedProcess(handle: RunnerProcessHandle, identity: DurableRecoveryIdentity): Promise<void> {
+    // A custom launcher may describe a remote process. Never consult the local
+    // process table for it or turn an adopted liveness probe into an exit ACK.
+    const ownedPid = handle.child.pid;
+    if (!this.options.runnerProcessLauncher && typeof ownedPid === "number" && handle.processGroupId === ownedPid) {
+      const startedAt = readLocalProcessStartedAt(ownedPid);
+      if (startedAt) {
+        this.#ownedProcessStarts.set(handle, { pid: ownedPid, processGroupId: ownedPid, startedAt });
+        this.#ownedProcessIdentities.set(handle, { runnerInstanceId: identity.runnerInstanceId,
+          environmentLeaseId: identity.environmentLeaseId, runId: identity.runId,
+          normalizedSessionId: identity.normalizedSessionId, turnId: identity.turnId, itemId: identity.itemId });
+      }
+    }
     this.#evidence.runnerPid = handle.child.pid ?? null;
     this.#evidence.runnerProcessGroupId = handle.processGroupId ?? null;
     this.#publish();
@@ -4421,13 +4695,16 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       }
       try {
         if (this.#handle) {
+          const handle = this.#handle;
           const result = await waitForProcess(
-            this.#handle,
+            handle,
             Math.max(0, closeDeadline - Date.now()),
           );
           this.#evidence.runnerExited = true;
           this.#evidence.runnerExitCode = result.code;
           this.#evidence.runnerSignal = result.signal as NodeJS.Signals | null;
+          await this.#publishOwnedExit(handle, this.#ownedProcessIdentities.get(handle) ?? null,
+            this.#ownedProcessStarts.get(handle) ?? null);
           if (result.stderr.trim())
             this.#diagnostic(result.stderr.trim().slice(-4_096));
         } else if (adoptedRunner) {
@@ -4513,6 +4790,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           this.#evidence.runnerExited = true;
           this.#evidence.runnerExitCode = result.code;
           this.#evidence.runnerSignal = result.signal as NodeJS.Signals | null;
+          await this.#publishOwnedExit(handle, this.#ownedProcessIdentities.get(handle) ?? null,
+            this.#ownedProcessStarts.get(handle) ?? null);
         },
         release: this.#controlPlaneRelease,
       });
@@ -4964,7 +5243,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     });
     this.#handle = handle;
     this.#watchRunner(handle);
-    await this.#publishSpawnedProcess(handle);
+    await this.#publishSpawnedProcess(handle, identity);
     await registration?.activate?.();
     if (registration?.failure) {
       void registration.failure.catch((error: unknown) => {
@@ -5589,7 +5868,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (handle) {
       this.#handle = handle;
       this.#watchRunner(handle);
-      await this.#publishSpawnedProcess(handle);
+      await this.#publishSpawnedProcess(handle, warmRecovery?.runnerIdentity ?? identity);
     }
     if (oldTransitionRegistration && newTransitionRegistration) {
       await oldTransitionRegistration.activate?.();
@@ -5742,6 +6021,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
               paperclipTrace: {
                 sourceEventId: call.sourceEventId,
                 sourceEventType: call.sourceEventType,
+                nativeToolExecution: Object.freeze({ callId: call.callId, operationId: call.operationId,
+                  sourceEventId: call.sourceEventId, sourceEventType: call.sourceEventType,
+                  inputDigest: commandDigest(call.input).slice(7),
+                  correlation: Object.freeze({ runId: call.correlation.runId,
+                    normalizedSessionId: call.correlation.normalizedSessionId,
+                    turnId: call.correlation.turnId, itemId: call.correlation.itemId }) }),
               },
             }
           : {}),
@@ -6697,6 +6982,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #watchRunner(handle: RunnerProcessHandle): void {
     void handle.completion.then(
       (result) => {
+        void this.#publishOwnedExit(handle, this.#ownedProcessIdentities.get(handle) ?? null,
+          this.#ownedProcessStarts.get(handle) ?? null).catch(() => {
+          this.#diagnostic("native_owned_process_exit_receipt_unverified");
+        });
         this.#evidence.runnerExited = true;
         this.#evidence.runnerExitCode = result.code;
         this.#evidence.runnerSignal = result.signal as NodeJS.Signals | null;
@@ -6970,6 +7259,7 @@ export const runnerdLaunchProfileInternals = Object.freeze({
 });
 
 export const runnerdRecoveryInternals = Object.freeze({
+  createOwnedProcessExitPublisher,
   completedMaintenanceTerminalReceipt,
   completedMaintenanceTerminalReplayMatches,
   readControlPlaneState,

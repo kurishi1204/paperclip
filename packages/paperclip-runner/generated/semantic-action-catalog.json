@@ -821,10 +821,42 @@
       "planning",
       "skill_test"
     ],
-    "description": "Create a typed, durable interaction on the active task.",
+    "description": "Create a typed, durable interaction on the active task, or withdraw your own pending named business-document confirmation through the live server. Withdrawal requires interactionId, reason, payload.target with the unchanged issue/document/key/revision, and a stable idempotencyKey; it does not answer, reassign, clear quarantine or schedule another review. Never resend an unknown effect.",
     "effect": "write",
     "inputSchema": {
       "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "withdraw"
+              ]
+            }
+          },
+          "required": [
+            "operation",
+            "interactionId",
+            "reason",
+            "payload"
+          ]
+        },
+        {
+          "properties": {
+            "operation": {
+              "enum": [
+                "create"
+              ]
+            }
+          },
+          "required": [
+            "interactionKind",
+            "title",
+            "prompt",
+            "continuationPolicy"
+          ]
+        }
+      ],
       "properties": {
         "addresseeAgentId": {
           "description": "Optional existing independent employee for a fixed standard-mode business document confirmation only; never key plan. Omit for human questions and approvals.",
@@ -847,6 +879,11 @@
           "minLength": 1,
           "type": "string"
         },
+        "interactionId": {
+          "maxLength": 240,
+          "minLength": 1,
+          "type": "string"
+        },
         "interactionKind": {
           "enum": [
             "confirmation",
@@ -856,6 +893,13 @@
             "item_verdicts"
           ]
         },
+        "operation": {
+          "description": "Omit or use create for a new request. Use withdraw only for your own pending named business-document confirmation on this task; it never answers or reassigns it.",
+          "enum": [
+            "create",
+            "withdraw"
+          ]
+        },
         "payload": {
           "additionalProperties": true,
           "type": "object"
@@ -863,6 +907,11 @@
         "prompt": {
           "description": "Short question or decision prompt, at most 1000 UTF-16 code units. Keep long QA material in a saved task document and bind its exact revision.",
           "maxLength": 1000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 4000,
           "minLength": 1,
           "type": "string"
         },
@@ -882,11 +931,7 @@
         }
       },
       "required": [
-        "idempotencyKey",
-        "interactionKind",
-        "title",
-        "prompt",
-        "continuationPolicy"
+        "idempotencyKey"
       ],
       "type": "object"
     },

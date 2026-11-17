@@ -6,6 +6,21 @@ import { redactCodexDiagnostic } from "./diagnostic-redaction.js";
 
 export { redactCodexDiagnostic } from "./diagnostic-redaction.js";
 
+/** Runner-owned correlation, never supplied through provider tool arguments. */
+export interface CodexNativeToolExecutionMetadata {
+  readonly callId: string;
+  readonly operationId: string;
+  readonly sourceEventId: string;
+  readonly sourceEventType: string;
+  readonly inputDigest: string;
+  readonly correlation: {
+    readonly runId: string;
+    readonly normalizedSessionId: string;
+    readonly turnId: string;
+    readonly itemId: string;
+  };
+}
+
 export interface CodexRpcNotification {
   method: string;
   params: Record<string, unknown>;
@@ -13,6 +28,7 @@ export interface CodexRpcNotification {
   paperclipTrace?: {
     sourceEventId: string;
     sourceEventType: string;
+    nativeToolExecution?: CodexNativeToolExecutionMetadata;
   };
 }
 

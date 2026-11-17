@@ -4212,6 +4212,67 @@ describe("executeNativeSession recovery", () => {
     completeTerminatedLocalNativeSessionCleanup(binding);
   });
 
+  it.each(["observed", "unknown"])("preserves the original cleanup owner and missing proof on later admission (%s)", async mode => {
+    const owner = { ...identity, companyId: `cleanup-metadata-${mode}`, runId: "original-owner-run" };
+    let observedIdentity = owner;
+    const failure = new NativeSessionCloseUnrecoverableError(mode === "observed" ? {
+      runnerSuspended: false, providerDrained: true,
+      semanticTools: { pending: [{ input: "PRIVATE_TOOL_INPUT" }], persistenceFailed: false },
+      finalProviderState: { pendingEventCount: 2, providerSettled: false },
+      credentials: "PRIVATE_CREDENTIAL",
+    } : undefined);
+    const capabilities = { resume: true, typedEvents: true, steering: false, interruption: false, structuredResult: true };
+    const session: NativeSession = {
+      identity: () => observedIdentity, capabilities: async () => capabilities,
+      async *events() { throw new Error("original provider notification failed"); },
+      startTurn: async () => ({ turnId: "original-owner-turn" }), result: async () => null,
+      async snapshot() { return { backendKind: "mock", sessionId: owner.sessionId, identity: this.identity(),
+        providerSessionId: "original-provider", cursor: null, activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }; },
+      close: vi.fn(async () => {
+        observedIdentity = { ...owner, runId: "unrelated-later-carrier" };
+        throw failure;
+      }),
+    };
+    const backend: NativeSessionBackend = {
+      descriptor: async () => ({ kind: "local", name: "cleanup-metadata-test", version: "1", capabilities }),
+      openSession: vi.fn(async () => session),
+    };
+    const controlPlane: ControlPlanePort = {
+      openRun: async () => {}, checkpointSession: async () => {},
+      appendEvent: async () => ({ cursor: 0, highestContiguousSourceSeq: 0, disposition: "committed" }),
+      replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }), completeRun: vi.fn(async () => {}),
+    };
+    const scopedInput = { ...input, binding: { ...input.binding, companyId: owner.companyId, runId: owner.runId } };
+    const options = { input: scopedInput, backend, controlPlane, runnerInstanceId: "original-owner-runner",
+      controlPlaneInstanceId: "control", requireSessionCloseBeforeReturn: true };
+    await expect(executeNativeSession(options)).rejects.toMatchObject({ message: "original provider notification failed", cleanupError: failure });
+    let admission: unknown;
+    try {
+      await executeNativeSession({ ...options, runnerInstanceId: "new-carrier-runner",
+        input: { ...scopedInput, binding: { ...scopedInput.binding, runId: "new-qa-attempt" } } });
+    } catch (error) { admission = error; }
+    expect(admission).toBeInstanceOf(NativeSessionCleanupQuarantinedError);
+    const retained = (admission as NativeSessionCleanupQuarantinedError).cleanupOwners;
+    expect(retained).toHaveLength(1);
+    expect(failure.cleanupOwner).toEqual(retained![0]);
+    expect(retained![0]).toMatchObject({ binding: owner, runnerInstanceId: "original-owner-runner",
+      operatorRecoveryRequired: true, runnerSuspended: mode === "observed" ? false : null,
+      providerDrained: mode === "observed" ? true : null,
+      semanticToolPendingCount: mode === "observed" ? 1 : null, semanticToolsSettled: null });
+    expect(retained![0]!.missingEvidence).toContain("runner_suspension_unverified");
+    expect(retained![0]!.missingEvidence).toContain("semantic_tool_settlement_unverified");
+    expect(new Date(retained![0]!.retainedAtUTC).toISOString()).toBe(retained![0]!.retainedAtUTC);
+    expect(JSON.stringify(retained)).not.toContain("PRIVATE_");
+    expect(JSON.stringify(retained)).not.toContain("unrelated-later-carrier");
+    expect(backend.openSession).toHaveBeenCalledOnce();
+    expect(session.close).toHaveBeenCalledOnce();
+    expect(controlPlane.completeRun).not.toHaveBeenCalled();
+    // Only the existing test-boundary proof removes this controlled owner.
+    observedIdentity = owner;
+    completeTerminatedLocalNativeSessionCleanup({ companyId: owner.companyId, runId: owner.runId,
+      runnerInstanceId: "original-owner-runner" });
+  });
+
   it("propagates an exhausted required backend checkpoint close", async () => {
     vi.useFakeTimers();
     try {

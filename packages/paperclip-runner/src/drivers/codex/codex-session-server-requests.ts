@@ -138,6 +138,9 @@ async function handleServerRequestBody(
               threadId,
               turnId,
               arguments: request.params.arguments,
+              ...(request.paperclipTrace?.nativeToolExecution
+                ? { nativeToolExecution: request.paperclipTrace.nativeToolExecution }
+                : {}),
             });
             state.emit(
               "item.completed",

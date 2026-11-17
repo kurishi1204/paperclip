@@ -12,6 +12,7 @@ import { createSkillAction } from "../protocol-actions/create-skill.js";
 import { searchApiAction } from "../protocol-actions/search-api.js";
 import { callApiAction } from "../protocol-actions/call-api.js";
 import { projectIconSchema, projectRepositoryUrlSchema } from "../protocol-actions/create-project.js";
+import { requestHumanInputOperationRequirements, requestHumanInputWithdrawalFields } from "../protocol-actions/request-human-input.js";
 
 const ALL_MODES = ["standard", "ask", "planning", "skill_test"] as const;
 const WORK_MODES = ["standard", "planning", "skill_test"] as const;
@@ -263,12 +264,13 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
   descriptor({
     operationId: "request_human_input",
     title: "Request structured human input",
-    description: "Create a typed, durable interaction on the active task.",
+    description: "Create a typed, durable interaction on the active task, or withdraw your own pending named business-document confirmation through the live server. Withdrawal requires interactionId, reason, payload.target with the unchanged issue/document/key/revision, and a stable idempotencyKey; it does not answer, reassign, clear quarantine or schedule another review. Never resend an unknown effect.",
     effect: "write",
     allowedModes: ALL_MODES,
-    inputSchema: object(
+    inputSchema: { ...object(
       {
         ...idempotency,
+        ...requestHumanInputWithdrawalFields,
         interactionKind: {
           enum: [
             "confirmation",
@@ -295,12 +297,8 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
       },
       [
         "idempotencyKey",
-        "interactionKind",
-        "title",
-        "prompt",
-        "continuationPolicy",
       ],
-    ),
+    ), anyOf: requestHumanInputOperationRequirements },
     outputSchema: operationReceipt,
   }),
   descriptor({

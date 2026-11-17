@@ -25,6 +25,51 @@ export const nativeCleanupHistoryCount = sql<number | null>`case
       with ordinality entry(value, ordinality) where ${cleanupFamily}
   ) else null end`;
 
+// Provider-failure owner evidence is distinct from cleanup-event history.
+// Select only the matching quarantine failure and explicit non-secret fields.
+export const nativeCleanupOwnerHistoryReadback = sql<unknown>`case
+  when jsonb_typeof(${nativeRunFinalizations.recoveryHistory}) = 'array' then coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'at', entry.value->>'at',
+      'ownerCount', case when jsonb_typeof(entry.value->'cleanupOwners') = 'array'
+        then jsonb_array_length(entry.value->'cleanupOwners') else null end,
+      'owners', case when jsonb_typeof(entry.value->'cleanupOwners') = 'array' then (
+        select coalesce(jsonb_agg(jsonb_build_object(
+          'binding', case when jsonb_typeof(owner.value->'binding') = 'object' then jsonb_build_object(
+            'runId', owner.value->'binding'->>'runId',
+            'sessionId', owner.value->'binding'->>'sessionId',
+            'companyId', owner.value->'binding'->>'companyId',
+            'issueId', owner.value->'binding'->>'issueId',
+            'agentId', owner.value->'binding'->>'agentId') else null end,
+          'runnerInstanceId', owner.value->>'runnerInstanceId',
+          'retainedAtUTC', owner.value->>'retainedAtUTC',
+          'operatorRecoveryRequired', owner.value->'operatorRecoveryRequired',
+          'runnerSuspended', owner.value->'runnerSuspended',
+          'providerDrained', owner.value->'providerDrained',
+          'semanticToolsSettled', owner.value->'semanticToolsSettled',
+          'semanticToolPendingCount', owner.value->'semanticToolPendingCount',
+          'semanticToolPersistenceFailed', owner.value->'semanticToolPersistenceFailed',
+          'providerPendingEventCount', owner.value->'providerPendingEventCount',
+          'providerSettled', owner.value->'providerSettled',
+          'missingEvidence', case when jsonb_typeof(owner.value->'missingEvidence') = 'array'
+            then owner.value->'missingEvidence' else null end
+        ) order by owner.ordinality), '[]'::jsonb)
+        from (select value, ordinality from jsonb_array_elements(entry.value->'cleanupOwners')
+          with ordinality owner(value, ordinality) order by ordinality limit ${LIMIT + 1}) owner
+      ) else null end
+    ) order by entry.ordinality desc)
+    from (select value, ordinality from jsonb_array_elements(${nativeRunFinalizations.recoveryHistory})
+      with ordinality entry(value, ordinality)
+      where entry.value->>'reason' = 'native_session_cleanup_quarantined'
+      order by ordinality desc limit ${LIMIT + 1}) entry
+  ), '[]'::jsonb) else null end`;
+export const nativeCleanupOwnerHistoryCount = sql<number | null>`case
+  when jsonb_typeof(${nativeRunFinalizations.recoveryHistory}) = 'array' then (
+    select count(*)::integer from jsonb_array_elements(${nativeRunFinalizations.recoveryHistory})
+      with ordinality entry(value, ordinality)
+      where entry.value->>'reason' = 'native_session_cleanup_quarantined'
+  ) else null end`;
+
 const record = (v: unknown): Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v)
   ? v as Record<string, unknown> : {};
 const text = (v: unknown) => typeof v === "string" && v.length > 0 && v.length <= 256 ? v : null;
@@ -35,6 +80,36 @@ const hash = (v: unknown) => text(v) === null ? null : createHash("sha256").upda
 const count = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null;
 const at = (v: unknown) => typeof v === "string" && Number.isFinite(Date.parse(v)) ? new Date(v).toISOString() : null;
 const kinds = new Set(["native_cleanup_maintenance", "native_cleanup_source_archive", "native_cleanup_runner_epoch"]);
+const cleanupMissingEvidence = new Set([
+  "owner_binding_unverified", "runner_instance_unverified", "runner_suspension_unverified",
+  "provider_drain_unverified", "semantic_tool_settlement_unverified", "provider_settlement_unverified",
+]);
+const nullableBool = (v: unknown) => typeof v === "boolean" ? v : null;
+const ownerBinding = (v: unknown) => {
+  const b = record(v);
+  if (!Object.keys(b).length) return null;
+  return { runId: code(b.runId), sessionId: text(b.sessionId), companyId: code(b.companyId),
+    issueId: code(b.issueId), agentId: code(b.agentId) };
+};
+const cleanupOwner = (v: unknown) => {
+  const o = record(v);
+  const evidence = Array.isArray(o.missingEvidence) ? o.missingEvidence : null;
+  const safeEvidence = evidence?.filter((item): item is string =>
+    typeof item === "string" && cleanupMissingEvidence.has(item)) ?? [];
+  const rawBinding = record(o.binding);
+  const bindingPresent = Object.keys(rawBinding).length > 0;
+  const value = { binding: bindingPresent ? ownerBinding(rawBinding) : null, runnerInstanceId: code(o.runnerInstanceId),
+    retainedAtUTC: at(o.retainedAtUTC), operatorRecoveryRequired: nullableBool(o.operatorRecoveryRequired),
+    runnerSuspended: nullableBool(o.runnerSuspended), providerDrained: nullableBool(o.providerDrained),
+    semanticToolsSettled: nullableBool(o.semanticToolsSettled), semanticToolPendingCount: count(o.semanticToolPendingCount),
+    semanticToolPersistenceFailed: nullableBool(o.semanticToolPersistenceFailed),
+    providerPendingEventCount: count(o.providerPendingEventCount), providerSettled: nullableBool(o.providerSettled),
+    missingEvidence: safeEvidence };
+  const unclassified = evidence === null || safeEvidence.length !== evidence.length
+    || value.retainedAtUTC === null || value.operatorRecoveryRequired === null
+    || (bindingPresent && Object.values(value.binding ?? {}).some(v => v === null));
+  return { value, unclassified };
+};
 
 export type NativeRunRecoveryProjection = { runId: string; projection: ExecutionProjection | null };
 
@@ -43,7 +118,8 @@ export async function readNativeRunRecoveryReadback(
   db: Pick<Db, "select">,
   run: { id: string; companyId: string; agentId: string; nativeIssueId: string;
     nativeSessionId: string | null; runnerInstanceId: string | null },
-  cleanup: { finalizationObserved: boolean; history: unknown; totalCount: unknown },
+  cleanup: { finalizationObserved: boolean; history: unknown; totalCount: unknown;
+    ownerHistory?: unknown; ownerHistoryTotalCount?: unknown },
   execution?: NativeRunRecoveryProjection,
 ) {
   const events = await db.select({
@@ -107,6 +183,24 @@ export async function readNativeRunRecoveryReadback(
       bindingState: v.rawSourceInstanceId !== run.runnerInstanceId ? "conflicting" : valid ? "same_run" : "unverified" };
   });
   const eventUnclassified = eventRows.filter(v => v.bindingState !== "same_run").length;
+  const ownerHistory = Array.isArray(cleanup.ownerHistory) ? cleanup.ownerHistory : [];
+  const ownerHistoryRows = ownerHistory.slice(0, LIMIT).map(value => {
+    const v = record(value);
+    const ownerValues = Array.isArray(v.owners) ? v.owners.map(cleanupOwner) : null;
+    const ownerCount = count(v.ownerCount);
+    const ownersComplete = ownerCount !== null && ownerCount <= LIMIT
+      && ownerValues !== null && ownerValues.length === ownerCount;
+    return { at: at(v.at), ownerCount, ownersComplete,
+      owners: ownerValues?.map(owner => owner.value) ?? null,
+      unclassified: at(v.at) === null || !ownersComplete || ownerValues?.some(owner => owner.unclassified) === true };
+  });
+  const ownerHistoryTotal = cleanup.finalizationObserved ? count(cleanup.ownerHistoryTotalCount) : null;
+  const ownerHistoryComplete = ownerHistoryTotal !== null && ownerHistoryTotal <= LIMIT
+    && ownerHistoryRows.length === ownerHistoryTotal;
+  const ownerHistoryUnclassified = ownerHistoryRows.filter(v => v.unclassified).length;
+  const ownerHistoryState = !cleanup.finalizationObserved || !Array.isArray(cleanup.ownerHistory)
+    || !ownerHistoryComplete || ownerHistoryUnclassified ? "unverified"
+    : ownerHistoryTotal === 0 ? "not_recorded" : "recorded";
   const actionRows = actions.slice(0, LIMIT).map(row => {
     const v = record(row.evidence);
     const matches = v.runId === run.id || v.sourceRunId === run.id;
@@ -138,6 +232,8 @@ export async function readNativeRunRecoveryReadback(
       inspectionActions: projection?.permittedActions.filter(v => v === "inspect_run" || v === "inspect_recovery") ?? [] },
     cleanupHistory: { state: historyState, complete: historyComplete, totalCount: total,
       observedCount: historyRows.length, unclassifiedCount: historyUnclassified, rows: historyRows },
+    cleanupOwnerHistory: { state: ownerHistoryState, complete: ownerHistoryComplete, totalCount: ownerHistoryTotal,
+      observedCount: ownerHistoryRows.length, unclassifiedCount: ownerHistoryUnclassified, rows: ownerHistoryRows },
     maintenanceEvents: { state: events.length > LIMIT || eventUnclassified ? "unverified"
       : events.length ? "recorded" : "not_recorded", complete: events.length <= LIMIT,
       observedCount: eventRows.length, unclassifiedCount: eventUnclassified, rows: eventRows },

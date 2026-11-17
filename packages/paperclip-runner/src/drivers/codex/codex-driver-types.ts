@@ -9,7 +9,7 @@ import type {
   CodexModelContextSnapshot,
   CodexTaskEnvelope,
 } from "../../contracts/codex.js";
-import type { CodexAppServerTransport } from "./app-server-transport.js";
+import type { CodexAppServerTransport, CodexNativeToolExecutionMetadata } from "./app-server-transport.js";
 import type { CodexWorkingDirectoryAuthority } from "./codex-boundaries.js";
 import type { CodexQuestionResponseContext } from "./codex-question-adapter.js";
 
@@ -55,6 +55,7 @@ export interface CodexAppServerDriverOptions {
     threadId: string;
     turnId: string;
     arguments: unknown;
+    nativeToolExecution?: CodexNativeToolExecutionMetadata;
   }) => Promise<unknown>;
   /** Current server constraints; does not commit task status before the turn ends. */
   completionFeedback?: (result: import("../../protocol/replay-contract.js").PrpStructuredRunResult) => Promise<string>;

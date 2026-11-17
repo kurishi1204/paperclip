@@ -6,7 +6,8 @@ import {
 } from "@paperclipai/db";
 import { badRequest, conflict } from "../../errors.js";
 import { executionProjectionForRun } from "../execution-projection.js";
-import { nativeCleanupHistoryReadback, nativeCleanupHistoryCount, readNativeRunRecoveryReadback } from "./native-run-recovery-readback.js";
+import { nativeCleanupHistoryReadback, nativeCleanupHistoryCount, nativeCleanupOwnerHistoryReadback,
+  nativeCleanupOwnerHistoryCount, readNativeRunRecoveryReadback } from "./native-run-recovery-readback.js";
 
 const RESULT_LIMIT = 20;
 const EFFECT_LIMIT = 50;
@@ -80,6 +81,7 @@ export async function readNativeRunReceiptReadback(
       controlDeadlineAt: nativeRunFinalizations.controlDeadlineAt, nextAttemptAt: nativeRunFinalizations.nextAttemptAt,
       updatedAt: nativeRunFinalizations.updatedAt,
       cleanupHistory: nativeCleanupHistoryReadback, cleanupHistoryCount: nativeCleanupHistoryCount,
+      cleanupOwnerHistory: nativeCleanupOwnerHistoryReadback, cleanupOwnerHistoryCount: nativeCleanupOwnerHistoryCount,
     }).from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, run.companyId),
       eq(nativeRunFinalizations.issueId, run.nativeIssueId!), eq(nativeRunFinalizations.runId, run.id)))
       .limit(1).then(rows => rows[0] ?? null) : null;
@@ -155,10 +157,13 @@ export async function readNativeRunReceiptReadback(
         state = "accepted_same_hash";
       }
     }
-    const { leaseOwner, recoveryRequestId, cleanupHistory, cleanupHistoryCount, ...safeFinalization } = finalization
-      ?? { leaseOwner: null, recoveryRequestId: null, cleanupHistory: null, cleanupHistoryCount: null };
+    const { leaseOwner, recoveryRequestId, cleanupHistory, cleanupHistoryCount, cleanupOwnerHistory,
+      cleanupOwnerHistoryCount, ...safeFinalization } = finalization
+      ?? { leaseOwner: null, recoveryRequestId: null, cleanupHistory: null, cleanupHistoryCount: null,
+        cleanupOwnerHistory: null, cleanupOwnerHistoryCount: null };
     const recovery = await readNativeRunRecoveryReadback(tx, { ...run, nativeIssueId: scope.issueId },
-      { finalizationObserved: finalization !== null, history: cleanupHistory, totalCount: cleanupHistoryCount },
+      { finalizationObserved: finalization !== null, history: cleanupHistory, totalCount: cleanupHistoryCount,
+        ownerHistory: cleanupOwnerHistory, ownerHistoryTotalCount: cleanupOwnerHistoryCount },
       execution ? { runId: run.id, projection: execution } : undefined);
     return {
       schema: "paperclip.native-run-receipt-readback.v1" as const,

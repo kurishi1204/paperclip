@@ -138,6 +138,8 @@ export function isSemanticToolOutcomeUnknownError(error: unknown): error is Sema
 /** The exact close owner has torn down its controller without proving suspension. */
 export class NativeSessionCloseUnrecoverableError extends Error {
   readonly code = "native_session_close_unrecoverable";
+  /** Safe retained-owner observation; the raw settlement is never the API payload. */
+  cleanupOwner?: NativeSessionCleanupOwnerMetadata;
 
   constructor(readonly settlement?: Record<string, unknown>) {
     super(
@@ -166,12 +168,28 @@ export class NativeSessionProtocolIntegrityError extends Error {
   }
 }
 
+/** Non-secret observations of the retained close owner, never stop or retry authority. */
+export interface NativeSessionCleanupOwnerMetadata {
+  binding: NativeRunIdentity | null;
+  runnerInstanceId: string | null;
+  retainedAtUTC: string;
+  operatorRecoveryRequired: boolean;
+  runnerSuspended: boolean | null;
+  providerDrained: boolean | null;
+  semanticToolsSettled: boolean | null;
+  semanticToolPendingCount: number | null;
+  semanticToolPersistenceFailed: boolean | null;
+  providerPendingEventCount: number | null;
+  providerSettled: boolean | null;
+  missingEvidence: string[];
+}
+
 /** Admission is blocked by a retained owner that has no safe automatic close retry. */
 export class NativeSessionCleanupQuarantinedError extends Error {
   readonly code = "native_session_cleanup_quarantined";
   readonly recovery = "operator_required";
 
-  constructor() {
+  constructor(readonly cleanupOwners?: readonly NativeSessionCleanupOwnerMetadata[]) {
     super(
       "native_session_cleanup_quarantined: prior session cleanup requires operator recovery; verify its retained process ownership and checkpoint before a controlled restart. Clearing a task session does not resolve this quarantine.",
     );

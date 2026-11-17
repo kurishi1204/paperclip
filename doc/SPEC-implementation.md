@@ -888,6 +888,8 @@ The watched subtree is the source issue plus descendants reached through `parent
 
 Task-watchdog wakes must include server-derived capability metadata that names the watched root, reusable watchdog issue, excluded `task_watchdog` origin branches, allowed operations, and denied operations. Watchdogs must use that metadata and server denials for capability discovery; they must not create visible probe issues, comments, or throwaway tasks to learn their permissions.
 
+Native `request_human_input` also supports `operation: "withdraw"` for the current task executor's own pending named business-document confirmation. It requires the exact existing interaction and unchanged issue/document/key/revision, uses the ordinary withdrawal service and administrative outcome (`status: cancelled`, `result.outcome: withdrawn`), and persists a semantic receipt atomically. It does not answer a card, reassign its addressee, clear session quarantine, create another review, or broaden `call_api`. Governed/human-only decisions and plan approvals retain their original workflow. A lost acknowledgement is inspected, not automatically resent.
+
 ### Allowed watchdog mutations
 
 Within the watched subtree, a watchdog run may perform only mutations that restore or clarify the next live/waiting path:

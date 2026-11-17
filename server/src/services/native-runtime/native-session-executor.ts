@@ -1,3 +1,4 @@
+import { NativeToolExecutionQuiescence, createNativeToolExecutionStopAssertion, type NativeToolExecutionEpochBinding, type NativeToolExecutionCallIdentity } from "./native-tool-execution-quiescence.js";
 import { hasDocumentReturn, readCurrentDocumentReturnWake } from "../document-return-wake.js";
 import { CURSOR_DISTRIBUTION_PINS, QUALIFIED_ACPX_PROFILES, QUALIFIED_ACPX_VERSION } from "../../vendor/paperclip-runner/index.js";
 import { isProviderMode } from "../../vendor/paperclip-runner/index.js";
@@ -30,7 +31,7 @@ import { nativeCompletionFeedback } from "./native-completion-feedback.js";
 import { hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
 import { stoppedCodexTurnIsTextOnly } from "./stopped-codex-turn.js";
 import { prepareVerifiedRemoteProviderPack } from "./remote-provider-pack.js";
-import { readNativeLocalProcessStop, PROCESS_START_REQUESTED } from "../native-local-process-stop.js";
+import { recordNativeLocalProcessStop, readNativeLocalProcessStop, PROCESS_START_REQUESTED } from "../native-local-process-stop.js";
 import { remoteLeaseCleanupScope } from "../remote-execution-termination.js";
 import { resolveConnectorAssignments, isConnectorSkill } from "../connector-runtime.js";
 import {
@@ -80,9 +81,11 @@ import type {
 } from "../../vendor/paperclip-runner/index.js";
 import {
   NativeProviderTerminalFailure,
+  NativeSessionCloseUnrecoverableError,
   NativeSessionCleanupQuarantinedError,
   NativeSessionProtocolIntegrityError,
   completeRetainedNativeSessionCleanup,
+  readRetainedNativeSessionCleanupOwner,
   completeTerminatedLocalNativeSessionCleanup,
   acpxRuntimeSessionDirectoryName,
   createNativeSessionBackend,
@@ -1505,22 +1508,42 @@ export async function synchronizeCompletedProviderPlan(input: {
 
 class SessionToolAuthorityEpoch {
   readonly runId: string;
+  readonly execution: NativeToolExecutionQuiescence;
   #authority: PaperclipRunnerToolAuthority;
   #revoked = false;
 
-  constructor(runId: string, authority: PaperclipRunnerToolAuthority, private readonly toolTrace?: NativeToolTrace) {
-    this.runId = runId;
+  constructor(binding: NativeToolExecutionEpochBinding, authority: PaperclipRunnerToolAuthority, private readonly toolTrace?: NativeToolTrace) {
+    this.runId = binding.runId;
     this.#authority = authority;
+    this.execution = new NativeToolExecutionQuiescence(binding);
   }
 
   revoke(): void {
     this.#revoked = true;
+    this.execution.revoke();
+  }
+
+  matchesOwner(owner: Omit<NativeToolExecutionEpochBinding, "epochId">): boolean {
+    return (Object.keys(owner) as (keyof typeof owner)[]).every(key => this.execution.binding[key] === owner[key]);
+  }
+
+  stoppedExecutionAssertion(owner: Omit<NativeToolExecutionEpochBinding, "epochId">) {
+    if (!this.matchesOwner(owner)) throw new Error("native_tool_execution_stop_receipt_unverified");
+    const receipt = this.execution.getStoppedReceipt();
+    for (const key of Object.keys(this.execution.binding) as (keyof NativeToolExecutionEpochBinding)[]) {
+      if (receipt.binding[key] !== this.execution.binding[key]) throw new Error("native_tool_execution_stop_receipt_unverified");
+    }
+    return createNativeToolExecutionStopAssertion(receipt);
+  }
+
+  async observeStopped(): Promise<void> {
+    // This observes handler finalization only. Missing source metadata/call0
+    // leaves no receipt and never changes the original close/business result.
+    try { await this.execution.awaitStopped(); } catch { /* no stop evidence */ }
   }
 
   #assertCurrent(): void {
-    if (this.#revoked) {
-      throw new Error("native_tool_authority_epoch_revoked");
-    }
+    if (this.#revoked) throw new Error("native_tool_authority_epoch_revoked");
   }
 
   definitions() {
@@ -1528,15 +1551,34 @@ class SessionToolAuthorityEpoch {
     return this.#authority.definitions();
   }
 
-  async execute(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]) {
+  async execute(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0] & {
+    nativeToolExecution?: NativeToolExecutionCallIdentity;
+  }) {
     this.#assertCurrent();
-    return this.toolTrace
-      ? await this.toolTrace.execute(call, () => this.#authority.execute(call))
-      : await this.#authority.execute(call);
+    return this.execution.track({ callId: call.callId, operationId: call.tool, nativeToolExecution: call.nativeToolExecution },
+      () => this.toolTrace
+        ? this.toolTrace.execute(call, () => this.#authority.execute(call))
+        : this.#authority.execute(call));
   }
 }
 
 const sessionToolAuthorityEpochs = new Map<string, SessionToolAuthorityEpoch>();
+const sessionToolEpochCloseBindings = new WeakSet<NativeSession>();
+function bindSessionToolAuthorityEpochClose(session: NativeSession, scope: string, runnerInstanceId: string, environmentLeaseId: string): void {
+  if (sessionToolEpochCloseBindings.has(session)) return;
+  sessionToolEpochCloseBindings.add(session);
+  const close = session.close.bind(session);
+  session.close = async input => {
+    const actual = session.identity();
+    const epoch = sessionToolAuthorityEpochs.get(scope);
+    const owner = { companyId: actual.companyId, agentId: actual.agentId, issueId: actual.issueId,
+      runId: actual.runId, normalizedSessionId: actual.sessionId, runnerInstanceId, environmentLeaseId };
+    const owned = epoch?.matchesOwner(owner) ? epoch : null;
+    owned?.revoke();
+    try { await close(input); }
+    finally { await owned?.observeStopped(); }
+  };
+}
 const initializingSessionToolAuthorities = new Set<string>();
 const executingRunnerdSessionScopes = new Map<string, string>();
 const executingNativeOwnerScopes = new Map<string, symbol>();
@@ -2521,6 +2563,68 @@ export function rebaseRetainedNativeCleanupProviderHome(
   }
 }
 
+type NativeOwnedProcessExit = Parameters<NonNullable<NonNullable<
+  Parameters<typeof createRunnerdCodexTransport>[0]
+>["onOwnedProcessExit"]>>[0];
+
+/** Save only the original locally owned child's completion. Never use a later
+ * carrier to fill missing process/PRP identity or retry an unknown callback. */
+async function recordOwnedNativeProcessExit(
+  db: Db,
+  execution: NativeExecutionInput,
+  runnerInstanceId: string,
+  environmentLeaseId: string,
+  receipt: NativeOwnedProcessExit,
+): Promise<void> {
+  const binding = { ...execution.binding };
+  const sessionId = nativeSessionKey(execution);
+  if (receipt.identity.runId !== binding.runId ||
+      receipt.identity.normalizedSessionId !== sessionId ||
+      receipt.identity.runnerInstanceId !== runnerInstanceId ||
+      receipt.identity.environmentLeaseId !== environmentLeaseId) {
+    throw new Error("native_owned_process_exit_unverified");
+  }
+  await db.transaction(async (tx) => {
+    const [source] = await tx.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, binding.companyId),
+      eq(heartbeatRuns.id, receipt.identity.runId),
+    )).for("update").limit(1);
+    if (!source || source.runtimeMode !== "native" ||
+        source.agentId !== binding.agentId || source.nativeIssueId !== binding.issueId ||
+        source.nativeSessionId !== sessionId || source.runnerInstanceId !== runnerInstanceId ||
+        source.processPid !== receipt.pid || source.processGroupId !== receipt.processGroupId ||
+        !source.processStartedAt || source.processStartedAt.getTime() !== Date.parse(receipt.startedAt) ||
+        Date.parse(receipt.observedAt) < source.processStartedAt.getTime() ||
+        !await recordNativeLocalProcessStop(tx as unknown as Db, source, receipt)) {
+      throw new Error("native_owned_process_exit_unverified");
+    }
+  });
+}
+
+function ownedTerminationMatchesCheckpoint(
+  stopped: Awaited<ReturnType<typeof readNativeLocalProcessStop>>,
+  run: typeof heartbeatRuns.$inferSelect,
+  identity: Record<string, unknown>,
+  runner: Record<string, unknown>,
+): boolean {
+  if (!stopped || !("terminationReceipt" in stopped) || !stopped.terminationReceipt) return false;
+  const receipt = stopped.terminationReceipt;
+  const startedAt = Date.parse(receipt.processStartedAt);
+  if (!Number.isFinite(startedAt) || !Number.isFinite(Date.parse(receipt.observedAt)) ||
+      Date.parse(receipt.observedAt) < startedAt ||
+      (run.processStartedAt !== null && run.processStartedAt.getTime() !== startedAt) ||
+      (run.processPid !== null && (run.processPid !== stopped.processPid || run.processGroupId !== stopped.processGroupId)) ||
+      receipt.identity.runId !== run.id || receipt.identity.normalizedSessionId !== run.nativeSessionId ||
+      receipt.identity.runnerInstanceId !== run.runnerInstanceId) return false;
+  const checkpoint = record(record(run.runnerProfileJson).sessionCheckpoint);
+  const process = record(checkpoint.process);
+  if ((process.runnerPid !== undefined && process.runnerPid !== null && process.runnerPid !== stopped.processPid) ||
+      (process.runnerProcessGroupId !== undefined && process.runnerProcessGroupId !== null && process.runnerProcessGroupId !== stopped.processGroupId)) return false;
+  return (["runnerInstanceId", "environmentLeaseId", "runId", "normalizedSessionId", "turnId", "itemId"] as const)
+    .every(key => typeof identity[key] === "string" && identity[key] !== "" &&
+      runner[key] === identity[key] && receipt.identity[key] === identity[key]);
+}
+
 /** Physical cleanup for an explicitly authorized NEW conversation turn. Unlike
  * automatic replacement, this does not certify or replay the interrupted actions.
  * The caller holds the issue/controller/run locks and preserves their history.
@@ -2557,6 +2661,7 @@ export async function verifyStoppedNativeSessionForContinuation(
         !["runnerInstanceId", "environmentLeaseId", "runId", "normalizedSessionId", "turnId", "itemId"].every(key =>
           typeof identity[key] === "string" && identity[key] && snapshot.runner[key] === identity[key]) ||
         !Array.isArray(snapshot.control.committedEvents)) return null;
+    if (!ownedTerminationMatchesCheckpoint(stopped, run, identity, snapshot.runner)) return null;
     // An incomplete provider launch can own a process that never emitted its
     // session identity. It cannot be certified from an earlier owner's receipt.
     if (snapshot.control.schema !== "paperclip.runner.durable.control-plane-state.v1" ||
@@ -2666,6 +2771,7 @@ export async function verifyStoppedNativeSessionForReplacement(
         snapshot.runner.lifecycle !== "ready" || snapshot.provider.lifecycle !== "turn_active" ||
         record(snapshot.provider.config).provider !== "codex" || record(snapshot.provider.config).cwd !== execution.workspace.cwd ||
         !Array.isArray(snapshot.control.committedEvents) || !Array.isArray(snapshot.control.commands)) return null;
+    if (!ownedTerminationMatchesCheckpoint(stopped, run, identity, snapshot.runner)) return null;
     const events = snapshot.control.committedEvents.map(entry => record(record(record(entry).envelope).payload));
     const providerEvent = events.filter(event => ["session.started", "session.resumed"].includes(String(event.eventType))).at(-1);
     const provider = record(providerEvent?.payload);
@@ -2755,6 +2861,197 @@ export async function verifyStoppedNativeSessionForReplacement(
   } catch { return null; }
 }
 
+/** Explicit trusted service lane. The opaque live-owner token cannot be made
+ * from an HTTP body or a stored carrier observation. No new route selects it. */
+async function reconcileAlreadySettledNativeSessionCleanup(
+  db: Db,
+  input: { companyId: string; runId: string; alreadySettledNoLaunch: Readonly<object> },
+): Promise<{ status: "settled" | "operator_required"; runId: string; reason?: string;
+  unsettledToolCalls?: readonly NativeToolExecutionCallIdentity[]; businessOutcome?: "unverified" }> {
+  const denied = (reason = "native_cleanup_no_launch_unverified") => new Error(reason);
+  const leaseOwner = `native-cleanup:${randomUUID()}`;
+  let scope: string | null = null;
+  let claimed = false;
+  let result: { status: "settled" | "operator_required"; runId: string; reason?: string;
+  unsettledToolCalls?: readonly NativeToolExecutionCallIdentity[]; businessOutcome?: "unverified" } =
+    { status: "operator_required", runId: input.runId, reason: "native_cleanup_no_launch_unverified" };
+  try {
+    const owned = await db.transaction(async tx => {
+      const [run] = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId),
+      )).for("update", { noWait: true }).limit(1);
+      if (!run || run.runtimeMode !== "native" || !run.finishedAt ||
+          !["succeeded", "failed"].includes(run.status) || !run.nativeIssueId || !run.nativeSessionId ||
+          !run.runnerInstanceId || !run.processPid || run.processGroupId !== run.processPid ||
+          !run.processStartedAt || !cleanupProcessAbsent(run.processPid)) throw denied();
+      const execution = parseNativeExecutionInput(record(run.runnerProfileJson).nativeExecutionInput);
+      if (execution.provider.kind !== "codex" || execution.session.driverKind !== "codex_app_server" ||
+          execution.binding.companyId !== run.companyId || execution.binding.runId !== run.id ||
+          execution.binding.issueId !== run.nativeIssueId || execution.binding.agentId !== run.agentId ||
+          nativeSessionKey(execution) !== run.nativeSessionId ||
+          record(run.runnerProfileJson).nativeToolContractFingerprint !== nativeToolContractFingerprintForTarget("local")) throw denied();
+      const sessionScope = nativeSessionScopeKey(execution);
+      if (activeNativeSessions.has(run.id) || executingRunnerdSessionScopes.has(sessionScope) ||
+          initializingSessionToolAuthorities.has(sessionScope) || warmNativeSessions.has(sessionScope)) throw denied();
+      const root = scopedRunnerdStateRoot(execution);
+      const source = cleanupStateSnapshot(root);
+      const identity = record(source.control.identity);
+      if (!durableIdentityMatchesExecution(identity, execution) || identity.runnerInstanceId !== run.runnerInstanceId ||
+          !["runnerInstanceId", "environmentLeaseId", "runId", "normalizedSessionId", "turnId", "itemId"]
+            .every(key => typeof identity[key] === "string" && identity[key] && source.runner[key] === identity[key])) throw denied();
+      type Maintenance = Parameters<typeof settleRetainedRunnerdSession>[0];
+      const binding = { companyId: run.companyId, agentId: run.agentId, issueId: run.nativeIssueId,
+        runId: run.id, sessionId: run.nativeSessionId };
+      const backend = { kind: "runner", name: "codex_app_server" };
+      const ownerIdentity: Maintenance["identity"] = {
+        runnerInstanceId: identity.runnerInstanceId as string,
+        environmentLeaseId: identity.environmentLeaseId as string,
+        runId: identity.runId as string,
+        normalizedSessionId: identity.normalizedSessionId as string,
+        turnId: identity.turnId as string,
+        itemId: identity.itemId as string,
+      };
+      const ownerInput = { binding, backend, identity: ownerIdentity };
+      if (readRetainedNativeSessionCleanupOwner(ownerInput) !== input.alreadySettledNoLaunch) throw denied("native_cleanup_owner_unverified");
+      const [coordinator] = await tx.select().from(nativeRunFinalizations).where(and(
+        eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id),
+        eq(nativeRunFinalizations.issueId, run.nativeIssueId),
+      )).for("update", { noWait: true }).limit(1);
+      if (!coordinator || coordinator.phase !== "committed" || !coordinator.resultId || !coordinator.assessmentId ||
+          !coordinator.decisionId || coordinator.nextAttemptAt ||
+          (coordinator.leaseOwner && coordinator.leaseExpiresAt && coordinator.leaseExpiresAt > new Date())) throw denied("native_cleanup_lease_unverified");
+      const [accepted] = await tx.select().from(nativeRunResults).where(and(
+        eq(nativeRunResults.id, coordinator.resultId), eq(nativeRunResults.companyId, run.companyId),
+        eq(nativeRunResults.runId, run.id), eq(nativeRunResults.issueId, run.nativeIssueId),
+      )).for("share", { noWait: true }).limit(1);
+      if (!accepted || accepted.schemaStatus !== "accepted") throw denied();
+      const providerEvent = (source.control.committedEvents as unknown[]).map(entry => record(record(record(entry).envelope).payload))
+        .filter(event => ["session.started", "session.resumed"].includes(String(event.eventType))).at(-1);
+      const provider = record(providerEvent?.payload);
+      if (!providerEvent || !validatePrpEvent(providerEvent).ok || providerEvent.runId !== run.id ||
+          providerEvent.sourceInstanceId !== run.runnerInstanceId || providerEvent.normalizedSessionId !== run.nativeSessionId ||
+          providerEvent.turnId !== identity.turnId || providerEvent.itemId !== identity.itemId ||
+          typeof provider.providerSessionId !== "string" || source.provider.threadId !== provider.providerSessionId ||
+          !cleanupProcessAbsent(provider.processId) || provider.processId === run.processPid) throw denied();
+      executingRunnerdSessionScopes.set(sessionScope, leaseOwner); scope = sessionScope;
+      await tx.update(nativeRunFinalizations).set({ leaseOwner, leaseExpiresAt: new Date(Date.now() + 60_000) })
+        .where(and(eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id)));
+      claimed = true;
+      return { run, execution, root, source, ownerInput, accepted, coordinator,
+        providerPid: provider.processId as number, providerSessionId: provider.providerSessionId };
+    });
+    const coordinatorFence = (row: typeof nativeRunFinalizations.$inferSelect) => nativeSha256({
+      phase: row.phase, resultId: row.resultId, assessmentId: row.assessmentId, decisionId: row.decisionId,
+      nextAttemptAt: row.nextAttemptAt, recoveryHistory: row.recoveryHistory,
+    });
+    let stoppedToolExecutions: ReturnType<SessionToolAuthorityEpoch["stoppedExecutionAssertion"]> | undefined;
+    const authorize = async (tx: Db) => {
+      stoppedToolExecutions?.assertCurrent();
+      if (!scope || executingRunnerdSessionScopes.get(scope) !== leaseOwner ||
+          readRetainedNativeSessionCleanupOwner(owned.ownerInput) !== input.alreadySettledNoLaunch ||
+          cleanupStateSnapshot(owned.root).fingerprint !== owned.source.fingerprint ||
+          !cleanupProcessAbsent(owned.run.processPid) || !cleanupProcessAbsent(owned.providerPid)) throw denied("native_cleanup_owner_unverified");
+      const [current] = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, owned.run.companyId), eq(heartbeatRuns.id, owned.run.id),
+      )).for("update").limit(1);
+      const [lease] = await tx.select().from(nativeRunFinalizations).where(and(
+        eq(nativeRunFinalizations.companyId, owned.run.companyId), eq(nativeRunFinalizations.runId, owned.run.id),
+        eq(nativeRunFinalizations.leaseOwner, leaseOwner), gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`),
+      )).for("update").limit(1);
+      const [accepted] = await tx.select().from(nativeRunResults).where(and(
+        eq(nativeRunResults.id, owned.coordinator.resultId!), eq(nativeRunResults.runId, owned.run.id),
+        eq(nativeRunResults.companyId, owned.run.companyId),
+      )).for("share").limit(1);
+      if (!current || JSON.stringify(current) !== JSON.stringify(owned.run) || !lease ||
+          lease.leaseOwner !== leaseOwner || !lease.leaseExpiresAt || lease.leaseExpiresAt <= new Date() ||
+          coordinatorFence(lease) !== coordinatorFence(owned.coordinator) ||
+          !accepted || JSON.stringify(accepted) !== JSON.stringify(owned.accepted)) throw denied("native_cleanup_lease_unverified");
+      const environment = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+        eq(environmentLeases.companyId, owned.run.companyId), eq(environmentLeases.heartbeatRunId, owned.run.id),
+        inArray(environmentLeases.status, ["active", "pending_cleanup"]),
+      )).limit(1);
+      const receipts = await tx.select().from(heartbeatRunEvents).where(and(
+        eq(heartbeatRunEvents.companyId, owned.run.companyId), eq(heartbeatRunEvents.runId, owned.run.id),
+        or(
+          and(eq(heartbeatRunEvents.sourceInstanceId, owned.run.runnerInstanceId!),
+            inArray(heartbeatRunEvents.eventType, ["session.started", "session.resumed"])),
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->>'sourceKind' = 'control_plane'`,
+        ),
+      )).limit(20);
+      if (environment.length || receipts.length >= 20 || !retainedNativeCleanupJournalMatches({
+        run: owned.run, execution: owned.execution, accepted: owned.accepted, control: owned.source.control,
+        providerSessionId: owned.providerSessionId, providerAccountSessionId: typeof owned.source.provider.providerAccountSessionId === "string"
+          ? owned.source.provider.providerAccountSessionId : null, persistedEvents: receipts,
+      })) throw denied();
+    };
+    // The no-launch consumer independently rechecks this real owner/lease
+    // twice. Its separate authorize callback retains the original source fence.
+    const authorityEpoch = sessionToolAuthorityEpochs.get(scope!);
+    const stopOwner = { companyId: owned.run.companyId, agentId: owned.run.agentId, issueId: owned.run.nativeIssueId!,
+      runId: owned.run.id, normalizedSessionId: owned.run.nativeSessionId!,
+      runnerInstanceId: owned.ownerInput.identity.runnerInstanceId,
+      environmentLeaseId: owned.ownerInput.identity.environmentLeaseId };
+    if (authorityEpoch) {
+      try {
+        const observed = authorityEpoch.stoppedExecutionAssertion(stopOwner);
+        const assertCurrent = () => {
+          if (sessionToolAuthorityEpochs.get(scope!) !== authorityEpoch || !authorityEpoch.matchesOwner(stopOwner))
+            throw denied("native_cleanup_owner_unverified");
+          observed.assertCurrent();
+        };
+        stoppedToolExecutions = { assertCurrent, assertCallsStopped: calls => {
+          assertCurrent(); observed.assertCallsStopped(calls);
+        } };
+      } catch { /* Legacy/uninstrumented handlers remain unproven, never synthesized. */ }
+    }
+    const proof = await settleRetainedRunnerdSession({
+      requestId: leaseOwner, ...owned.ownerInput, providerSessionId: owned.providerSessionId,
+      stateDirectory: owned.root, activationDirectory: owned.root, sourceFingerprint: owned.source.fingerprint,
+      originalRunnerPid: owned.run.processPid!, originalProviderPid: owned.providerPid,
+      alreadySettledNoLaunch: { authorizeOwnerAndLease: () => db.transaction(tx => authorize(tx as unknown as Db)),
+        ...(stoppedToolExecutions ? { stoppedToolExecutions } : {}) },
+      authorize: async () => {
+        if (cleanupStateSnapshot(owned.root).fingerprint !== owned.source.fingerprint) throw denied();
+      },
+      // This lane must never launch an epoch or publish an event. An accidental
+      // call remains a refusal, not a dummy acknowledgement.
+      appendEvent: async () => { throw denied(); },
+      recordEpoch: async () => { throw denied(); },
+    });
+    await db.transaction(async tx => {
+      await authorize(tx as unknown as Db);
+      if (readRetainedNativeSessionCleanupOwner(owned.ownerInput) !== input.alreadySettledNoLaunch ||
+          completeRetainedNativeSessionCleanup(proof) !== 1) throw denied("native_cleanup_owner_unverified");
+      authorityEpoch?.execution.invalidate();
+    });
+    const unsettledToolCalls = proof.unsettledToolCalls?.map(call => ({
+      callId: call.callId, operationId: call.operationId, sourceEventId: call.sourceEventId,
+      sourceEventType: call.sourceEventType, inputDigest: call.inputDigest,
+      correlation: { runId: call.correlation.runId, normalizedSessionId: call.correlation.normalizedSessionId,
+        turnId: call.correlation.turnId, itemId: call.correlation.itemId },
+    }));
+    // Cleanup completion is not a semantic result. Preserve every original
+    // unresolved call in the owner-only result; arguments/content never leave.
+    result = { status: "settled", runId: input.runId,
+      ...(unsettledToolCalls?.length ? { unsettledToolCalls, businessOutcome: "unverified" as const } : {}) };
+  } catch (error) {
+    const code = error instanceof Error ? error.message : "";
+    result = { status: "operator_required", runId: input.runId, reason:
+      ["native_cleanup_owner_unverified", "native_cleanup_lease_unverified", "native_cleanup_tool_settlement_unverified"].includes(code)
+        ? code : "native_cleanup_no_launch_unverified" };
+  } finally {
+    if (claimed) {
+      try {
+        await db.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null })
+          .where(and(eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, input.runId),
+            eq(nativeRunFinalizations.leaseOwner, leaseOwner)));
+      } catch { result = { status: "operator_required", runId: input.runId, reason: "native_cleanup_lease_unverified" }; }
+    }
+    if (scope && executingRunnerdSessionScopes.get(scope) === leaseOwner) executingRunnerdSessionScopes.delete(scope);
+  }
+  return result;
+}
+
 /** Exact local cleanup only: the accepted result and original quarantine are
  * never rewritten. A failed/interrupted maintenance attempt is retained for
  * inspection, not retried from an older snapshot with unknown process owners. */
@@ -2763,11 +3060,17 @@ export async function reconcileRetainedNativeSessionCleanup(
   input: {
     companyId: string;
     runId: string;
+    alreadySettledNoLaunch?: Readonly<object>;
   },
 ): Promise<{
   status: "settled" | "not_eligible" | "operator_required";
   runId: string;
+  reason?: string;
+  unsettledToolCalls?: readonly NativeToolExecutionCallIdentity[];
+  businessOutcome?: "unverified";
 }> {
+  if (input.alreadySettledNoLaunch !== undefined) return reconcileAlreadySettledNativeSessionCleanup(db,
+    { ...input, alreadySettledNoLaunch: input.alreadySettledNoLaunch });
   const denied = () => new Error("native_cleanup_maintenance_unproven");
   const leaseOwner = `native-cleanup:${randomUUID()}`;
   let reservedScope: string | null = null;
@@ -8890,6 +9193,35 @@ async function executePaperclipNativeSessionWithinScope(
         error instanceof Error ? error.message : String(error),
       ).slice(0, 2_000);
       const sanitizedStderrTail = redactIdentityText(message).slice(-4_096);
+      const attachedCloseError = error instanceof Error
+        ? Object.getOwnPropertyDescriptor(error, "cleanupError")?.value
+        : undefined;
+      const closeOwnerError = error instanceof NativeSessionCloseUnrecoverableError
+        ? error
+        : attachedCloseError instanceof NativeSessionCloseUnrecoverableError
+          ? attachedCloseError
+          : undefined;
+      const cleanupOwners = error instanceof NativeSessionCleanupQuarantinedError
+        ? (error as { cleanupOwners?: readonly unknown[] }).cleanupOwners
+        : closeOwnerError ? (() => {
+            const descriptor = Object.getOwnPropertyDescriptor(closeOwnerError, "cleanupOwner");
+            return descriptor && "value" in descriptor && descriptor.value !== undefined
+              ? [descriptor.value] : undefined;
+          })() : undefined;
+      // One value feeds both identical JSONB append expressions below.
+      // Undefined means an old/unobserved owner and is never an empty inventory.
+      const providerFailureHistoryEntry = {
+        at: now.toISOString(),
+        disposition: phase,
+        reason: sourceFailureCode,
+        controllerBootId: controller.bootId,
+        controllerGeneration: input.restartRecovery?.controllerGeneration ?? null,
+        providerAttempt: attempt,
+        stderrTail: sanitizedStderrTail,
+        providerSessionEstablished: recoveryEvidence.providerSessionEstablished,
+        checkpointExists: recoveryEvidence.checkpointExists,
+        ...(cleanupOwners === undefined ? {} : { cleanupOwners }),
+      };
       // Set inside the transaction only when the write below genuinely
       // transitions the run into "failed". Read after the transaction
       // commits, so a rolled-back write never reports a false failure.
@@ -8965,36 +9297,12 @@ async function executePaperclipNativeSessionWithinScope(
               select coalesce(jsonb_agg(item order by ordinal), '[]'::jsonb)
               from jsonb_array_elements(
                 coalesce(${nativeRunFinalizations.recoveryHistory}, '[]'::jsonb)
-                || jsonb_build_array(${JSON.stringify({
-                  at: now.toISOString(),
-                  disposition: phase,
-                  reason: sourceFailureCode,
-                  controllerBootId: controller.bootId,
-                  controllerGeneration:
-                    input.restartRecovery?.controllerGeneration ?? null,
-                  providerAttempt: attempt,
-                  stderrTail: sanitizedStderrTail,
-                  providerSessionEstablished:
-                    recoveryEvidence.providerSessionEstablished,
-                  checkpointExists: recoveryEvidence.checkpointExists,
-                })}::jsonb)
+                || jsonb_build_array(${JSON.stringify(providerFailureHistoryEntry)}::jsonb)
               ) with ordinality as history(item, ordinal)
               where ordinal > greatest(
                 jsonb_array_length(
                   coalesce(${nativeRunFinalizations.recoveryHistory}, '[]'::jsonb)
-                  || jsonb_build_array(${JSON.stringify({
-                    at: now.toISOString(),
-                    disposition: phase,
-                    reason: sourceFailureCode,
-                    controllerBootId: controller.bootId,
-                    controllerGeneration:
-                      input.restartRecovery?.controllerGeneration ?? null,
-                    providerAttempt: attempt,
-                    stderrTail: sanitizedStderrTail,
-                    providerSessionEstablished:
-                      recoveryEvidence.providerSessionEstablished,
-                    checkpointExists: recoveryEvidence.checkpointExists,
-                  })}::jsonb)
+                  || jsonb_build_array(${JSON.stringify(providerFailureHistoryEntry)}::jsonb)
                 ) - 20,
                 0
               )
@@ -10948,20 +11256,6 @@ async function createRunnerdBackendWithinSessionClaim(
     syncIssueExternalObjects: input.syncIssueExternalObjects,
     enqueueWakeup: input.enqueueWakeup,
   });
-  const authorityEpoch = new SessionToolAuthorityEpoch(
-    input.execution.binding.runId,
-    authority,
-    input.toolTrace,
-  );
-  let dynamicTools: Awaited<
-    ReturnType<SessionToolAuthorityEpoch["definitions"]>
-  >;
-  try {
-    dynamicTools = await authorityEpoch.definitions();
-  } catch (error) {
-    authorityEpoch.revoke();
-    throw error;
-  }
   const root = runnerdStateRoot(input.execution);
   const durableIdentity = readRunnerdDurableIdentity(root);
   const durableBinding = retainedTransition
@@ -10975,6 +11269,23 @@ async function createRunnerdBackendWithinSessionClaim(
     durableBinding?.environmentLeaseId ??
     input.durableEnvironmentLeaseId ??
     input.execution.binding.executionWorkspaceId;
+  const authorityEpoch = new SessionToolAuthorityEpoch(
+    { companyId: input.execution.binding.companyId, agentId: input.execution.binding.agentId,
+      issueId: input.execution.binding.issueId, runId: input.execution.binding.runId,
+      epochId: randomUUID(), normalizedSessionId: nativeSessionKey(input.execution),
+      runnerInstanceId: effectiveRunnerInstanceId, environmentLeaseId: effectiveEnvironmentLeaseId },
+    authority,
+    input.toolTrace,
+  );
+  let dynamicTools: Awaited<
+    ReturnType<SessionToolAuthorityEpoch["definitions"]>
+  >;
+  try {
+    dynamicTools = await authorityEpoch.definitions();
+  } catch (error) {
+    authorityEpoch.revoke();
+    throw error;
+  }
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const remoteRuntimeRoot = remoteTarget
     ? posix.join(
@@ -12635,6 +12946,9 @@ async function createRunnerdBackendWithinSessionClaim(
     codexTransportFactory: (recoveryContext) =>
       createRunnerdCodexTransport({
         onSpawn: input.onSpawn,
+        onOwnedProcessExit: (receipt) => recordOwnedNativeProcessExit(
+          input.db, input.execution, effectiveRunnerInstanceId, effectiveEnvironmentLeaseId, receipt,
+        ),
         provider:
           input.execution.provider.kind === "codex"
             ? "codex"
@@ -13086,6 +13400,7 @@ async function createRunnerdBackendWithinSessionClaim(
   });
   const boundManagedSessions = new WeakSet<NativeSession>();
   const wrapManagedSession = (session: NativeSession): NativeSession => {
+    bindSessionToolAuthorityEpochClose(session, sessionScopeId, effectiveRunnerInstanceId, effectiveEnvironmentLeaseId);
     if (isGrok && grokCredential?.home && !boundManagedSessions.has(session)) {
       boundManagedSessions.add(session);
       // The launch runtime directory already ends in "acpx"; ACPX adds its

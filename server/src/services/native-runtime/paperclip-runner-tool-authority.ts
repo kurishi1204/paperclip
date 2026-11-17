@@ -43,7 +43,7 @@ import { getStorageService } from "../../storage/index.js";
 import type { StorageService } from "../../storage/types.js";
 import { assetService } from "../assets.js";
 import { workspaceFileResourceService } from "../workspace-file-resources.js";
-import { badRequest, forbidden, notFound, HttpError } from "../../errors.js";
+import { badRequest, conflict, forbidden, notFound, HttpError } from "../../errors.js";
 import { searchRunnerApi } from "./runner-api-catalog.js";
 import { executeRunnerApi, validateRunnerApiCall, RUNNER_API_MAX_BYTES, type RunnerApiFile } from "./runner-api-client.js";
 import { acquireRunnerApiResponseSlot, runnerApiCompanyCaptureMaxBytes, RUNNER_API_RESPONSE_MAX_BYTES, RUNNER_API_RESPONSE_RUN_MAX_BYTES, RunnerApiResponseLimitError } from "./runner-api-response-limits.js";
@@ -1592,7 +1592,11 @@ export class PaperclipRunnerToolAuthority {
         } });
         if (!decision.allowed) throw forbidden(decision.explanation);
       }
-      await assertAssignableAgent(tx, this.binding.companyId, assigneeAgentId, { kind: "work" });
+      // Consume the persisted work contract before cancellation and again under
+      // the final row lock, using the proposed executor without changing its brief.
+      await assertAssignableAgent(tx, this.binding.companyId, assigneeAgentId, {
+        kind: "work", work: { ...target, assigneeAgentId },
+      });
       const [externalChat] = await tx.select({ id: chatConversations.id }).from(chatConversations).where(and(
         eq(chatConversations.companyId, this.binding.companyId), eq(chatConversations.issueId, taskId),
       )).limit(1);
@@ -2269,6 +2273,8 @@ export class PaperclipRunnerToolAuthority {
   }
 
   async #requestHumanInput(input: Record<string, unknown>, identityContextId: string | null): Promise<unknown> {
+    if (input.operation === "withdraw") return this.#withdrawDocumentConfirmation(input);
+    if (input.operation !== undefined && input.operation !== "create") throw badRequest("Unknown interaction operation");
     const interactionKind = requiredString(input.interactionKind);
     const interactionKinds = {
       confirmation: "request_confirmation",
@@ -2400,6 +2406,83 @@ export class PaperclipRunnerToolAuthority {
         creatorAgentId: this.binding.agentId, interactionId: requiredString(interaction.id),
       }, this.binding.enqueueWakeup!);
     }
+    return result;
+  }
+
+  async #withdrawDocumentConfirmation(input: Record<string, unknown>): Promise<unknown> {
+    if (Object.keys(input).some(key => !["operation", "interactionId", "idempotencyKey", "reason", "payload"].includes(key))) {
+      throw badRequest("Withdrawal accepts only the existing interaction and fixed document target");
+    }
+    const interactionId = requiredUuid(input.interactionId);
+    const idempotencyKey = requiredString(input.idempotencyKey);
+    const reason = requiredString(input.reason);
+    const payload = record(input.payload), expected = record(payload.target);
+    if (idempotencyKey.length > 240 || reason.length > 4000 || Object.keys(payload).some(key => key !== "target")
+      || expected.type !== "issue_document" || expected.issueId !== this.binding.issueId
+      || expected.key === "plan") throw badRequest("Withdrawal requires the same fixed business-document target");
+    const documentId = requiredUuid(expected.documentId), revisionId = requiredUuid(expected.revisionId);
+    const key = requiredString(expected.key);
+    let publication: Awaited<ReturnType<typeof persistActivity>>["publication"] | null = null;
+    let effectAttempted = false;
+    const authorize = async (tx: Db, context: { issue: typeof issues.$inferSelect }, replay = false) => {
+      // This is a strict subset of the ordinary withdraw route: the current
+      // task executor must also be this request's original creator. The shared
+      // mutation gate rechecks active native run/company/assignee authority.
+      if (context.issue.workMode !== "standard" || (context.issue.reviewPolicy != null && context.issue.reviewPolicy !== "anyone")) {
+        throw forbidden("Governed review withdrawal requires its original authorized workflow");
+      }
+      const current = await issueThreadInteractionService(tx).getForIssue(context.issue, interactionId);
+      const target = record(record(current.payload).target);
+      if (current.createdByAgentId !== this.binding.agentId || current.kind !== "request_confirmation"
+        || !current.addresseeAgentId || current.effectiveResolverPolicy === "human_only"
+        || record(current.payload).toolAction !== undefined || record(current.payload).secretProposal !== undefined) {
+        throw forbidden("Only the original creator may withdraw this pending named document confirmation");
+      }
+      if (target.type !== "issue_document" || target.issueId !== this.binding.issueId
+        || target.documentId !== documentId || target.key !== key || target.revisionId !== revisionId) {
+        throw conflict("The interaction's fixed document target differs from the withdrawal request");
+      }
+      if (!replay && current.status !== "pending") throw conflict("The interaction is no longer pending");
+      // Serialize against ordinary document writers as well as the task/run
+      // lock, so a new revision cannot slip between the check and withdrawal.
+      await tx.select({ id: documents.id }).from(documents).where(and(
+        eq(documents.id, documentId), eq(documents.companyId, this.binding.companyId),
+      )).for("update");
+      const document = await documentService(tx).getIssueDocumentByKey(this.binding.issueId, key);
+      if (!document || document.id !== documentId || document.latestRevisionId !== revisionId) {
+        throw conflict("The fixed document revision changed before withdrawal");
+      }
+      return current;
+    };
+    let result: unknown;
+    try {
+      result = await this.#withMutationReceipt("request_human_input", idempotencyKey, input, async (tx, context) => {
+      await authorize(tx, context);
+      // Keep the existing service's pending CAS, linked-action protection and
+      // original administrative outcome. No answer or wake is synthesized.
+      effectAttempted = true;
+      const interaction = await issueThreadInteractionService(tx).withdrawInteraction(context.issue, interactionId,
+        { reason }, { agentId: this.binding.agentId, runId: this.binding.runId, userId: null });
+      const activity = await persistActivity(tx, {
+        companyId: this.binding.companyId, actorType: "agent", actorId: this.binding.agentId,
+        agentId: this.binding.agentId, runId: this.binding.runId, issueId: this.binding.issueId,
+        action: "issue.thread_interaction_withdrawn", entityType: "issue", entityId: this.binding.issueId,
+        details: { interactionId: interaction.id, interactionKind: interaction.kind,
+          interactionStatus: interaction.status, reason, source: "paperclip_runner_protocol" },
+      });
+      publication = activity.publication;
+      return { interaction, disposition: "applied" };
+      }, { beforeReceiptReplay: async (tx, context) => { await authorize(tx, context, true); } });
+    } catch (error) {
+      if (effectAttempted && !(error instanceof HttpError)) {
+        throw new SemanticToolOutcomeUnknownError(
+          `paperclip_runner_interaction_withdrawal_outcome_unknown interaction_id=${interactionId}; inspect the original interaction and semantic receipt; do not resend`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+    if (publication) publishActivity(publication);
     return result;
   }
 }

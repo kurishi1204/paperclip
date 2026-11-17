@@ -76,6 +76,8 @@ export const inspectWarmRunTransition = runner.inspectWarmRunTransition;
 export const readRunnerdArtifactBinding = runner.readRunnerdArtifactBinding;
 export const NativeSessionCleanupQuarantinedError =
   runner.NativeSessionCleanupQuarantinedError;
+export const NativeSessionCloseUnrecoverableError =
+  runner.NativeSessionCloseUnrecoverableError;
 export const NativeSessionProtocolIntegrityError =
   runner.NativeSessionProtocolIntegrityError;
 export const SemanticToolOutcomeUnknownError = runner.SemanticToolOutcomeUnknownError;
@@ -106,6 +108,7 @@ export const executeNativeSession = runner.executeNativeSession;
 export const applyNativeSessionGoalControl =
   runner.applyNativeSessionGoalControl;
 export const completeRetainedNativeSessionCleanup = runner.completeRetainedNativeSessionCleanup;
+export const readRetainedNativeSessionCleanupOwner = runner.readRetainedNativeSessionCleanupOwner;
 export const settleRetainedRunnerdSession = runner.settleRetainedRunnerdSession;
 export const retainedRunnerdMaintenanceIsIdle =
   runner.retainedRunnerdMaintenanceIsIdle;

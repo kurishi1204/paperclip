@@ -22,6 +22,37 @@ function emptyReadDb(): Pick<Db, "select"> {
 }
 
 describe("native run recovery readback", () => {
+  it("projects only the persisted owner fields from matching quarantine failure history", async () => {
+    const owner = {
+      binding: { runId: "owner-run", sessionId: "provider-session", companyId: "company-1", issueId: "issue-1", agentId: "agent-1" },
+      runnerInstanceId: "runner-original", retainedAtUTC: "2026-11-17T12:00:00.000Z",
+      operatorRecoveryRequired: true, runnerSuspended: false, providerDrained: true,
+      semanticToolsSettled: null, semanticToolPendingCount: 1, semanticToolPersistenceFailed: false,
+      providerPendingEventCount: 2, providerSettled: false, missingEvidence: ["runner_suspension_unverified"],
+    };
+    const receipt = await readNativeRunRecoveryReadback(emptyReadDb(), {
+      id: "carrier-run", companyId: "company-1", agentId: "agent-1", nativeIssueId: "issue-1",
+      nativeSessionId: "carrier-session", runnerInstanceId: "carrier-runner",
+    }, { finalizationObserved: true, history: [], totalCount: 0,
+      ownerHistory: [{ at: "2026-11-17T12:01:00.000Z", ownerCount: 1, owners: [owner] }], ownerHistoryTotalCount: 1 });
+
+    expect(receipt.cleanupOwnerHistory).toMatchObject({ state: "recorded", complete: true, totalCount: 1,
+      rows: [{ owners: [owner] }] });
+    expect(JSON.stringify(receipt.cleanupOwnerHistory)).not.toContain("carrier-session");
+    expect(JSON.stringify(receipt.cleanupOwnerHistory)).not.toContain("stderr");
+  });
+
+  it("keeps pre-change quarantine rows unverified rather than filling them from the current carrier", async () => {
+    const receipt = await readNativeRunRecoveryReadback(emptyReadDb(), {
+      id: "carrier-run", companyId: "company-1", agentId: "agent-1", nativeIssueId: "issue-1",
+      nativeSessionId: "carrier-session", runnerInstanceId: "carrier-runner",
+    }, { finalizationObserved: true, history: [], totalCount: 0,
+      ownerHistory: [{ at: "2026-11-17T12:01:00.000Z", ownerCount: null, owners: null }], ownerHistoryTotalCount: 1 });
+
+    expect(receipt.cleanupOwnerHistory).toMatchObject({ state: "unverified", complete: true, totalCount: 1,
+      rows: [{ owners: null }] });
+  });
+
   it("preserves the original long operator next action without loosening bounded identifiers", async () => {
     expect(CLEANUP_NEXT_ACTION.length).toBe(267);
     const projection = {
