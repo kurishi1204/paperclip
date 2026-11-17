@@ -28,6 +28,7 @@ export const nativeCleanupHistoryCount = sql<number | null>`case
 const record = (v: unknown): Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v)
   ? v as Record<string, unknown> : {};
 const text = (v: unknown) => typeof v === "string" && v.length > 0 && v.length <= 256 ? v : null;
+const humanText = (v: unknown) => typeof v === "string" && v.length > 0 ? v : null;
 const code = (v: unknown) => typeof v === "string" && /^[a-z0-9_.:-]{1,160}$/i.test(v) ? v : null;
 const sha = (v: unknown) => typeof v === "string" && /^[a-f0-9]{64}$/i.test(v) ? v.toLowerCase() : null;
 const hash = (v: unknown) => text(v) === null ? null : createHash("sha256").update(v as string, "utf8").digest("hex");
@@ -133,7 +134,7 @@ export async function readNativeRunRecoveryReadback(
     schema: "paperclip.native-run-recovery-readback.v1" as const, inspectionOnly: true,
     projection: { state: projection ? "observed" : "unverified", phase: code(projection?.phase),
       cause: code(projection?.cause), recoveryOwner: code(projection?.recoveryOwner),
-      nextAction: text(projection?.nextAction), successorRunId: text(projection?.successorRunId),
+      nextAction: humanText(projection?.nextAction), successorRunId: text(projection?.successorRunId),
       inspectionActions: projection?.permittedActions.filter(v => v === "inspect_run" || v === "inspect_recovery") ?? [] },
     cleanupHistory: { state: historyState, complete: historyComplete, totalCount: total,
       observedCount: historyRows.length, unclassifiedCount: historyUnclassified, rows: historyRows },

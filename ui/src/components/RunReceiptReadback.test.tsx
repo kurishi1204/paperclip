@@ -77,6 +77,14 @@ describe("Run receipt readback", () => {
     expect(el.textContent).toContain("正規に停止したか");
     expect(el.textContent).not.toContain("継続が保留されています");
   });
+  it("renders the original 267-character cleanup next action without truncation", async () => {
+    const nextAction = "Send a new message to continue after Paperclip verifies that the previous provider and its tools have stopped. If cleanup cannot be verified, inspect the run and its environment. Clearing a task session does not resolve this quarantine. Automatic retries are stopped.";
+    expect(nextAction.length).toBe(267);
+    const receipt = receiptWithRecovery({ state: "observed", phase: "recovery_needed", cause: "native_session_cleanup_quarantined",
+      recoveryOwner: "board", inspectionActions: ["inspect_run", "inspect_recovery"], nextAction, successorRunId: null });
+    const el = await render(<RunReceiptReadbackView run={run} receipt={receipt} />);
+    expect(el.textContent).toContain(`現在の次の動作: ${nextAction}`);
+  });
   it("shows the current recovery phase and next action separately from the old cause", async () => {
     const receipt = receiptWithRecovery({ state: "observed", phase: "recovery_needed", cause: "provider_failure_meaning_unverified",
       recoveryOwner: "board", inspectionActions: ["inspect_run", "inspect_recovery"], nextAction: "Inspect the original recovery record.", successorRunId: null });
