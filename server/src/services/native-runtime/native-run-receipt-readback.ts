@@ -5,6 +5,7 @@ import {
   nativeRunResults, statusDecisionEffects, statusDecisions, type Db,
 } from "@paperclipai/db";
 import { badRequest, conflict } from "../../errors.js";
+import { nativeCleanupHistoryReadback, nativeCleanupHistoryCount, readNativeRunRecoveryReadback, type NativeRunRecoveryProjection } from "./native-run-recovery-readback.js";
 
 const RESULT_LIMIT = 20;
 const EFFECT_LIMIT = 50;
@@ -33,6 +34,7 @@ export async function readNativeRunReceiptReadback(
   db: Db,
   binding: { id: string; companyId: string; agentId: string; nativeIssueId: string | null },
   expectedCanonicalSha256: string | null,
+  execution?: NativeRunRecoveryProjection,
 ) {
   // A readback is a snapshot, never a lease claim, repair, or finalizer call.
   return db.transaction(async (tx) => {
@@ -73,6 +75,7 @@ export async function readNativeRunReceiptReadback(
       recoveryState: nativeRunFinalizations.recoveryState, recoveryRequestId: nativeRunFinalizations.recoveryRequestId,
       controlDeadlineAt: nativeRunFinalizations.controlDeadlineAt, nextAttemptAt: nativeRunFinalizations.nextAttemptAt,
       updatedAt: nativeRunFinalizations.updatedAt,
+      cleanupHistory: nativeCleanupHistoryReadback, cleanupHistoryCount: nativeCleanupHistoryCount,
     }).from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, run.companyId),
       eq(nativeRunFinalizations.issueId, run.nativeIssueId!), eq(nativeRunFinalizations.runId, run.id)))
       .limit(1).then(rows => rows[0] ?? null) : null;
@@ -148,10 +151,13 @@ export async function readNativeRunReceiptReadback(
         state = "accepted_same_hash";
       }
     }
-    const { leaseOwner, recoveryRequestId, ...safeFinalization } = finalization ?? { leaseOwner: null, recoveryRequestId: null };
+    const { leaseOwner, recoveryRequestId, cleanupHistory, cleanupHistoryCount, ...safeFinalization } = finalization
+      ?? { leaseOwner: null, recoveryRequestId: null, cleanupHistory: null, cleanupHistoryCount: null };
+    const recovery = await readNativeRunRecoveryReadback(tx, { ...run, nativeIssueId: scope.issueId },
+      { finalizationObserved: finalization !== null, history: cleanupHistory, totalCount: cleanupHistoryCount }, execution);
     return {
       schema: "paperclip.native-run-receipt-readback.v1" as const,
-      observedAtUTC: new Date().toISOString(), scope,
+      observedAtUTC: new Date().toISOString(), scope, recovery,
       comparison: { state, expectedCanonicalSha256, reasons, complete },
       results: { complete, limit: RESULT_LIMIT, rows: visibleResults.map(({ turnId, callerResultId, callerDedupeKey, ...row }) => ({
         ...row, canonicalSha256: canonicalDigest(row.canonicalSha256), serverFingerprint: canonicalDigest(row.serverFingerprint),

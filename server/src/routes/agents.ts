@@ -7244,7 +7244,11 @@ export function agentRoutes(
       if (run.runtimeMode !== "native" || !run.nativeIssueId) {
         throw conflict("Native run receipt readback is unavailable for this run");
       }
-      receiptReadback = await readNativeRunReceiptReadback(db, run, receiptOptions.expectedCanonicalSha256);
+    }
+    const execution = await executionProjectionForRun(db, run.companyId, run.id);
+    if (receiptOptions) {
+      receiptReadback = await readNativeRunReceiptReadback(db, run, receiptOptions.expectedCanonicalSha256,
+        { runId: run.id, projection: execution });
     }
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
@@ -7252,7 +7256,7 @@ export function agentRoutes(
       run.companyId,
       run.id,
       redactCurrentUserValue(
-        { ...decoratedRun, ...(receiptReadback ? { receiptReadback } : {}), execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+        { ...decoratedRun, ...(receiptReadback ? { receiptReadback } : {}), execution, identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
         await getCurrentUserRedactionOptions(),
       ),
     ));

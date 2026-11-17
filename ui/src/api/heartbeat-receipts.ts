@@ -3,6 +3,8 @@ export interface NativeRunReceiptReadback {
   schema: "paperclip.native-run-receipt-readback.v1";
   observedAtUTC: string;
   scope: { companyId: string; issueId: string | null; runId: string; agentId: string };
+  /** Optional on older servers; absence is unverified, never a clean recovery. */
+  recovery?: NativeRunRecoveryReadback;
   comparison: {
     state: "accepted_same_hash" | "missing" | "unverified" | "conflicting";
     expectedCanonicalSha256: string | null;
@@ -63,5 +65,53 @@ export interface NativeRunReceiptReadback {
         releasedAt: string | null; cleanupStatus: string | null;
       }>;
     };
+  };
+}
+
+export interface NativeRunRecoveryReadback {
+  schema: "paperclip.native-run-recovery-readback.v1";
+  inspectionOnly: true;
+  projection: {
+    state: "observed" | "unverified"; phase: string | null; cause: string | null;
+    recoveryOwner: string | null; inspectionActions: Array<"inspect_run" | "inspect_recovery">;
+  };
+  cleanupHistory: {
+    state: "recorded" | "not_recorded" | "unverified"; complete: boolean;
+    totalCount: number | null; observedCount: number; unclassifiedCount: number;
+    rows: Array<{
+      kind: string | null; phase: string | null; requestIdHash: string | null;
+      sourceFingerprint: string | null; settledFingerprint: string | null;
+      code: string | null; startedAt: string | null; settledAt: string | null;
+      bindingState: "exact" | "row_scoped" | "conflicting" | "unverified";
+    }>;
+  };
+  maintenanceEvents: {
+    state: "recorded" | "not_recorded" | "unverified"; complete: boolean;
+    observedCount: number; unclassifiedCount: number;
+    rows: Array<{
+      eventSeq: number; createdAt: string; rawSourceSeq: number | null; eventType: string | null;
+      requestIdHash: string | null; canonicalSha256: string | null;
+      bindingState: "same_run" | "conflicting" | "unverified";
+    }>;
+  };
+  actions: {
+    state: "recorded" | "not_recorded" | "unverified"; complete: boolean;
+    observedCount: number; unclassifiedCount: number;
+    rows: Array<{
+      id: string; kind: string | null; status: string | null; cause: string | null;
+      ownerType: string | null; ownerAgentId: string | null; returnOwnerAgentId: string | null;
+      outcome: string | null; attemptCount: number; maxAttempts: number | null;
+      timeoutAt: string | null; updatedAt: string; automaticRecoveryPolicy: string | null;
+      automaticActionOutcome: string | null; replay: string | null;
+      providerStoppedRecorded: boolean | null; entry: string | null;
+    }>;
+  };
+  gaps: string[];
+  verification: {
+    providerStop: "unverified"; actionOutcomes: "unverified"; sourceRunLink: "unverified";
+    sourceRunId: null; automaticRetry: false;
+  };
+  operatorEntry: {
+    runPath: string; taskPath: string; kind: "inspect_original_run_and_task_recovery";
   };
 }

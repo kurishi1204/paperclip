@@ -5,7 +5,8 @@ import { heartbeatsApi } from "../api/heartbeats";
 import { ApiError, detachInflightGet } from "../api/client";
 import { accessApi } from "../api/access";
 import { useAccountIdentity } from "../api/companies-query";
-import type { NativeRunReceiptReadback } from "../api/heartbeat-receipts";
+import { Link } from "../lib/router";
+import type { NativeRunRecoveryReadback, NativeRunReceiptReadback } from "../api/heartbeat-receipts";
 import { queryKeys } from "../lib/queryKeys";
 import { formatDateTime } from "../lib/utils";
 
@@ -34,6 +35,72 @@ function companyRunLabel(status: string): string {
     failed: "失敗として記録", timed_out: "時間切れとして記録", cancelled: "取消として記録",
   };
   return labels[status] ?? "状態を確認できません";
+}
+
+function nativeRecoveryCauseLabel(cause: string | null): string {
+  if (cause === "native_session_cleanup_quarantined") {
+    return "前の実行の停止確認が不足し、起動前に隔離されています。";
+  }
+  if (cause === "provider_failure_meaning_unverified") {
+    return "前の実行の終了理由と返却の作用を確認できず、継続が保留されています。";
+  }
+  return "停止理由を確定できていません。元の復旧記録で確認が必要です。";
+}
+
+function recoveryMetadata(receipt: NativeRunReceiptReadback): NativeRunRecoveryReadback | null {
+  const recovery = receipt.recovery;
+  return recovery?.schema === "paperclip.native-run-recovery-readback.v1"
+    && recovery.inspectionOnly === true && Boolean(recovery.projection && recovery.verification)
+    && Array.isArray(recovery.cleanupHistory?.rows) && Array.isArray(recovery.maintenanceEvents?.rows)
+    && Array.isArray(recovery.actions?.rows) && Array.isArray(recovery.gaps)
+    ? recovery : null;
+}
+
+function recoveryRecordLabel(record: { state: string; complete: boolean; unclassifiedCount: number }): string {
+  if (record.state === "unverified") return "原記録は未確認です。";
+  if (!record.complete || record.unclassifiedCount > 0) return "原記録を一部確認しました。全体または対応付けが未確認です。";
+  if (record.state === "not_recorded") return "取得範囲に該当記録はありません。処理がなかった証明ではありません。";
+  if (record.state === "recorded") return "原記録を確認できました。停止・復旧の完了確認とは別です。";
+  return "原記録の状態は未確認です。";
+}
+
+function NativeRecoverySummary({ receipt }: { receipt: NativeRunReceiptReadback }) {
+  const recovery = recoveryMetadata(receipt);
+  if (!recovery) return <div className="space-y-1"><h4 className="font-medium">起動と復旧の確認</h4><p className="text-muted-foreground">この応答では、起動と復旧の原記録を確認できません。隔離の解消や正規停止を確認したことにはなりません。</p></div>;
+  const taskPath = receipt.scope.issueId ? `/issues/${encodeURIComponent(receipt.scope.issueId)}` : null;
+  const taskEntry = taskPath && recovery.operatorEntry?.taskPath === taskPath;
+  return <div className="space-y-2" aria-label="起動と復旧の確認">
+    <h4 className="font-medium">起動と復旧の確認</h4>
+    <p>{recovery.projection.state === "observed" ? nativeRecoveryCauseLabel(recovery.projection.cause) : "停止理由はこの応答では未確認です。"}</p>
+    {recovery.projection.state === "observed" && recovery.projection.cause === "native_session_cleanup_quarantined" && <p className="text-muted-foreground">この停止理由は実行環境の停止確認不足です。本人の回答待ちや文書の閲覧権限待ちとは区別します。</p>}
+    <dl className="space-y-1"><div><dt className="font-medium">停止確認の履歴</dt><dd>{recoveryRecordLabel(recovery.cleanupHistory)}</dd></div>
+      <div><dt className="font-medium">停止・終了に関する通知</dt><dd>{recoveryRecordLabel(recovery.maintenanceEvents)}</dd></div>
+      <div><dt className="font-medium">元の復旧記録</dt><dd>{recoveryRecordLabel(recovery.actions)}</dd></div></dl>
+    <p className="text-muted-foreground">前の実行と付随ツールが正規に停止したか、復旧処理が何を反映したかは未確認です。元になった別Runとの対応も未確認です。</p>
+    <p>{recovery.projection.recoveryOwner === "board" ? "次は会社の復旧担当（運用者）が、原記録と停止の根拠を確認してください。" : "次に確認する元の復旧担当は未確認です。会社の運用者が原記録を確認してください。"}</p>
+    <div className="flex flex-wrap gap-3">
+      {taskEntry ? <Link to={taskPath} disableIssueQuicklook className="text-primary underline underline-offset-2">Taskの復旧記録を開く</Link> : <span className="text-muted-foreground">元Taskへの入口は未確認です。</span>}
+      {recovery.actions.rows.map((action, index) => {
+        const expected = receipt.scope.issueId ? `/api/issues/${encodeURIComponent(receipt.scope.issueId)}/recovery-actions?actionId=${encodeURIComponent(action.id)}` : null;
+        return expected && action.entry === expected ? <a key={action.id} href={expected} target="_blank" rel="noreferrer" className="text-primary underline underline-offset-2">原復旧記録を読む{recovery.actions.rows.length > 1 ? `（${index + 1}）` : ""}</a> : null;
+      })}
+    </div>
+  </div>;
+}
+
+function NativeRecoveryTechnicalRows({ receipt }: { receipt: NativeRunReceiptReadback }) {
+  const recovery = recoveryMetadata(receipt);
+  if (!recovery) return null;
+  return <div className="space-y-3"><p className="font-medium">起動・復旧の原記録</p>
+    <dl className="space-y-1"><TechnicalRow label="元の停止理由" value={recovery.projection.cause} /><TechnicalRow label="処理段階" value={recovery.projection.phase} /><TechnicalRow label="元の復旧担当" value={recovery.projection.recoveryOwner} />
+      <TechnicalRow label="不足・未確認の根拠" value={recovery.gaps.join(" · ") || null} /></dl>
+    <dl className="space-y-1"><TechnicalRow label="停止履歴の元件数" value={recovery.cleanupHistory.totalCount} /><TechnicalRow label="停止履歴の確認件数" value={recovery.cleanupHistory.observedCount} /><TechnicalRow label="停止履歴の未分類件数" value={recovery.cleanupHistory.unclassifiedCount} /></dl>
+    {recovery.cleanupHistory.rows.map((row, index) => <dl key={index} className="space-y-1"><TechnicalRow label="履歴の種別・段階" value={[row.kind, row.phase].filter(Boolean).join(" · ") || null} /><TechnicalRow label="履歴との対応" value={row.bindingState} /><TechnicalRow label="開始日時" value={row.startedAt} /><TechnicalRow label="確定日時" value={row.settledAt} /><TechnicalRow label="元のコード" value={row.code} /><TechnicalRow label="要求のハッシュ" value={row.requestIdHash} /><TechnicalRow label="対象版・確定版の指紋" value={[row.sourceFingerprint, row.settledFingerprint].filter(Boolean).join(" · ") || null} /></dl>)}
+    <dl className="space-y-1"><TechnicalRow label="通知の確認件数" value={recovery.maintenanceEvents.observedCount} /><TechnicalRow label="通知の未分類件数" value={recovery.maintenanceEvents.unclassifiedCount} /></dl>
+    {recovery.maintenanceEvents.rows.map(row => <dl key={row.eventSeq} className="space-y-1"><TechnicalRow label="通知番号" value={row.eventSeq} /><TechnicalRow label="元の番号" value={row.rawSourceSeq} /><TechnicalRow label="通知種別" value={row.eventType} /><TechnicalRow label="Runとの対応" value={row.bindingState} /><TechnicalRow label="記録日時" value={row.createdAt} /><TechnicalRow label="要求・本文のハッシュ" value={[row.requestIdHash, row.canonicalSha256].filter(Boolean).join(" · ") || null} /></dl>)}
+    <dl className="space-y-1"><TechnicalRow label="復旧記録の確認件数" value={recovery.actions.observedCount} /><TechnicalRow label="復旧記録の未分類件数" value={recovery.actions.unclassifiedCount} /></dl>
+    {recovery.actions.rows.map(action => <dl key={action.id} className="space-y-1"><TechnicalRow label="原復旧記録ID" value={action.id} /><TechnicalRow label="元の状態・結果" value={[action.status, action.outcome].filter(Boolean).join(" · ") || null} /><TechnicalRow label="停止の元申告（正規停止の確認とは別）" value={action.providerStoppedRecorded === null ? null : String(action.providerStoppedRecorded)} /><TechnicalRow label="原試行回数・上限" value={`${action.attemptCount} / ${action.maxAttempts ?? "未確認"}`} /><TechnicalRow label="元の再送制約" value={action.replay} /><TechnicalRow label="更新日時" value={action.updatedAt} /></dl>)}
+  </div>;
 }
 
 function finalizationLabel(receipt: NativeRunReceiptReadback): string {
@@ -101,9 +168,11 @@ export function RunReceiptReadbackView({ run, receipt, pending, error, detailsOp
           {!current.authority.issue && <dd className="text-muted-foreground">元Taskの担当・処置の記録は未確認です。</dd>}
           {!current.authority.environmentLeases.complete && <dd className="text-muted-foreground">保持資源の記録は全体未確認です。</dd>}</div>
       </dl>
+      <NativeRecoverySummary receipt={current} />
       <p className="text-xs text-muted-foreground">ここで確認できるのは技術上の保存・処理記録です。会社担当は、対象版のQA・採否と返却先の実受領を元の記録で確認してください。</p>
       <details className="text-xs" open={detailsOpen} onToggle={event => onDetailsToggle?.(event.currentTarget.open)}><summary className="cursor-pointer text-muted-foreground">照合に使う技術記録</summary>
         <div className="pt-3 space-y-3">
+          <NativeRecoveryTechnicalRows receipt={current} />
           <dl className="space-y-2"><TechnicalRow label="Run" value={current.scope.runId} /><TechnicalRow label="照合状態" value={current.comparison.state} />
             <TechnicalRow label="終了処理" value={current.finalization.record?.phase} /><TechnicalRow label="終了処理の試行" value={current.finalization.record?.attempt} />
             <TechnicalRow label="終了処理の結果ID" value={current.finalization.record?.resultId} /><TechnicalRow label="終了処理の判定ID" value={current.finalization.record?.assessmentId} />
