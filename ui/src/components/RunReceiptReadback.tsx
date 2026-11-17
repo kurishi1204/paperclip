@@ -39,12 +39,20 @@ function companyRunLabel(status: string): string {
 
 function nativeRecoveryCauseLabel(cause: string | null): string {
   if (cause === "native_session_cleanup_quarantined") {
-    return "前の実行の停止確認が不足し、起動前に隔離されています。";
+    return "前の実行で停止確認が不足した記録があります。";
   }
   if (cause === "provider_failure_meaning_unverified") {
-    return "前の実行の終了理由と返却の作用を確認できず、継続が保留されています。";
+    return "前の実行で終了理由と返却の作用が未確認だった記録があります。";
   }
-  return "停止理由を確定できていません。元の復旧記録で確認が必要です。";
+  return "前の実行の停止理由はこの応答では確認できません。";
+}
+
+function nativeRecoveryCurrentStatus(projection: NativeRunRecoveryReadback["projection"]): string {
+  if (projection.state !== "observed" || !projection.phase) return "現在の処理段階は未確認です。";
+  if (projection.phase === "completed") return "このRunは完了として記録されています。過去の停止確認や処理結果を証明するものではありません。";
+  if (projection.phase === "recovery_needed") return "現在、復旧記録の確認が必要な段階として記録されています。";
+  if (projection.phase === "failed") return "このRunは失敗として記録されています。";
+  return `現在の処理段階: ${projection.phase}`;
 }
 
 function recoveryMetadata(receipt: NativeRunReceiptReadback): NativeRunRecoveryReadback | null {
@@ -71,8 +79,9 @@ function NativeRecoverySummary({ receipt }: { receipt: NativeRunReceiptReadback 
   const taskEntry = taskPath && recovery.operatorEntry?.taskPath === taskPath;
   return <div className="space-y-2" aria-label="起動と復旧の確認">
     <h4 className="font-medium">起動と復旧の確認</h4>
-    <p>{recovery.projection.state === "observed" ? nativeRecoveryCauseLabel(recovery.projection.cause) : "停止理由はこの応答では未確認です。"}</p>
-    {recovery.projection.state === "observed" && recovery.projection.cause === "native_session_cleanup_quarantined" && <p className="text-muted-foreground">この停止理由は実行環境の停止確認不足です。本人の回答待ちや文書の閲覧権限待ちとは区別します。</p>}
+    <p>{nativeRecoveryCurrentStatus(recovery.projection)}</p>
+    {recovery.projection.state === "observed" && recovery.projection.cause && <p className="text-muted-foreground">過去に記録された理由: {nativeRecoveryCauseLabel(recovery.projection.cause)}</p>}
+    {recovery.projection.state === "observed" && <p className="text-muted-foreground">現在の次の動作: {recovery.projection.nextAction === undefined ? "旧サーバー応答では未確認です。" : recovery.projection.nextAction ?? "記録なし"}</p>}
     <dl className="space-y-1"><div><dt className="font-medium">停止確認の履歴</dt><dd>{recoveryRecordLabel(recovery.cleanupHistory)}</dd></div>
       <div><dt className="font-medium">停止・終了に関する通知</dt><dd>{recoveryRecordLabel(recovery.maintenanceEvents)}</dd></div>
       <div><dt className="font-medium">元の復旧記録</dt><dd>{recoveryRecordLabel(recovery.actions)}</dd></div></dl>
@@ -92,7 +101,7 @@ function NativeRecoveryTechnicalRows({ receipt }: { receipt: NativeRunReceiptRea
   const recovery = recoveryMetadata(receipt);
   if (!recovery) return null;
   return <div className="space-y-3"><p className="font-medium">起動・復旧の原記録</p>
-    <dl className="space-y-1"><TechnicalRow label="元の停止理由" value={recovery.projection.cause} /><TechnicalRow label="処理段階" value={recovery.projection.phase} /><TechnicalRow label="元の復旧担当" value={recovery.projection.recoveryOwner} />
+    <dl className="space-y-1"><TechnicalRow label="過去に記録された停止理由" value={recovery.projection.cause} /><TechnicalRow label="現在の処理段階" value={recovery.projection.phase} /><TechnicalRow label="現在の次の動作" value={recovery.projection.nextAction} /><TechnicalRow label="記録された後継Run" value={recovery.projection.successorRunId} /><TechnicalRow label="元の復旧担当" value={recovery.projection.recoveryOwner} />
       <TechnicalRow label="不足・未確認の根拠" value={recovery.gaps.join(" · ") || null} /></dl>
     <dl className="space-y-1"><TechnicalRow label="停止履歴の元件数" value={recovery.cleanupHistory.totalCount} /><TechnicalRow label="停止履歴の確認件数" value={recovery.cleanupHistory.observedCount} /><TechnicalRow label="停止履歴の未分類件数" value={recovery.cleanupHistory.unclassifiedCount} /></dl>
     {recovery.cleanupHistory.rows.map((row, index) => <dl key={index} className="space-y-1"><TechnicalRow label="履歴の種別・段階" value={[row.kind, row.phase].filter(Boolean).join(" · ") || null} /><TechnicalRow label="履歴との対応" value={row.bindingState} /><TechnicalRow label="開始日時" value={row.startedAt} /><TechnicalRow label="確定日時" value={row.settledAt} /><TechnicalRow label="元のコード" value={row.code} /><TechnicalRow label="要求のハッシュ" value={row.requestIdHash} /><TechnicalRow label="対象版・確定版の指紋" value={[row.sourceFingerprint, row.settledFingerprint].filter(Boolean).join(" · ") || null} /></dl>)}

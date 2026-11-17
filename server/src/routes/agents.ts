@@ -7248,7 +7248,7 @@ export function agentRoutes(
     const execution = await executionProjectionForRun(db, run.companyId, run.id);
     if (receiptOptions) {
       receiptReadback = await readNativeRunReceiptReadback(db, run, receiptOptions.expectedCanonicalSha256,
-        { runId: run.id, projection: execution });
+      );
     }
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);

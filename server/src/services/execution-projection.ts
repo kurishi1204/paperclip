@@ -46,7 +46,7 @@ type Recovery = Pick<
 
 /** Batched reads; list consumers do not perform per-task polling. */
 export async function executionProjectionsForRuns(
-  db: Db,
+  db: Pick<Db, "select">,
   companyId: string,
   runIds: string[],
   now = new Date(),
@@ -150,7 +150,7 @@ export async function executionProjectionsForRuns(
   return projections;
 }
 export async function executionProjectionForRun(
-  db: Db,
+  db: Pick<Db, "select">,
   companyId: string,
   runId: string,
   now = new Date(),

@@ -41,6 +41,18 @@ function fixture(): NativeRunReceiptReadback {
     authority: { run: { status: "failed", runtimeMode: "native", runnerInstanceId: null, nativeSessionId: null, controllerBootId: null, controllerLeaseExpiresAt: null, processPid: null, processStartedAt: null }, issue: null, environmentLeases: { complete: true, limit: 20, rows: [] } },
   };
 }
+function receiptWithRecovery(projection: NonNullable<NativeRunReceiptReadback["recovery"]>["projection"]): NativeRunReceiptReadback {
+  return { ...fixture(), recovery: {
+    schema: "paperclip.native-run-recovery-readback.v1", inspectionOnly: true,
+    projection,
+    cleanupHistory: { state: "unverified", complete: false, totalCount: null, observedCount: 0, unclassifiedCount: 0, rows: [] },
+    maintenanceEvents: { state: "not_recorded", complete: true, observedCount: 0, unclassifiedCount: 0, rows: [] },
+    actions: { state: "not_recorded", complete: true, observedCount: 0, unclassifiedCount: 0, rows: [] },
+    gaps: ["cleanup_history_unverified"],
+    verification: { providerStop: "unverified", actionOutcomes: "unverified", sourceRunLink: "unverified", sourceRunId: null, automaticRetry: false },
+    operatorEntry: { runPath: "/agents/agent-1/runs/run-1", taskPath: "/issues/other-task", kind: "inspect_original_run_and_task_recovery" },
+  } };
+}
 async function render(element: React.ReactNode) {
   container = document.createElement("div"); document.body.append(container);
   root = createRoot(container);
@@ -54,6 +66,25 @@ afterEach(async ({ task }) => {
 });
 
 describe("Run receipt readback", () => {
+  it("separates a completed successor projection from its historical recovery cause", async () => {
+    const receipt = receiptWithRecovery({ state: "observed", phase: "completed", cause: "native_session_cleanup_quarantined",
+      recoveryOwner: null, inspectionActions: ["inspect_run"], nextAction: null, successorRunId: "successor-1" });
+    const el = await render(<RunReceiptReadbackView run={run} receipt={receipt} />);
+    expect(el.textContent).toContain("このRunは完了として記録されています");
+    expect(el.textContent).toContain("過去に記録された理由");
+    expect(el.textContent).toContain("現在の次の動作: 記録なし");
+    expect(el.textContent).toContain("記録された後継Run");
+    expect(el.textContent).toContain("正規に停止したか");
+    expect(el.textContent).not.toContain("継続が保留されています");
+  });
+  it("shows the current recovery phase and next action separately from the old cause", async () => {
+    const receipt = receiptWithRecovery({ state: "observed", phase: "recovery_needed", cause: "provider_failure_meaning_unverified",
+      recoveryOwner: "board", inspectionActions: ["inspect_run", "inspect_recovery"], nextAction: "Inspect the original recovery record.", successorRunId: null });
+    const el = await render(<RunReceiptReadbackView run={run} receipt={receipt} />);
+    expect(el.textContent).toContain("現在、復旧記録の確認が必要な段階として記録されています");
+    expect(el.textContent).toContain("過去に記録された理由");
+    expect(el.textContent).toContain("現在の次の動作: Inspect the original recovery record.");
+  });
   it.each(["denied", "failed"])("hides an opened receipt when permission refresh is %s", async (outcome) => {
     read.mockResolvedValue({ receiptReadback: fixture() });
     const client = new QueryClient();

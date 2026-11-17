@@ -133,6 +133,7 @@ export async function readNativeRunRecoveryReadback(
     schema: "paperclip.native-run-recovery-readback.v1" as const, inspectionOnly: true,
     projection: { state: projection ? "observed" : "unverified", phase: code(projection?.phase),
       cause: code(projection?.cause), recoveryOwner: code(projection?.recoveryOwner),
+      nextAction: text(projection?.nextAction), successorRunId: text(projection?.successorRunId),
       inspectionActions: projection?.permittedActions.filter(v => v === "inspect_run" || v === "inspect_recovery") ?? [] },
     cleanupHistory: { state: historyState, complete: historyComplete, totalCount: total,
       observedCount: historyRows.length, unclassifiedCount: historyUnclassified, rows: historyRows },

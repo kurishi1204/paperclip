@@ -74,6 +74,8 @@ export interface NativeRunRecoveryReadback {
   projection: {
     state: "observed" | "unverified"; phase: string | null; cause: string | null;
     recoveryOwner: string | null; inspectionActions: Array<"inspect_run" | "inspect_recovery">;
+    /** Current projection only; absence from older servers remains unknown. */
+    nextAction?: string | null; successorRunId?: string | null;
   };
   cleanupHistory: {
     state: "recorded" | "not_recorded" | "unverified"; complete: boolean;

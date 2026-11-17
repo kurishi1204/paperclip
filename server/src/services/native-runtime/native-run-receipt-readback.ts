@@ -5,7 +5,8 @@ import {
   nativeRunResults, statusDecisionEffects, statusDecisions, type Db,
 } from "@paperclipai/db";
 import { badRequest, conflict } from "../../errors.js";
-import { nativeCleanupHistoryReadback, nativeCleanupHistoryCount, readNativeRunRecoveryReadback, type NativeRunRecoveryProjection } from "./native-run-recovery-readback.js";
+import { executionProjectionForRun } from "../execution-projection.js";
+import { nativeCleanupHistoryReadback, nativeCleanupHistoryCount, readNativeRunRecoveryReadback } from "./native-run-recovery-readback.js";
 
 const RESULT_LIMIT = 20;
 const EFFECT_LIMIT = 50;
@@ -34,10 +35,10 @@ export async function readNativeRunReceiptReadback(
   db: Db,
   binding: { id: string; companyId: string; agentId: string; nativeIssueId: string | null },
   expectedCanonicalSha256: string | null,
-  execution?: NativeRunRecoveryProjection,
 ) {
   // A readback is a snapshot, never a lease claim, repair, or finalizer call.
   return db.transaction(async (tx) => {
+    const observedAt = new Date();
     const run = await tx.select({
       id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
       nativeIssueId: heartbeatRuns.nativeIssueId, completionContractId: heartbeatRuns.completionContractId, status: heartbeatRuns.status,
@@ -53,6 +54,9 @@ export async function readNativeRunReceiptReadback(
     if (run.runtimeMode !== "native" || !run.nativeIssueId) {
       throw conflict("Native run receipt readback is unavailable for this run");
     }
+    // Keep the execution projection in the same read-only repeatable-read snapshot
+    // as the receipt rows; an outside projection could describe another state.
+    const execution = await executionProjectionForRun(tx, run.companyId, run.id, observedAt);
     const scope = { companyId: run.companyId, issueId: run.nativeIssueId, runId: run.id, agentId: run.agentId };
     const native = run.runtimeMode === "native" && run.nativeIssueId !== null;
     const resultRows = native ? await tx.select({
@@ -154,10 +158,11 @@ export async function readNativeRunReceiptReadback(
     const { leaseOwner, recoveryRequestId, cleanupHistory, cleanupHistoryCount, ...safeFinalization } = finalization
       ?? { leaseOwner: null, recoveryRequestId: null, cleanupHistory: null, cleanupHistoryCount: null };
     const recovery = await readNativeRunRecoveryReadback(tx, { ...run, nativeIssueId: scope.issueId },
-      { finalizationObserved: finalization !== null, history: cleanupHistory, totalCount: cleanupHistoryCount }, execution);
+      { finalizationObserved: finalization !== null, history: cleanupHistory, totalCount: cleanupHistoryCount },
+      execution ? { runId: run.id, projection: execution } : undefined);
     return {
       schema: "paperclip.native-run-receipt-readback.v1" as const,
-      observedAtUTC: new Date().toISOString(), scope, recovery,
+      observedAtUTC: observedAt.toISOString(), scope, recovery,
       comparison: { state, expectedCanonicalSha256, reasons, complete },
       results: { complete, limit: RESULT_LIMIT, rows: visibleResults.map(({ turnId, callerResultId, callerDedupeKey, ...row }) => ({
         ...row, canonicalSha256: canonicalDigest(row.canonicalSha256), serverFingerprint: canonicalDigest(row.serverFingerprint),
