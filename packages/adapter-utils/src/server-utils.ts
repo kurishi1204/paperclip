@@ -341,6 +341,10 @@ export type PaperclipWakeTaskWatchdogContext = {
   terminalLeafSummaries: PaperclipWakeTaskWatchdogLeaf[];
   customInstructions: string | null;
   capabilities: PaperclipWakeTaskWatchdogCapabilities | null;
+  documentReturnFollowthrough: {
+    state: "not_supplied" | "readable" | "invalid";
+    issues: Array<{issueId:string; state:"readable"|"unreadable"; events:Array<{eventKey:string|null;state:string;reason:string|null}>}>;
+  };
 };
 
 export interface PaperclipSkillEntry {
@@ -856,6 +860,7 @@ type PaperclipWakePayload = {
   // Experimental: write user-interaction content in ASD-STE100 Simplified
   // Technical English with brief decision context.
   simplifiedEnglishInteractions: boolean;
+  documentReturn: boolean;
   dependencyBlockedInteraction: boolean;
   treeHoldInteraction: boolean;
   activeTreeHold: PaperclipWakeTreeHoldSummary | null;
@@ -1585,6 +1590,39 @@ function normalizePaperclipWakeTaskWatchdog(
   const capabilities = normalizePaperclipWakeTaskWatchdogCapabilities(
     watchdog.capabilities,
   );
+  const followthrough: PaperclipWakeTaskWatchdogContext["documentReturnFollowthrough"] = {
+    state:Object.hasOwn(watchdog,"documentReturnFollowthrough")?"readable":"not_supplied", issues:[],
+  };
+  if(followthrough.state==="readable") {
+    const rows=watchdog.documentReturnFollowthrough;
+    const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if(!Array.isArray(rows)) followthrough.state="invalid";
+    else for(const raw of rows) {
+      const r=parseObject(raw);
+      if(r.schema==="paperclip.document-return-unreadable.v1") {
+        if(r.authorizesEffect!==false || r.mayResend!==false ||
+          typeof r.companyId!=="string" || !uuid.test(r.companyId) ||
+          typeof r.issueId!=="string" || !uuid.test(r.issueId)) {followthrough.state="invalid";break;}
+        followthrough.issues.push({issueId:r.issueId,state:"unreadable",events:[]});
+        continue;
+      }
+      if(r.schema!=="paperclip.document-return-followthrough.v1" || r.authorizesEffect!==false ||
+        typeof r.issueId!=="string" || !uuid.test(r.issueId) || !Array.isArray(r.events)) {followthrough.state="invalid";break;}
+      const events=[];
+      for(const value of r.events) {
+        const e=parseObject(value);
+        if(e.authorizesEffect!==false || e.mayResend!==false ||
+          !["handoff_pending","processing","held","effect_unconfirmed"].includes(String(e.state)) ||
+          !(e.eventKey===null || (typeof e.eventKey==="string" && /^document-return:[0-9a-f-]{36}:[0-9a-f-]{36}$/i.test(e.eventKey))) ||
+          !(e.reason===null || (typeof e.reason==="string" && /^[a-zA-Z0-9_]+$/.test(e.reason)))) {followthrough.state="invalid";break;}
+        events.push({eventKey:e.eventKey as string|null,state:e.state as string,reason:e.reason as string|null});
+      }
+      if(followthrough.state==="invalid") break;
+      followthrough.issues.push({issueId:r.issueId,state:"readable",events});
+    }
+    if(followthrough.state==="invalid") followthrough.issues=[];
+  }
+
 
   if (
     !watchedIssueId &&
@@ -1606,6 +1644,7 @@ function normalizePaperclipWakeTaskWatchdog(
     terminalLeafSummaries,
     customInstructions,
     capabilities,
+    documentReturnFollowthrough:followthrough,
   };
 }
 
@@ -1916,6 +1955,7 @@ export function normalizePaperclipWakePayload(
       payload.simplifiedEnglishInteractions,
       false,
     ),
+    documentReturn: Object.hasOwn(payload, "documentReturn"),
     dependencyBlockedInteraction: asBoolean(
       payload.dependencyBlockedInteraction,
       false,
@@ -2706,6 +2746,9 @@ function renderPaperclipWakePromptBody(
       "- interaction language (experimental): write every user interaction you post (request_confirmation, ask_user_questions, suggest_tasks, checkbox prompts and options, and any other content rendered inside an interaction block) in ASD-STE100 Simplified Technical English. In each interaction, briefly tell the user what information they need to make the decision and what happens for each choice. This applies only to interaction content — write your thinking, comments, documents, and other responses in your usual style.",
     );
   }
+  if (normalized.documentReturn) {
+    lines.push("- fixed document return: read get_task_context.documentReturn; use only its exact body and idempotencyKey with report_progress. A storage acknowledgment is not company acceptance. Do not execute deliverable work, change the document, remove blockers, or invent a comment ID.");
+  }
   if (normalized.dependencyBlockedInteraction) {
     lines.push("- dependency-blocked interaction: yes");
     lines.push(
@@ -3051,6 +3094,11 @@ function renderPaperclipWakePromptBody(
           lines.push(`  ${leaf.summary}`);
         }
       }
+    }
+    if(watchdog.documentReturnFollowthrough.state!=="not_supplied") {
+      lines.push("", "Fixed document return observations (read-only; never retry or admission authority):",
+        JSON.stringify(watchdog.documentReturnFollowthrough),
+        "A saved return is not company acceptance or effectiveness. Invalid/unreadable evidence requires re-read, never blind resend. No deadline or watchdog enablement is granted by this observation.");
     }
     if (watchdog.customInstructions) {
       lines.push(

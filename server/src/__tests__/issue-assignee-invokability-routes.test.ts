@@ -15,6 +15,7 @@ const agentStatusById: Record<string, string> = {
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
+  getByIdForUpdate: vi.fn(),
   findOpenAncestorCreatedByAgent: vi.fn(),
   update: vi.fn(),
   create: vi.fn(),
@@ -48,6 +49,7 @@ vi.mock("../services/cross-issue-influence-limit.js", async (importOriginal) => 
 }));
 
 vi.mock("../services/index.js", () => ({
+  taskWatchdogService: () => ({ reconcileForIssueAndAncestors: vi.fn(async () => []) }),
   companyService: () => ({
     getById: vi.fn(async () => ({ id: "company-1" })),
   }),
@@ -132,6 +134,7 @@ vi.mock("../services/index.js", () => ({
 }));
 
 import { errorHandler } from "../middleware/index.js";
+import { HttpError } from "../errors.js";
 import { issueRoutes } from "../routes/issues.js";
 
 type Actor = Record<string, unknown>;
@@ -164,7 +167,9 @@ function stubDb(): any {
     query[method] = () => query;
   }
   query.then = (resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([]));
-  return { select: () => query };
+  const db: any = { select: () => query };
+  db.transaction = async (body: any) => body(db);
+  return db;
 }
 
 function createApp(actor: Actor) {
@@ -347,5 +352,222 @@ describe("agent delegation cycle guard", () => {
 
     expect(res.status).toBe(201);
     expect(mockIssueService.findOpenAncestorCreatedByAgent).not.toHaveBeenCalled();
+  });
+});
+
+const mockWorkAssignmentCheck = vi.hoisted(() => vi.fn());
+vi.mock("../services/agent-assignability.js", async (load) => {
+ const actual = await load<typeof import("../services/agent-assignability.js")>();
+ return { ...actual, assertAssignableAgent: async (_db, _company, agentId, options) => {
+  mockWorkAssignmentCheck(options);
+  const result = actual.assignmentWorkCompatibility({issue:options.work,agent:{id:agentId,adapterType:"hermes_local",adapterConfig:{boundedExecution:true}}});
+  if (result.kind === "blocked") {
+   const {conflict} = await import("../errors.js");
+   throw conflict(result.block.reason,{code:result.block.errorCode,...result.block.details});
+  }
+ }};
+});
+
+describe("normal work sender before ownership side effects, no HTTP server", () => {
+ it("returns explicit document mismatch through the real PATCH handler before any stop, update or wake", async () => {
+  const existing=makeIssue({description:"Original requested saved document.",assigneeAgentId:AGENT_ACTOR_ID});
+  mockIssueService.getById.mockResolvedValue(existing);
+  mockIssueService.update.mockClear();mockHeartbeatService.cancelRun.mockClear();mockHeartbeatService.wakeup.mockClear();
+  const router=issueRoutes(stubDb() as any,{} as any);
+  const layer=(router as any).stack.find((l:any)=>l.route?.path==="/issues/:id"&&l.route.methods.patch);
+  const {updateIssueSchema}=await import("@paperclipai/shared");
+  const body=updateIssueSchema.parse({assigneeAgentId:IDLE_AGENT_ID,status:"todo",workRequirements:{requiredOperations:["issue_document_write"],deliverable:"saved_issue_document"}});
+  const req:any={params:{id:existing.id},body,actor:boardActor(),headers:{},method:"PATCH",path:`/issues/${existing.id}`,get:()=>undefined};
+  const res:any={status:vi.fn().mockReturnThis(),json:vi.fn().mockReturnThis(),on:vi.fn(),once:vi.fn(),locals:{}};
+  await expect(layer.route.stack.at(-1).handle(req,res,()=>{})).rejects.toMatchObject({status:409,details:{code:"agent_work_requirements_unavailable"}});
+  expect(mockWorkAssignmentCheck).toHaveBeenCalled();
+  expect(mockIssueService.update).not.toHaveBeenCalled();expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+ });
+ it("saves a valid normal sender contract using the locked brief and preserves concurrent unrelated metadata", async () => {
+  const existing=makeIssue({description:"Current brief.",revision:36,assigneeAdapterOverrides:{adapterConfig:{before:"keep"}}});
+  const locked={...existing,revision:39,assigneeAdapterOverrides:{useProjectWorkspace:true,adapterConfig:{before:"keep",concurrent:"keep too"}}};
+  mockIssueService.getById.mockResolvedValue(existing);mockIssueService.getByIdForUpdate.mockResolvedValue(locked);
+  mockIssueService.update.mockImplementation(async (_id,data)=>({...locked,...data}));
+  const router=issueRoutes(stubDb() as any,{} as any);
+  const layer=(router as any).stack.find((l:any)=>l.route?.path==="/issues/:id"&&l.route.methods.patch);
+  const {updateIssueSchema}=await import("@paperclipai/shared");
+  const body=updateIssueSchema.parse({workRequirements:{requiredOperations:["web_search","final_response"],deliverable:"research_response"}});
+  const req:any={params:{id:existing.id},body,actor:boardActor(),headers:{},method:"PATCH",path:`/issues/${existing.id}`,get:()=>undefined};
+  const res:any={status:vi.fn().mockReturnThis(),json:vi.fn().mockReturnThis(),on:vi.fn(),once:vi.fn(),locals:{}};
+  await layer.route.stack.at(-1).handle(req,res,()=>{});
+  expect(mockIssueService.getByIdForUpdate).toHaveBeenCalled();
+  const data=mockIssueService.update.mock.calls.at(-1)![1];
+  expect(data).not.toHaveProperty("workRequirements");
+  expect(data.assigneeAdapterOverrides).toMatchObject({useProjectWorkspace:true,adapterConfig:{before:"keep",concurrent:"keep too",paperclipWorkRequirements:{companyId:existing.companyId,issueId:existing.id,requiredOperations:["web_search","final_response"]}}});
+  expect(res.json).toHaveBeenCalled();
+ });
+ it("rejects a source-brief change under the existing row lock before saving or waking", async () => {
+  const existing=makeIssue({description:"Current brief.",revision:36});
+  mockIssueService.getById.mockResolvedValue(existing);mockIssueService.getByIdForUpdate.mockResolvedValue({...existing,description:"Changed requirement.",revision:37});
+  mockIssueService.update.mockClear();mockHeartbeatService.wakeup.mockClear();
+  const router=issueRoutes(stubDb() as any,{} as any);
+  const layer=(router as any).stack.find((l:any)=>l.route?.path==="/issues/:id"&&l.route.methods.patch);
+  const {updateIssueSchema}=await import("@paperclipai/shared");
+  const body=updateIssueSchema.parse({workRequirements:{requiredOperations:["web_search"],deliverable:"research_response"}});
+  const req:any={params:{id:existing.id},body,actor:boardActor(),headers:{},method:"PATCH",path:`/issues/${existing.id}`,get:()=>undefined};
+  const res:any={status:vi.fn().mockReturnThis(),json:vi.fn().mockReturnThis(),on:vi.fn(),once:vi.fn(),locals:{}};
+  await expect(layer.route.stack.at(-1).handle(req,res,()=>{})).rejects.toMatchObject({status:409,details:{code:"assignment_work_contract_invalid"}});
+  expect(mockIssueService.update).not.toHaveBeenCalled();expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+ });
+
+ it("keeps an unclassified ordinary reassignment on the original path without an extra guard or transaction", async () => {
+  const existing=makeIssue({description:"Unclassified existing request."});
+  mockIssueService.getById.mockResolvedValue(existing);mockIssueService.update.mockImplementation(async (_id,data)=>({...existing,...data}));
+  mockWorkAssignmentCheck.mockClear();mockIssueService.getByIdForUpdate.mockClear();
+  const db=stubDb();const transaction=vi.spyOn(db,"transaction");
+  const router=issueRoutes(db,{} as any);
+  const layer=(router as any).stack.find((l:any)=>l.route?.path==="/issues/:id"&&l.route.methods.patch);
+  const req:any={params:{id:existing.id},body:{assigneeAgentId:IDLE_AGENT_ID},actor:boardActor(),headers:{},method:"PATCH",path:`/issues/${existing.id}`,get:()=>undefined};
+  const res:any={status:vi.fn().mockReturnThis(),json:vi.fn().mockReturnThis(),on:vi.fn(),once:vi.fn(),locals:{}};
+  await layer.route.stack.at(-1).handle(req,res,()=>{});
+  expect(mockWorkAssignmentCheck).not.toHaveBeenCalled();expect(transaction).not.toHaveBeenCalled();
+  expect(mockIssueService.getByIdForUpdate).not.toHaveBeenCalled();expect(mockIssueService.update).toHaveBeenCalled();expect(res.json).toHaveBeenCalled();
+ });
+
+});
+
+describe("stop boundary qualification with a modeled active run, no HTTP", () => {
+ async function invoke(requiredOperations: string[]) {
+  const runId="55555555-5555-4555-8555-555555555555";
+  const existing=makeIssue({description:"Current brief.",revision:36,executionRunId:runId,checkoutRunId:runId});
+  const run={id:runId,companyId:existing.companyId,agentId:AGENT_ACTOR_ID,status:"running",nativeIssueId:existing.id,contextSnapshot:{issueId:existing.id}};
+  mockIssueService.getById.mockResolvedValue(existing);
+  mockIssueService.getByIdForUpdate.mockResolvedValue({...existing,description:"Concurrent changed brief.",revision:37});
+  mockHeartbeatService.getRun.mockClear();mockHeartbeatService.getRun.mockResolvedValue(run as any);
+  mockHeartbeatService.getActiveRunForAgent.mockClear();mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(run as any);
+  mockHeartbeatService.cancelRun.mockClear();mockHeartbeatService.cancelRun.mockResolvedValue({...run,status:"cancelled"} as any);
+  mockIssueService.update.mockClear();mockHeartbeatService.wakeup.mockClear();mockIssueService.getByIdForUpdate.mockClear();
+  const router=issueRoutes(stubDb() as any,{} as any);
+  const layer=(router as any).stack.find((l:any)=>l.route?.path==="/issues/:id"&&l.route.methods.patch);
+  const {updateIssueSchema}=await import("@paperclipai/shared");
+  const body=updateIssueSchema.parse({assigneeAgentId:IDLE_AGENT_ID,workRequirements:{requiredOperations,deliverable:"explicit_deliverable"}});
+  const req:any={params:{id:existing.id},body,actor:boardActor(),headers:{},method:"PATCH",path:`/issues/${existing.id}`,get:()=>undefined};
+  const res:any={status:vi.fn().mockReturnThis(),json:vi.fn().mockReturnThis(),on:vi.fn(),once:vi.fn(),locals:{}};
+  return layer.route.stack.at(-1).handle(req,res,()=>{});
+ }
+ it("rejects preflight mismatch before even resolving or cancelling the modeled active run", async () => {
+  await expect(invoke(["issue_document_write"])).rejects.toMatchObject({details:{code:"agent_work_requirements_unavailable"}});
+  expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();expect(mockHeartbeatService.getActiveRunForAgent).not.toHaveBeenCalled();
+  expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();expect(mockIssueService.getByIdForUpdate).not.toHaveBeenCalled();
+  expect(mockIssueService.update).not.toHaveBeenCalled();expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+ });
+ it("can cancel the modeled original run before a later locked brief-change rejection", async () => {
+  await expect(invoke(["web_search","final_response"])).rejects.toMatchObject({details:{code:"assignment_work_contract_invalid"}});
+  expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("55555555-5555-4555-8555-555555555555",expect.any(String),expect.objectContaining({errorCode:"issue_reassigned"}));
+  expect(mockIssueService.getByIdForUpdate).toHaveBeenCalled();
+  expect(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0]).toBeLessThan(mockIssueService.getByIdForUpdate.mock.invocationCallOrder[0]);
+  expect(mockIssueService.update).not.toHaveBeenCalled();expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+ });
+});
+
+describe("reserved work contract raw updates through original PATCH, no HTTP", () => {
+ async function executeRaw(existingOverrides: unknown, nextOverrides: unknown, lockedOverrides = existingOverrides) {
+  const existing = makeIssue({ description: "Fixed brief.", assigneeAdapterOverrides: existingOverrides });
+  const locked = { ...existing, assigneeAdapterOverrides: lockedOverrides };
+  mockIssueService.getById.mockResolvedValue(existing);
+  mockIssueService.getByIdForUpdate.mockResolvedValue(locked);
+  mockIssueService.update.mockClear();
+  mockIssueService.update.mockImplementation(async (_id, data) => ({ ...locked, ...data }));
+  mockHeartbeatService.cancelRun.mockClear();mockHeartbeatService.wakeup.mockClear();
+  const router = issueRoutes(stubDb() as any, {} as any);
+  const layer = (router as any).stack.find((l: any) => l.route?.path === "/issues/:id" && l.route.methods.patch);
+  const { updateIssueSchema } = await import("@paperclipai/shared");
+  const req: any = { params: { id: existing.id }, body: updateIssueSchema.parse({ assigneeAdapterOverrides: nextOverrides }), actor: boardActor(), headers: {}, method: "PATCH", path: `/issues/${existing.id}`, get: () => undefined };
+  const res: any = { status: vi.fn().mockReturnThis(), json: vi.fn().mockReturnThis(), on: vi.fn(), once: vi.fn(), locals: {} };
+  return layer.route.stack.at(-1).handle(req, res, () => {});
+ }
+ const contract = { schema: "paperclip.work-requirements.v1", companyId: "company-1", issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sourceBriefSha256: "fixed", requiredOperations: ["issue_document_write"], deliverable: "saved document" };
+ const protectedOverrides = { adapterConfig: { paperclipWorkRequirements: contract, unrelated: "kept" } };
+ for (const next of [null, {}, { adapterConfig: {} }, { adapterConfig: { paperclipWorkRequirements: { ...contract, requiredOperations: ["web_search"] } } }]) {
+  it(`rejects raw deletion or rewrite ${JSON.stringify(next)} before stop or save`, async () => {
+   await expect(executeRaw(protectedOverrides, next)).rejects.toMatchObject({ status: 409, details: { code: "assignment_work_contract_invalid" } });
+   expect(mockIssueService.update).not.toHaveBeenCalled();expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+ }
+ it("rejects raw contract creation rather than accepting client-supplied pins", async () => {
+  await expect(executeRaw({}, protectedOverrides)).rejects.toMatchObject({ status: 409, details: { code: "assignment_work_contract_invalid" } });
+  expect(mockIssueService.update).not.toHaveBeenCalled();
+ });
+ it("rechecks locked current contract before unrelated stale raw replacement", async () => {
+  await expect(executeRaw({ adapterConfig: { unrelated: "old" } }, { adapterConfig: { unrelated: "new" } }, protectedOverrides)).rejects.toMatchObject({ status: 409, details: { code: "assignment_work_contract_invalid" } });
+  expect(mockIssueService.getByIdForUpdate).toHaveBeenCalled();expect(mockIssueService.update).not.toHaveBeenCalled();
+ });
+ it("preserves the exact contract while allowing unrelated configuration to change", async () => {
+  const next = { adapterConfig: { unrelated: "new", paperclipWorkRequirements: { ...contract } } };
+  await executeRaw(protectedOverrides, next);
+  expect(mockIssueService.update.mock.calls.at(-1)![1].assigneeAdapterOverrides).toEqual(next);
+ });
+ it("allows unrelated raw updates when neither current nor next has a contract", async () => {
+  const next = { adapterConfig: { unrelated: "new" } };
+  await executeRaw({ adapterConfig: { unrelated: "old" } }, next);
+  expect(mockIssueService.update.mock.calls.at(-1)![1].assigneeAdapterOverrides).toEqual(next);
+ });
+});
+
+
+describe("assignment failure response after modeled cancellation, no HTTP", () => {
+  async function invoke(mode: "locked-rejection" | "update-unknown" | "preflight" | "locked-other-owner") {
+    const runId = "55555555-5555-4555-8555-555555555555";
+    const existing = makeIssue({ description: "Current brief.", revision: 36, statusVersion: 8, executionRunId: runId, checkoutRunId: runId });
+    const locked = { ...existing, revision: 37,
+      description: mode === "locked-rejection" ? "Concurrent brief." : existing.description,
+      assigneeAgentId: mode === "locked-other-owner" ? PAUSED_AGENT_ID : existing.assigneeAgentId,
+    };
+    const run = { id: runId, companyId: existing.companyId, agentId: AGENT_ACTOR_ID, status: "running", nativeIssueId: existing.id, contextSnapshot: { issueId: existing.id } };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.getByIdForUpdate.mockResolvedValue(locked);
+    mockHeartbeatService.getRun.mockResolvedValue(run as any);
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(run as any);
+    mockHeartbeatService.cancelRun.mockReset();
+    mockHeartbeatService.cancelRun.mockImplementation(async (_id, _reason, options) => ({ ...run, status: "cancelled", resultJson: options?.resultJson }) as any);
+    const originalError = new Error("private database failure, commit outcome unknown");
+    mockIssueService.update.mockReset(); mockIssueService.update.mockRejectedValue(originalError);
+    mockHeartbeatService.wakeup.mockClear(); mockIssueService.getByIdForUpdate.mockClear();
+    const router = issueRoutes(stubDb() as any, {} as any);
+    const layer = (router as any).stack.find((l: any) => l.route?.path === "/issues/:id" && l.route.methods.patch);
+    const { updateIssueSchema } = await import("@paperclipai/shared");
+    const body = updateIssueSchema.parse({ assigneeAgentId: IDLE_AGENT_ID, workRequirements: { requiredOperations: mode === "preflight" ? ["issue_document_write"] : ["web_search", "final_response"], deliverable: "research" } });
+    const req: any = { params: { id: existing.id }, body, actor: boardActor(), headers: {}, method: "PATCH", path: `/issues/${existing.id}`, originalUrl: `/api/issues/${existing.id}`, get: () => undefined };
+    const res: any = { status: vi.fn().mockReturnThis(), json: vi.fn().mockReturnThis(), on: vi.fn(), once: vi.fn(), locals: {} };
+    let caught: unknown;
+    try { await layer.route.stack.at(-1).handle(req, res, () => {}); } catch (err) { caught = err; errorHandler(err, req, res, () => {}); }
+    return { caught, originalError, existing, locked, res, payload: res.json.mock.calls.at(-1)?.[0] };
+  }
+  it("reports confirmed cancellation and locked ownership without claiming assignment or replay", async () => {
+    const result = await invoke("locked-rejection");
+    expect(result.caught).toBeInstanceOf(HttpError);
+    expect(result.res.status).toHaveBeenCalledWith(409);
+    expect(result.payload).toMatchObject({ code: "assignment_work_contract_invalid", issueMutation: {
+      issueId: result.existing.id, assignmentWrite: "not_attempted", currentOwnership: "unverified", automaticRetry: false,
+      runCancellation: { runId: "55555555-5555-4555-8555-555555555555", observedStatus: "cancelled", evidence: "cancelRun_return" },
+      lastObservedOwnership: { source: "locked_before_update", revision: 37, assigneeAgentId: AGENT_ACTOR_ID },
+    } });
+    expect(result.payload.issueMutation.issueMutationStopId).toBe(mockHeartbeatService.cancelRun.mock.calls[0][2]?.resultJson?.issueMutationStopId);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+    expect(mockIssueService.update).not.toHaveBeenCalled(); expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+  it("keeps an update/commit exception unknown, preserves original error and masks private message", async () => {
+    const result = await invoke("update-unknown");
+    expect(result.caught).toBe(result.originalError);
+    expect(result.res.status).toHaveBeenCalledWith(500);
+    expect(result.payload).toMatchObject({ error: "Internal server error", issueMutation: { assignmentWrite: "outcome_unknown", currentOwnership: "unverified", automaticRetry: false } });
+    expect(JSON.stringify(result.payload)).not.toContain("private database failure");
+    expect(mockIssueService.update).toHaveBeenCalledTimes(1); expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+  it("reports concurrent owner only as last locked observation", async () => {
+    const result = await invoke("locked-other-owner");
+    expect(result.payload.issueMutation).toMatchObject({ assignmentWrite: "not_attempted", currentOwnership: "unverified", lastObservedOwnership: { assigneeAgentId: PAUSED_AGENT_ID, revision: 37 } });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+  it("does not invent a cancellation receipt for a preflight rejection", async () => {
+    const result = await invoke("preflight");
+    expect(result.payload).toMatchObject({ code: "agent_work_requirements_unavailable" });
+    expect(result.payload).not.toHaveProperty("issueMutation");
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
 });

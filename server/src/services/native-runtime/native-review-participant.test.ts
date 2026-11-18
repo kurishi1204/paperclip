@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  getNativeReviewAssignment,
   readNativeReviewAssignmentContext,
   validateNativeReviewAssignmentFacts,
   type NativeReviewAssignmentFacts,
 } from "./native-review-participant.js";
+import { nativeSha256 } from "./canonical.js";
 
 const ids = { nativeReviewInteractionId: "11111111-1111-4111-8111-111111111111", nativeReviewDecisionId: "22222222-2222-4222-8222-222222222222" };
 
@@ -33,6 +35,46 @@ function facts(overrides: object = {}): NativeReviewAssignmentFacts {
 }
 
 describe("native review participant", () => {
+  it.each([true, false])("retained pending card requires current policy designation: %s", async designated => {
+    const f = facts();
+    const policy = { mode: "normal", stages: [{ type: "review", approvalsNeeded: 1,
+      participants: [{ type: "agent", agentId: designated ? f.agentId : "99999999-9999-4999-8999-999999999999" }] }] };
+    const issue = { id: f.issueId, companyId: f.companyId, status: f.issueStatus,
+      statusVersion: f.issueStatusVersion, lastStatusDecisionId: f.issueLastStatusDecisionId,
+      assigneeAgentId: f.issueAssigneeAgentId, executionPolicy: policy };
+    const agent = { id: f.agentId, companyId: f.companyId, name: "reviewer", status: "idle", reportsTo: null };
+    const rows = [[issue], [agent], [f.interaction], [f.decision], [f.sourceRun], [agent]];
+    const db: any = { select: () => {
+      const values = rows.shift();
+      const query: any = { from: () => query, where: () => query, limit: () => query,
+        then: (ok: any, no: any) => Promise.resolve(values).then(ok, no) }; return query;
+    } };
+    const assignment = await getNativeReviewAssignment(db, { companyId: f.companyId, issueId: f.issueId,
+      agentId: f.agentId, contextSnapshot: ids });
+    expect(assignment !== null).toBe(designated);
+  });
+  it.each(["same", "policy changed", "card changed", "malformed"])("rechecks reviewer return proof at original delivery: %s", async change => {
+    const f = facts();
+    const policy = { stages: [{ type: "review", participants: [{ type: "agent", agentId: f.agentId }] }] };
+    const proof = { previousRunId: "previous-review-run", policySha256: nativeSha256(policy),
+      interactionPayloadSha256: nativeSha256(f.interaction.payload) };
+    const issue = { id: f.issueId, companyId: f.companyId, status: f.issueStatus,
+      statusVersion: f.issueStatusVersion, lastStatusDecisionId: f.issueLastStatusDecisionId,
+      assigneeAgentId: f.issueAssigneeAgentId, executionPolicy: change === "policy changed" ? null : policy };
+    const card = change === "card changed" ? { ...f.interaction, payload: { ...f.interaction.payload, prompt: "changed" } } : f.interaction;
+    const agent = { id: f.agentId, companyId: f.companyId, name: "reviewer", status: "idle", reportsTo: null };
+    const rows = [[issue], [agent], [card], [f.decision], [f.sourceRun], [agent]];
+    const db: any = { select: () => {
+      const values = rows.shift();
+      const query: any = { from: () => query, where: () => query, limit: () => query,
+        then: (resolve: any, reject: any) => Promise.resolve(values).then(resolve, reject) };
+      return query;
+    } };
+    const result = await getNativeReviewAssignment(db, { companyId: f.companyId, issueId: f.issueId,
+      agentId: f.agentId, contextSnapshot: { ...ids, nativeReviewReturn: change === "malformed" ? {} : proof } });
+    if (change === "same") expect(result?.interaction.id).toBe(ids.nativeReviewInteractionId);
+    else expect(result).toBeNull();
+  });
   it("requires the two distinct native context bindings", () => {
     expect(readNativeReviewAssignmentContext({ nativeReviewInteractionId: "i" })).toBeNull();
     expect(readNativeReviewAssignmentContext(ids)).toEqual(ids);

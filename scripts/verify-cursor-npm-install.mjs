@@ -42,6 +42,7 @@ function visit(name) {
  for (const [dependency, version] of Object.entries({...entry.manifest.dependencies, ...entry.manifest.optionalDependencies})) if (version.startsWith('workspace:') || dependency === '@paperclipai/server' && name === 'paperclipai') visit(dependency);
 }
 visit('paperclipai');
+  const workspaceVersions = Object.fromEntries([...needed].map(name => [name, releaseVersion]));
 // Run after the candidate build, including its required standalone adapters.
 for (const name of needed) assert.ok(existsSync(join(repo, packages.get(name).dir, 'dist')), `Missing built public package ${name}`);
 run('bash', [join(repo, 'scripts/prepare-server-ui-dist.sh')], repo);
@@ -50,15 +51,18 @@ for (const path of [assets, consumer, cache]) mkdirSync(path, { mode: 0o755 });
 writeFileSync(join(consumer, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
 for (const [index, name] of [...needed].entries()) {
  const { dir, manifest } = packages.get(name); const staged = join(root, `source-${index}`); const target = join(root, `package-${index}`); mkdirSync(staged);
+ const stagedFiles = [];
  for (const file of manifest.files ?? ['dist']) {
   const skills = file === 'skills' && ['server', 'packages/adapters/claude-local', 'packages/adapters/codex-local'].includes(dir);
+  // Match release.sh; absent optional skills are omitted, not supplied elsewhere.
   if (file === 'skills' && !skills && !existsSync(join(repo,dir,file))) continue;
   cpSync(skills ? join(repo,'skills') : join(repo,dir,file), join(staged,file), { recursive: true });
+  stagedFiles.push(file);
  }
- const releaseManifest = { ...manifest, version: releaseVersion };
+ const releaseManifest = { ...manifest, version: releaseVersion, files: stagedFiles };
  writeFileSync(join(staged,'package.json'), JSON.stringify(releaseManifest));
- if ((manifest.bundleDependencies ?? manifest.bundledDependencies ?? []).length) prepareBundledPackage(staged,target);
- else { cpSync(staged,target,{recursive:true}); writeFileSync(join(target,'package.json'),JSON.stringify(materializePublishManifest(releaseManifest))); }
+ if ((manifest.bundleDependencies ?? manifest.bundledDependencies ?? []).length) prepareBundledPackage(staged,target,{ workspaceVersions });
+ else { cpSync(staged,target,{recursive:true}); writeFileSync(join(target,'package.json'),JSON.stringify(materializePublishManifest(releaseManifest, { workspaceVersions, sourceDir: staged }))); }
  run('npm',['pack','--ignore-scripts','--pack-destination',assets],target);
  console.log(`Packed ${name}`);
 }

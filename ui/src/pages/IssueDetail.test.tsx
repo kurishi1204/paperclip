@@ -1453,7 +1453,11 @@ describe("IssueDetail", () => {
     });
   });
 
-  afterEach(async () => {
+  afterEach(async (context) => {
+    const metadata = context.task.meta as typeof context.task.meta & { assignmentOutcomeNotices: unknown[] };
+    metadata.assignmentOutcomeNotices = mockPushToast.mock.calls
+      .map(([notice]) => notice)
+      .filter((notice) => notice.title === "Assignment needs confirmation");
     await act(async () => {
       root.unmount();
     });
@@ -1491,6 +1495,69 @@ describe("IssueDetail", () => {
     await act(async () => successfulUpdate.resolve({ ...issue, projectId }));
     await waitForAssertion(() => expect(getLastProjectId(issue.companyId)).toBe(projectId ?? ""));
     expect(getLastProjectId("company-2")).toBeUndefined();
+  });
+
+  it.each([
+    ["issueMutation", "outcome_unknown"],
+    ["details", "not_attempted"],
+  ])("shows the cancellation outcome after an assignment error (%s, %s)", async (location, write) => {
+    const issue = createIssue({ assigneeAgentId: "agent-previous" });
+    const pending = createDeferred<Issue>();
+    mockIssuesApi.get.mockResolvedValue(issue);
+    mockAgentsApi.list.mockResolvedValue([createAgent({ id: "agent-previous", name: "Previous owner" })]);
+    mockIssuesApi.update.mockClear().mockReturnValue(pending.promise);
+    mockHeartbeatsApi.cancel.mockClear();
+    await act(async () => root.render(<QueryClientProvider client={queryClient}><IssueDetail /></QueryClientProvider>));
+    let properties!: { onUpdate: (data: Record<string, unknown>) => void };
+    await waitForAssertion(() => {
+      properties = mockOpenPanel.mock.calls.at(-1)?.[0]?.props.children?.props;
+      expect(properties?.onUpdate).toBeTypeOf("function");
+    });
+    await act(async () => properties.onUpdate({ assigneeAgentId: "agent-next", assigneeUserId: null }));
+    await waitForAssertion(() => expect(mockIssuesApi.update).toHaveBeenCalledTimes(1));
+    const failure = {
+      issueId: issue.id, issueMutationStopId: "private-stop-id",
+      runCancellation: { runId: "private-run-id", observedStatus: "cancelled", evidence: "cancelRun_return" },
+      assignmentWrite: write,
+      lastObservedOwnership: { source: "locked_before_update", revision: 12, statusVersion: 3, assigneeAgentId: "agent-previous", assigneeUserId: null },
+      currentOwnership: "unverified", automaticRetry: false, nextAction: "read_issue_and_run_before_owner_decision",
+    };
+    const body = location === "details" ? { details: { issueMutation: failure } } : { issueMutation: failure };
+    await act(async () => pending.reject(new ApiError("private backend failure", 500, body)));
+    await waitForAssertion(() => expect(mockPushToast).toHaveBeenCalledWith(expect.objectContaining({
+      title: "Assignment needs confirmation",
+      body: expect.stringContaining(write === "not_attempted" ? "did not attempt the assignment change" : "assignment change result is unknown"),
+      tone: "error",
+    })));
+    const notice = mockPushToast.mock.calls.at(-1)![0];
+    expect(notice.body).toContain("previous run is marked cancelled");
+    expect(notice.body).toContain("processes have not been verified as stopped");
+    expect(notice.body).toContain("Last observed assignee: Previous owner");
+    expect(notice.body).toContain("does not verify the current assignee");
+    expect(notice.body).toContain("Do not resubmit this change");
+    expect(JSON.stringify(notice)).not.toMatch(/private-|private backend/);
+    expect(mockIssuesApi.update).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatsApi.cancel).not.toHaveBeenCalled();
+  });
+
+  it("keeps cancellation outcomes visible when a comment also reassigns the task", async () => {
+    const issue = createIssue({ assigneeAgentId: "agent-previous" });
+    mockIssuesApi.get.mockResolvedValue(issue);
+    mockIssuesApi.update.mockClear().mockRejectedValue(new ApiError("private backend failure", 409, {
+      details: { issueMutation: {
+        issueId: issue.id, issueMutationStopId: "private-stop-id",
+        runCancellation: { runId: "private-run-id", observedStatus: "cancelled", evidence: "cancelRun_return" },
+        assignmentWrite: "outcome_unknown",
+        lastObservedOwnership: { source: "request_read", revision: 11, statusVersion: 2, assigneeAgentId: "agent-previous", assigneeUserId: null },
+        currentOwnership: "unverified", automaticRetry: false, nextAction: "read_issue_and_run_before_owner_decision",
+      } },
+    }));
+    await act(async () => root.render(<QueryClientProvider client={queryClient}><IssueDetail /></QueryClientProvider>));
+    await waitForAssertion(() => expect(mockIssueChatThreadRender).toHaveBeenCalled());
+    const props = mockIssueChatThreadRender.mock.calls.at(-1)![0] as { onAdd: (body: string, reopen: undefined, reassignment: { assigneeAgentId: string; assigneeUserId: null }) => Promise<void> };
+    await act(async () => { await expect(props.onAdd("Keep this draft", undefined, { assigneeAgentId: "agent-next", assigneeUserId: null })).rejects.toBeInstanceOf(ApiError); });
+    expect(mockPushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "Assignment needs confirmation", body: expect.stringContaining("assignment change result is unknown") }));
+    expect(mockIssuesApi.update).toHaveBeenCalledTimes(1);
   });
 
   it("keeps an existing conversation on its agent-addressed route", async () => {

@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { readFileSync } from "node:fs";
 import {
   access,
@@ -7743,6 +7745,15 @@ describe("native session bounded recovery", () => {
     const updates: Array<{ table: unknown; values: Record<string, unknown> }> =
       [];
     const failure = new NativeSessionCleanupQuarantinedError();
+    const cleanupOwner = {
+      binding: { ...execution.binding }, runnerInstanceId: "original-runner",
+      retainedAtUTC: "2026-11-17T12:00:00.000Z", operatorRecoveryRequired: true,
+      runnerSuspended: false, providerDrained: null, semanticToolsSettled: null,
+      semanticToolPendingCount: 1, semanticToolPersistenceFailed: false,
+      providerPendingEventCount: 2, providerSettled: false,
+      missingEvidence: ["runner_suspension_unverified", "provider_drain_unverified"],
+    };
+    Object.defineProperty(failure, "cleanupOwners", { value: [cleanupOwner] });
     state.execute.mockReset().mockRejectedValueOnce(failure);
     state.upsertRecoveryAction.mockReset().mockResolvedValue({});
     const updateIssue = vi.fn(async () => ({ status: "blocked", statusVersion: 7 }));
@@ -7759,13 +7770,10 @@ describe("native session bounded recovery", () => {
           runnerInstanceId: "runner",
         }),
       ).rejects.toBe(failure);
-      expect(
-        updates.find(
-          (entry) =>
-            entry.table === nativeRunFinalizations &&
-            entry.values.phase === "terminal_failure",
-        )?.values,
-      ).toMatchObject({
+      const finalizationWrite = updates.find(
+        (entry) => entry.table === nativeRunFinalizations && entry.values.phase === "terminal_failure",
+      )?.values;
+      expect(finalizationWrite).toMatchObject({
         failureCode: "native_session_cleanup_quarantined",
         nextAttemptAt: null,
         failureDetail: {
@@ -7774,6 +7782,14 @@ describe("native session bounded recovery", () => {
           ),
         },
       });
+      const historyQuery = new PgDialect().sqlToQuery(finalizationWrite?.recoveryHistory as SQL);
+      const persistedCopies = historyQuery.params
+        .filter((value): value is string => typeof value === "string" && value.includes("\"cleanupOwners\""))
+        .map(value => JSON.parse(value));
+      expect(persistedCopies).toHaveLength(2);
+      expect(persistedCopies[0]).toEqual(persistedCopies[1]);
+      expect(persistedCopies[0].cleanupOwners).toEqual([cleanupOwner]);
+      expect(JSON.stringify(persistedCopies)).not.toContain("private");
       expect(state.upsertRecoveryAction).toHaveBeenCalledWith(
         expect.objectContaining({
           cause: "native_session_cleanup_quarantined",

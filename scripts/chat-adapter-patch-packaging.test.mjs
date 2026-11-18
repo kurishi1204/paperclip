@@ -14,6 +14,7 @@ import test from "node:test";
 import {
   createBundledInstallManifest,
   materializePublishManifest,
+  readWorkspaceVersions,
   selectBundledDependencyPatches,
 } from "./prepare-bundled-package.mjs";
 
@@ -39,7 +40,7 @@ const required = [
 
 for (const [name, version] of required) {
   test(`published server retains the patched ${name}@${version} runtime`, () => {
-    const published = materializePublishManifest(serverPackage);
+    const published = materializePublishManifest(serverPackage, { workspaceVersions: readWorkspaceVersions() });
     const installed = createBundledInstallManifest(
       published,
       serverPackage.bundleDependencies,

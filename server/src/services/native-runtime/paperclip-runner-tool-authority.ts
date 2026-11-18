@@ -1,4 +1,7 @@
-import { documentReadReceipt } from "./document-read-receipt.js";
+import { readIssueDocumentReturnFollowthrough, hasDocumentReturn, readDocumentReturnPacket, readCurrentDocumentReturnWake, readDocumentReturnDelivery } from "../document-return-wake.js";
+import { consumeDocumentReturn, documentReturnBody, documentReturnKey } from "../document-return-contract.js";
+import { parseDocumentInclusions, composeIncludedDocuments, assertIncludedDocumentReadback, type InclusionSource } from "./document-inclusion.js";
+import { documentReadResult } from "./document-read-receipt.js";
 import { readTaskQuestionContext } from "../issue-question-context.js";
 import { isConversation } from "../agent-conversations.js";
 import { setIssueTitle } from "../issue-title.js";
@@ -40,7 +43,7 @@ import { getStorageService } from "../../storage/index.js";
 import type { StorageService } from "../../storage/types.js";
 import { assetService } from "../assets.js";
 import { workspaceFileResourceService } from "../workspace-file-resources.js";
-import { badRequest, forbidden, notFound, HttpError } from "../../errors.js";
+import { badRequest, conflict, forbidden, notFound, HttpError } from "../../errors.js";
 import { searchRunnerApi } from "./runner-api-catalog.js";
 import { executeRunnerApi, validateRunnerApiCall, RUNNER_API_MAX_BYTES, type RunnerApiFile } from "./runner-api-client.js";
 import { acquireRunnerApiResponseSlot, runnerApiCompanyCaptureMaxBytes, RUNNER_API_RESPONSE_MAX_BYTES, RUNNER_API_RESPONSE_RUN_MAX_BYTES, RunnerApiResponseLimitError } from "./runner-api-response-limits.js";
@@ -58,6 +61,7 @@ import {
   chatConversations,
   companies,
   documentRevisions,
+  documents,
   heartbeatRuns,
   issueApprovals,
   issueExecutionDecisions,
@@ -146,6 +150,8 @@ const REVIEW_STAGE_DEFINITION = {
 };
 
 type Binding = {
+  /** Purpose only; authority is re-read from server records on every call. */
+  documentReturn?: boolean;
   /** Server-derived scope for one addressed native completion review. */
   nativeReview?: NativeReviewAssignmentContext;
   /** Server-bound request ID, revalidated on every call. */
@@ -228,6 +234,9 @@ export class PaperclipRunnerToolAuthority {
   constructor(readonly db: Db, readonly binding: Binding) {}
 
   definitions(): Array<Record<string, unknown>> {
+    if (this.binding.documentReturn) return CAPABILITY_SEMANTIC_TOOL_CATALOG
+      .filter(tool => ["get_task_context","read_document","report_progress"].includes(tool.operationId))
+      .map(tool => ({name:tool.operationId,description:tool.description,inputSchema:tool.inputSchema}));
     if (this.binding.nativeReview || this.binding.documentReviewInteractionId) {
       // Scope Paperclip control-plane actions. Provider file and shell access
       // still follow the configured agent/environment policy, including tests.
@@ -242,7 +251,7 @@ export class PaperclipRunnerToolAuthority {
             type: "object", additionalProperties: false,
             properties: {
               decision: { type: "string", enum: ["accept", "reject"] },
-              reason: { type: "string", description: "Required when rejecting: the specific changes the worker must make." },
+              reason: { type: "string", maxLength: 4000, description: "Review rationale, preserved with an acceptance. Required when rejecting: the specific changes the worker must make." },
             },
             required: ["decision"],
           },
@@ -314,6 +323,11 @@ export class PaperclipRunnerToolAuthority {
     callId: string;
     arguments: unknown;
   }): Promise<unknown> {
+    const [returnScope]=await this.db.select({contextSnapshot:heartbeatRuns.contextSnapshot}).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id,this.binding.runId),eq(heartbeatRuns.companyId,this.binding.companyId)));
+    if (this.binding.documentReturn || hasDocumentReturn(returnScope?.contextSnapshot)) {
+      throw forbidden("Fixed document returns use the server executor, not provider tools.");
+    }
     if (call.tool === APPROVAL_STAGE_TOOL || call.tool === REVIEW_STAGE_TOOL) {
       if (this.binding.nativeReview || this.binding.documentReviewInteractionId || (this.binding.workMode ?? "standard") !== "standard") {
         throw forbidden("Approval stage decision is unavailable in this run mode");
@@ -556,6 +570,10 @@ export class PaperclipRunnerToolAuthority {
           acceptedPlan: await this.#acceptedPlan(context.run.contextSnapshot),
           sourcePlanApproval: await handoffPlanContext(this.db, context.issue),
           childReviewOutcomes: await childReviewOutcomes(this.db, this.binding.companyId, this.binding.issueId),
+          documentReturnFollowthrough: await readIssueDocumentReturnFollowthrough(this.db, this.binding),
+          ...(hasDocumentReturn(context.run.contextSnapshot) ? {
+            documentReturn: await readDocumentReturnPacket(this.db, { ...this.binding, contextSnapshot: record(context.run.contextSnapshot) }),
+          } : {}),
           ...(this.binding.documentReviewInteractionId ? {
             assignedReview: (await getNativeDocumentReviewAssignment(this.db, { ...this.binding, allowResolved: true }))?.interaction,
           } : this.binding.nativeReview ? {
@@ -600,20 +618,29 @@ export class PaperclipRunnerToolAuthority {
         if (this.binding.documentReviewInteractionId && !review) throw forbidden("The fixed document review is no longer available.");
         // Listing is discovery, not a bulk body read. Full bodies can exceed the
         // bounded semantic transport before an agent can discover a document key.
-        const visible = review ? documents.filter(document => document.key === review.binding.key) : documents;
+        const visible = review ? documents.filter(document => [review.binding, ...(review.binding.supportingDocuments ?? [])].some(scope => document.key === scope.key && document.id === scope.documentId && document.latestRevisionId === scope.revisionId)) : documents;
         return { documents: visible.map(({ body: _body, ...metadata }) => metadata) };
       }
       case "read_document": {
-        const review = await this.#assertDocumentReviewKey(input.key);
-        const document = await documentService(this.db).getIssueDocumentByKey(this.binding.issueId, requiredString(input.key));
+        const review = await this.#assertDocumentReviewKey(input);
+        const returnBinding = this.binding.documentReturn ? await readCurrentDocumentReturnWake(this.db, {
+          ...this.binding, contextSnapshot: record(context.run.contextSnapshot),
+        }) : null;
+        if (this.binding.documentReturn && !returnBinding) throw forbidden("The fixed return document is no longer current.");
+        const document = await documentService(this.db).getIssueDocumentByKey(this.binding.issueId, requiredString(input.key), returnBinding ?? review?.binding);
         if (!document) throw new Error("paperclip_runner_document_not_found");
         if (review && (document.id !== review.binding.documentId || document.latestRevisionId !== review.binding.revisionId)) {
           throw forbidden("The fixed document revision changed before the read completed.");
         }
-        return { document, readReceipt: documentReadReceipt(this.binding, document) };
+        if (returnBinding && (typeof document.body !== "string" || document.id !== returnBinding.documentId || document.latestRevisionId !== returnBinding.revisionId ||
+            Buffer.byteLength(document.body,"utf8") !== returnBinding.bodyBytes ||
+            createHash("sha256").update(document.body,"utf8").digest("hex") !== returnBinding.bodySha256)) {
+          throw forbidden("The fixed return document changed during the read.");
+        }
+        return documentReadResult(this.binding, document, input.range);
       }
       case "list_document_revisions": {
-        const review=await this.#assertDocumentReviewKey(input.key);
+        const review=await this.#assertDocumentReviewKey(input);
         const service=documentService(this.db), key=requiredString(input.key);
         const {limit,cursor}=documentRevisionPage(input);
         // Bound the query itself: a newer revision can arrive after admission
@@ -1100,11 +1127,17 @@ export class PaperclipRunnerToolAuthority {
     return row;
   }
 
-  async #assertDocumentReviewKey(key: unknown) {
+  async #assertDocumentReviewKey(input: Record<string, unknown>) {
     if (!this.binding.documentReviewInteractionId) return;
     const review = await getNativeDocumentReviewAssignment(this.db, { ...this.binding, allowResolved: true });
-    if (!review || key !== review.binding.key) throw forbidden("Read only the fixed document assigned to this review.");
-    return review;
+    if (!review) throw forbidden("Read only the fixed document assigned to this review.");
+    if (Object.keys(input).some(key => !["key", "limit", "cursor", "range"].includes(key))) {
+      throw forbidden("Document read scope comes only from the saved review assignment.");
+    }
+    const scope = [review.binding, ...(review.binding.supportingDocuments ?? [])].find(item => item.key === input.key);
+    if (!scope) throw forbidden("Read only the fixed document or its saved supporting evidence.");
+    // Only read methods receive the selected scope. The verdict target is unchanged.
+    return { ...review, binding: { ...review.binding, ...scope } };
   }
 
   async #resolveReview(value: unknown) {
@@ -1137,13 +1170,27 @@ export class PaperclipRunnerToolAuthority {
     const response = await fetch(`${apiUrl.replace(/\/$/, "")}/api/issues/${this.binding.issueId}/interactions/${review.interaction.id}/${input.decision}`, {
       method: "POST", redirect: "error", signal: AbortSignal.timeout(30_000),
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "X-Paperclip-Run-Id": this.binding.runId },
-      body: JSON.stringify(input.decision === "reject" ? { reason } : {}),
+      body: JSON.stringify(reason ? { reason } : {}),
     });
     if (!response.ok) throw new Error(`Review decision was not accepted (${response.status}): ${(await response.text()).slice(0, 2_000)}`);
     return { interactionId: review.interaction.id, status: expectedStatus };
   }
 
   async #reportProgress(input: Record<string, unknown>): Promise<unknown> {
+    const bound = await this.#boundContext();
+    const returnOnly = hasDocumentReturn(bound.run.contextSnapshot);
+    if (returnOnly) {
+      const packet = await readDocumentReturnPacket(this.db, { ...this.binding, contextSnapshot: record(bound.run.contextSnapshot) });
+      if (!packet || packet.state === "rejected") throw forbidden("The fixed document return is not available.");
+      // An already committed return is observed via its real receipt only;
+      // arbitrary new keys/bodies cannot become a second return.
+      const b = await readCurrentDocumentReturnWake(this.db, { ...this.binding, contextSnapshot: record(bound.run.contextSnapshot) });
+      if (!b || input.idempotencyKey !== documentReturnKey(b) || input.body !== documentReturnBody(b) ||
+          Object.keys(input).some(key => !["body","idempotencyKey"].includes(key))) {
+        throw forbidden("Use exactly the saved fixed-document return body and key from get_task_context.");
+      }
+      if (packet.state === "already_returned") return { commentId: packet.commentId, disposition: "already_returned", companyAccepted: false };
+    }
     const body = typeof input.body === "string" ? input.body.trim() : "";
     const idempotencyKey = typeof input.idempotencyKey === "string" ? input.idempotencyKey.trim() : "";
     if (!body || !idempotencyKey) throw new Error("paperclip_runner_tool_input_invalid");
@@ -1153,6 +1200,17 @@ export class PaperclipRunnerToolAuthority {
       idempotencyKey,
       input,
       async (tx, context) => {
+        const returnBinding = returnOnly ? await readCurrentDocumentReturnWake(tx, {
+          ...this.binding, contextSnapshot: record(context.run.contextSnapshot),
+        }) : null;
+        if (returnOnly) {
+          const packet = consumeDocumentReturn({ expected: record(context.run.contextSnapshot).documentReturn,
+            current: returnBinding, delivery: returnBinding ? await readDocumentReturnDelivery(tx,returnBinding,this.binding.runId) : {state:"unknown"},
+            operation:"return",dependenciesReady:false });
+          if (packet.state !== "ready" || packet.body !== body || packet.idempotencyKey !== idempotencyKey) {
+            throw forbidden("Fixed document return changed or already has an outcome.");
+          }
+        }
         const comment = await issueService(tx).addComment(
           this.binding.issueId,
           body,
@@ -1160,7 +1218,10 @@ export class PaperclipRunnerToolAuthority {
           { authorizationReason: "paperclip_runner_protocol" },
           tx,
         );
-        const result = { commentId: comment.id, issueId: this.binding.issueId, disposition: "applied" };
+        const result = { commentId: comment.id, issueId: this.binding.issueId, disposition: "applied",
+          ...(returnBinding ? { documentReturn: returnBinding,
+            documentReturnAck: { commentId: comment.id, binding: returnBinding, scope: "durable_storage_only" },
+            companyAccepted: false } : {}) };
         const activity = await persistActivity(tx, {
           companyId: this.binding.companyId,
           actorType: "agent",
@@ -1192,19 +1253,74 @@ export class PaperclipRunnerToolAuthority {
     const idempotencyKey = requiredString(input.idempotencyKey);
     let publication: Awaited<ReturnType<typeof persistActivity>>["publication"] | null = null;
     const result = await this.#withMutationReceipt("write_document", idempotencyKey, input, async (tx) => {
+      const key = requiredString(input.key);
+      const appending = input.append !== undefined;
+      if (appending && (input.body !== undefined || input.includeDocuments !== undefined ||
+          typeof input.append !== "string" || input.append.length === 0)) {
+        throw new Error("paperclip_runner_document_append_input_invalid");
+      }
+      const references = parseDocumentInclusions(input.includeDocuments, key);
+      const sources: InclusionSource[] = [];
+      // #withMutationReceipt already locks the issue. Migration 0313 makes
+      // linked document/link writes serialize on that row. Do not lock document
+      // rows here: a writer can hold one while its trigger waits for this issue.
+      for (const ref of references ?? []) {
+        const [source] = await tx.select({
+          companyId: documents.companyId, issueId: issueDocuments.issueId,
+          documentId: documents.id, key: issueDocuments.key,
+          revisionId: documentRevisions.id, latestRevisionId: documents.latestRevisionId,
+          revisionNumber: documentRevisions.revisionNumber, body: documentRevisions.body,
+          latestBody: documents.latestBody,
+        }).from(issueDocuments)
+          .innerJoin(documents, eq(documents.id, issueDocuments.documentId))
+          .innerJoin(documentRevisions, eq(documentRevisions.documentId, documents.id))
+          .where(and(
+            eq(issueDocuments.companyId, this.binding.companyId), eq(documents.companyId, this.binding.companyId),
+            eq(documentRevisions.companyId, this.binding.companyId), eq(issueDocuments.issueId, this.binding.issueId),
+            eq(issueDocuments.key, ref.key), eq(documents.id, ref.documentId),
+            eq(documentRevisions.id, ref.revisionId), eq(documents.latestRevisionId, ref.revisionId),
+            sql`octet_length(${documentRevisions.body}) = ${ref.bodyBytes}`,
+          ));
+        if (!source) throw new Error("paperclip_runner_document_inclusion_source_unavailable");
+        sources.push(source);
+      }
+      const composition = references ? composeIncludedDocuments(input.body as string, references,
+        references.map(ref => sources.find(source => source.documentId === ref.documentId)!), this.binding) : undefined;
+      const body = appending ? undefined : composition?.body ?? requiredString(input.body);
       const write = await documentService(tx).upsertIssueDocument({
         issueId: this.binding.issueId,
-        key: requiredString(input.key),
+        key,
         title: requiredString(input.title),
         format: "markdown",
-        body: requiredString(input.body),
-        baseRevisionId: nullableProviderId(input.baseRevisionId),
+        body,
+        ...(appending ? { append: input.append as string } : {}),
+        baseRevisionId: appending ? input.baseRevisionId as string : nullableProviderId(input.baseRevisionId),
         changeSummary: input.changeSummary === null || input.changeSummary === undefined
           ? null
           : requiredString(input.changeSummary),
         createdByAgentId: this.binding.agentId,
         createdByRunId: this.binding.runId,
       });
+      if (composition || appending) {
+        const saved = await documentService(tx).getIssueDocumentByKey(this.binding.issueId, key, {
+          companyId: this.binding.companyId, documentId: write.document.id,
+          revisionId: write.document.latestRevisionId!,
+        });
+        const [revision] = await tx.select({ body: documentRevisions.body }).from(documentRevisions).where(and(
+          eq(documentRevisions.companyId, this.binding.companyId), eq(documentRevisions.documentId, write.document.id),
+          eq(documentRevisions.id, write.document.latestRevisionId!),
+        ));
+        assertIncludedDocumentReadback(write.document.body, saved?.body);
+        assertIncludedDocumentReadback(write.document.body, revision?.body);
+      }
+      const appendDigest = appending ? await documentService(tx).getIssueDocumentRevisionDigest({
+        companyId: this.binding.companyId, issueId: this.binding.issueId, key,
+        revisionId: write.document.latestRevisionId!,
+      }) : null;
+      if (appending && (!appendDigest || appendDigest.bodySha256 !==
+          createHash("sha256").update(write.document.body, "utf8").digest("hex"))) {
+        throw new Error("paperclip_runner_document_append_readback_mismatch");
+      }
       const activity = await persistActivity(tx, {
         companyId: this.binding.companyId,
         actorType: "agent",
@@ -1233,6 +1349,11 @@ export class PaperclipRunnerToolAuthority {
         disposition: "applied",
         created: write.created,
         document: write.document,
+        ...(appendDigest ? { appendReceipt: { version: 1, mode: "append", baseRevisionId: input.baseRevisionId,
+          appendedBytes: Buffer.byteLength(input.append as string, "utf8"), ...appendDigest } } : {}),
+        ...(composition ? { inclusionReceipt: { ...composition.manifest,
+          bodyBytes: composition.bodyBytes, bodySha256: composition.bodySha256,
+          documentId: write.document.id, revisionId: write.document.latestRevisionId } } : {}),
         documentHref: `/${encodeURIComponent(target.issuePrefix)}/issues/${encodeURIComponent(target.identifier ?? this.binding.issueId)}#document-${encodeURIComponent(write.document.key)}`,
       };
     });
@@ -1471,7 +1592,11 @@ export class PaperclipRunnerToolAuthority {
         } });
         if (!decision.allowed) throw forbidden(decision.explanation);
       }
-      await assertAssignableAgent(tx, this.binding.companyId, assigneeAgentId, { kind: "work" });
+      // Consume the persisted work contract before cancellation and again under
+      // the final row lock, using the proposed executor without changing its brief.
+      await assertAssignableAgent(tx, this.binding.companyId, assigneeAgentId, {
+        kind: "work", work: { ...target, assigneeAgentId },
+      });
       const [externalChat] = await tx.select({ id: chatConversations.id }).from(chatConversations).where(and(
         eq(chatConversations.companyId, this.binding.companyId), eq(chatConversations.issueId, taskId),
       )).limit(1);
@@ -2148,6 +2273,8 @@ export class PaperclipRunnerToolAuthority {
   }
 
   async #requestHumanInput(input: Record<string, unknown>, identityContextId: string | null): Promise<unknown> {
+    if (input.operation === "withdraw") return this.#withdrawDocumentConfirmation(input);
+    if (input.operation !== undefined && input.operation !== "create") throw badRequest("Unknown interaction operation");
     const interactionKind = requiredString(input.interactionKind);
     const interactionKinds = {
       confirmation: "request_confirmation",
@@ -2279,6 +2406,83 @@ export class PaperclipRunnerToolAuthority {
         creatorAgentId: this.binding.agentId, interactionId: requiredString(interaction.id),
       }, this.binding.enqueueWakeup!);
     }
+    return result;
+  }
+
+  async #withdrawDocumentConfirmation(input: Record<string, unknown>): Promise<unknown> {
+    if (Object.keys(input).some(key => !["operation", "interactionId", "idempotencyKey", "reason", "payload"].includes(key))) {
+      throw badRequest("Withdrawal accepts only the existing interaction and fixed document target");
+    }
+    const interactionId = requiredUuid(input.interactionId);
+    const idempotencyKey = requiredString(input.idempotencyKey);
+    const reason = requiredString(input.reason);
+    const payload = record(input.payload), expected = record(payload.target);
+    if (idempotencyKey.length > 240 || reason.length > 4000 || Object.keys(payload).some(key => key !== "target")
+      || expected.type !== "issue_document" || expected.issueId !== this.binding.issueId
+      || expected.key === "plan") throw badRequest("Withdrawal requires the same fixed business-document target");
+    const documentId = requiredUuid(expected.documentId), revisionId = requiredUuid(expected.revisionId);
+    const key = requiredString(expected.key);
+    let publication: Awaited<ReturnType<typeof persistActivity>>["publication"] | null = null;
+    let effectAttempted = false;
+    const authorize = async (tx: Db, context: { issue: typeof issues.$inferSelect }, replay = false) => {
+      // This is a strict subset of the ordinary withdraw route: the current
+      // task executor must also be this request's original creator. The shared
+      // mutation gate rechecks active native run/company/assignee authority.
+      if (context.issue.workMode !== "standard" || (context.issue.reviewPolicy != null && context.issue.reviewPolicy !== "anyone")) {
+        throw forbidden("Governed review withdrawal requires its original authorized workflow");
+      }
+      const current = await issueThreadInteractionService(tx).getForIssue(context.issue, interactionId);
+      const target = record(record(current.payload).target);
+      if (current.createdByAgentId !== this.binding.agentId || current.kind !== "request_confirmation"
+        || !current.addresseeAgentId || current.effectiveResolverPolicy === "human_only"
+        || record(current.payload).toolAction !== undefined || record(current.payload).secretProposal !== undefined) {
+        throw forbidden("Only the original creator may withdraw this pending named document confirmation");
+      }
+      if (target.type !== "issue_document" || target.issueId !== this.binding.issueId
+        || target.documentId !== documentId || target.key !== key || target.revisionId !== revisionId) {
+        throw conflict("The interaction's fixed document target differs from the withdrawal request");
+      }
+      if (!replay && current.status !== "pending") throw conflict("The interaction is no longer pending");
+      // Serialize against ordinary document writers as well as the task/run
+      // lock, so a new revision cannot slip between the check and withdrawal.
+      await tx.select({ id: documents.id }).from(documents).where(and(
+        eq(documents.id, documentId), eq(documents.companyId, this.binding.companyId),
+      )).for("update");
+      const document = await documentService(tx).getIssueDocumentByKey(this.binding.issueId, key);
+      if (!document || document.id !== documentId || document.latestRevisionId !== revisionId) {
+        throw conflict("The fixed document revision changed before withdrawal");
+      }
+      return current;
+    };
+    let result: unknown;
+    try {
+      result = await this.#withMutationReceipt("request_human_input", idempotencyKey, input, async (tx, context) => {
+      await authorize(tx, context);
+      // Keep the existing service's pending CAS, linked-action protection and
+      // original administrative outcome. No answer or wake is synthesized.
+      effectAttempted = true;
+      const interaction = await issueThreadInteractionService(tx).withdrawInteraction(context.issue, interactionId,
+        { reason }, { agentId: this.binding.agentId, runId: this.binding.runId, userId: null });
+      const activity = await persistActivity(tx, {
+        companyId: this.binding.companyId, actorType: "agent", actorId: this.binding.agentId,
+        agentId: this.binding.agentId, runId: this.binding.runId, issueId: this.binding.issueId,
+        action: "issue.thread_interaction_withdrawn", entityType: "issue", entityId: this.binding.issueId,
+        details: { interactionId: interaction.id, interactionKind: interaction.kind,
+          interactionStatus: interaction.status, reason, source: "paperclip_runner_protocol" },
+      });
+      publication = activity.publication;
+      return { interaction, disposition: "applied" };
+      }, { beforeReceiptReplay: async (tx, context) => { await authorize(tx, context, true); } });
+    } catch (error) {
+      if (effectAttempted && !(error instanceof HttpError)) {
+        throw new SemanticToolOutcomeUnknownError(
+          `paperclip_runner_interaction_withdrawal_outcome_unknown interaction_id=${interactionId}; inspect the original interaction and semantic receipt; do not resend`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+    if (publication) publishActivity(publication);
     return result;
   }
 }

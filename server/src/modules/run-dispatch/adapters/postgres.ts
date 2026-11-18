@@ -1,3 +1,6 @@
+import { assignmentWorkCompatibility, type AssignmentWorkBlock } from "../../../services/agent-assignability.js";
+import { issueRecoveryActionService } from "../../../services/issue-recovery-actions.js";
+import {hasDocumentReturn,readCurrentDocumentReturnWake} from "../../../services/document-return-wake.js";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { readCurrentPendingDocumentReviewWake, hasPendingDocumentReviewAdmission } from "../../../services/pending-document-review-wake.js";
 import { getExecutionBlocker, isIndependentQaDocumentEpisode } from "../../../services/execution-blocker.js";
@@ -339,6 +342,9 @@ export function createPostgresRunDispatchAdapter(
         assigneeUserId: issues.assigneeUserId,
         executionRunId: issues.executionRunId,
         checkoutRunId: issues.checkoutRunId,
+        title: issues.title,
+        description: issues.description,
+        assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
         monitorNextCheckAt: issues.monitorNextCheckAt,
@@ -440,6 +446,9 @@ export function createPostgresRunDispatchAdapter(
           }
         : null;
 
+    const workCompatibility = assignmentWorkCompatibility({ issue, agent });
+    facts.assignmentWorkBlock = workCompatibility.kind === "blocked" ? workCompatibility.block : null;
+
     return { agentFound: true, facts };
   }
 
@@ -516,6 +525,10 @@ export function createPostgresRunDispatchAdapter(
     const issueQuery = dbOrTx
       .select({
         id: issues.id,
+        companyId: issues.companyId,
+        title: issues.title,
+        description: issues.description,
+        assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
         executionRunId: issues.executionRunId,
@@ -527,6 +540,21 @@ export function createPostgresRunDispatchAdapter(
     const issue = await (tx ? issueQuery.for("update") : issueQuery).then(
       (rows) => rows[0] ?? null,
     );
+
+    let assignmentWorkBlock: AssignmentWorkBlock | null = null;
+    // Per-assignee work applies only to that executor. Fixed-return requests are
+    // validated by readCurrentDocumentReturnWake before any gate can admit them;
+    // that server-owned operation does not invoke the research adapter.
+    // No explicit contract means no extra capability read and no new gate.
+    if (issue && issue.assigneeAgentId === input.agentId && !hasDocumentReturn(context) && Object.hasOwn(parseObject(parseObject(issue.assigneeAdapterOverrides).adapterConfig), "paperclipWorkRequirements")) {
+      const agent = await dbOrTx.select().from(agents).where(and(
+        eq(agents.id, input.agentId), eq(agents.companyId, input.companyId),
+      )).then(rows => rows[0] ?? null);
+      if (agent) {
+        const compatibility = assignmentWorkCompatibility({ issue, agent });
+        assignmentWorkBlock = compatibility.kind === "blocked" ? compatibility.block : null;
+      }
+    }
 
     const wakeCommentId = deriveCommentId(context);
     const pendingDocumentReviewAuthority = await readCurrentPendingDocumentReviewWake(dbOrTx, {
@@ -598,6 +626,7 @@ export function createPostgresRunDispatchAdapter(
       runAgentId: input.agentId,
       issueId,
       retryReasonKind,
+      assignmentWorkBlock,
       dependenciesBlocked: readiness && !readiness.isDependencyReady ? {
         unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
         unresolvedBlockerCount: readiness.unresolvedBlockerCount,
@@ -678,11 +707,40 @@ export function createPostgresRunDispatchAdapter(
     return { applied: true as const, run: row, postCommitEffects: [queuedEffect(row)] };
   }
 
+  async function recordAssignmentWorkBlockInTx(
+    tx: Db, run: HeartbeatRun, issueId: string | null, block: { errorCode: string; reason: string; details: Record<string, unknown> },
+  ) {
+    if (!issueId || !["assignment_work_contract_invalid", "agent_work_requirements_unavailable"].includes(block.errorCode)) return run;
+    const actions = issueRecoveryActionService(tx);
+    const action = await actions.upsertSourceScoped({
+      preserveExistingAction: true,
+      companyId: run.companyId, sourceIssueId: issueId,
+      kind: "configuration_validation", cause: "configuration_incomplete",
+      fingerprint: `source_scoped_recovery:${run.companyId}:${issueId}:assignment_work_requirements`,
+      ownerType: "board", ownerAgentId: null, ownerUserId: null,
+      previousOwnerAgentId: run.agentId, returnOwnerAgentId: run.agentId,
+      evidence: { sourceRunId: run.id, assignmentWorkRequirements: block.details,
+        routingPolicy: "board_escalation_no_takeover_v1" },
+      nextAction: block.reason,
+      wakePolicy: { type: "board_escalation", reason: block.errorCode, preservesSourceAssignee: true },
+      monitorPolicy: null, attemptCount: 0, maxAttempts: null,
+    });
+    // Existing UNKNOWN/retry actions retain their exact identity, owner, budget
+    // and resolution. The refused run records the new observation separately.
+    const [updated] = await tx.update(heartbeatRuns).set({ resultJson: {
+      ...parseObject(run.resultJson), assignmentWorkRequirementsBlock: {
+        errorCode: block.errorCode, ...block.details, recoveryActionId: action.id,
+      },
+    } }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.status, "cancelled"))).returning();
+    if (!updated) throw new Error("Assignment refusal receipt lost its cancelled run");
+    return updated;
+  }
+
   async function cancelSuppressedRetryInTx(
     tx: Db,
     input: CancelSuppressedRetryInput,
   ): Promise<CancelSuppressedRetryResult> {
-    const [row] = await tx
+    let [row] = await tx
       .update(heartbeatRuns)
       .set({
         status: "cancelled",
@@ -720,6 +778,8 @@ export function createPostgresRunDispatchAdapter(
       )
       .returning();
     if (!row) return { applied: false };
+
+    row = await recordAssignmentWorkBlockInTx(tx, row, input.issueId, input);
 
     if (row.wakeupRequestId) {
       await tx
@@ -895,7 +955,7 @@ export function createPostgresRunDispatchAdapter(
     expectedStatus: "queued" | "running",
     now: Date,
   ): Promise<CancelStaleQueuedRunOutcome> {
-      const [row] = await tx
+      let [row] = await tx
         .update(heartbeatRuns)
         .set({
           status: "cancelled",
@@ -927,6 +987,8 @@ export function createPostgresRunDispatchAdapter(
       // `expectedStatus`: the caller's staleness decision lost the race, so
       // this write must not overwrite whatever status won it.
       if (!row) return { outcome: "lost_race" };
+
+      row = await recordAssignmentWorkBlockInTx(tx, row, issueId, decision);
 
       if (row.wakeupRequestId) {
         await tx
@@ -1001,6 +1063,12 @@ export function createPostgresRunDispatchAdapter(
       now,
       tx,
     );
+    if (hasDocumentReturn(contextSnapshot) && !await readCurrentDocumentReturnWake(tx,{
+      phase:run.status === "queued" ? "claim" : "server",companyId:run.companyId,issueId,
+      agentId:run.agentId,runId:run.id,contextSnapshot})) {
+      return {issueId,facts,decision:{stale:true as const,errorCode:"interaction_review_stale" as const,
+        reason:"Fixed document return is no longer current",details:{issueId}}};
+    }
     const recordedReview = readNonEmptyString(parseObject(parseObject(run.runnerProfileJson).pendingDocumentReviewAdmission).interactionId);
     if (hasPendingDocumentReviewAdmission(run.runnerProfileJson) && (!facts.pendingDocumentReview ||
         recordedReview !== readNonEmptyString(contextSnapshot.interactionId))) {

@@ -316,7 +316,14 @@ describe("Codex app-server Codex driver", () => {
         expect.objectContaining({ name: "get_task_context" }),
       ]),
     );
+    const metadata = {
+      callId: "call-context", operationId: "get_task_context",
+      sourceEventId: "runner:run-tools:93", sourceEventType: "semantic_tool.input",
+      inputDigest: "a".repeat(64),
+      correlation: { runId: "run-tools", normalizedSessionId: "normalized-tools", turnId: "turn-1", itemId: "item-tools" },
+    };
     const response = await transport.invoke({
+      paperclipTrace: { sourceEventId: metadata.sourceEventId, sourceEventType: metadata.sourceEventType, nativeToolExecution: metadata },
       id: "rpc-tool",
       method: "item/tool/call",
       params: {
@@ -340,8 +347,16 @@ describe("Codex app-server Codex driver", () => {
         tool: "get_task_context",
         callId: "call-context",
         arguments: {},
+        nativeToolExecution: metadata,
       }),
     );
+    expect(handler.mock.calls[0]?.[0].nativeToolExecution).toBe(metadata);
+    await transport.invoke({
+      id: "rpc-provider-params", method: "item/tool/call",
+      params: { threadId: "thread-1", turnId: "turn-1", callId: "provider-params", tool: "get_task_context", arguments: { nativeToolExecution: metadata }, nativeToolExecution: metadata },
+    });
+    expect(handler.mock.calls[1]?.[0]).not.toHaveProperty("nativeToolExecution");
+    expect(handler.mock.calls[1]?.[0].arguments).toEqual({ nativeToolExecution: metadata });
   });
 
   it("fails closed when an agent message changes a tool-committed result", async () => {

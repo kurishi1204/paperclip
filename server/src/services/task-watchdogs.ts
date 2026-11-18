@@ -1,3 +1,4 @@
+import { collectDocumentReturnSupervision } from "./document-return-wake.js";
 import { createHash } from "node:crypto";
 import { and, asc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -18,9 +19,10 @@ import {
 import type { IssueWatchdog, IssueWatchdogSummary } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import { parseObject } from "../adapters/utils.js";
-import { logActivity } from "./activity-log.js";
+import { logger } from "../middleware/logger.js";
+import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
-import { issueService } from "./issues.js";
+import { issueService, executeIssuePostCommitActions, type IssuePostCommitAction } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { TASK_WATCHDOG_ORIGIN_KIND } from "./task-watchdog-scope.js";
 
@@ -858,7 +860,7 @@ export async function upsertIssueWatchdogForIssue(
 }
 
 export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) {
-  const issuesSvc = issueService(db);
+
 
   async function loadWatchdogSubtreeIssues(companyId: string, watchedIssueId: string) {
     const rows = await db.execute(sql`
@@ -1163,8 +1165,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     return [...completed];
   }
 
-  async function findTaskWatchdogIssue(companyId: string, watchedIssueId: string) {
-    return db
+  async function findTaskWatchdogIssue(companyId: string, watchedIssueId: string, reader: Db = db) {
+    return reader
       .select()
       .from(issues)
       .where(and(
@@ -1233,15 +1235,15 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     return true;
   }
 
-  async function watchdogIssueNeedsFreshWake(watchdogIssue: IssueRow) {
+  async function watchdogIssueNeedsFreshWake(watchdogIssue: IssueRow, reader: Db = db) {
     if (watchdogIssue.status !== "in_review") return false;
-    const hasPendingReviewPath = await watchdogIssueHasPendingReviewPath(watchdogIssue.companyId, watchdogIssue.id);
+    const hasPendingReviewPath = await watchdogIssueHasPendingReviewPath(watchdogIssue.companyId, watchdogIssue.id, reader);
     return !isWatchdogReviewDisposition(watchdogIssue, hasPendingReviewPath);
   }
 
-  async function watchdogIssueHasPendingReviewPath(companyId: string, issueId: string) {
+  async function watchdogIssueHasPendingReviewPath(companyId: string, issueId: string, reader: Db = db) {
     const [interaction, approval] = await Promise.all([
-      db
+      reader
         .select({ id: issueThreadInteractions.id })
         .from(issueThreadInteractions)
         .where(and(
@@ -1251,7 +1253,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         ))
         .limit(1)
         .then((rows) => rows[0] ?? null),
-      db
+      reader
         .select({ id: approvals.id })
         .from(issueApprovals)
         .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
@@ -1325,7 +1327,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     sourceIssue: IssueRow;
     classification: Extract<TaskWatchdogClassifierResult, { state: "stopped" }>;
     runId?: string | null;
-  }) {
+  }, db: Db, publications: ActivityPublication[], actions: IssuePostCommitAction[]) {
+    const issuesSvc = issueService(db);
     const existing = input.watchdog.watchdogIssueId
       ? await db
         .select()
@@ -1337,12 +1340,12 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         ))
         .then((rows) => rows[0] ?? null)
       : null;
-    const fallback = existing ?? await findTaskWatchdogIssue(input.watchdog.companyId, input.sourceIssue.id);
+    const fallback = existing ?? await findTaskWatchdogIssue(input.watchdog.companyId, input.sourceIssue.id, db);
 
     if (fallback) {
       const shouldReopen = isTerminalIssueStatus(fallback.status) ||
         fallback.status === "backlog" ||
-        await watchdogIssueNeedsFreshWake(fallback);
+        await watchdogIssueNeedsFreshWake(fallback, db);
       const watchdogIssue = shouldReopen
         ? await issuesSvc.update(fallback.id, {
           status: "todo",
@@ -1352,7 +1355,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           goalId: input.sourceIssue.goalId,
           billingCode: input.sourceIssue.billingCode,
           originFingerprint: input.classification.stopFingerprint,
-        }) ?? fallback
+        }, db, publications, actions) ?? fallback
         : fallback;
       if (!shouldReopen && watchdogIssue.originFingerprint !== input.classification.stopFingerprint) {
         await db
@@ -1408,7 +1411,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       })
       .catch(async (error: unknown) => {
         if (!isActiveTaskWatchdogUniqueConflict(error)) throw error;
-        const winner = await findTaskWatchdogIssue(input.watchdog.companyId, input.sourceIssue.id);
+        const winner = await findTaskWatchdogIssue(input.watchdog.companyId, input.sourceIssue.id, db);
         if (!winner) throw error;
         return winner;
       });
@@ -1502,69 +1505,209 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       };
     }
 
-    const watchdogIssue = await ensureReusableWatchdogIssue({
-      watchdog,
-      sourceIssue,
-      classification,
-      runId: opts.runId ?? null,
+    // Finish supplemental observation and publish any failure before the first
+    // durable trigger/review write. A failed read cannot strand a saved trigger
+    // before enqueue. Existing open/unknown handoffs above remain non-replayable.
+    const documentReturnSupervision = await collectDocumentReturnSupervision(db,
+      classification.stoppedLeaves
+        .filter(leaf => leaf.assigneeAgentId !== null)
+        .map(leaf => ({ companyId: watchdog.companyId, issueId: leaf.issueId, agentId: leaf.assigneeAgentId! })),
+    );
+    const documentReturnFollowthrough = documentReturnSupervision.observations.map(observation => {
+      if (observation.state === "readable" && observation.assessment) return observation.assessment;
+      if (observation.state !== "unreadable") throw new Error("Unexpected document-return handoff observation");
+      return {
+        schema: "paperclip.document-return-unreadable.v1" as const,
+        companyId: observation.companyId,
+        issueId: observation.issueId,
+        authorizesEffect: false as const,
+        mayResend: false as const,
+      };
     });
-    const now = new Date();
-    await db
-      .update(issueWatchdogs)
-      .set({
-        watchdogIssueId: watchdogIssue.id,
-        lastObservedFingerprint: classification.stopFingerprint,
-        lastObservedStopSnapshot: classification.stopSnapshot,
-        lastTriggeredAt: now,
-        triggerCount: sql`${issueWatchdogs.triggerCount} + 1`,
-        updatedAt: now,
-      })
-      .where(eq(issueWatchdogs.id, watchdog.id));
+    if (documentReturnSupervision.attentionRequired) {
+      logger.warn({ documentReturnSupervision },
+        "document-return supervision requires attention; read-only, no retry authority");
+    }
 
-    await logActivity(db, {
-      companyId: sourceIssue.companyId,
-      actorType: "system",
-      actorId: "system",
-      agentId: watchdog.watchdogAgentId,
-      runId: opts.runId ?? null,
-      action: "issue.task_watchdog_triggered",
-      entityType: "issue",
-      entityId: sourceIssue.id,
-      details: {
-        source: "task_watchdogs.evaluate",
-        watchdogId: watchdog.id,
-        watchdogIssueId: watchdogIssue.id,
-        stopFingerprint: classification.stopFingerprint,
-        stopSnapshot: classification.stopSnapshot,
-        stoppedLeaves: classification.stoppedLeaves,
-      },
+    // The row fence, review/trigger and delivery intent are one transaction.
+    // A process loss before commit leaves no new trigger; after commit the
+    // existing reconciler can deliver the pending intent without inventing one
+    // for legacy fingerprints or historical UNKNOWN rows.
+    const publications: ActivityPublication[] = [];
+    const actions: IssuePostCommitAction[] = [];
+    const saved = await db.transaction(async tx => {
+      const [current] = await tx.select().from(issueWatchdogs).where(and(
+        eq(issueWatchdogs.id, watchdog.id), eq(issueWatchdogs.companyId, watchdog.companyId),
+      )).for("update");
+      if (!current || current.status !== "active" || current.watchdogAgentId !== watchdog.watchdogAgentId ||
+          current.issueId !== watchdog.issueId ||
+          current.lastTriggeredAt?.getTime() !== watchdog.lastTriggeredAt?.getTime()) return null;
+      const key = taskWatchdogWakeIdempotencyKey(watchdog.id, classification.stopFingerprint);
+      const prior = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, watchdog.companyId),
+        eq(agentWakeupRequests.idempotencyKey, key),
+      )).limit(1);
+      if (prior.length) return null; // Never reconstruct/replay an old delivery.
+      const watchdogIssue = await ensureReusableWatchdogIssue({
+        watchdog: current, sourceIssue, classification, runId: opts.runId ?? null,
+      }, tx as unknown as Db, publications, actions);
+      const context = {...watchdogWakeContext({watchdog: current, watchdogIssue, sourceIssue, classification})};
+      Object.assign(context.taskWatchdog, {documentReturnFollowthrough});
+      const now = new Date();
+      await tx.update(issueWatchdogs).set({
+        watchdogIssueId: watchdogIssue.id, lastObservedFingerprint: classification.stopFingerprint,
+        lastObservedStopSnapshot: classification.stopSnapshot, lastTriggeredAt: now,
+        triggerCount: sql`${issueWatchdogs.triggerCount} + 1`, updatedAt: now,
+      }).where(eq(issueWatchdogs.id, watchdog.id));
+      const [intent] = await tx.insert(agentWakeupRequests).values({
+        companyId: watchdog.companyId, agentId: watchdog.watchdogAgentId,
+        source: "automation", triggerDetail: "system", reason: "task_watchdog_stopped_subtree",
+        payload: {...context, _watchdogHandoff: {version: 1, watchdogId: watchdog.id,
+          watchedIssueId: sourceIssue.id, fingerprint: classification.stopFingerprint}},
+        status: "watchdog_pending", requestedByActorType: "system",
+        requestedByActorId: "task-watchdog-outbox-v1", idempotencyKey: key,
+      }).returning();
+      await logActivity(tx as unknown as Db, {
+        companyId: sourceIssue.companyId, actorType: "system", actorId: "system",
+        agentId: watchdog.watchdogAgentId, runId: opts.runId ?? null,
+        action: "issue.task_watchdog_triggered", entityType: "issue", entityId: sourceIssue.id,
+        details: {source: "task_watchdogs.evaluate", watchdogId: watchdog.id,
+          watchdogIssueId: watchdogIssue.id, stopFingerprint: classification.stopFingerprint,
+          stopSnapshot: classification.stopSnapshot, stoppedLeaves: classification.stoppedLeaves,
+          handoffRequestId: intent.id},
+      }, publications);
+      return {watchdogIssue, intent};
     });
+    if (!saved) return {state: "watchdog_review_open" as const, classification,
+      watchdogIssueId: existingWatchdogIssueId ?? watchdog.issueId};
+    for (const publication of publications) publishActivity(publication);
+    await executeIssuePostCommitActions(db, actions);
+    const delivery = await dispatchWatchdogHandoffs(watchdog.companyId, saved.intent.id);
+    return {state: "triggered" as const, classification, watchdogIssueId: saved.watchdogIssue.id,
+      wakeupRunId: delivery[0]?.runId ?? null};
+  }
 
-    const context = watchdogWakeContext({
-      watchdog,
-      watchdogIssue,
-      sourceIssue,
-      classification,
-    });
-    const wake = deps.enqueueWakeup
-      ? await deps.enqueueWakeup(watchdog.watchdogAgentId, {
-        source: "automation",
-        triggerDetail: "system",
-        reason: "task_watchdog_stopped_subtree",
-        payload: context,
-        contextSnapshot: context,
-        idempotencyKey: taskWatchdogWakeIdempotencyKey(watchdog.id, classification.stopFingerprint),
-        requestedByActorType: "system",
-        requestedByActorId: null,
-      })
-      : null;
-
-    return {
-      state: "triggered" as const,
-      classification,
-      watchdogIssueId: watchdogIssue.id,
-      wakeupRunId: wake?.id ?? null,
-    };
+  /** Only new, atomically saved intents enter this dispatcher. Claim is a
+   * one-way CAS: neither age nor a missing receipt grants another invocation.
+   * A crash/throw after claim stays UNKNOWN; an exact committed receipt may be
+   * linked on a later sweep, but its effect is never sent again. */
+  async function dispatchWatchdogHandoffs(companyId?: string | null, requestId?: string) {
+    if (!deps.enqueueWakeup) return [];
+    const rows = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.requestedByActorType, "system"),
+      eq(agentWakeupRequests.requestedByActorId, "task-watchdog-outbox-v1"),
+      inArray(agentWakeupRequests.status, ["watchdog_pending", "watchdog_dispatching", "watchdog_unknown", "watchdog_accepted"]),
+      companyId ? eq(agentWakeupRequests.companyId, companyId) : undefined,
+      requestId ? eq(agentWakeupRequests.id, requestId) : undefined,
+    )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id));
+    const observations: Array<{requestId: string; state: string; runId: string | null}> = [];
+    for (const candidate of rows) {
+      const actor = `task-watchdog-delivery:${candidate.id}`;
+      const payload = parseObject(candidate.payload);
+      const binding = parseObject(payload._watchdogHandoff);
+      if (typeof payload.issueId !== "string" || binding.version !== 1 || typeof binding.watchdogId !== "string" ||
+          typeof binding.watchedIssueId !== "string" || typeof binding.fingerprint !== "string" ||
+          candidate.idempotencyKey !== taskWatchdogWakeIdempotencyKey(binding.watchdogId, binding.fingerprint)) {
+        throw new Error("Invalid persisted watchdog handoff binding");
+      }
+      let current = candidate;
+      if (candidate.status === "watchdog_pending") {
+        // Serialize claim with disable/reassignment and other evaluations.
+        const claimed = await db.transaction(async tx => {
+          const [watchdog] = await tx.select().from(issueWatchdogs).where(and(
+            eq(issueWatchdogs.id, binding.watchdogId as string),
+            eq(issueWatchdogs.companyId, candidate.companyId),
+          )).for("update");
+          const heldReason = !watchdog ? "watchdog_missing" : watchdog.status !== "active" ? "watchdog_disabled"
+            : watchdog.watchdogAgentId !== candidate.agentId ? "watchdog_owner_changed"
+              : watchdog.issueId !== binding.watchedIssueId || watchdog.lastObservedFingerprint !== binding.fingerprint
+                ? "watchdog_binding_changed" : null;
+          if (heldReason) {
+            await tx.update(agentWakeupRequests).set({error: heldReason, updatedAt: new Date()}).where(and(
+              eq(agentWakeupRequests.id, candidate.id), eq(agentWakeupRequests.status, "watchdog_pending"),
+            ));
+            return {kind: "held" as const, reason: heldReason};
+          }
+          const [claim] = await tx.update(agentWakeupRequests).set({status: "watchdog_dispatching",
+            claimedAt: new Date(), updatedAt: new Date()}).where(and(
+            eq(agentWakeupRequests.id, candidate.id), eq(agentWakeupRequests.companyId, candidate.companyId),
+            eq(agentWakeupRequests.status, "watchdog_pending"), isNull(agentWakeupRequests.runId),
+          )).returning();
+          return claim ? {kind: "claimed" as const, claim} : {kind: "claimed_elsewhere" as const};
+        });
+        if (claimed.kind !== "claimed") {
+          const observation = {requestId: candidate.id,
+            state: claimed.kind === "held" ? `held:${claimed.reason}` : "claimed_elsewhere", runId: null};
+          // Routes discard the reconcile result and periodic callers log only
+          // new triggers. Publish here so restored pending work has an outlet.
+          if (claimed.kind === "held") logger.warn({handoff: observation, mayResend: false}, "watchdog handoff held");
+          else logger.info({handoff: observation, mayResend: false}, "watchdog handoff owned by another claim");
+          observations.push(observation);
+          continue;
+        }
+        current = claimed.claim;
+        const {_watchdogHandoff: _binding, ...context} = payload;
+        try {
+          await deps.enqueueWakeup(candidate.agentId, {source: "automation", triggerDetail: "system",
+            reason: candidate.reason, payload: context, contextSnapshot: context,
+            idempotencyKey: candidate.idempotencyKey, requestedByActorType: "system", requestedByActorId: actor});
+        } catch (error) {
+          // The durable claim already prohibits retry. A secondary persistence
+          // or logging failure must not replace the original admission error.
+          let outcomeRecordError: unknown;
+          try {
+            await db.update(agentWakeupRequests).set({status: "watchdog_unknown",
+              error: "watchdog_delivery_outcome_unknown", updatedAt: new Date()}).where(and(
+              eq(agentWakeupRequests.id, candidate.id), eq(agentWakeupRequests.status, "watchdog_dispatching"),
+            ));
+          } catch (recordError) {
+            outcomeRecordError = recordError;
+          }
+          try {
+            logger.warn({err: error, outcomeRecordError, handoffRequestId: candidate.id,
+              state: "outcome_unknown", mayResend: false},
+              "watchdog handoff requires attention; original delivery is not retried");
+          } finally {
+            // Even an unavailable warning outlet leaves the caller failed with
+            // the exact original result; no failure is converted to success.
+            throw error;
+          }
+        }
+      }
+      const receipts = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, current.companyId), eq(agentWakeupRequests.agentId, current.agentId),
+        eq(agentWakeupRequests.requestedByActorType, "system"), eq(agentWakeupRequests.requestedByActorId, actor),
+        eq(agentWakeupRequests.idempotencyKey, current.idempotencyKey!),
+      )).limit(2);
+      const receipt = receipts.length === 1 ? receipts[0] : null;
+      if (!receipt || parseObject(receipt.payload).issueId !== payload.issueId) {
+        observations.push({requestId: current.id, state: "outcome_unknown", runId: null});
+        logger.warn({handoffRequestId: current.id, state: "outcome_unknown", mayResend: false},
+          "watchdog handoff requires attention; receipt missing or ambiguous");
+        continue;
+      }
+      const [run] = receipt.runId ? await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, receipt.runId), eq(heartbeatRuns.companyId, current.companyId),
+        eq(heartbeatRuns.agentId, current.agentId),
+      )).limit(1) : [];
+      const state = receipt.runId && !run ? "outcome_unknown" : run?.status === "running" ? "running"
+        : run && TASK_WATCHDOG_TERMINAL_RUN_STATUSES.includes(run.status as typeof TASK_WATCHDOG_TERMINAL_RUN_STATUSES[number])
+          ? `finished:${run.status}` : run && !TASK_WATCHDOG_LIVE_RUN_STATUSES.includes(run.status as typeof TASK_WATCHDOG_LIVE_RUN_STATUSES[number])
+            ? "outcome_unknown" : ["skipped", "failed", "cancelled"].includes(receipt.status)
+              ? `held:${receipt.status}` : `accepted:${receipt.status}`;
+      await db.update(agentWakeupRequests).set({status: state.startsWith("finished:") ? "watchdog_finished" : "watchdog_accepted",
+        runId: receipt.runId, updatedAt: new Date(), error: state === "outcome_unknown" ? state : null,
+      }).where(and(eq(agentWakeupRequests.id, current.id),
+        inArray(agentWakeupRequests.status, ["watchdog_dispatching", "watchdog_unknown", "watchdog_accepted"])));
+      const observation = {requestId: current.id, state, runId: receipt.runId};
+      if (state === "outcome_unknown" || state.startsWith("held:")) {
+        logger.warn({handoff: observation, mayResend: false}, "watchdog handoff requires attention");
+      } else {
+        logger.info({handoff: observation, mayResend: false}, "watchdog handoff receipt observed");
+      }
+      observations.push(observation);
+    }
+    return observations;
   }
 
   async function listActiveWatchdogsForCompany(companyId?: string | null) {
@@ -1727,6 +1870,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       runId?: string | null;
       issueCreatedAtGte?: Date | null;
     } = {}) => {
+      const handoffDelivery = await dispatchWatchdogHandoffs(opts.companyId);
       let rows = await listActiveWatchdogsForCompany(opts.companyId ?? null);
       if (opts.issueCreatedAtGte) {
         const watchdogIssueIds = [...new Set(rows.map((row) => row.issueId))];
@@ -1744,7 +1888,39 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         );
         rows = rows.filter((row) => eligibleIssueIds.has(row.issueId));
       }
+      // Assess every already-watched issue, including live/reviewed branches.
+      // No classifier, wake admission, watchdog setting or fingerprint changes.
+      const followthroughTargets = [];
+      const unreadableTargets: Array<{ companyId: string; issueId: string; state: "unreadable" }> = [];
+      for (const row of rows) {
+        let subtree: Awaited<ReturnType<typeof loadWatchdogSubtreeIssues>>;
+        try {
+          subtree = await loadWatchdogSubtreeIssues(row.companyId, row.issueId);
+        } catch {
+          // Enumeration is part of read-only supervision, not admission for the
+          // original reconciliation. Publish the failure before evaluating rows.
+          unreadableTargets.push({ companyId: row.companyId, issueId: row.issueId, state: "unreadable" });
+          continue;
+        }
+        for (const issue of subtree) {
+          followthroughTargets.push({ companyId: row.companyId, issueId: issue.id, agentId: issue.assigneeAgentId });
+        }
+      }
+      const documentReturnSupervision = await collectDocumentReturnSupervision(db, followthroughTargets);
+      if (unreadableTargets.length > 0) {
+        documentReturnSupervision.observations.push(...unreadableTargets);
+        documentReturnSupervision.attentionRequired = true;
+        documentReturnSupervision.coverage = "configured_watchdog_scope_only";
+      }
+      // Publish before effectful reconciliation: a later failure must not erase
+      // the read-only assessment. Original errors still propagate unchanged.
+      if (documentReturnSupervision.attentionRequired) {
+        logger.warn({ documentReturnSupervision },
+          "document-return supervision requires attention; read-only, no retry authority");
+      }
       const result = {
+        documentReturnSupervision,
+        handoffDelivery,
         checked: 0,
         triggered: 0,
         live: 0,
@@ -1781,8 +1957,10 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       issueId: string,
       opts: { runId?: string | null } = {},
     ) => {
+      const handoffDelivery = await dispatchWatchdogHandoffs(companyId);
       const rows = await activeWatchdogsForIssueAndAncestors(companyId, issueId);
       const result = {
+        handoffDelivery,
         checked: 0,
         triggered: 0,
         pendingFirstRun: 0,

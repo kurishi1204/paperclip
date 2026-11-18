@@ -77,6 +77,7 @@ import { useToastActions } from "../context/ToastContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import {
   assigneeValueFromSelection,
+  assignmentFailureNotice,
   formatAssigneeUserLabel,
   formatUserLabel,
   suggestedCommentAssigneeValue,
@@ -4129,7 +4130,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
       applyOptimisticIssueCacheUpdate(issueRefs, data);
 
-      return { previousDetailQueries, previousList, selectedCompanyId };
+      return { previousDetailQueries, previousList, selectedCompanyId, mutationIssueId: previousIssue?.id ?? issueId! };
     },
     onSuccess: ({
       comment: _comment,
@@ -4162,10 +4163,15 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           context.previousList,
         );
       }
+      const assignmentNotice = err instanceof ApiError
+        ? assignmentFailureNotice(err.body, context?.mutationIssueId ?? issue?.id ?? issueId!, (selection) =>
+            selection.assigneeAgentId ? agentMap.get(selection.assigneeAgentId)?.name ?? null
+              : selection.assigneeUserId ? userLabelMap.get(selection.assigneeUserId) ?? null : null)
+        : null;
       pushToast({
-        title: "Task update failed",
-        body:
-          err instanceof Error ? err.message : "Unable to save task changes",
+        title: assignmentNotice?.title ?? "Task update failed",
+        body: assignmentNotice?.body ??
+          (err instanceof Error ? err.message : "Unable to save task changes"),
         tone: "error",
       });
     },
@@ -5152,12 +5158,17 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           context.previousIssue,
         );
       }
+      const assignmentNotice = err instanceof ApiError
+        ? assignmentFailureNotice(err.body, context?.previousIssue?.id ?? issue?.id ?? issueId!, (selection) =>
+            selection.assigneeAgentId ? agentMap.get(selection.assigneeAgentId)?.name ?? null
+              : selection.assigneeUserId ? userLabelMap.get(selection.assigneeUserId) ?? null : null)
+        : null;
       pushToast({
-        title:
-          err instanceof CommentSubmissionUnknownError
+        title: assignmentNotice?.title ??
+          (err instanceof CommentSubmissionUnknownError
             ? "Comment save unconfirmed"
-            : "Comment failed",
-        body: err instanceof Error ? err.message : "Unable to post comment",
+            : "Comment failed"),
+        body: assignmentNotice?.body ?? (err instanceof Error ? err.message : "Unable to post comment"),
         tone: "error",
       });
     },

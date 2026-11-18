@@ -15,6 +15,7 @@ import {
 import type {
   NativeSession,
   NativeSessionBackend,
+  NativeSessionCleanupOwnerMetadata,
 } from "./contracts/native-session-backend.js";
 import type { PersistedNativeSession } from "./contracts/native-session-backend.js";
 import type { HarnessThreadGoal } from "./contracts/harness-driver.js";
@@ -83,10 +84,89 @@ interface QuarantinedSessionCleanup {
   recoveryMaxAttempts: number | null;
   timer: ReturnType<typeof setTimeout> | null;
   operatorRecoveryRequired: boolean;
+  owner: Pick<NativeSessionCleanupOwnerMetadata, "binding" | "runnerInstanceId" | "retainedAtUTC">;
+  settlement: ReturnType<typeof safeCleanupSettlement>;
 }
 
 const quarantinedSessionCleanups = new Set<QuarantinedSessionCleanup>();
 const sessionOriginRunnerInstances = new WeakMap<NativeSession, string>();
+const retainedOwnerInspectionTokens = new WeakMap<QuarantinedSessionCleanup, Readonly<object>>();
+
+/** Read the exact live retained owner. The opaque token is not a cleanup proof
+ * or permission; a second read can only confirm the same still-idle owner. */
+export function readRetainedNativeSessionCleanupOwner(
+  input: Pick<RetainedRunnerdCleanupProof, "binding" | "identity" | "backend">,
+): Readonly<object> | null {
+  try {
+    const domain = JSON.stringify([input.binding.companyId, input.backend.kind, input.backend.name]);
+    const matches = [...quarantinedSessionCleanups].filter(entry => entry.domain === domain &&
+      Object.entries(input.binding).every(([key, value]) => entry.session.identity()[key as keyof typeof input.binding] === value));
+    if (matches.length !== 1) return null;
+    const entry = matches[0]!;
+    if (!entry.owner.binding || !Object.entries(input.binding).every(([key, value]) =>
+          entry.owner.binding![key as keyof typeof input.binding] === value) ||
+        entry.owner.runnerInstanceId !== input.identity.runnerInstanceId ||
+        sessionOriginRunnerInstances.get(entry.session) !== input.identity.runnerInstanceId ||
+        !entry.operatorRecoveryRequired || entry.attempt || entry.recovery || entry.timer) return null;
+    let token = retainedOwnerInspectionTokens.get(entry);
+    if (!token) { token = Object.freeze({}); retainedOwnerInspectionTokens.set(entry, token); }
+    return token;
+  } catch { return null; }
+}
+
+function captureCleanupOwner(session: NativeSession, cleanupDomain: NativeSessionCleanupDomain): QuarantinedSessionCleanup["owner"] {
+  let binding: NativeSessionCleanupOwnerMetadata["binding"] = null;
+  try {
+    const identity = session.identity();
+    const keys = ["companyId", "issueId", "agentId", "runId", "sessionId"] as const;
+    const companyId = JSON.parse(cleanupDomain)[0];
+    if (identity.companyId === companyId && keys.every(key => typeof identity[key] === "string" &&
+        /^[A-Za-z0-9_.:-]{1,256}$/.test(identity[key]))) {
+      binding = { companyId: identity.companyId, issueId: identity.issueId, agentId: identity.agentId,
+        runId: identity.runId, sessionId: identity.sessionId };
+    }
+  } catch { /* Unknown identity stays unknown; it never retires ownership. */ }
+  return { binding, runnerInstanceId: binding ? sessionOriginRunnerInstances.get(session) ?? null : null,
+    retainedAtUTC: new Date().toISOString() };
+}
+
+function safeCleanupSettlement(error?: unknown) {
+  const raw = error instanceof NativeSessionCloseUnrecoverableError ? error.settlement : undefined;
+  const bool = (value: unknown): boolean | null => typeof value === "boolean" ? value : null;
+  const count = (value: unknown): number | null => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+  const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const tools = record(raw?.semanticTools);
+  const provider = record(raw?.finalProviderState);
+  return {
+    runnerSuspended: bool(raw?.runnerSuspended), providerDrained: bool(raw?.providerDrained),
+    // Diagnostics do not expose the complete settlement predicate. Never infer
+    // it from an empty pending list, process absence, or partial counters.
+    semanticToolsSettled: bool(raw?.semanticToolsSettled),
+    semanticToolPendingCount: Array.isArray(tools?.pending) ? tools.pending.length : null,
+    semanticToolPersistenceFailed: bool(tools?.persistenceFailed),
+    providerPendingEventCount: count(provider?.pendingEventCount),
+    providerSettled: bool(provider?.providerSettled),
+  };
+}
+
+function attachCleanupOwnerObservation(error: unknown, cleanup: QuarantinedSessionCleanup): void {
+  if (!(error instanceof NativeSessionCloseUnrecoverableError)) return;
+  try { error.cleanupOwner = retainedCleanupOwnerMetadata(cleanup); }
+  catch { /* A frozen error retains its identity; the quarantine still carries the observation. */ }
+}
+
+function retainedCleanupOwnerMetadata(cleanup: QuarantinedSessionCleanup): NativeSessionCleanupOwnerMetadata {
+  const missingEvidence: string[] = [];
+  if (cleanup.owner.binding === null) missingEvidence.push("owner_binding_unverified");
+  if (cleanup.owner.runnerInstanceId === null) missingEvidence.push("runner_instance_unverified");
+  if (cleanup.settlement.runnerSuspended !== true) missingEvidence.push("runner_suspension_unverified");
+  if (cleanup.settlement.providerDrained !== true) missingEvidence.push("provider_drain_unverified");
+  if (cleanup.settlement.semanticToolsSettled !== true) missingEvidence.push("semantic_tool_settlement_unverified");
+  if (cleanup.settlement.providerSettled !== true || cleanup.settlement.providerPendingEventCount !== 0)
+    missingEvidence.push("provider_settlement_unverified");
+  return { ...cleanup.owner, binding: cleanup.owner.binding && { ...cleanup.owner.binding },
+    ...cleanup.settlement, operatorRecoveryRequired: cleanup.operatorRecoveryRequired, missingEvidence };
+}
 
 /** Retire only the exact owner whose separate authenticated cleanup completed.
  * The rejected close promise remains rejected; this neither resets a session
@@ -473,6 +553,7 @@ function retainUnadmittedSessionCleanup(
   reason: string,
   cleanupDomain: NativeSessionCleanupDomain,
 ): Promise<void> {
+  const owner = captureCleanupOwner(session, cleanupDomain);
   const cleanup = (async () => {
     let attempt = Promise.resolve().then(() => session.close({ reason }));
     let retryCount = 0;
@@ -482,11 +563,11 @@ function retainUnadmittedSessionCleanup(
         return;
       } catch (error) {
         if (error instanceof NativeSessionCloseUnrecoverableError) {
-          quarantineSessionCleanup(session, cleanupDomain, true);
+          quarantineSessionCleanup(session, cleanupDomain, true, error, owner);
           throw error;
         }
         if (retryCount >= MAX_FAILED_SESSION_CLOSE_RETRIES) {
-          quarantineSessionCleanup(session, cleanupDomain);
+          quarantineSessionCleanup(session, cleanupDomain, false, error, owner);
           throw error;
         }
         retryCount += 1;
@@ -645,6 +726,8 @@ function quarantineSessionCleanup(
   session: NativeSession,
   cleanupDomain: NativeSessionCleanupDomain,
   operatorRecoveryRequired = false,
+  error?: unknown,
+  owner = captureCleanupOwner(session, cleanupDomain),
 ): void {
   const existing = [...quarantinedSessionCleanups].find(
     (entry) => entry.session === session,
@@ -652,6 +735,8 @@ function quarantineSessionCleanup(
   if (existing) {
     if (operatorRecoveryRequired) {
       existing.operatorRecoveryRequired = true;
+      existing.settlement = safeCleanupSettlement(error);
+      attachCleanupOwnerObservation(error, existing);
       if (existing.timer) clearTimeout(existing.timer);
       existing.timer = null;
     }
@@ -666,8 +751,11 @@ function quarantineSessionCleanup(
     recoveryMaxAttempts: null,
     timer: null,
     operatorRecoveryRequired,
+    owner,
+    settlement: safeCleanupSettlement(error),
   };
   quarantinedSessionCleanups.add(cleanup);
+  attachCleanupOwnerObservation(error, cleanup);
   if (operatorRecoveryRequired) return;
   startQuarantinedSessionCleanupRecovery(
     cleanup,
@@ -713,6 +801,8 @@ function startQuarantinedSessionCleanupRecovery(
       } catch (error) {
         if (error instanceof NativeSessionCloseUnrecoverableError) {
           cleanup.operatorRecoveryRequired = true;
+          cleanup.settlement = safeCleanupSettlement(error);
+          attachCleanupOwnerObservation(error, cleanup);
         }
         // Retain the quarantine after this finite, sequential retry batch.
       } finally {
@@ -785,7 +875,11 @@ async function retryQuarantinedSessionCleanups(
           cleanup.domain === cleanupDomain && cleanup.operatorRecoveryRequired,
       )
     ) {
-      throw new NativeSessionCleanupQuarantinedError();
+      throw new NativeSessionCleanupQuarantinedError(
+        [...quarantinedSessionCleanups]
+          .filter(cleanup => cleanup.domain === cleanupDomain)
+          .map(retainedCleanupOwnerMetadata),
+      );
     }
     const cleanupOwners = new Set<Promise<void>>(
       [...failedSessionCleanupOwners]
@@ -2151,7 +2245,9 @@ export async function executeNativeSession(
     quarantineSession("session_close_recovery_retained");
     retainFailedSessionCleanupOwner(cleanup, cleanupDomain);
   };
+  let sessionCloseOwner: QuarantinedSessionCleanup["owner"] | null = null;
   const startSessionClose = (reason: string) => {
+    sessionCloseOwner ??= captureCleanupOwner(session, cleanupDomain);
     const attempt = session.close({ reason });
     sessionClosePromise = attempt;
     return attempt;
@@ -2175,11 +2271,11 @@ export async function executeNativeSession(
             return;
           } catch (error) {
             if (error instanceof NativeSessionCloseUnrecoverableError) {
-              quarantineSessionCleanup(session, cleanupDomain, true);
+              quarantineSessionCleanup(session, cleanupDomain, true, error, sessionCloseOwner!);
               throw error;
             }
             if (retryCount >= MAX_FAILED_SESSION_CLOSE_RETRIES) {
-              quarantineSessionCleanup(session, cleanupDomain);
+              quarantineSessionCleanup(session, cleanupDomain, false, error, sessionCloseOwner!);
               throw error;
             }
             retryCount += 1;

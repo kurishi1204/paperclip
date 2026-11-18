@@ -123,6 +123,7 @@ export function arbitrateNativeStatus(input: {
   /** Review decisions own task state; a reviewer's finish report cannot override them. */
   nativeReviewOutcome?: "resolved" | "pending" | "stale";
   /** A fixed document verdict is separate from worker completion. */
+  fixedDocumentReturn?: boolean;
   documentReviewOutcome?: "resolved" | "pending" | "stale";
   /** The committed issue_execution_decisions row for this exact run and formal approval stage. */
   formalApprovalDecisionId?: string | null;
@@ -170,6 +171,12 @@ export function arbitrateNativeStatus(input: {
       ],
     };
   }
+  if (input.fixedDocumentReturn) return {
+    policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+    statusAction: "preserve", toStatus: input.priorIssueStatus,
+    reasonCode: "fixed_document_return_preserves_task", unblockDescriptor: null,
+    effects: [{kind:"release_checkout"}],
+  };
   if (input.documentReviewOutcome) {
     const outcome = input.documentReviewOutcome;
     return {

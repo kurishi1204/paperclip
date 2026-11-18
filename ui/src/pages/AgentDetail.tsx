@@ -67,6 +67,7 @@ import { tryCreateWebSocket } from "../lib/websocket";
 import { formatDate, relativeTime, formatTokens, visibleRunCostUsd } from "../lib/utils";
 import { cn } from "../lib/utils";
 import { RunRetryDetails } from "../components/RunRetryDetails";
+import { RunReceiptReadback } from "../components/RunReceiptReadback";
 import { Button } from "@/components/ui/button";
 import { Tabs } from "@/components/ui/tabs";
 import { PageTabBar } from "../components/PageTabBar";
@@ -4012,6 +4013,8 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig, 
           </div>
         </div>
       )}
+
+      <RunReceiptReadback run={run} />
 
       {/* stderr excerpt for failed runs */}
       {run.stderrExcerpt && (

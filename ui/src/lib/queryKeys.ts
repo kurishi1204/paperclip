@@ -717,6 +717,10 @@ export const queryKeys = {
   runDetail: (runId: string) => ["heartbeat-run", runId] as const,
   providerTraceMetadata: (companyId: string, runIds: readonly string[]) =>
     ["provider-trace-metadata", companyId, [...runIds].sort()] as const,
+  runReceiptViewerAccess: (userId: string | null) =>
+    ["access", "run-receipt-viewer", userId] as const,
+  runReceiptReadback: (companyId: string, runId: string, status: string, viewerScope: string) =>
+    ["run-receipt-readback", companyId, runId, status, viewerScope] as const,
   runWorkspaceOperations: (runId: string) =>
     ["heartbeat-run", runId, "workspace-operations"] as const,
   liveRuns: (companyId: string) => ["live-runs", companyId] as const,

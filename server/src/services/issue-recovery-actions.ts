@@ -64,6 +64,9 @@ export type UpsertIssueRecoveryActionInput = {
   // evidence/attempt metadata without silently changing the recorded owner or
   // the wake/monitor contract that made that owner authoritative.
   preserveExistingOwner?: boolean;
+  /** Pre-dispatch observations never alter an existing action, owner or budget,
+   * including when a concurrent insert wins and the upsert retries. */
+  preserveExistingAction?: boolean;
 };
 
 export type ResolveIssueRecoveryActionInput = {
@@ -359,6 +362,7 @@ export function issueRecoveryActionService(db: Db) {
     const now = new Date();
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
     if (existing) {
+      if (input.preserveExistingAction) return existing;
       // A distinct failure identity must not overwrite the active action of a
       // prior identity. Resolve the prior action and insert a new one, so the
       // operator gets a new notice for the new failure.

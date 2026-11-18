@@ -1,4 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { assignmentWorkCompatibility, assignmentWorkSourcePin, prepareAssignmentWorkRequirements } from "../../../services/agent-assignability.js";
+import { updateIssueSchema } from "@paperclipai/shared";
+
+// The compatibility decision is pure. Assignment DB helpers are not invoked.
+vi.mock("@paperclipai/db", () => ({ agents: {} }));
+vi.mock("@paperclipai/shared", async (importOriginal) => ({ ...await importOriginal<typeof import("@paperclipai/shared")>(), getAgentWorkEligibility: vi.fn() }));
 import {
   decideQueuedRunStaleness,
   decideScheduledRetryGate,
@@ -526,5 +532,105 @@ describe("AI subscription wait ownership", () => {
       .toMatchObject({ allowed: false, errorCode: "issue_execution_lock_changed" });
     expect(decideQueuedRunStaleness({ ...queued, ...nonAssignee, retryReasonKind: "max_turn_continuation" }, NOW))
       .toMatchObject({ stale: true, errorCode: "issue_execution_lock_changed" });
+  });
+});
+
+
+describe("explicit assignment work requirements at both dispatch gates", () => {
+  const issue = { id: "issue-1", companyId: "co-1", assigneeAgentId: "agent-1", title: "Existing handoff", description: "Save the agreed handoff document." };
+  const agent = { id: "agent-1", adapterType: "hermes_local", adapterConfig: { boundedExecution: true } };
+  const contract = (requiredOperations: string[]) => ({ schema: "paperclip.work-requirements.v1",
+    companyId: issue.companyId, issueId: issue.id, sourceBriefSha256: assignmentWorkSourcePin(issue),
+    requiredOperations, deliverable: "saved_issue_document" });
+  const assigned = (value: unknown) => ({ ...issue, assigneeAdapterOverrides: { adapterConfig: { paperclipWorkRequirements: value } } });
+  const checkBoth = (value: ReturnType<typeof assignmentWorkCompatibility>) => {
+    const assignmentWorkBlock = value.kind === "blocked" ? value.block : null;
+    return { initial: decideQueuedRunStaleness({ ...baseStalenessFacts(), assignmentWorkBlock }, NOW),
+      retry: decideScheduledRetryGate({ ...baseGateFacts(), assignmentWorkBlock }, NOW) };
+  };
+
+  it("leaves existing unclassified research unchanged, without reading task words", () => {
+    const decision = assignmentWorkCompatibility({ issue, agent });
+    expect(decision).toEqual({ kind: "unclassified", reason: "not_supplied" });
+    expect(checkBoth(decision)).toEqual({ initial: { stale: false }, retry: { allowed: true } });
+  });
+
+  it("accepts an explicit research response and refuses an explicit document save at both original gates", () => {
+    const research = assignmentWorkCompatibility({ issue: assigned(contract(["web_search", "final_response"])), agent });
+    expect(research.kind).toBe("compatible");
+    expect(checkBoth(research)).toEqual({ initial: { stale: false }, retry: { allowed: true } });
+    const document = assignmentWorkCompatibility({ issue: assigned(contract(["issue_document_write"])), agent });
+    expect(document).toMatchObject({ kind: "blocked", block: { errorCode: "agent_work_requirements_unavailable",
+      details: { unavailableOperations: ["issue_document_write"] } } });
+    expect(checkBoth(document)).toMatchObject({ initial: { stale: true, errorCode: "agent_work_requirements_unavailable" },
+      retry: { allowed: false, errorCode: "agent_work_requirements_unavailable" } });
+  });
+
+  it("uses the existing PATCH override shape and keeps the source pin stable across that write and assignment/status changes", () => {
+    const overrides = { adapterConfig: { paperclipWorkRequirements: contract(["web_search", "final_response"]) } };
+    const assignment = { assigneeAgentId: "8978b315-a57a-481a-a30c-755b6c838369", status: "todo", assigneeAdapterOverrides: overrides };
+    expect(updateIssueSchema.parse(assignment)).toMatchObject(assignment);
+    // These lifecycle/metadata fields are the ones changed by ordinary issue PATCHes.
+    const patched = { ...issue, revision: 37, status: "todo", assigneeAgentId: agent.id, assigneeAdapterOverrides: overrides };
+    expect(assignmentWorkSourcePin(patched)).toBe(assignmentWorkSourcePin(issue));
+    expect(assignmentWorkCompatibility({ issue: patched, agent }).kind).toBe("compatible");
+    expect(checkBoth(assignmentWorkCompatibility({ issue: patched, agent }))).toEqual({ initial: { stale: false }, retry: { allowed: true } });
+    const changed = { ...patched, description: "The requested source content changed." };
+    expect(assignmentWorkCompatibility({ issue: changed, agent })).toMatchObject({ kind: "blocked",
+      block: { errorCode: "assignment_work_contract_invalid", details: { invalidFields: ["sourceBriefSha256"] } } });
+  });
+
+  it("consumes explicit owner input from the normal issue update and pins the brief on the server", () => {
+    const request = { assigneeAgentId: agent.id, status: "todo", workRequirements: {
+      requiredOperations: ["issue_document_write"], deliverable: "saved_issue_document",
+    } };
+    const parsed = updateIssueSchema.parse(request);
+    expect(parsed).toEqual(request);
+    const prepared = prepareAssignmentWorkRequirements({ ...issue, assigneeAdapterOverrides: {
+      useProjectWorkspace: true, adapterConfig: { unchangedSetting: "keep" },
+    } }, parsed.workRequirements!);
+    expect(prepared.assigneeAdapterOverrides).toMatchObject({ useProjectWorkspace: true, adapterConfig: {
+      unchangedSetting: "keep", paperclipWorkRequirements: {
+        companyId: issue.companyId, issueId: issue.id, sourceBriefSha256: assignmentWorkSourcePin(issue),
+        requiredOperations: request.workRequirements.requiredOperations,
+      },
+    } });
+    expect(checkBoth(assignmentWorkCompatibility({ issue: prepared, agent }))).toMatchObject({
+      initial: { stale: true, errorCode: "agent_work_requirements_unavailable" },
+      retry: { allowed: false, errorCode: "agent_work_requirements_unavailable" },
+    });
+    const research = prepareAssignmentWorkRequirements(issue, { requiredOperations: ["web_search", "final_response"], deliverable: "research_response" });
+    expect(checkBoth(assignmentWorkCompatibility({ issue: research, agent }))).toEqual({ initial: { stale: false }, retry: { allowed: true } });
+    for (const workRequirements of [{ requiredOperations: [], deliverable: "document" },
+      { requiredOperations: ["web_search"], deliverable: "document", sourceBriefSha256: "caller-must-not-supply-pins" }]) {
+      expect(updateIssueSchema.safeParse({ ...request, workRequirements }).success).toBe(false);
+    }
+  });
+
+  it("does not silently fall back when an explicit contract is malformed or from another source", () => {
+    for (const value of [null, {}, { ...contract(["web_search"]), issueId: "other-issue" },
+      { ...contract(["web_search"]), requiredOperations: [] }, { ...contract(["web_search"]), unexpected: true }]) {
+      const decision = assignmentWorkCompatibility({ issue: assigned(value), agent });
+      expect(checkBoth(decision)).toMatchObject({ initial: { stale: true, errorCode: "assignment_work_contract_invalid" },
+        retry: { allowed: false, errorCode: "assignment_work_contract_invalid" } });
+    }
+  });
+
+  it("does not apply the assignee override or its malformed metadata to another reviewer/coordinator", () => {
+    for (const value of [contract(["issue_document_write"]), null]) {
+      const decision = assignmentWorkCompatibility({ issue: { ...assigned(value), assigneeAgentId: "other-author" }, agent });
+      expect(decision).toEqual({kind:"unclassified",reason:"not_assigned_executor"});
+      expect(checkBoth(decision)).toEqual({initial:{stale:false},retry:{allowed:true}});
+    }
+  });
+
+  it("does not call an undeclared adapter capable or downgrade an operator-pinned worker", () => {
+    const target = { ...agent, adapterType: "codex_local" };
+    expect(assignmentWorkCompatibility({ issue: assigned(contract(["issue_document_write"])), agent: target }))
+      .toEqual({ kind: "unclassified", reason: "adapter_capabilities_not_declared" });
+    const current = { ...assigned(contract(["issue_document_write"])), assigneeAdapterOverrides: {
+      adapterConfig: { boundedExecution: false, paperclipWorkRequirements: contract(["issue_document_write"]) } } };
+    expect(assignmentWorkCompatibility({ issue: current, agent, operatorBoundedAgentId: agent.id }))
+      .toMatchObject({ kind: "blocked", block: { errorCode: "agent_work_requirements_unavailable" } });
   });
 });

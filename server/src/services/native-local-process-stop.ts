@@ -5,6 +5,8 @@ import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 export const PROCESS_START_REQUESTED = "native.process_start_requested";
 export const PROCESS_IDENTITY_RECORDED = "native.process_identity_recorded";
 const LOCAL_PROCESS_STOPPED = "native.local_process_stopped";
+type RunnerOptions = NonNullable<Parameters<typeof import("../vendor/paperclip-runner/index.js").createRunnerdCodexTransport>[0]>;
+type OwnedExitReceipt = Parameters<NonNullable<RunnerOptions["onOwnedProcessExit"]>>[0];
 
 function absent(pid: number): boolean {
   try {
@@ -20,8 +22,21 @@ function absent(pid: number): boolean {
  * Call in the same transaction as that compare-and-set. Never inspect remote
  * process IDs in the control-plane host's process table.
  */
-export async function recordNativeLocalProcessStop(db: Db, run: typeof heartbeatRuns.$inferSelect) {
+export async function recordNativeLocalProcessStop(db: Db, run: typeof heartbeatRuns.$inferSelect,
+  ownedExit?: OwnedExitReceipt) {
   if (run.runtimeMode !== "native" || (!run.processPid && !run.processGroupId)) return false;
+  if (ownedExit && (ownedExit.identity.runId !== run.id ||
+      ownedExit.identity.normalizedSessionId !== run.nativeSessionId ||
+      ownedExit.identity.runnerInstanceId !== run.runnerInstanceId ||
+      ownedExit.pid !== run.processPid || ownedExit.processGroupId !== run.processGroupId ||
+      !run.processStartedAt || Date.parse(ownedExit.startedAt) !== run.processStartedAt.getTime() ||
+      !Number.isFinite(Date.parse(ownedExit.observedAt)) ||
+      (ownedExit.exitCode === null && ownedExit.signal === null) ||
+      (ownedExit.exitCode !== null && (!Number.isSafeInteger(ownedExit.exitCode) || ownedExit.exitCode < 0)) ||
+      (ownedExit.signal !== null && (typeof ownedExit.signal !== "string" || !/^SIG[A-Z0-9]+$/.test(ownedExit.signal))) ||
+      ![ownedExit.identity.runnerInstanceId, ownedExit.identity.environmentLeaseId, ownedExit.identity.runId,
+        ownedExit.identity.normalizedSessionId, ownedExit.identity.turnId, ownedExit.identity.itemId]
+        .every(value => typeof value === "string" && /^[A-Za-z0-9_.:-]{1,256}$/.test(value)))) return false;
   const leases = await db.select({ provider: environmentLeases.provider })
     .from(environmentLeases)
     .where(and(
@@ -39,7 +54,15 @@ export async function recordNativeLocalProcessStop(db: Db, run: typeof heartbeat
     stream: "system",
     level: "info",
     message: "Recovery verified the local process stopped before clearing its identity.",
-    payload: { processPid: run.processPid, processGroupId: run.processGroupId },
+    payload: { processPid: run.processPid, processGroupId: run.processGroupId,
+      ...(ownedExit ? { completionSource: "owned_child_completion", processStartedAt: ownedExit.startedAt,
+        companyId: run.companyId, runId: run.id, agentId: run.agentId, issueId: run.nativeIssueId,
+        nativeSessionId: run.nativeSessionId, runnerInstanceId: run.runnerInstanceId,
+        identity: { runnerInstanceId: ownedExit.identity.runnerInstanceId,
+          environmentLeaseId: ownedExit.identity.environmentLeaseId, runId: ownedExit.identity.runId,
+          normalizedSessionId: ownedExit.identity.normalizedSessionId, turnId: ownedExit.identity.turnId,
+          itemId: ownedExit.identity.itemId },
+        exitCode: ownedExit.exitCode, signal: ownedExit.signal, observedAt: ownedExit.observedAt } : {}) },
   });
   return true;
 }
@@ -102,5 +125,40 @@ export async function readNativeLocalProcessStop(db: Db, companyId: string, runI
   const group = event?.payload?.processGroupId;
   if (event?.eventType !== LOCAL_PROCESS_STOPPED || typeof pid !== "number" ||
       !Number.isSafeInteger(pid) || pid <= 1 || group !== pid || !absent(pid) || !absent(-pid)) return null;
+  const payload = event.payload;
+  if (payload?.completionSource !== undefined) {
+    if (payload.completionSource !== "owned_child_completion") return null;
+    const identity = payload.identity;
+    if (!identity || typeof identity !== "object" || Array.isArray(identity)) return null;
+    const observed = identity as Record<string, unknown>;
+    const { runnerInstanceId, environmentLeaseId, runId: receiptRunId,
+      normalizedSessionId, turnId, itemId } = observed;
+    if (typeof runnerInstanceId !== "string" || typeof environmentLeaseId !== "string" ||
+        typeof receiptRunId !== "string" || typeof normalizedSessionId !== "string" ||
+        typeof turnId !== "string" || typeof itemId !== "string") return null;
+    const [run] = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId))).limit(1);
+    if (!run || run.runtimeMode !== "native" || payload.companyId !== companyId || payload.runId !== runId ||
+        payload.agentId !== run.agentId || payload.issueId !== run.nativeIssueId ||
+        payload.nativeSessionId !== run.nativeSessionId || payload.runnerInstanceId !== run.runnerInstanceId ||
+        observed.runId !== runId || observed.normalizedSessionId !== run.nativeSessionId ||
+        observed.runnerInstanceId !== run.runnerInstanceId ||
+        typeof payload.processStartedAt !== "string" || !Number.isFinite(Date.parse(payload.processStartedAt)) ||
+        typeof payload.observedAt !== "string" || !Number.isFinite(Date.parse(payload.observedAt)) ||
+        (run.processStartedAt !== null && run.processStartedAt.getTime() !== Date.parse(payload.processStartedAt)) ||
+        (run.processPid !== null && (run.processPid !== pid || run.processGroupId !== group || run.processStartedAt === null)) ||
+        (payload.exitCode === null && payload.signal === null) ||
+        (payload.exitCode !== null && (typeof payload.exitCode !== "number" || !Number.isSafeInteger(payload.exitCode) || payload.exitCode < 0)) ||
+        (payload.signal !== null && (typeof payload.signal !== "string" || !/^SIG[A-Z0-9]+$/.test(payload.signal))) ||
+        ![observed.runnerInstanceId, observed.environmentLeaseId, observed.runId,
+          observed.normalizedSessionId, observed.turnId, observed.itemId]
+          .every(value => typeof value === "string" && /^[A-Za-z0-9_.:-]{1,256}$/.test(value))) return null;
+    return { processPid: pid, processGroupId: pid, terminationReceipt: {
+      identity: { runnerInstanceId, environmentLeaseId, runId: receiptRunId,
+        normalizedSessionId, turnId, itemId }, processStartedAt: payload.processStartedAt,
+      exitCode: payload.exitCode, signal: payload.signal, observedAt: payload.observedAt } };
+  }
+  // Legacy absence observations remain distinguishable. They never acquire
+  // an owned completion ACK or new provider/checkpoint authority retroactively.
   return { processPid: pid, processGroupId: pid };
 }

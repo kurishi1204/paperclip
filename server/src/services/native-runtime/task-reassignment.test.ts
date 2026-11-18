@@ -4,6 +4,7 @@ import { eq, and } from "drizzle-orm";
 import { activityLog, agents, companies, createDb, heartbeatRuns, issues, issueComments } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { issueService } from "../issues.js";
+import { prepareAssignmentWorkRequirements } from "../agent-assignability.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 
 describe("runner task reassignment", () => {
@@ -36,6 +37,44 @@ describe("runner task reassignment", () => {
     const target = async () => (await db.select().from(issues).where(eq(issues.id, targetId)))[0]!;
     return { companyId, agentId, nextId, issueId, targetId, runId, authority, binding, call, target, enqueueWakeup, stopTaskForReassignment };
   }
+
+  it.each(["unsupported_operation", "stale_brief"])("rejects the persisted work contract before stopping execution: %s", async mismatch => {
+    const f = await fixture("in_progress");
+    const oldRun = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: oldRun, companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.targetId, runtimeMode: "native", status: "running", invocationSource: "assignment", triggerDetail: "system" });
+    await db.update(agents).set({ adapterType: "hermes_local", adapterConfig: { boundedExecution: true } }).where(eq(agents.id, f.nextId));
+    const target = await f.target();
+    const work = prepareAssignmentWorkRequirements(target, {
+      requiredOperations: mismatch === "unsupported_operation" ? ["issue_document_write"] : ["web_search", "final_response"],
+      deliverable: mismatch === "unsupported_operation" ? "saved_issue_document" : "research_response",
+    });
+    await db.update(issues).set({ assigneeAdapterOverrides: work.assigneeAdapterOverrides,
+      ...(mismatch === "stale_brief" ? { description: "The source brief changed after the owner specified the work." } : {}),
+      executionRunId: oldRun,
+    }).where(eq(issues.id, f.targetId));
+    await expect(f.authority.execute(f.call)).rejects.toMatchObject({ status: 409, details: {
+      code: mismatch === "unsupported_operation" ? "agent_work_requirements_unavailable" : "assignment_work_contract_invalid",
+    } });
+    expect(f.stopTaskForReassignment).not.toHaveBeenCalled();
+    expect(f.enqueueWakeup).not.toHaveBeenCalled();
+    expect(await f.target()).toMatchObject({ assigneeAgentId: f.agentId, statusVersion: 0, executionRunId: oldRun });
+    expect(await db.select().from(activityLog).where(and(eq(activityLog.companyId, f.companyId), eq(activityLog.action, "issue.reassigned")))).toHaveLength(0);
+  });
+
+  it.each(["research_contract", "unclassified"])("preserves the existing bounded-worker handoff: %s", async mode => {
+    const f = await fixture();
+    await db.update(agents).set({ adapterType: "hermes_local", adapterConfig: { boundedExecution: true } }).where(eq(agents.id, f.nextId));
+    if (mode === "research_contract") {
+      const work = prepareAssignmentWorkRequirements(await f.target(), {
+        requiredOperations: ["web_search", "final_response"], deliverable: "research_response",
+      });
+      await db.update(issues).set({ assigneeAdapterOverrides: work.assigneeAdapterOverrides }).where(eq(issues.id, f.targetId));
+    }
+    await expect(f.authority.execute(f.call)).resolves.toMatchObject({ disposition: "applied", stateRevision: 1 });
+    expect(await f.target()).toMatchObject({ assigneeAgentId: f.nextId, statusVersion: 1 });
+    expect(f.enqueueWakeup).toHaveBeenCalledTimes(1);
+  });
 
   it("moves existing work once, persists context and audit, and dispatches a guarded wake", async () => {
     const f = await fixture();

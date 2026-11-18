@@ -141,7 +141,11 @@ export function createRunSecretRedactionRegistry(db: Db) {
     },
     redactForRun: async <T>(companyId: string, runId: string, value: T): Promise<T> =>
       redactRegisteredSecretValues(value, await valuesForRun(companyId, runId)),
-    redactForIssue: async <T>(companyId: string, issueId: string, value: T): Promise<T> =>
-      redactRegisteredSecretValues(value, await valuesForIssue(companyId, issueId)),
+    redactForIssue: async <T>(companyId: string, issueId: string, value: T): Promise<T> => {
+      // An empty result contains no text or registry material to redact. Keep
+      // authorization in the caller and avoid resolving every issue run's secrets.
+      if (Array.isArray(value) && value.length === 0) return value;
+      return redactRegisteredSecretValues(value, await valuesForIssue(companyId, issueId));
+    },
   };
 }

@@ -8,7 +8,8 @@ import type {
   ProviderTraceMetadata,
 } from "@paperclipai/shared";
 import { tenantSessionRecovery } from "@/lib/tenant-session-recovery";
-import { api, type RequestOptions } from "./client";
+import { api, detachInflightGet, type RequestOptions } from "./client";
+import type { NativeRunReceiptReadback } from "./heartbeat-receipts";
 
 export interface RunLivenessFields {
   livenessState: HeartbeatRun["livenessState"];
@@ -133,6 +134,14 @@ export const heartbeatsApi = {
     );
   },
   get: (runId: string) => api.get<HeartbeatRun>(`/heartbeat-runs/${runId}`),
+  receiptReadback: (runId: string, options?: RequestOptions) => {
+    const path = `/heartbeat-runs/${encodeURIComponent(runId)}?receiptReadback=1`;
+    // React Query dedupes within a viewer scope; URL-only coalescing must not cross viewers.
+    detachInflightGet(path);
+    return api.get<HeartbeatRun & { receiptReadback?: NativeRunReceiptReadback }>(path, {
+      ...options, cache: "no-store",
+    });
+  },
   events: (runId: string, afterSeq = 0, limit = 200, options?: RequestOptions) =>
     api.get<HeartbeatRunEvent[]>(
       `/heartbeat-runs/${runId}/events?afterSeq=${encodeURIComponent(String(afterSeq))}&limit=${encodeURIComponent(String(limit))}`,

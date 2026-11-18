@@ -130,6 +130,17 @@ describe("paperclip MCP tools", () => {
     });
   });
 
+  it("rejects append on the replacement-only document tool before sending", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await getTool("paperclipUpsertIssueDocument").execute({
+      issueId: "PAP-1135", key: "plan", body: "must not replace", append: "suffix",
+    });
+    const response = JSON.parse(result.content[0]!.text);
+    expect(response.error).toContain("append");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("defaults issue document format to markdown", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ key: "plan", latestRevisionNumber: 2 }),

@@ -565,6 +565,15 @@ V1 non-terminal liveness rule:
 - active-run output silence is an informational board UI signal at five minutes (`suspicious`) and fifteen minutes (`critical`); it does not create or update issues or recovery actions, comment on or block source work, change assignments, or wake an agent
 - board snooze and continue decisions suppress the run signal until their stored re-arm time; a false-positive decision suppresses it permanently for that run; open legacy evaluation issues remain readable and manually resolvable without automatic refresh
 
+Explicit board execution reconciliation can record an already-produced result as
+`done` on an unchanged blocked task without scheduling a successor. This is a
+source-recovery operation, not a general `blocked -> done` transition or permission
+to bypass a review. It requires the exact recovery action and stopped source run,
+unchanged owner and expected source revision, no live or queued execution, and satisfied dependency, interaction,
+and review gates. The original failed run and automatic no-replay evidence remain
+history; the separately recorded terminal receipt owns no continuation delivery.
+See the terminal reconciliation contract in `doc/execution-semantics.md`.
+
 Detailed ownership, execution, blocker, active-run watchdog, crash-recovery, and non-terminal liveness semantics are documented in `doc/execution-semantics.md`.
 
 For native ordinary tasks, answering a Board comment does not authorize an
@@ -879,6 +888,8 @@ The watched subtree is the source issue plus descendants reached through `parent
 
 Task-watchdog wakes must include server-derived capability metadata that names the watched root, reusable watchdog issue, excluded `task_watchdog` origin branches, allowed operations, and denied operations. Watchdogs must use that metadata and server denials for capability discovery; they must not create visible probe issues, comments, or throwaway tasks to learn their permissions.
 
+Native `request_human_input` also supports `operation: "withdraw"` for the current task executor's own pending named business-document confirmation. It requires the exact existing interaction and unchanged issue/document/key/revision, uses the ordinary withdrawal service and administrative outcome (`status: cancelled`, `result.outcome: withdrawn`), and persists a semantic receipt atomically. It does not answer a card, reassign its addressee, clear session quarantine, create another review, or broaden `call_api`. Governed/human-only decisions and plan approvals retain their original workflow. A lost acknowledgement is inspected, not automatically resent.
+
 ### Allowed watchdog mutations
 
 Within the watched subtree, a watchdog run may perform only mutations that restore or clarify the next live/waiting path:
@@ -895,6 +906,27 @@ Within the watched subtree, a watchdog run may perform only mutations that resto
 - update the reusable watchdog issue itself to `done`, `in_review`, or `blocked` with the evidence for the watchdog decision
 
 Every watchdog-triggered mutation must write activity with the watchdog id, source issue id, watchdog issue id when present, run id, and stop fingerprint. Mutations still use the normal status-transition, blocker, assignment, budget, and company-boundary guards.
+
+### Durable watchdog handoff
+
+New stopped-subtree triggers persist their reusable review, trigger activity, and
+`agent_wakeup_requests` delivery intent in one transaction under the watchdog row
+lock. The existing reconciliation calls inspect these versioned intents; no new
+scheduler or retry authority is implied. `watchdog_pending` means not yet claimed.
+A conditional update from pending to `watchdog_dispatching` permits one normal
+admission call, still subject to the existing pause, owner, dependency and budget
+gates. A task-watchdog fingerprint key alone is not a concurrency fence.
+
+After claim, a throw or missing/ambiguous receipt is outcome-unknown, never an
+expired lease eligible for another call. A later sweep can link an exact saved
+company/agent/request-actor/key/issue receipt and its run; it cannot resend it.
+Reconciliation returns pending, accepted, running, held, finished, or unknown
+observations and warns for unknown delivery. Legacy triggers without the versioned
+intent remain untouched. A process crash between claim and admission requires
+original-result recovery or a separate authorized disposition; this change does
+not promise automatic recovery of that unknown window. Offline/stopped reconcilers
+cannot deliver or observe pending work. Non-DB tests do not establish PostgreSQL
+atomicity, live delivery, company QA, or business acceptance.
 
 ### Atomic recovery batch
 

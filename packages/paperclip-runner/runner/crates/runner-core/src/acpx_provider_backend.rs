@@ -1626,6 +1626,36 @@ impl AcpxCommandExecutor {
                 "reason": reason,
             })));
         };
+        // Reserve the entire durable settlement before touching the owned
+        // provider. Capacity/sequence failure must leave both the owner and
+        // original pending requests intact, without exposing partial events.
+        let mut stopped_state = self
+            .state
+            .as_ref()
+            .expect("ACPX active turn has durable state")
+            .clone();
+        stopped_state.expire_runtime_requests("explicit_cancellation", true)?;
+        // Retain the local interruption in the same atomic snapshot that
+        // clears the active turn. The lifetime fence below still owns cleanup
+        // admission. This is NOT a provider terminal
+        // or evidence that prior tool effects completed; it must not authorize
+        // a restart continuation or turn/input replay.
+        stopped_state.push(NormalizedProviderEvent {
+            event_type: "turn.failed".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({
+                "provider": "acpx",
+                "providerTurnId": turn_id,
+                "status": "failed",
+                "error": {
+                    "code": "acpx_turn_stopped_for_suspension",
+                    "recoverable": false,
+                    "providerTerminalObserved": false,
+                    "reportedWorkDisposition": "unknown",
+                    "replayAllowed": false,
+                },
+            }),
+        })?;
         let provider_lifetime_fence_candidates = {
             let session = self
                 .session
@@ -1646,11 +1676,11 @@ impl AcpxCommandExecutor {
         // group. Require the inherited listener quorum before making this
         // durable session attachable, and retain it through the state write.
         self.session = None;
+        self.state = Some(stopped_state);
         let state = self
             .state
             .as_mut()
             .expect("ACPX state remains available after provider termination");
-        state.expire_runtime_requests("explicit_cancellation", true)?;
         state.active_turn_id = None;
         self.context.provider_turn_id = None;
         // Persist a non-attachable, recoverable boundary before the fallible
@@ -2495,6 +2525,72 @@ mod tests {
             .unwrap()
             .pending_runtime_requests
             .is_empty());
+    }
+
+    #[test]
+    fn stop_event_admission_failure_precedes_provider_access() {
+        for (pending_request, exhausted_sequence) in [(false, false), (true, false), (false, true)]
+        {
+            let directory = temporary_directory("stop-admission");
+            let operations = Vec::new();
+            let mut state = AcpxDurableState::new(
+                serde_json::from_value(descriptor("codex")).unwrap(),
+                AuthorizedToolSet {
+                    schema: TOOL_SET_SCHEMA.into(),
+                    schema_version: 1,
+                    catalog_digest: authorized_tool_catalog_digest(&operations).unwrap(),
+                    operations,
+                },
+                "test".into(),
+            );
+            state.lifecycle = "turn_active".into();
+            state.active_turn_id = Some("turn-1".into());
+            if pending_request {
+                state
+                    .push(NormalizedProviderEvent {
+                        event_type: "runtime_request.created".into(),
+                        priority: EventPriority::P0,
+                        payload: json!({"request":pending_input_request("input-1")}),
+                    })
+                    .unwrap();
+            }
+            if exhausted_sequence {
+                state.next_event_sequence = u64::MAX;
+            } else {
+                let limit = MAX_PENDING_EVENTS - usize::from(pending_request);
+                while state.pending_events.len() < limit {
+                    state
+                        .push(NormalizedProviderEvent {
+                            event_type: "harness.diagnostic".into(),
+                            priority: EventPriority::P0,
+                            payload: json!({"code":"fixture_backlog"}),
+                        })
+                        .unwrap();
+                }
+            }
+            let before = state.clone();
+            let config = test_config(&directory, None);
+            let mut executor = AcpxCommandExecutor::with_runner_config(&directory, &config);
+            executor.state = Some(state);
+            // No provider is installed: reaching provider access would return
+            // "session is unavailable", not the required admission error.
+            let error = executor
+                .stop_turn_for_suspension("test")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(if exhausted_sequence {
+                    "sequence exhausted"
+                } else {
+                    "backlog exceeds"
+                }),
+                "{error}"
+            );
+            assert_eq!(executor.state.as_ref().unwrap(), &before);
+            assert!(executor.persistence_error.is_none());
+            assert!(!executor.state_path().exists());
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

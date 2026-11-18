@@ -1556,6 +1556,9 @@ function commandForOperation(
         changeSummary: typeof input.changeSummary === "string" ? input.changeSummary : undefined,
       };
     case "request_human_input":
+      if (input.operation === "withdraw") {
+        throw new Error("interaction_withdrawal_requires_live_server");
+      }
       if (input.addresseeAgentId != null) {
         throw new Error("named_document_review_requires_live_server");
       }

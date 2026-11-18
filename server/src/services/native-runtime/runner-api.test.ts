@@ -57,6 +57,43 @@ describe("bounded response capture receipts", () => {
   });
 });
 
+describe("assignment failure outcome from the issue PATCH response", () => {
+  const issueMutation = {
+    issueId: "issue-a", issueMutationStopId: "stop-a",
+    runCancellation: { runId: "cancelled-a", observedStatus: "cancelled", evidence: "cancelRun_return" },
+    assignmentWrite: "outcome_unknown",
+    lastObservedOwnership: { source: "locked_before_update", revision: 36, statusVersion: 3,
+      assigneeAgentId: "previous-a", assigneeUserId: null },
+    currentOwnership: "unverified", automaticRetry: false,
+    nextAction: "read_issue_and_run_before_owner_decision",
+  };
+  const input = { operationId: "PATCH /api/issues/{id}", pathParams: { id: context.issueId }, body: { description: "Content-only edit" } };
+
+  it("keeps HTTP409 and its original metadata while exposing an unknown effect without retry", async () => {
+    const body = { error: "Original conflict", issueMutation, details: { code: "original_conflict", issueMutation } };
+    const fetcher = vi.fn(async () => Response.json(body, { status: 409 }));
+    const result = await executeRunnerApi(input, context, io(fetcher));
+    expect(result).toMatchObject({ ok: false, status: 409, outcome: "unknown", automaticRetry: false, data: body });
+    expect(result).toHaveProperty("data", body);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not manufacture unknown assignment evidence from another operation or an incomplete/not-attempted contract", async () => {
+    for (const [operation, metadata] of [
+      [input, { ...issueMutation, assignmentWrite: "not_attempted" }],
+      [input, { assignmentWrite: "outcome_unknown" }],
+      [{ operationId: createProject }, issueMutation],
+    ] as const) {
+      const body = { error: "Original rejection", details: { issueMutation: metadata } };
+      const fetcher = vi.fn(async () => Response.json(body, { status: 409 }));
+      const result = await executeRunnerApi(operation, context, io(fetcher));
+      expect(result).toMatchObject({ ok: false, status: 409, data: body });
+      expect(result).not.toHaveProperty("outcome");
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    }
+  });
+});
+
 describe("runner API catalog", () => {
   it.each(["standard", "ask", "planning", "skill_test"])("permits the title-only API in %s mode", workMode => {
     const operationId = "PUT /api/issues/{id}/title";

@@ -1,0 +1,286 @@
+// @vitest-environment jsdom
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { QueryClient, QueryClientProvider, focusManager } from "@tanstack/react-query";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { NativeRunReceiptReadback } from "../api/heartbeat-receipts";
+import { queryKeys } from "../lib/queryKeys";
+import { ApiError } from "../api/client";
+import { RunReceiptReadback, RunReceiptReadbackView } from "./RunReceiptReadback";
+
+declare module "vitest" {
+  interface TaskMeta { renderedHTML?: string; disclosureStages?: Record<string, string> }
+}
+
+const read = vi.hoisted(() => vi.fn());
+const access = vi.hoisted(() => vi.fn());
+const identity = vi.hoisted(() => ({ userId: "owner-a" as string | null, settled: true, failed: false }));
+vi.mock("../api/companies-query", () => ({ useAccountIdentity: () => identity }));
+vi.mock("../api/access", () => ({ accessApi: { getCurrentBoardAccess: access } }));
+function ownerAccess(userId = identity.userId ?? "local-board", role = "owner") {
+  return { userId, source: identity.userId ? "session" : "local_implicit", keyId: null,
+    isInstanceAdmin: false, memberships: [{ companyId: run.companyId, status: "active", membershipRole: role }] };
+}
+beforeEach(() => {
+  identity.userId = "owner-a"; identity.settled = true; identity.failed = false;
+  access.mockImplementation(async () => ownerAccess());
+});
+vi.mock("../api/heartbeats", () => ({ heartbeatsApi: { receiptReadback: read } }));
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+const run = { id: "run-1", companyId: "company-1", agentId: "agent-1", status: "failed" as const, runtimeMode: "native" as const, nativeIssueId: "task-1" };
+let root: Root | undefined;
+let container: HTMLDivElement | undefined;
+function fixture(): NativeRunReceiptReadback {
+  return {
+    schema: "paperclip.native-run-receipt-readback.v1", observedAtUTC: "2026-11-16T12:00:00Z",
+    scope: { companyId: run.companyId, issueId: "task-1", runId: run.id, agentId: run.agentId },
+    comparison: { state: "unverified", expectedCanonicalSha256: null, reasons: [], complete: true },
+    results: { complete: true, limit: 20, rows: [{ id: "saved-result", schemaStatus: "accepted", canonicalSha256: "a".repeat(64), completionContractId: "contract", turnIdHash: null, serverFingerprint: null, callerResultIdHash: null, callerDedupeKeyHash: null, createdAt: "2026-11-16T11:59:00Z" }] },
+    finalization: { state: "missing", record: null }, decision: { state: "missing", record: null },
+    effects: { state: "unverified", complete: true, limit: 50, rows: [] },
+    authority: { run: { status: "failed", runtimeMode: "native", runnerInstanceId: null, nativeSessionId: null, controllerBootId: null, controllerLeaseExpiresAt: null, processPid: null, processStartedAt: null }, issue: null, environmentLeases: { complete: true, limit: 20, rows: [] } },
+  };
+}
+function receiptWithRecovery(projection: NonNullable<NativeRunReceiptReadback["recovery"]>["projection"]): NativeRunReceiptReadback {
+  return { ...fixture(), recovery: {
+    schema: "paperclip.native-run-recovery-readback.v1", inspectionOnly: true,
+    projection,
+    cleanupHistory: { state: "unverified", complete: false, totalCount: null, observedCount: 0, unclassifiedCount: 0, rows: [] },
+    maintenanceEvents: { state: "not_recorded", complete: true, observedCount: 0, unclassifiedCount: 0, rows: [] },
+    actions: { state: "not_recorded", complete: true, observedCount: 0, unclassifiedCount: 0, rows: [] },
+    gaps: ["cleanup_history_unverified"],
+    verification: { providerStop: "unverified", actionOutcomes: "unverified", sourceRunLink: "unverified", sourceRunId: null, automaticRetry: false },
+    operatorEntry: { runPath: "/agents/agent-1/runs/run-1", taskPath: "/issues/other-task", kind: "inspect_original_run_and_task_recovery" },
+  } };
+}
+async function render(element: React.ReactNode) {
+  container = document.createElement("div"); document.body.append(container);
+  root = createRoot(container);
+  await act(async () => { root!.render(element); });
+  return container;
+}
+afterEach(async ({ task }) => {
+  if (container) task.meta.renderedHTML = container.outerHTML;
+  if (root) await act(async () => root!.unmount());
+  root = undefined; container?.remove(); container = undefined; vi.resetAllMocks();
+});
+
+describe("Run receipt readback", () => {
+  it("separates a completed successor projection from its historical recovery cause", async () => {
+    const receipt = receiptWithRecovery({ state: "observed", phase: "completed", cause: "native_session_cleanup_quarantined",
+      recoveryOwner: null, inspectionActions: ["inspect_run"], nextAction: null, successorRunId: "successor-1" });
+    const el = await render(<RunReceiptReadbackView run={run} receipt={receipt} />);
+    expect(el.textContent).toContain("このRunは完了として記録されています");
+    expect(el.textContent).toContain("過去に記録された理由");
+    expect(el.textContent).toContain("現在の次の動作: 記録なし");
+    expect(el.textContent).toContain("記録された後継Run");
+    expect(el.textContent).toContain("正規に停止したか");
+    expect(el.textContent).not.toContain("継続が保留されています");
+  });
+  it("renders the original 267-character cleanup next action without truncation", async () => {
+    const nextAction = "Send a new message to continue after Paperclip verifies that the previous provider and its tools have stopped. If cleanup cannot be verified, inspect the run and its environment. Clearing a task session does not resolve this quarantine. Automatic retries are stopped.";
+    expect(nextAction.length).toBe(267);
+    const receipt = receiptWithRecovery({ state: "observed", phase: "recovery_needed", cause: "native_session_cleanup_quarantined",
+      recoveryOwner: "board", inspectionActions: ["inspect_run", "inspect_recovery"], nextAction, successorRunId: null });
+    const el = await render(<RunReceiptReadbackView run={run} receipt={receipt} />);
+    expect(el.textContent).toContain(`現在の次の動作: ${nextAction}`);
+  });
+  it("shows the current recovery phase and next action separately from the old cause", async () => {
+    const receipt = receiptWithRecovery({ state: "observed", phase: "recovery_needed", cause: "provider_failure_meaning_unverified",
+      recoveryOwner: "board", inspectionActions: ["inspect_run", "inspect_recovery"], nextAction: "Inspect the original recovery record.", successorRunId: null });
+    const el = await render(<RunReceiptReadbackView run={run} receipt={receipt} />);
+    expect(el.textContent).toContain("現在、復旧記録の確認が必要な段階として記録されています");
+    expect(el.textContent).toContain("過去に記録された理由");
+    expect(el.textContent).toContain("現在の次の動作: Inspect the original recovery record.");
+  });
+  it.each(["denied", "failed"])("hides an opened receipt when permission refresh is %s", async (outcome) => {
+    read.mockResolvedValue({ receiptReadback: fixture() });
+    const client = new QueryClient();
+    const el = await render(<QueryClientProvider client={client}><RunReceiptReadback run={run} /></QueryClientProvider>);
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+    await act(async () => { const details = el.querySelector("details")!; details.open = true; details.dispatchEvent(new Event("toggle")); });
+    expect(el.querySelector("details")?.open).toBe(true);
+    access.mockRejectedValueOnce(outcome === "denied" ? new ApiError("private", 403, {}) : new Error("private"));
+    await act(async () => { await client.refetchQueries({ queryKey: queryKeys.runReceiptViewerAccess(identity.userId) }); });
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+    expect(access).toHaveBeenCalledTimes(2); expect(read).toHaveBeenCalledTimes(1);
+    expect(el.textContent).not.toContain("saved-result"); expect(el.querySelector("details")).toBeNull();
+    client.clear();
+  });
+  it.each(["viewer", "company", "run"])("resets opened disclosure on %s switch without displaying old metadata", async (scope) => {
+    let currentRun = run;
+    const receiptForRun = () => ({ ...fixture(), scope: { ...fixture().scope, companyId: currentRun.companyId, runId: currentRun.id },
+      results: { ...fixture().results, rows: [{ ...fixture().results.rows[0], id: "new-result" }] } });
+    read.mockResolvedValueOnce({ receiptReadback: fixture() });
+    const client = new QueryClient();
+    const element = () => <QueryClientProvider client={client}><RunReceiptReadback run={currentRun} /></QueryClientProvider>;
+    const settle = () => act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+    const el = await render(element()); await settle();
+    await act(async () => { const details = el.querySelector("details")!; details.open = true; details.dispatchEvent(new Event("toggle")); });
+    expect(el.querySelector("details")?.open).toBe(true);
+    if (scope === "viewer") identity.userId = "owner-b";
+    if (scope === "company") currentRun = { ...run, companyId: "company-2" };
+    if (scope === "run") currentRun = { ...run, id: "run-2" };
+    let finishAccess!: (value: ReturnType<typeof ownerAccess>) => void;
+    access.mockImplementationOnce(() => new Promise(resolve => { finishAccess = resolve; }));
+    read.mockResolvedValueOnce({ receiptReadback: receiptForRun() });
+    await act(async () => root!.render(element())); await settle();
+    expect(el.textContent).not.toContain("saved-result"); expect(el.querySelector("details")).toBeNull();
+    const accessForRun = { ...ownerAccess(), memberships: [{ companyId: currentRun.companyId, status: "active", membershipRole: "owner" }] };
+    await act(async () => finishAccess(accessForRun)); await settle();
+    expect(el.textContent).toContain("new-result"); expect(el.textContent).not.toContain("saved-result");
+    expect(el.querySelector("details")?.open).toBe(false);
+    // Returning to a previous scope also starts closed and obtains fresh permission/data.
+    identity.userId = "owner-a"; currentRun = run;
+    access.mockResolvedValueOnce(ownerAccess()); read.mockResolvedValueOnce({ receiptReadback: fixture() });
+    await act(async () => root!.render(element())); await settle();
+    expect(el.querySelector("details")?.open).toBe(false);
+    client.clear();
+  });
+
+  it("preserves opened technical details across stale permission focus refresh", async ({ task }) => {
+    read.mockResolvedValue({ receiptReadback: fixture() });
+    const client = new QueryClient({ defaultOptions: { queries: { staleTime: 30_000, refetchOnWindowFocus: true } } });
+    const el = await render(<QueryClientProvider client={client}><RunReceiptReadback run={run} /></QueryClientProvider>);
+    const settle = () => act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+    await settle();
+    const details = el.querySelector("details")!;
+    await act(async () => { details.open = true; details.dispatchEvent(new Event("toggle")); });
+    expect(details.open).toBe(true);
+    task.meta.disclosureStages = { before: el.outerHTML };
+    let finishAccess!: (value: ReturnType<typeof ownerAccess>) => void;
+    access.mockImplementationOnce(() => new Promise(resolve => { finishAccess = resolve; }));
+    client.setQueryData(queryKeys.runReceiptViewerAccess(identity.userId), ownerAccess(), { updatedAt: Date.now() - 31_000 });
+    await act(async () => { focusManager.setFocused(false); focusManager.setFocused(true); });
+    await settle();
+    expect(access).toHaveBeenCalledTimes(2);
+    expect(el.textContent).not.toContain("saved-result");
+    expect(el.querySelector("details")).toBeNull();
+    task.meta.disclosureStages.pending = el.outerHTML;
+    await act(async () => { finishAccess(ownerAccess()); });
+    await settle();
+    task.meta.disclosureStages.refreshed = el.outerHTML;
+    expect(el.querySelector("details")?.open).toBe(true);
+    expect(el.textContent).toContain("saved-result");
+    expect(read).toHaveBeenCalledTimes(2);
+    client.clear(); focusManager.setFocused(undefined);
+  });
+
+  it("keeps a saved accepted result visible beside a failed company Run without business acceptance", async () => {
+    const receipt = { ...fixture(), resultJson: "PRIVATE-BODY-MUST-NOT-RENDER" };
+    const el = await render(<RunReceiptReadbackView run={run} receipt={receipt} />);
+    expect(el.textContent).toContain("結果の受領記録が保存されています");
+    expect(el.textContent).toContain("失敗として記録");
+    expect(el.textContent).toContain("返却処理の配達記録は未確認");
+    expect(el.textContent).toContain("対象版との一致は未確認");
+    expect(el.textContent).not.toContain("PRIVATE-BODY-MUST-NOT-RENDER");
+    expect(el.querySelectorAll("button")).toHaveLength(0);
+  });
+  it("does not convert owner denial or store failure into missing results", async () => {
+    const el = await render(<RunReceiptReadbackView run={run} error={new ApiError("raw-sensitive-error", 403, {})} />);
+    expect(el.textContent).toContain("会社所有者だけが確認できます");
+    expect(el.textContent).not.toContain("見つかりません");
+    expect(el.textContent).not.toContain("raw-sensitive-error");
+    await act(async () => root!.render(<RunReceiptReadbackView run={run} error={new Error("private-store-path")} />));
+    expect(el.textContent).toContain("最新の受領記録を取得できません");
+    expect(el.textContent).not.toContain("private-store-path");
+  });
+  it("rejects metadata from another Run and handles an older API response", async () => {
+    const receipt = fixture(); receipt.scope.runId = "another-run";
+    const el = await render(<RunReceiptReadbackView run={run} receipt={receipt} />);
+    expect(el.textContent).toContain("対象Runと一致する受領記録を確認できません");
+    expect(el.textContent).not.toContain("saved-result");
+    await act(async () => root!.render(<RunReceiptReadbackView run={run} />));
+    expect(el.textContent).toContain("この応答には受領記録が含まれていません");
+  });
+  it("retains every returned row and marks capped lists incomplete", async () => {
+    const receipt = fixture(); receipt.results.complete = false; receipt.comparison.complete = false;
+    receipt.effects.complete = false; receipt.authority.environmentLeases.complete = false;
+    receipt.results.rows.push({ ...receipt.results.rows[0], id: "second-result" });
+    const el = await render(<RunReceiptReadbackView run={run} receipt={receipt} />);
+    expect(el.textContent).toContain("結果全体は未確認");
+    expect(el.textContent).toContain("返却処理の一覧は全体未確認");
+    expect(el.textContent).toContain("保持資源の記録は全体未確認");
+    expect(el.textContent).toContain("saved-result"); expect(el.textContent).toContain("second-result");
+  });
+  it("does not claim consumer acknowledgement even when recorded effects are delivered", async () => {
+    const receipt = fixture(); receipt.effects.state = "found";
+    receipt.effects.rows = [{ id: "effect-1", decisionId: "decision-1", ordinal: 0, effectKind: "publish_comment", targetType: "task", targetIdHash: null, idempotencyKeyHash: "b".repeat(64), deliveryState: "delivered", attemptCount: 1, nextAttemptAt: null, deliveredAt: "2026-11-16T12:00:00Z", updatedAt: "2026-11-16T12:00:00Z" }];
+    const el = await render(<RunReceiptReadbackView run={run} receipt={receipt} />);
+    expect(el.textContent).toContain("相手の実読・採否は別に確認が必要");
+  });
+  it("uses the opt-in read client and makes no mutation or retry", async () => {
+    read.mockResolvedValue({ receiptReadback: fixture() });
+    const client = new QueryClient({ defaultOptions: { queries: { gcTime: 0 } } });
+    const el = await render(<QueryClientProvider client={client}><RunReceiptReadback run={run} /></QueryClientProvider>);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 40)); });
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(read).toHaveBeenCalledWith(run.id, { signal: expect.any(AbortSignal) });
+    expect(el.textContent).toContain("結果の受領記録が保存されています");
+    client.clear();
+  });
+  it.each([401, 403, 404, 409])("hides cached owner metadata after refusal %s", async (status) => {
+    const el = await render(<RunReceiptReadbackView run={run} receipt={fixture()} error={new ApiError("private", status, {})} />);
+    expect(el.textContent).not.toContain("saved-result");
+    expect(el.textContent).not.toContain("結果の受領記録が保存されています");
+  });
+  it("distinguishes unsupported Runs without requesting receipt metadata", async () => {
+    read.mockResolvedValue({ receiptReadback: fixture() });
+    const client = new QueryClient();
+    const el = await render(<QueryClientProvider client={client}><RunReceiptReadback run={{ ...run, runtimeMode: "adapter" }} /></QueryClientProvider>);
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+    expect(el.textContent).toContain("表示対象外");
+    expect(read).not.toHaveBeenCalled(); client.clear();
+  });
+  it("does not infer ownership from admin or local implicit authority", async () => {
+    access.mockResolvedValue({ ...ownerAccess("owner-a", "admin"), isInstanceAdmin: true });
+    read.mockResolvedValue({ receiptReadback: fixture() });
+    const client = new QueryClient();
+    const el = await render(<QueryClientProvider client={client}><RunReceiptReadback run={run} /></QueryClientProvider>);
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+    expect(el.textContent).toContain("会社所有者だけ"); expect(read).not.toHaveBeenCalled(); client.clear();
+  });
+  it("never displays the previous viewer's receipt while the next viewer is unresolved", async () => {
+    read.mockResolvedValue({ receiptReadback: fixture() });
+    const client = new QueryClient();
+    const element = () => <QueryClientProvider client={client}><RunReceiptReadback run={run} /></QueryClientProvider>;
+    const el = await render(element());
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 40)); });
+    expect(el.textContent).toContain("saved-result");
+    identity.userId = "owner-b"; access.mockImplementation(() => new Promise(() => {}));
+    await act(async () => root!.render(element()));
+    expect(el.textContent).not.toContain("saved-result");
+    expect(read).toHaveBeenCalledTimes(1); client.clear();
+  });
+  it("does not retry a rejected owner read and hides its old cached data", async () => {
+    read.mockRejectedValue(new ApiError("private", 403, {}));
+    const client = new QueryClient();
+    const el = await render(<QueryClientProvider client={client}><RunReceiptReadback run={run} /></QueryClientProvider>);
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 60)); });
+    expect(read).toHaveBeenCalledTimes(1); expect(el.textContent).toContain("会社所有者だけ");
+    expect(el.textContent).not.toContain("saved-result"); client.clear();
+  });
+
+  it("does not share an in-flight actual GET between viewers", async () => {
+    const actual = await vi.importActual<typeof import("../api/heartbeats")>("../api/heartbeats");
+    const pending: Array<(response: Response) => void> = [];
+    const fetchMock = vi.fn(() => new Promise<Response>(resolve => pending.push(resolve)));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const first = actual.heartbeatsApi.receiptReadback(run.id);
+      const second = actual.heartbeatsApi.receiptReadback(run.id);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      pending[0](new Response(JSON.stringify({ receiptReadback: { ...fixture(), observedAtUTC: "viewer-a" } }), { status: 200, headers: { "content-type": "application/json" } }));
+      pending[1](new Response(JSON.stringify({ receiptReadback: { ...fixture(), observedAtUTC: "viewer-b" } }), { status: 200, headers: { "content-type": "application/json" } }));
+      expect((await first).receiptReadback?.observedAtUTC).toBe("viewer-a");
+      expect((await second).receiptReadback?.observedAtUTC).toBe("viewer-b");
+    } finally { vi.unstubAllGlobals(); }
+  });
+  it("leaves omitted native fields unknown rather than declaring an unsupported Run", async () => {
+    const client = new QueryClient();
+    const el = await render(<QueryClientProvider client={client}><RunReceiptReadback run={{ ...run, runtimeMode: undefined, nativeIssueId: undefined }} /></QueryClientProvider>);
+    expect(el.textContent).toContain("native実行情報は未確認");
+    expect(read).not.toHaveBeenCalled(); client.clear();
+  });
+
+});

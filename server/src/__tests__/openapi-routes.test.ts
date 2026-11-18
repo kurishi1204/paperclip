@@ -1083,3 +1083,17 @@ describe("heartbeat run ID OpenAPI contract", () => {
     expect(checked).toBe(12);
   });
 });
+
+
+it("publishes mutually exclusive exact document append alternatives", () => {
+  const spec = buildOpenApiSpec() as any;
+  const input = spec.paths["/api/issues/{id}/documents/{key}"].put.requestBody.content["application/json"].schema;
+  expect(input.oneOf).toHaveLength(2);
+  const [replace, append] = input.oneOf;
+  expect(replace.required).toContain("body");
+  expect(replace.properties.append).toEqual({ not: {} });
+  expect(append.required).toEqual(expect.arrayContaining(["append", "baseRevisionId"]));
+  expect(append.properties.body).toEqual({ not: {} });
+  expect(append.properties.includeDocuments).toEqual({ not: {} });
+  expect(append.properties.baseRevisionId).toMatchObject({ type: "string" });
+});

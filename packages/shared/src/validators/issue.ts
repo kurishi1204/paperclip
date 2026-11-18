@@ -591,6 +591,7 @@ export const resolveIssueRecoveryActionSchema = z
       })
       .strict()
       .optional(),
+    expectedSourceRevision: z.number().int().positive().optional(),
     actionId: z.string().guid().optional(),
     outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
     sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
@@ -598,6 +599,11 @@ export const resolveIssueRecoveryActionSchema = z
   })
   .strict()
   .superRefine((value, ctx) => {
+    if (value.sourceIssueStatus === "done" && value.executionReconciliation &&
+        value.expectedSourceRevision === undefined) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Terminal reconciliation requires the verified source revision", path: ["expectedSourceRevision"] });
+    }
+
     if (value.outcome === "restored") {
       if (
         value.sourceIssueStatus !== "todo" &&
@@ -898,6 +904,15 @@ export const updateIssueSchema = objectWithoutDefaults(
   .partial()
   .extend({
     expectedRevision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    /** The assigning owner states required operations; the server pins the current brief.
+     * Omission leaves the work unclassified. This never grants adapter capabilities. */
+    workRequirements: z.object({
+      requiredOperations: z.array(z.string().trim().min(1)).min(1)
+        .refine((operations) => new Set(operations).size === operations.length, {
+          message: "Required operations must be unique",
+        }),
+      deliverable: z.string().trim().min(1),
+    }).strict().optional(),
     requestDepth: issueRequestDepthInputSchema.optional(),
     assigneeAgentId: z.string().trim().min(1).optional().nullable(),
     comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
@@ -1564,6 +1579,11 @@ export const requestConfirmationSecretProposalPayloadSchema = z.object({
   expiresAt: z.string().datetime({ offset: true }),
 });
 
+const requestConfirmationSupportingDocumentSchema = requestConfirmationBoundDocumentSchema.extend({
+  companyId: z.string().guid(),
+  issueId: z.string().guid(),
+}).strict();
+
 export const requestConfirmationPayloadSchema = z.object({
   version: z.literal(1),
   prompt: z.string().trim().min(1).max(1000),
@@ -1582,6 +1602,8 @@ export const requestConfirmationPayloadSchema = z.object({
   detailsMarkdown: z.string().max(20000).nullable().optional(),
   supersedeOnUserComment: z.boolean().optional(),
   target: requestConfirmationTargetSchema.nullable().optional(),
+  // Read authority for evidence, separate from the one review decision target.
+  supportingDocuments: z.array(requestConfirmationSupportingDocumentSchema).optional(),
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
   secretProposal: requestConfirmationSecretProposalPayloadSchema.optional(),
 });
@@ -2066,6 +2088,8 @@ export type CreateIssueThreadInteractionInput = z.input<
 
 export const acceptIssueThreadInteractionSchema = z
   .object({
+    // Optional confirmation-review rationale uses the existing stored result contract.
+    reason: requestConfirmationResultSchema.shape.reason,
     rememberAction: z.boolean().optional(),
     selectedClientKeys: z
       .array(z.string().trim().min(1).max(120))
@@ -2217,9 +2241,18 @@ export const issueDocumentFormatSchema = z.enum(ISSUE_DOCUMENT_FORMATS);
 export const upsertIssueDocumentSchema = z.object({
   title: z.string().trim().max(200).nullable().optional(),
   format: issueDocumentFormatSchema,
-  body: multilineTextSchema.pipe(z.string().max(524288)),
+  body: multilineTextSchema.pipe(z.string().max(524288)).optional(),
+  append: z.string().min(1).max(200_000).regex(/^[^\u0000\uD800-\uDFFF]*$/u, "Append must be valid Unicode text without NUL").optional(),
+  includeDocuments: z.never().optional(),
   changeSummary: z.string().trim().max(500).nullable().optional(),
   baseRevisionId: z.string().guid().nullable().optional(),
+}).superRefine((input, ctx) => {
+  if ((input.body !== undefined) === (input.append !== undefined)) {
+    ctx.addIssue({ code: "custom", message: "Supply exactly one of body or append", path: ["append"] });
+  }
+  if (input.append !== undefined && !input.baseRevisionId) {
+    ctx.addIssue({ code: "custom", message: "Append requires the exact baseRevisionId", path: ["baseRevisionId"] });
+  }
 });
 
 export const restoreIssueDocumentRevisionSchema = z.object({});

@@ -12,6 +12,7 @@ import { createSkillAction } from "../protocol-actions/create-skill.js";
 import { searchApiAction } from "../protocol-actions/search-api.js";
 import { callApiAction } from "../protocol-actions/call-api.js";
 import { projectIconSchema, projectRepositoryUrlSchema } from "../protocol-actions/create-project.js";
+import { requestHumanInputOperationRequirements, requestHumanInputWithdrawalFields } from "../protocol-actions/request-human-input.js";
 
 const ALL_MODES = ["standard", "ask", "planning", "skill_test"] as const;
 const WORK_MODES = ["standard", "planning", "skill_test"] as const;
@@ -200,34 +201,76 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
     operationId: "write_document",
     title: "Write revisioned document",
     description:
-      "Create or update an active-task document with optimistic revision safety.",
+      "Create or update an active-task document with optimistic revision safety. Before named QA, the author selects all required same-task sources and may supply includeDocuments to embed their exact current revisions in this one document. Selection/completeness remain the author responsibility; byte verification is not QA or adoption.",
     effect: "write",
     allowedModes: WORK_MODES,
-    inputSchema: object(
+    inputSchema: { ...object(
       {
         ...idempotency,
         key: text("Stable issue-document key.", 120),
         title: text("Document title.", 300),
         body: text("Markdown document body.", 200_000),
+        append: text("Raw suffix; exact baseRevisionId required. No body/includeDocuments; total <=200000 UTF-8 bytes.", 200_000),
         baseRevisionId: nullableText(
           "Current revision id, or null when creating.",
           240,
         ),
+        includeDocuments: {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "description": "Author-selected same-company, same-task current documents. Obtain fixed IDs and UTF-8 digest from read_document.readReceipt; do not estimate or hash redacted display text. The composed document is limited to 200000 UTF-8 bytes including metadata. Omit to preserve ordinary writes.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "documentId": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+              },
+              "key": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+              },
+              "revisionId": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+              },
+              "bodyBytes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 200000
+              },
+              "bodySha256": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            },
+            "required": [
+              "documentId",
+              "key",
+              "revisionId",
+              "bodyBytes",
+              "bodySha256"
+            ]
+          }
+        },
         changeSummary: nullableText("Optional revision summary."),
       },
-      ["idempotencyKey", "key", "title", "body", "baseRevisionId"],
-    ),
+      ["idempotencyKey", "key", "title", "baseRevisionId"],
+    ), oneOf: [{"properties": {"body": {}, "append": { "not": {} }}, "required": ["body"]}, {"properties": {"append": {}, "body": { "not": {} }, "includeDocuments": { "not": {} }, "baseRevisionId": {"type": "string", "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"}}, "required": ["append", "baseRevisionId"]}] },
     outputSchema: operationReceipt,
   }),
   descriptor({
     operationId: "request_human_input",
     title: "Request structured human input",
-    description: "Create a typed, durable interaction on the active task.",
+    description: "Create a typed, durable interaction on the active task, or withdraw your own pending named business-document confirmation through the live server. Withdrawal requires interactionId, reason, payload.target with the unchanged issue/document/key/revision, and a stable idempotencyKey; it does not answer, reassign, clear quarantine or schedule another review. Never resend an unknown effect.",
     effect: "write",
     allowedModes: ALL_MODES,
-    inputSchema: object(
+    inputSchema: { ...object(
       {
         ...idempotency,
+        ...requestHumanInputWithdrawalFields,
         interactionKind: {
           enum: [
             "confirmation",
@@ -254,12 +297,8 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
       },
       [
         "idempotencyKey",
-        "interactionKind",
-        "title",
-        "prompt",
-        "continuationPolicy",
       ],
-    ),
+    ), anyOf: requestHumanInputOperationRequirements },
     outputSchema: operationReceipt,
   }),
   descriptor({

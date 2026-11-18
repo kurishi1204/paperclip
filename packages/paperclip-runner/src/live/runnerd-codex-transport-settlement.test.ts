@@ -24,6 +24,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { expect, it, vi } from "vitest";
+import { NativeToolExecutionQuiescence, createNativeToolExecutionStopAssertion } from "../../../../server/src/services/native-runtime/native-tool-execution-quiescence.js";
+import { durableRecoveryInternals } from "../control-plane/durable-prp-control-plane.js";
+import { createPrpSemanticToolInputEnvelope, createPrpSemanticToolResultEnvelope } from "../protocol/semantic-tool-receipts.js";
 import type { ControlPlanePort } from "../contracts/control-plane-port.js";
 import type { NativeExecutionInputV1 } from "../contracts/native-execution.js";
 import type {
@@ -1752,3 +1755,122 @@ it.each([
   40_000,
 );
 
+
+
+it.each(["settled", "missing_read", "missing_result_command", "wrong_input_digest", "wrong_source_event", "wrong_delivery_status", "other_owner", "revoked_lease", "pending_terminal", "changed_checkpoint", "unknown_stopped", "unknown_inflight", "unknown_wrong_call"])(
+  "already-settled no-launch original consumer preserves old UNKNOWN: %s", async mode => {
+    const directory = await mkdtemp(join(tmpdir(), "runnerd-already-settled-"));
+    const identity = { runnerInstanceId: "runner-old", environmentLeaseId: "lease-old", runId: "run-old",
+      normalizedSessionId: "session-old", turnId: "turn-old", itemId: "item-old" };
+    const correlation = { runId: identity.runId, normalizedSessionId: identity.normalizedSessionId,
+      turnId: identity.turnId, itemId: identity.itemId };
+    const digest = (value: unknown) => createHash("sha256").update(durableRecoveryInternals.canonicalJson(value)).digest("hex");
+    const callId = "exec-0cc5a3f5-074f-49b8-bf45-51c61195802b";
+    const originalInput = { key: "video-company-handoff-independent-qa-v1" };
+    const unknownMode = mode.startsWith("unknown_");
+    const missingOutcome = mode === "missing_read" || unknownMode;
+    const semantics = [{ ...createPrpSemanticToolInputEnvelope({ operationId: "read_document", callId, correlation, content: originalInput }), input: originalInput },
+      ...(missingOutcome ? [] : [createPrpSemanticToolResultEnvelope({ operationId: "read_document", callId,
+        correlation, content: {}, outcome: "succeeded", code: "ok", retryable: false, authorizationBoundary: "active_task" })])];
+    const events = semantics.map((semantic, index) => ({ schema: "paperclip.prp.event.v1", schemaVersion: 1,
+      sourceEventId: `old:${index + 1}`, sourceSeq: index + 1, sourceKind: "runner", sourceInstanceId: identity.runnerInstanceId,
+      ...correlation, eventType: index === 0 ? "semantic_tool.input" : "semantic_tool.result", priority: 1,
+      emittedAt: "2026-11-16T10:44:57.000Z", payload: { semantic_tool: semantic } }));
+    const commandId = `command_tool_${createHash("sha256").update(`${identity.runId}\0${callId}`).digest("hex").slice(0,32)}`;
+    const toolPayload = { callId, operationId: "read_document", sourceEventId: mode === "wrong_source_event" ? "wrong-source" : "old:1",
+      sourceEventType: "semantic_tool.input", correlation, inputDigest: mode === "wrong_input_digest" ? "0".repeat(64) : digest(originalInput) };
+    const commandKinds = missingOutcome || mode === "missing_result_command"
+      ? ["runner.drain", "runner.suspend"] : ["semantic_tool.result", "runner.drain", "runner.suspend"];
+    const commands = commandKinds.map((type, index) => {
+      const id = type === "semantic_tool.result" ? commandId : `command-${index}`; const controllerSeq = index + 1;
+      return { schema: "paperclip.prp.command.v1", commandId: id, controllerSeq, type,
+        issuedAt: "2026-11-16T10:55:00.000Z", payload: type === "semantic_tool.result" ? toolPayload : {}, status: "completed",
+        result: { commandId: id, commandType: type, controllerSeq, status: "completed",
+          result: type === "semantic_tool.result" ? { status: mode === "wrong_delivery_status" ? "pending" : "delivered", callId }
+            : { status: "completed", ...(type === "runner.drain" ? { retainedEventsDrained: true } : {}) } } };
+    });
+    const runner = { schema: "paperclip.runner.durable.state.v1", ...identity, lifecycle: "suspended", outbox: [],
+      ackedSourceSeq: events.length, nextSourceSeq: events.length + 1, lastControllerCommandSeq: commands.length,
+      pendingTerminalDelivery: mode === "pending_terminal" ? {} : null,
+      processedCommands: Object.fromEntries(commands.map(command => [command.commandId, command.result])),
+      processedCommandFingerprints: Object.fromEntries(commands.map(command => [command.commandId, digest({
+        schema: command.schema, commandId: command.commandId, controllerSeq: command.controllerSeq, type: command.type,
+        issuedAt: command.issuedAt, deadlineAt: null, precondition: null, payload: command.payload })])) };
+    const control = { schema: "paperclip.runner.durable.control-plane-state.v1", identity, ackedSourceSeq: events.length,
+      commands, committedEvents: events.map(event => ({ sourceSeq: event.sourceSeq, sourceEventId: event.sourceEventId, eventType: event.eventType, envelope: { payload: event } })) };
+    const provider = { schema: "paperclip.runner.codex-provider-state.v1", config: { provider: "codex" },
+      threadId: "provider-old", lifecycle: "session_open", activeProviderTurnId: null,
+      toolBridge: { pending: unknownMode ? { [callId]: {callId,operationId:"read_document",input:originalInput} } : {} }, pendingEvents: [], queuedEvents: [] };
+    const files = ["control-plane/control-plane-state.json", "runner/runner-state.json", "runner/codex-provider-state.json"];
+    await mkdir(join(directory, "control-plane")); await mkdir(join(directory, "runner"));
+    for (const [i, value] of [control, runner, provider].entries()) await writeFile(join(directory, files[i]!), JSON.stringify(value));
+    const snapshot = maintenanceReplaySnapshot(directory);
+    const appendEvent = vi.fn(async () => {}); const recordEpoch = vi.fn(async () => {});
+    const authorize = vi.fn(async () => {});
+    const authorizeOwnerAndLease = vi.fn(async () => {
+      if (mode === "other_owner") throw new Error("current_retained_owner_mismatch");
+      if (mode === "revoked_lease") throw new Error("original_cleanup_lease_revoked");
+      if (mode === "changed_checkpoint") await writeFile(join(directory, files[1]!), JSON.stringify({ ...runner, itemId: "later-carrier" }));
+    });
+    const quiescence = unknownMode ? new NativeToolExecutionQuiescence({ companyId:"company-old",agentId:"agent-old",issueId:"issue-old",
+      runId:identity.runId,epochId:"original-epoch",normalizedSessionId:identity.normalizedSessionId,
+      runnerInstanceId:identity.runnerInstanceId,environmentLeaseId:identity.environmentLeaseId }) : null;
+    let releaseHandler: (()=>void) | undefined;
+    let trackedHandler: Promise<unknown> | undefined;
+    let stoppedToolExecutions: ReturnType<typeof createNativeToolExecutionStopAssertion> | undefined;
+    if (quiescence) {
+      const trackedCallId = mode === "unknown_wrong_call" ? "another-call" : callId;
+      const nativeToolExecution = {callId:trackedCallId,operationId:"read_document",sourceEventId:"old:1",sourceEventType:"semantic_tool.input",
+        inputDigest:digest(originalInput),correlation};
+      trackedHandler = quiescence.track({callId:trackedCallId,operationId:"read_document",nativeToolExecution},async()=>{
+        if (mode === "unknown_inflight") await new Promise<void>(resolve=>{releaseHandler=resolve;});
+        throw new Error("controlled_business_outcome_unknown");
+      });
+      void trackedHandler.catch(()=>undefined);
+      quiescence.revoke();
+      if (mode === "unknown_inflight") {
+        stoppedToolExecutions = {assertCurrent:()=>{quiescence.getStoppedReceipt();},
+          assertCallsStopped:calls=>quiescence.assertCallsStopped(quiescence.getStoppedReceipt(),calls)};
+      } else {
+        await trackedHandler.catch(()=>undefined);
+        const receipt=await quiescence.awaitStopped();
+        expect(receipt.businessOutcome).toBe("unverified");
+        stoppedToolExecutions=createNativeToolExecutionStopAssertion(receipt);
+      }
+    }
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("controlled absent probe"), { code: "ESRCH" }); });
+    const spawn = vi.spyOn(durableControlPlane, "spawnRunner");
+    try {
+      const input = { requestId: "old-proof-only", binding: { companyId: "company-old", agentId: "agent-old", issueId: "issue-old",
+        runId: identity.runId, sessionId: identity.normalizedSessionId }, identity,
+        backend: { kind: "runner", name: "codex_app_server" }, stateDirectory: directory, activationDirectory: directory,
+        sourceFingerprint: snapshot.fingerprint, providerSessionId: "provider-old", originalRunnerPid: 550010, originalProviderPid: 550011,
+        // A nonexistent path proves the no-launch branch never resolves a binary/home.
+        runnerBinary: "/fixture/no-runner-must-be-read", sourceCodexHome: "/fixture/no-home-must-be-read",
+        authorize, alreadySettledNoLaunch: { authorizeOwnerAndLease, stoppedToolExecutions }, appendEvent, recordEpoch };
+      if (mode === "settled" || mode === "unknown_stopped") {
+        const proof = await settleRetainedRunnerdSession(input);
+        expect(proof.binding).toEqual(input.binding);
+        expect(proof.identity).toEqual(identity);
+        expect(proof.sourceFingerprint).toBe(proof.settledFingerprint);
+        expect(retainedRunnerdCleanupProofIsCurrent(proof)).toBe(true);
+        expect(authorizeOwnerAndLease).toHaveBeenCalledTimes(2);
+        if (mode === "unknown_stopped") {
+          expect(proof.unsettledToolCalls).toEqual([{callId, operationId:"read_document", sourceEventId:"old:1", sourceEventType:"semantic_tool.input",
+            inputDigest:digest(originalInput), correlation}]);
+          expect(maintenanceReplaySnapshot(directory).fingerprint).toBe(snapshot.fingerprint);
+          expect(control.committedEvents[0]!.envelope.payload.eventType).toBe("semantic_tool.input");
+          expect(commands.some(command => command.type === "semantic_tool.result")).toBe(false);
+          quiescence!.invalidate();
+        } else await writeFile(join(directory, files[1]!), JSON.stringify({ ...runner, itemId: "later-carrier" }));
+        expect(retainedRunnerdCleanupProofIsCurrent(proof)).toBe(false);
+      } else {
+        await expect(settleRetainedRunnerdSession(input)).rejects.toThrow(unknownMode ? (mode === "unknown_inflight" ? "native_tool_execution_stop_not_observed" : "native_tool_execution_call_not_proven_stopped") : ["missing_read", "missing_result_command", "wrong_input_digest", "wrong_source_event", "wrong_delivery_status"].includes(mode)
+          ? "native_cleanup_tool_settlement_unverified" : mode === "other_owner" ? "current_retained_owner_mismatch"
+          : mode === "revoked_lease" ? "original_cleanup_lease_revoked" : "native_cleanup_maintenance_unproven");
+      }
+      expect(spawn).not.toHaveBeenCalled(); expect(appendEvent).not.toHaveBeenCalled(); expect(recordEpoch).not.toHaveBeenCalled();
+      if (!["settled", "changed_checkpoint"].includes(mode)) expect(maintenanceReplaySnapshot(directory).fingerprint).toBe(snapshot.fingerprint);
+      expect(kill.mock.calls.every(call => call[1] === 0)).toBe(true);
+    } finally { releaseHandler?.(); await trackedHandler?.catch(()=>undefined); spawn.mockRestore(); kill.mockRestore(); await rm(directory, { recursive: true, force: true }); }
+  });

@@ -1,3 +1,4 @@
+import {isDocumentReturnContext} from "../services/document-return-contract.js";
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { Request, RequestHandler } from "express";
 import { and, eq, isNull } from "drizzle-orm";
@@ -403,6 +404,10 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.id, claims.run_id), eq(heartbeatRuns.companyId, claims.company_id), eq(heartbeatRuns.agentId, claims.sub),
         ));
+      if (isDocumentReturnContext(identityRun?.contextSnapshot)) {
+        next(forbidden("Fixed document returns have no HTTP authority",{code:"document_return_server_executor_only"}));
+        return;
+      }
       if (agentRunWritesRevoked(identityRun)
         && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
         const conversation = identityRun?.contextSnapshot?.conversationMode === true;
@@ -469,6 +474,14 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
+    if (runIdHeader) {
+      const [boundRun]=await db.select({contextSnapshot:heartbeatRuns.contextSnapshot}).from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id,runIdHeader),eq(heartbeatRuns.companyId,key.companyId),eq(heartbeatRuns.agentId,key.agentId)));
+      if (isDocumentReturnContext(boundRun?.contextSnapshot)) {
+        next(forbidden("Fixed document returns have no HTTP authority",{code:"document_return_server_executor_only"}));
+        return;
+      }
+    }
     const responsibleUserId = normalizeOptionalString(key.responsibleUserId);
     if (!responsibleUserId) {
       await auditAgentKeyMissingResponsibleUser(db, {

@@ -30,6 +30,7 @@ try {
     }
   }
   visit('@paperclipai/server');
+  const workspaceVersions = Object.fromEntries([...needed].map(name => [name, releaseVersion]));
   // Match release.sh's unified versioning in temporary staging directories.
   // Source manifests remain untouched, including independently versioned SDKs.
   run(process.execPath, [join(repo, 'scripts/build-standalone-public-packages.mjs')], repo);
@@ -39,21 +40,23 @@ try {
     const { dir, manifest } = packages.get(name);
     const target = join(root, `package-${index}`); mkdirSync(target);
     const stagedSource = join(root, `source-${index}`); mkdirSync(stagedSource);
+    const stagedFiles = [];
     for (const file of manifest.files ?? ['dist']) {
       // release.sh stages runtime skills into these public packages before pack.
       const releaseSkills = file === 'skills' && ['server', 'packages/adapters/claude-local', 'packages/adapters/codex-local'].includes(dir);
-      // Other adapters declare an optional skills directory that npm pack omits
-      // when absent. Do not fabricate extra release payloads for those adapters.
+      // Preserve release.sh's three supply targets and npm's optional omission.
+      // The strict collector sees only files actually staged, never fabricated skills.
       if (file === 'skills' && !releaseSkills && !existsSync(join(repo, dir, file))) continue;
       cpSync(releaseSkills ? join(repo, 'skills') : join(repo, dir, file), join(stagedSource, file), { recursive: true });
+      stagedFiles.push(file);
     }
-    const releaseManifest = { ...manifest, version: releaseVersion };
+    const releaseManifest = { ...manifest, version: releaseVersion, files: stagedFiles };
     writeFileSync(join(stagedSource, 'package.json'), JSON.stringify(releaseManifest));
     if ((manifest.bundleDependencies ?? manifest.bundledDependencies ?? []).length) {
-      prepareBundledPackage(stagedSource, target);
+      prepareBundledPackage(stagedSource, target, { workspaceVersions });
     } else {
       cpSync(stagedSource, target, { recursive: true });
-      writeFileSync(join(target, 'package.json'), JSON.stringify(materializePublishManifest(releaseManifest)));
+      writeFileSync(join(target, 'package.json'), JSON.stringify(materializePublishManifest(releaseManifest, { workspaceVersions, sourceDir: stagedSource })));
     }
     run('npm', ['pack', '--ignore-scripts', '--pack-destination', root], target);
     const packed = readdirSync(root).filter(f => f.endsWith('.tgz') && !tarballs.includes(join(root, f)));

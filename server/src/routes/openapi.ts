@@ -453,6 +453,7 @@ function zodToOpenApiSchema(schema: z.ZodTypeAny): JsonSchema {
     return jsonSchema;
   }
 
+  if (typeName === "never") return { not: {} };
   if (typeName === "boolean") return { type: "boolean" };
   if (typeName === "date") return { type: "string", format: "date-time" };
   if (typeName === "any" || typeName === "unknown") return {};
@@ -4361,7 +4362,15 @@ registry.registerPath({
   summary: "Upsert an issue document",
   request: {
     params: z.object({ id: z.string(), key: z.string() }),
-    body: jsonBody(upsertIssueDocumentSchema),
+    body: jsonBody(z.union([
+      upsertIssueDocumentSchema.safeExtend({
+        body: upsertIssueDocumentSchema.shape.body.unwrap(), append: z.never().optional(),
+      }),
+      upsertIssueDocumentSchema.safeExtend({
+        body: z.never().optional(), append: upsertIssueDocumentSchema.shape.append.unwrap(),
+        baseRevisionId: z.string().guid(),
+      }),
+    ])),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
@@ -10360,7 +10369,18 @@ registerCurrentRoute({
   method: "get",
   path: "/api/issues/{id}/recovery-actions",
   tags: ["issues"],
-  summary: "List issue recovery actions",
+  summary: "Read active issue recovery or an exact scoped action receipt",
+  query: z.object({ actionId: z.string().guid().optional() }),
+  responses: {
+    200: {
+      ...r.ok(),
+      description: "Without actionId: the existing active-action projection. With actionId: { action } containing the original scoped action read model, including settled actions; no revalidation, state changes, or wake.",
+    },
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
 });
 
 registerCurrentRoute({

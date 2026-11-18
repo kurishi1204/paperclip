@@ -1441,6 +1441,8 @@ export interface RequestConfirmationPayload {
   detailsMarkdown?: string | null;
   supersedeOnUserComment?: boolean;
   target?: RequestConfirmationTarget | null;
+  /** Same-issue fixed revisions readable as evidence, never extra verdict targets. */
+  supportingDocuments?: Array<RequestConfirmationBoundDocument & { companyId: string; issueId: string }>;
   toolAction?: RequestConfirmationToolActionPayload;
   secretProposal?: RequestConfirmationSecretProposalPayload;
   connectionAuthorization?: RequestConfirmationConnectionAuthorizationPayload;

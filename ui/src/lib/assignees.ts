@@ -95,3 +95,51 @@ export function formatUserLabel(
   if (userId === "local-board") return "Board";
   return userId.slice(0, 5);
 }
+
+
+/** A cancellation receipt is not proof of the current assignment or permission to replay. */
+export function assignmentFailureNotice(
+  errorBody: unknown,
+  expectedIssueId: string,
+  assigneeLabel: (selection: AssigneeSelection) => string | null,
+): { title: string; body: string } | null {
+  const record = (value: unknown): Record<string, unknown> | null =>
+    value !== null && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown> : null;
+  const body = record(errorBody);
+  const failure = record(body?.issueMutation) ?? record(record(body?.details)?.issueMutation);
+  const cancellation = record(failure?.runCancellation);
+  const ownership = record(failure?.lastObservedOwnership);
+  const idOrNull = (value: unknown): value is string | null =>
+    value === null || (typeof value === "string" && value.length > 0);
+  if (!failure || failure.issueId !== expectedIssueId ||
+      typeof failure.issueMutationStopId !== "string" || !failure.issueMutationStopId ||
+      cancellation?.observedStatus !== "cancelled" || cancellation.evidence !== "cancelRun_return" ||
+      typeof cancellation.runId !== "string" || !cancellation.runId ||
+      !["not_attempted", "outcome_unknown"].includes(String(failure.assignmentWrite)) ||
+      failure.currentOwnership !== "unverified" || failure.automaticRetry !== false ||
+      failure.nextAction !== "read_issue_and_run_before_owner_decision" ||
+      !ownership || !["request_read", "locked_before_update"].includes(String(ownership.source)) ||
+      !Number.isInteger(ownership.revision) || Number(ownership.revision) < 0 ||
+      !Number.isInteger(ownership.statusVersion) || Number(ownership.statusVersion) < 0 ||
+      !idOrNull(ownership.assigneeAgentId) || !idOrNull(ownership.assigneeUserId) ||
+      (ownership.assigneeAgentId !== null && ownership.assigneeUserId !== null)) return null;
+
+  const selection = {
+    assigneeAgentId: ownership.assigneeAgentId,
+    assigneeUserId: ownership.assigneeUserId,
+  };
+  const label = assigneeLabel(selection);
+  const lastObserved = label
+    ? `Last observed assignee: ${label}.`
+    : selection.assigneeAgentId || selection.assigneeUserId
+      ? "An assignee was recorded in the last ownership observation."
+      : "No assignee was recorded in the last ownership observation.";
+  const writeOutcome = failure.assignmentWrite === "not_attempted"
+    ? "This request did not attempt the assignment change."
+    : "The assignment change result is unknown.";
+  return {
+    title: "Assignment needs confirmation",
+    body: `The previous run is marked cancelled. Its processes have not been verified as stopped. ${writeOutcome} ${lastObserved} This observation does not verify the current assignee. Check the current task and run before deciding what to do. Do not resubmit this change.`,
+  };
+}

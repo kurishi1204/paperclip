@@ -76,7 +76,7 @@ export const expandedMcpCapabilities: Capability[] = [
   {
     name: "paperclip_write_document", write: true, destructive: true,
     description: "Create or update a durable Markdown task document. Read it first and supply latestRevisionId as baseRevisionId; use null only for a new document. A stale revision is rejected. For videos or binary files use paperclip_get_upload_url.",
-    schema: z.object({ ...task, requestId, key, document: upsertIssueDocumentSchema.extend({ baseRevisionId: z.uuid().nullable() }).strict() }).strict(),
+    schema: z.object({ ...task, requestId, key, document: upsertIssueDocumentSchema.safeExtend({ baseRevisionId: z.uuid().nullable() }).strict() }).strict(),
     run: async (p, a, api) => ({ document: pick(await api(p, "PUT", `/issues/${pathId(a.taskId)}/documents/${pathId(a.key)}`, a.document), documentFields) }),
   },
   {

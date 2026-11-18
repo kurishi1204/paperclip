@@ -1,3 +1,6 @@
+import { recordIssueMutationFailure } from "../middleware/error-handler.js";
+import { prepareDocumentReturnWake } from "../services/document-return-wake.js";
+import { assertAssignableAgent, assertAssignmentWorkRequirementsPreserved, assignmentWorkSourcePin, hasAssignmentWorkRequirements, prepareAssignmentWorkRequirements } from "../services/agent-assignability.js";
 import {prepareCommanderAdmission} from "../services/commander-admission.js";
 import {commanderAdmissionDigest,prepareCommanderAdmissionSchema,commanderPolicySchema} from "../services/commander-cycle.js";
 import { activeIssueInteractionCondition, readTaskQuestionContext } from "../services/issue-question-context.js";
@@ -13,6 +16,7 @@ import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions
 import { getExecutionBlocker, getQaPredecessorWaitBlocker } from "../services/execution-blocker.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
+  assertTerminalReconciliationIdle,
   validateExecutionReconciliation,
   markExecutionReconciliation,
 } from "../services/execution-recovery-resolution.js";
@@ -348,6 +352,8 @@ import {
   type IssueThreadInteractionResolverRestriction,
 } from "../services/issue-thread-interaction-resolution.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
+import { requestNativeReviewReturn, requestNativeReviewReturnSchema } from "../services/native-runtime/native-review-return.js";
+import { amendNativeReviewPolicy, nativeReviewPolicySchema } from "../services/native-runtime/native-review-policy.js";
 import {
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
@@ -580,22 +586,15 @@ function noopTaskWatchdogService(): TaskWatchdogService {
       throw unprocessable("Task watchdog service is unavailable");
     },
     disableForIssue: async () => null,
-    reconcileTaskWatchdogs: async () => ({
-      checked: 0,
-      triggered: 0,
-      live: 0,
-      pendingFirstRun: 0,
-      alreadyReviewed: 0,
-      skipped: 0,
-      watchdogIssueIds: [],
-    }),
-    reconcileForIssueAndAncestors: async () => ({
-      checked: 0,
-      triggered: 0,
-      pendingFirstRun: 0,
-      skipped: 0,
-      watchdogIssueIds: [],
-    }),
+    reconcileTaskWatchdogs: async () => {
+      // An unavailable service cannot supply a read-only supervision assessment.
+      // Preserve that absence as a failure instead of fabricating an empty one.
+      throw unprocessable("Task watchdog service is unavailable");
+    },
+    reconcileForIssueAndAncestors: async () => {
+      // No dispatcher is available here; do not report a healthy empty sweep.
+      throw unprocessable("Task watchdog service is unavailable");
+    },
     revalidateMutationScope: async () => ({
       allowed: true,
       classification: {
@@ -2753,6 +2752,18 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       publication.idempotencyKey ===
       `interaction:${input.interaction.id}:${publication.endpointId}`,
   );
+  // Carry the server-read fixed target across the ordinary wake boundary.
+  // This does not manufacture a comment or relax dependency/pause admission.
+  const returnPreparation = await prepareDocumentReturnWake(input.db, {
+    companyId: input.issue.companyId, issueId: input.issue.id,
+    agentId: input.issue.assigneeAgentId, interactionId: input.interaction.id,
+  });
+  if (returnPreparation.kind === "held") {
+    logger.warn({ issueId: input.issue.id, interactionId: input.interaction.id, reason: returnPreparation.reason },
+      "Fixed document return held; ordinary continuation was not substituted");
+    return;
+  }
+  const documentReturn = returnPreparation.kind === "ready" ? returnPreparation.binding : null;
   await input.heartbeat
     .wakeup(input.issue.assigneeAgentId, {
       source: "automation",
@@ -2760,6 +2771,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       reason: "issue_commented",
       payload: {
         issueId: input.issue.id,
+        ...(documentReturn ? { documentReturn } : {}),
         interactionId: input.interaction.id,
         interactionKind: input.interaction.kind,
         interactionStatus: input.interaction.status,
@@ -2780,12 +2792,13 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       idempotencyKey:
         input.idempotencyKey ??
         `interaction:${input.interaction.id}:${input.interaction.status}`,
-      allowRunCoalescing: !hasExternalPromptBinding,
+      allowRunCoalescing: !hasExternalPromptBinding && !documentReturn,
       requestedByActorType: input.actor.actorType,
       requestedByActorId: input.actor.actorId,
       contextSnapshot: {
         issueId: input.issue.id,
         taskId: input.issue.id,
+        ...(documentReturn ? { documentReturn } : {}),
         interactionId: input.interaction.id,
         interactionKind: input.interaction.kind,
         interactionStatus: input.interaction.status,
@@ -9140,6 +9153,20 @@ export function issueRoutes(
     );
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    if (req.query.actionId !== undefined) {
+      const actionId = req.query.actionId;
+      if (typeof actionId !== "string" || !isUuidLike(actionId)) throw badRequest("Invalid recovery action id");
+      // Exact receipt lookup is read-only, including settled actions. Do not
+      // fold stale actions or admit another execution while reconciling a lost response.
+      const [action] = await db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.id, actionId),
+        eq(issueRecoveryActions.companyId, issue.companyId),
+        eq(issueRecoveryActions.sourceIssueId, issue.id),
+      ));
+      if (!action) throw notFound("Recovery action not found");
+      res.json({ action: issueRecoveryActionReadModel(action) });
+      return;
+    }
     const active = await revalidateActiveSourceRecoveryForRead({
       issue,
       trigger: "read_projection",
@@ -9218,11 +9245,17 @@ export function issueRoutes(
         sourceIssueStatus,
         resolutionNote,
         executionReconciliation,
+        expectedSourceRevision,
       } = req.body;
       if (outcome === "false_positive" || outcome === "cancelled") {
         assertBoard(req);
       }
 
+      const terminalReconciliation = sourceIssueStatus === "done" && executionReconciliation != null;
+      if (terminalReconciliation) {
+        assertBoard(req);
+        if (!actionId || outcome !== "restored") throw conflict("Terminal reconciliation requires the exact recovery action and restored outcome.");
+      }
       const actor = getActorInfo(req);
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
       const postCommitActivityPublications: ActivityPublication[] = [];
@@ -9241,6 +9274,33 @@ export function issueRoutes(
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
 
+        const assertTerminalGates = async () => {
+          await requireRecoverySourceMutationAuthority(req, lockedIssue);
+          await assertTerminalReconciliationIdle(tx as unknown as Db, lockedIssue);
+          if (lockedIssue.reviewPolicy === "human_only" && (!req.actor.userId || req.actor.source === "mcp_oauth")) {
+            throw forbidden("Terminal reconciliation cannot substitute for an authenticated human review.");
+          }
+          await assertIssueReviewVerdictActorAllowed(tx as unknown as Db, {
+            issue: lockedIssue, actor: { type: actor.actorType, id: actor.actorId },
+          });
+          const readiness = await svc.getDependencyReadiness(lockedIssue.id, tx);
+          if (readiness.unresolvedBlockerCount > 0) throw conflict("Resolve task dependencies before terminal reconciliation.");
+          const [pending] = await tx.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+            eq(issueThreadInteractions.companyId, lockedIssue.companyId),
+            eq(issueThreadInteractions.issueId, lockedIssue.id),
+            eq(issueThreadInteractions.status, "pending"), activeIssueInteractionCondition(),
+          )).limit(1);
+          if (pending) throw conflict("Resolve the pending interaction before terminal reconciliation.");
+        };
+        if (terminalReconciliation) {
+          // Bind the recorded action while checking and committing its terminal
+          // receipt; background recovery writers must not replace its evidence.
+          await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+            eq(issueRecoveryActions.id, actionId),
+            eq(issueRecoveryActions.companyId, lockedIssue.companyId),
+            eq(issueRecoveryActions.sourceIssueId, lockedIssue.id),
+          )).for("update");
+        }
         let activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
           lockedIssue.companyId,
           lockedIssue.id,
@@ -9268,6 +9328,26 @@ export function issueRoutes(
               issueRecoveryActionReadModel(settled),
               { source: "recovery_action_resolution" },
             );
+            const terminal = settled.evidence.terminalReconciliation as
+              { sourceIssueStatus?: string; expectedSourceRevision?: number; issueRevision?: number; assigneeAgentId?: string } | undefined;
+            if (terminal) {
+              assertBoard(req);
+              const recorded = settled.evidence.executionReconciliation as Record<string, unknown> | undefined;
+              if (!terminalReconciliation || activeRecoveryAction || settled.status !== "resolved" ||
+                  settled.outcome !== "owner_completed" || lockedIssue.status !== "done" ||
+                  terminal.sourceIssueStatus !== "done" || terminal.expectedSourceRevision !== expectedSourceRevision ||
+                  terminal.issueRevision !== lockedIssue.revision ||
+                  terminal.assigneeAgentId !== lockedIssue.assigneeAgentId ||
+                  settled.returnOwnerAgentId !== lockedIssue.assigneeAgentId ||
+                  recorded?.actorId !== actor.actorId ||
+                  settled.resolutionNote !== (resolutionNote ?? null) ||
+                  !["runId", "providerStopped", "actionOutcome", "outcomeEvidence", "workspaceRepairEvidence"].every(
+                    (key) => recorded?.[key] === executionReconciliation?.[key])) {
+                throw conflict("Terminal reconciliation receipt does not match this request or current task state.");
+              }
+              await assertTerminalGates();
+              return { issue: lockedIssue, recoveryAction: settled, replayed: true };
+            }
             const automatic = settled.evidence.automaticRecovery as
               { replay?: string } | undefined;
             if (automatic?.replay === "blocked" && executionReconciliation) {
@@ -9276,12 +9356,17 @@ export function issueRoutes(
               assertBoard(req);
               if (
                 activeRecoveryAction ||
-                sourceIssueStatus !== "todo" ||
+                (sourceIssueStatus !== "todo" && !terminalReconciliation) ||
                 outcome !== "restored"
               ) {
                 throw conflict(
                   "Verified outcomes must restore this source recovery without replacing another active recovery action.",
                 );
+              }
+              if (terminalReconciliation && (settled.status !== "resolved" || settled.outcome !== "blocked" ||
+                  settled.evidence.executionReconciliation != null || settled.evidence.continuationDelivery != null ||
+                  lockedIssue.status !== "blocked")) {
+                throw conflict("Only the unchanged automatic no-replay hold can be terminally reconciled.");
               }
               const [reopened] = await tx
                 .update(issueRecoveryActions)
@@ -9290,6 +9375,7 @@ export function issueRoutes(
                 .returning();
               activeRecoveryAction = issueRecoveryActionReadModel(reopened!);
             } else {
+              if (terminalReconciliation) throw conflict("This settled action is not an automatic no-replay hold.");
               return {
                 issue: lockedIssue,
                 recoveryAction: settled,
@@ -9310,6 +9396,18 @@ export function issueRoutes(
           activeRecoveryAction,
           { source: "recovery_action_resolution" },
         );
+
+        if (terminalReconciliation) {
+          if (lockedIssue.status !== "blocked" || expectedSourceRevision !== lockedIssue.revision ||
+              !activeRecoveryAction.returnOwnerAgentId ||
+              activeRecoveryAction.returnOwnerAgentId !== lockedIssue.assigneeAgentId ||
+              !requiresExecutionReconciliation(activeRecoveryAction.cause) ||
+              (activeRecoveryAction.evidence.runId != null && activeRecoveryAction.evidence.sourceRunId != null &&
+                activeRecoveryAction.evidence.runId !== activeRecoveryAction.evidence.sourceRunId)) {
+            throw conflict("Terminal reconciliation must match the stopped task owner and execution recovery.");
+          }
+          await assertTerminalGates();
+        }
 
         if (outcome === "restored" && activeRecoveryAction.cause === "native_workspace_sync_out_unsafe_archive") {
           throw conflict("Unsafe workspace export recovers automatically without another provider turn.", { code: "workspace_export_automatic_recovery" });
@@ -9380,7 +9478,7 @@ export function issueRoutes(
         }
 
         if (
-          sourceIssueStatus === "todo" &&
+          (sourceIssueStatus === "todo" || terminalReconciliation) &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
           assertBoard(req);
@@ -9393,6 +9491,7 @@ export function issueRoutes(
               activeRecoveryAction.evidence.runId ??
               activeRecoveryAction.evidence.sourceRunId,
             decision: executionReconciliation,
+            terminal: terminalReconciliation,
           });
         } else if (executionReconciliation) {
           throw conflict(
@@ -9445,7 +9544,7 @@ export function issueRoutes(
           }
         }
 
-        if (executionReconciliation) {
+        if (executionReconciliation && !terminalReconciliation) {
           // The authorized chat retry is the sole durable delivery owner.
           // Never also enqueue a generic successor that lacks chat provenance.
           await markExecutionReconciliation(
@@ -9536,7 +9635,7 @@ export function issueRoutes(
                 agentId: actor.agentId ?? null,
                 userId: actor.actorType === "user" ? actor.actorId : null,
               },
-              allowBoardOverride: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
+              allowBoardOverride: !terminalReconciliation && req.actor.type === "board" && req.actor.source !== "mcp_oauth",
               commentBody: resolutionNote ?? null,
             });
             Object.assign(updateFields, transition.patch);
@@ -9594,6 +9693,15 @@ export function issueRoutes(
                 );
           if (!updatedIssue) throw notFound("Issue not found");
           issue = updatedIssue;
+        }
+
+        if (terminalReconciliation) {
+          if (issue.status !== "done" || issue.assigneeAgentId !== activeRecoveryAction.returnOwnerAgentId) {
+            throw conflict("Terminal reconciliation cannot advance or replace a review workflow.");
+          }
+          await markExecutionReconciliation(tx as unknown as Db, activeRecoveryAction,
+            executionReconciliation, actor.actorId,
+            { kind: "terminal", expectedSourceRevision, issueRevision: issue.revision, assigneeAgentId: issue.assigneeAgentId! });
         }
 
         const recordedOutcome =
@@ -10351,7 +10459,7 @@ export function issueRoutes(
         const referenceSummaryBefore = await issueReferenceService(executor).listIssueReferenceSummary(issue.id);
         const result = await documentService(executor).upsertIssueDocument({
           issueId: issue.id, key, title: req.body.title ?? null, format: req.body.format,
-          body: req.body.body, changeSummary: req.body.changeSummary ?? null,
+          body: req.body.body, append: req.body.append, changeSummary: req.body.changeSummary ?? null,
           baseRevisionId: req.body.baseRevisionId ?? null,
           createdByAgentId: actor.agentId ?? null,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -10395,7 +10503,7 @@ export function issueRoutes(
         key: keyParsed.data,
         title: req.body.title ?? null,
         format: req.body.format,
-        body: req.body.body,
+        body: req.body.body, append: req.body.append,
         changeSummary: req.body.changeSummary ?? null,
         baseRevisionId: req.body.baseRevisionId ?? null,
         createdByAgentId: actor.agentId ?? null,
@@ -11288,6 +11396,12 @@ export function issueRoutes(
               .returning({ id: issueComments.id });
           }
           if (req.body.sourceArtifactKind === "document") {
+            await tx.select({ id: issueRows.id }).from(issueRows)
+              .where(and(eq(issueRows.id, issue.id), eq(issueRows.companyId, issue.companyId))).for("update");
+            const [linked] = await tx.select({ id: issueDocuments.id }).from(issueDocuments)
+              .where(and(eq(issueDocuments.issueId, issue.id), eq(issueDocuments.companyId, issue.companyId),
+                eq(issueDocuments.documentId, req.body.sourceArtifactId))).limit(1);
+            if (!linked) return [];
             return tx
               .update(documents)
               .set(markPromoted)
@@ -13248,7 +13362,7 @@ export function issueRoutes(
       }
       // MCP task changes cannot stop a run or implicitly decide a pending review.
       const mcpParticipationChange = req.actor.source === "mcp_oauth" &&
-        ["status", "assigneeAgentId", "assigneeUserId", "blockedByIssueIds", "parentId", "projectId"].some(key => req.body[key] !== undefined);
+        ["status", "assigneeAgentId", "assigneeUserId", "blockedByIssueIds", "parentId", "projectId", "workRequirements"].some(key => req.body[key] !== undefined);
       if (mcpParticipationChange) await assertMcpTaskParticipation(db, existing);
 
       assertNoAgentHostWorkspaceCommandMutation(
@@ -13303,6 +13417,7 @@ export function issueRoutes(
         : null;
       const {
         comment: commentBody,
+        workRequirements,
         commentClientRequestId,
         attachmentIds: commentAttachmentIds,
         reviewInteractionId: requestedReviewInteractionId,
@@ -13319,6 +13434,11 @@ export function issueRoutes(
         boardReviewExpected: _boardReviewExpected,
         ...updateFields
       } = req.body;
+      const rawWorkOverridesRequested = updateFields.assigneeAdapterOverrides !== undefined;
+      if (rawWorkOverridesRequested) {
+        // Reject before any separately requested interrupt/ownership effects.
+        assertAssignmentWorkRequirementsPreserved(existing, updateFields.assigneeAdapterOverrides);
+      }
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
         throw unprocessable("Send conversation messages through the comments endpoint with a clientRequestId");
       }
@@ -13894,8 +14014,15 @@ export function issueRoutes(
           code: "interaction_response_queued",
         });
       }
-      if (assigneeWillChange && !transition.workflowControlledAssignment) {
-        if (!isAgentReturningIssueToCreator) {
+      if (workRequirements !== undefined && (
+        !nextAssigneeAgentId || existing.conversationAgentId || transition.workflowControlledAssignment ||
+        (updateFields.status ?? existing.status) === "in_review" ||
+        updateFields.assigneeAdapterOverrides !== undefined
+      )) {
+        throw unprocessable("Work requirements need a normal agent work assignment and cannot be combined with raw adapter overrides");
+      }
+      if ((assigneeWillChange || workRequirements !== undefined) && !transition.workflowControlledAssignment) {
+        if (!isAgentReturningIssueToCreator || workRequirements !== undefined) {
           await assertCanAssignTasks(req, existing.companyId, {
             issueId: existing.id,
             projectId: await resolveAssignmentProjectId({
@@ -13917,9 +14044,48 @@ export function issueRoutes(
         }
       }
 
+      const prepareWorkAssignment = (current: NonNullable<typeof existing>) => {
+        const work = {
+          ...current,
+          assigneeAgentId: nextAssigneeAgentId,
+          title: updateFields.title === undefined ? current.title : updateFields.title,
+          description: updateFields.description === undefined ? current.description : updateFields.description,
+          assigneeAdapterOverrides: workRequirements === undefined && updateFields.assigneeAdapterOverrides !== undefined
+            ? updateFields.assigneeAdapterOverrides : current.assigneeAdapterOverrides,
+        };
+        return workRequirements === undefined ? work : prepareAssignmentWorkRequirements(work, workRequirements);
+      };
+      // Subsequent ordinary reassignments consume the already-persisted contract too.
+      // Workflow reviewers and the fixed server document-return path are separate work.
+      const nextWorkAssignment = nextAssigneeAgentId && !transition.workflowControlledAssignment &&
+        !existing.conversationAgentId && (updateFields.status ?? existing.status) !== "in_review" &&
+        (assigneeWillChange || workRequirements !== undefined)
+          ? prepareWorkAssignment(existing) : null;
+      // No contract means the original unclassified assignment path, with no new gate.
+      const preparedWorkAssignment = nextWorkAssignment && hasAssignmentWorkRequirements(nextWorkAssignment)
+        ? nextWorkAssignment : null;
+      if (preparedWorkAssignment) {
+        // Fail before goal stopping, run cancellation, ownership mutation or wake.
+        await assertAssignableAgent(db, existing.companyId, nextAssigneeAgentId, {
+          kind: "work", work: preparedWorkAssignment,
+        });
+        if (workRequirements !== undefined) {
+          updateFields.assigneeAdapterOverrides = preparedWorkAssignment.assigneeAdapterOverrides;
+        }
+      }
+
       // Only this request may finish a mutation that intentionally stops its
       // own run (for example handing work to a signoff reviewer).
       const issueMutationStopId = randomUUID();
+      let reassignmentCancelledRunId: string | null = null;
+      let assignmentUpdateStarted = false;
+      let lastAssignmentOwnership = {
+        source: "request_read" as "request_read" | "locked_before_update",
+        revision: existing.revision,
+        statusVersion: existing.statusVersion,
+        assigneeAgentId: existing.assigneeAgentId,
+        assigneeUserId: existing.assigneeUserId,
+      };
       if (!boardReviewExpected && !formalApprovalExpected && req.actor.source !== "mcp_oauth" && assigneeWillChange && existing.assigneeAgentId) {
         const ownershipChange = {
           companyId: existing.companyId,
@@ -13963,6 +14129,7 @@ export function issueRoutes(
             );
           }
           interruptedRunId = cancelled.id;
+          reassignmentCancelledRunId = cancelled.id;
         }
       }
 
@@ -14053,6 +14220,7 @@ export function issueRoutes(
       const shouldCollectTerminalIssueActions =
         updateFields.status === "done" || updateFields.status === "cancelled";
       const updateIssue = (tx?: Parameters<typeof svc.update>[2]) => {
+        assignmentUpdateStarted = true;
         if (tx) {
           if (shouldCollectCompletionPublication) {
             return svc.update(
@@ -14211,6 +14379,7 @@ export function issueRoutes(
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
+        rawWorkOverridesRequested || Boolean(preparedWorkAssignment) ||
         Boolean(commentAttachmentIds?.length) ||
         commentWithAdapterOverrides ||
         Boolean(decision) ||
@@ -14221,6 +14390,46 @@ export function issueRoutes(
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
+            if (rawWorkOverridesRequested) {
+              const locked = await svc.getByIdForUpdate(id, tx);
+              if (!locked || locked.companyId !== existing.companyId) {
+                throw conflict("Issue changed before adapter overrides could be saved", { code: "assignment_work_contract_invalid" });
+              }
+              // A concurrent authorized producer may have installed or changed
+              // the contract since preflight. Do not erase its committed value.
+              assertAssignmentWorkRequirementsPreserved(locked, issueUpdateData.assigneeAdapterOverrides);
+            }
+            if (preparedWorkAssignment) {
+              const locked = await svc.getByIdForUpdate(id, tx);
+              if (locked?.companyId === existing.companyId) {
+                lastAssignmentOwnership = {
+                  source: "locked_before_update", revision: locked.revision,
+                  statusVersion: locked.statusVersion,
+                  assigneeAgentId: locked.assigneeAgentId, assigneeUserId: locked.assigneeUserId,
+                };
+              }
+              if (!locked || locked.companyId !== existing.companyId ||
+                  locked.assigneeAgentId !== existing.assigneeAgentId ||
+                  locked.assigneeUserId !== existing.assigneeUserId) {
+                throw conflict("Assignment changed before the work requirements could be saved", { code: "assignment_work_contract_invalid" });
+              }
+              const lockedWorkAssignment = prepareWorkAssignment(locked);
+              if (assignmentWorkSourcePin(lockedWorkAssignment) !== assignmentWorkSourcePin(preparedWorkAssignment)) {
+                throw conflict("The source brief changed; the assigning owner must confirm the required operations again", {
+                  code: "assignment_work_contract_invalid",
+                  expectedSourceBriefSha256: assignmentWorkSourcePin(lockedWorkAssignment),
+                  suppliedSourceBriefSha256: assignmentWorkSourcePin(preparedWorkAssignment),
+                });
+              }
+              await assertAssignableAgent(tx as unknown as Db, locked.companyId, nextAssigneeAgentId, {
+                kind: "work", work: lockedWorkAssignment,
+              });
+              // Merge the currently locked overrides, preserving unrelated configuration.
+              if (workRequirements !== undefined) {
+                issueUpdateData.assigneeAdapterOverrides = lockedWorkAssignment.assigneeAdapterOverrides;
+                updateFields.assigneeAdapterOverrides = lockedWorkAssignment.assigneeAdapterOverrides;
+              }
+            }
             if (selfTaskReviewExpected) await withSelfTaskDocument(req, res, true, async (locked, executor) => {
               const expected = selfTaskReviewExpected;
               if (locked.revision !== expected.revision || locked.statusVersion !== expected.statusVersion ||
@@ -14323,6 +14532,18 @@ export function issueRoutes(
           issue = await updateIssue();
         }
       } catch (err) {
+        if (reassignmentCancelledRunId) {
+          recordIssueMutationFailure(res, {
+            issueId: existing.id,
+            issueMutationStopId,
+            runCancellation: { runId: reassignmentCancelledRunId, observedStatus: "cancelled", evidence: "cancelRun_return" },
+            assignmentWrite: assignmentUpdateStarted ? "outcome_unknown" : "not_attempted",
+            lastObservedOwnership: lastAssignmentOwnership,
+            currentOwnership: "unverified",
+            automaticRetry: false,
+            nextAction: "read_issue_and_run_before_owner_decision",
+          });
+        }
         if (err instanceof HttpError && err.status === 422) {
           logger.warn(
             {
@@ -16574,6 +16795,38 @@ export function issueRoutes(
     },
   );
 
+  router.post("/issues/:id/native-review-policy", validate(nativeReviewPolicySchema), async (req, res) => {
+    assertBoard(req);
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue) return;
+    if (req.actor.type !== "board" || !req.actor.userId || req.actor.source !== "session")
+      throw forbidden("Authenticated company owner session required");
+    res.json(await amendNativeReviewPolicy(db, { companyId: issue.companyId, issueId: issue.id,
+      userId: req.actor.userId, expected: req.body }));
+  });
+
+  router.post(
+    "/issues/:id/interactions/:interactionId/request-reviewer-return",
+    validate(requestNativeReviewReturnSchema),
+    async (req, res) => {
+      assertBoard(req);
+      const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+      if (!issue) return;
+      if (req.actor.type !== "board" || !req.actor.userId) throw forbidden("Authenticated board user required");
+      const receipt = await requestNativeReviewReturn(db, {
+        companyId: issue.companyId, issueId: issue.id,
+        interactionId: req.params.interactionId as string, userId: req.actor.userId,
+        expected: req.body,
+        authorizeReviewer: async (agentId) => {
+          const decision = await access.decide({ actor: req.actor, action: "agent:wake",
+            resource: { type: "agent", companyId: issue.companyId, agentId } });
+          if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+        },
+      });
+      res.status(202).json(receipt);
+    },
+  );
+
   router.post(
     "/issues/:id/interactions/:interactionId/resolve-from-comment",
     validate(resolveConfirmationFromCommentSchema),
@@ -16644,6 +16897,7 @@ export function issueRoutes(
         current.kind === "request_confirmation" &&
         current.payload.toolAction
       ) {
+        if (req.body.reason != null) throw unprocessable("Acceptance reasons are supported only for standard confirmation reviews.");
         if (!opts.approveToolActionRequest)
           throw unprocessable("Tool review resolution is unavailable");
         await opts.approveToolActionRequest({

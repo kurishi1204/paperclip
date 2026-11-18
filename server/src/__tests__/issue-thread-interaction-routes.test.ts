@@ -309,12 +309,293 @@ async function resolveMockInteraction(
 }
 
 describe("issue thread interaction routes", () => {
+  async function policyAmendment(fault?: string) {
+    const { getTableName } = await import("drizzle-orm");
+    const { nativeSha256 } = await import("../services/native-runtime/canonical.js");
+    const companyId = "47f6674e-962a-42b0-8e8d-62320d7e9c4e";
+    const qa = UNRELATED_AGENT_ID, oldApprover = CREATED_AGENT_ID, replacement = RUN_9;
+    const policy = { mode: "normal", commentRequired: true, stages: [
+      { type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: qa }] },
+      { type: "approval", approvalsNeeded: 1, participants: [{ type: "agent", agentId: oldApprover }] },
+    ] };
+    let issue = createIssue({ companyId, revision: 384, statusVersion: 7, status: "in_review",
+      lastStatusDecisionId: RUN_1, executionRunId: null, checkoutRunId: null,
+      executionState: null, reviewPolicy: null, executionPolicy: policy });
+    let cards: any[] = [qa, oldApprover].map((agent, i) => ({ id: i ? RUN_3 : RUN_2,
+      companyId, issueId: ISSUE_ID, kind: "request_confirmation", status: "pending", sourceRunId: RUN_1,
+      createdByAgentId: null, createdByUserId: null, addresseeAgentId: agent, addresseeUserId: null,
+      effectiveResolverPolicy: "anyone", resolverPolicyProvenance: "inherited", payload: { target: { type: "custom", key: "native_completion_review", revisionId: RUN_1 } } }));
+    const cardBytes = JSON.stringify(cards);
+    const document = { documentId: OTHER_ISSUE_ID, key: "work", revisionId: RUN_CROSS_COMPANY, revisionNumber: 2 };
+    const baseExpected = { expectedIssueRevision: 384, expectedStatusVersion: 7, expectedDecisionId: RUN_1,
+      expectedPolicySha256: nativeSha256(policy), expectedCardsSha256: nativeSha256(cards),
+      expectedDocumentsSha256: nativeSha256([document]) };
+    if (fault === "revision") issue.revision++;
+    if (fault === "execution") issue.executionRunId = RUN_9;
+    if (fault === "pending") cards[0].status = "accepted";
+    if (fault === "documents") document.revisionNumber++;
+    if (fault === "missing revision") document.revisionId = null as any;
+    const updates: any[] = [], cardUpdates: any[] = [], audit: any[] = [], locks: string[] = [];
+    let rows: Record<string, any[][]>;
+    function resetRows() {
+      rows = {
+        issues: [[issue], [{ id: issue.id }], []],
+        company_memberships: [[{ status: "active", membershipRole: fault === "owner" ? "operator" : "owner" }]],
+        status_decisions: [[{ id: RUN_1, runId: RUN_1, applicationState: "applied", decisionJson: { projectedStatusVersion: 7 } }]],
+        issue_thread_interactions: [cards],
+        status_decision_effects: [cards.map(c => ({ targetType: "issue_thread_interaction", targetId: c.id,
+          payload: { interactionId: c.id, ownerAgentId: c.addresseeAgentId }, deliveryState: "delivered", deliveredAt: new Date() }))],
+        issue_documents: [[document]],
+        document_revisions: [[{ documentId: document.documentId, revisionNumber: 1,
+          createdByAgentId: null, runAgentId: fault === "author" ? replacement : ASSIGNEE_AGENT_ID }]],
+        agents: [[{ id: replacement, companyId, status: "idle", adapterType: "paperclip_runner" }]],
+        heartbeat_runs: [[{ id: RUN_1, companyId, nativeIssueId: ISSUE_ID, agentId: ASSIGNEE_AGENT_ID,
+          status: "succeeded", exitCode: 0, finishedAt: new Date(fault === "execution advanced" && audit.length ? 2000 : 1000), runtimeMode: "native" },
+          ...(fault === "unknown" || fault === "live" ? [{ id: RUN_9, status: fault === "live" ? "running" : "failed", exitCode: null, runtimeMode: "native" }] : [])]],
+        native_run_finalizations: [[{ runId: RUN_1, phase: "committed" }]],
+        agent_wakeup_requests: [fault === "wake" ? [{ id: RUN_9 }] : []],
+        instance_settings: [[{ id: RUN_9, general: { censorUsernameInLogs: false }, experimental: {} }]],
+        activity_log: audit.length ? [[{ ...audit[0], id: RUN_TASK_BRIDGE }]] : [],
+      };
+    }
+    const tx = {
+      select: () => {
+        let values: any[]; const q: any = { from(table: any) {
+          const name = getTableName(table); const next = rows[name]?.shift();
+          if (!next) throw Error(`Unexpected SELECT ${name}`);
+          values = name === "issues" && rows[name].length === 0 ? [issue] : next; return q;
+        }, where: () => q, orderBy: () => q, limit: () => q, innerJoin: () => q, leftJoin: () => q,
+          for: (mode: string) => { locks.push(mode); return q; },
+          then: (ok: any, no: any) => Promise.resolve(values).then(ok, no) }; return q;
+      },
+      update: (table: any) => ({ set: (data: any) => {
+        if (getTableName(table) === "issue_thread_interactions") {
+          cardUpdates.push(data);
+          return { where: () => ({ returning: async () => {
+            cards = cards.map(card => card.addresseeAgentId === oldApprover ? { ...card, ...data } : card);
+            issue = { ...issue, revision: issue.revision + 1 };
+            return [cards.find(card => card.addresseeAgentId === oldApprover)];
+          } }) };
+        }
+        expect(getTableName(table)).toBe("issues");
+        expect(Object.keys(data).sort()).toEqual(["executionPolicy", "updatedAt"]);
+        updates.push(data);
+        return { where: () => ({ returning: async () => {
+          issue = { ...issue, ...data, revision: issue.revision + 1 }; return [issue];
+        } }) };
+      } }),
+      insert: (table: any) => ({ values: (value: any) => {
+        expect(getTableName(table)).toBe("activity_log"); audit.push(value);
+        return { returning: async () => [{ id: RUN_TASK_BRIDGE }] };
+      } }),
+    };
+    mockDbTransaction.mockImplementation(async (fn: any) => fn(tx));
+    mockIssueService.getById.mockImplementation(async () => issue);
+    const [{ issueRoutes }, { errorHandler }] = await loadAppModules();
+    const route = issueRoutes(mockDb as any, {} as any).stack.find((x: any) => x.route?.path === "/issues/:id/native-review-policy")?.route;
+    async function call(body: unknown) {
+      resetRows();
+      const res: any = { statusCode: 200, headersSent: false, status(c: number) { this.statusCode = c; return this; }, json(b: unknown) { this.body = b; return this; } };
+      if (!route) { res.status(404).json({ error: "No policy-only conditional entry" }); return res; }
+      const req: any = { method: "POST", path: route.path, headers: {}, params: { id: ISSUE_ID }, body,
+        actor: fault === "actor" ? { type: "agent", agentId: qa, companyId, runId: RUN_1 }
+          : { type: "board", userId: "owner", source: "session", companyIds: [companyId], isInstanceAdmin: false } };
+      try { for (const layer of route.stack) await layer.handle(req, res, (e: unknown) => { if (e) throw e; }); }
+      catch (e) { res.caught = String(e); errorHandler(e as any, req, res, () => {}); }
+      return res;
+    }
+    const first = await call({ ...baseExpected, operation: "amend", replacementAgentId: replacement,
+      oldApprovalDisposition: "withdraw_for_author_resubmission" });
+    let restored: any = null;
+    if (first.statusCode === 200) {
+      if (fault === "intervening") issue.revision++;
+      restored = await call({ ...baseExpected, operation: "restore", expectedIssueRevision: issue.revision,
+        expectedCardsSha256: first.body.postCardsSha256,
+        expectedPolicySha256: nativeSha256(issue.executionPolicy), amendmentActivityId: first.body.activityId });
+    }
+    return { first, restored, updates, cardUpdates, audit, issue, policy,
+      originalCards: JSON.parse(cardBytes), cards, locks };
+  }
+
+  it("policy amendment uses the original route for CAS, explicit withdrawal and restore without resurrection or delivery", async () => {
+    const r = await policyAmendment();
+    if (process.env.PAPERCLIP_POLICY_CONSUMER_RECEIPT) {
+      const { writeFile } = await import("node:fs/promises");
+      await writeFile(process.env.PAPERCLIP_POLICY_CONSUMER_RECEIPT, JSON.stringify({
+        scope: "nonDB original route/service; row IO substituted", first: r.first, restore: r.restored,
+        policyWrites: r.updates, cardWrites: r.cardUpdates, audit: r.audit,
+        originalCards: r.originalCards, finalCards: r.cards, finalPolicy: r.issue.executionPolicy,
+        locks: r.locks, wakeCalls: mockHeartbeatService.wakeup.mock.calls.length,
+      }, null, 2), { flag: "wx", mode: 0o600 });
+    }
+    expect(r.first.statusCode, JSON.stringify(r.first)).toBe(200);
+    expect(r.restored.statusCode, JSON.stringify(r.restored)).toBe(200);
+    expect(r.updates).toHaveLength(2);
+    expect(r.issue.executionPolicy).toEqual(r.policy);
+    expect(r.cardUpdates).toHaveLength(1);
+    expect(r.cards[0]).toEqual(r.originalCards[0]);
+    expect(r.cards[1]).toMatchObject({ status: "cancelled", result: { outcome: "withdrawn" }, resolvedByUserId: "owner" });
+    expect(r.cards.map(c => c.payload)).toEqual(r.originalCards.map((c: any) => c.payload));
+    expect(r.first.body).toMatchObject({ deliveryCreated: false, verdictRecorded: false, automaticRetry: false });
+    expect(r.audit.map(a => a.action)).toEqual(["issue.native_review_policy_amended", "issue.native_review_policy_restored"]);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+  it.each(["revision", "execution", "pending", "documents", "missing revision", "owner", "actor", "author", "unknown", "live", "wake"])(
+    "policy amendment stops %s before writes", async fault => {
+      const r = await policyAmendment(fault);
+      expect([403, 409], JSON.stringify(r.first)).toContain(r.first.statusCode);
+      expect(r.updates).toEqual([]); expect(r.cardUpdates).toEqual([]); expect(r.audit).toEqual([]);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+  it.each(["intervening", "execution advanced"])("policy amendment refuses restore after %s", async fault => {
+    const r = await policyAmendment(fault);
+    expect(r.first.statusCode, JSON.stringify(r.first)).toBe(200);
+    expect(r.restored.statusCode).toBe(409); expect(r.updates).toHaveLength(1);
+  });
+
+  // Drive the real route callback, assignment reader and durable wake writer.
+  // Only row IO is replaced; no socket or DB boots. The original audit writer runs.
+  async function reviewerReturn(fault?: string) {
+    const companyId = "47f6674e-962a-42b0-8e8d-62320d7e9c4e";
+    const issueId = "ca8953d2-d554-462f-ba22-2a66179f80c8";
+    const reviewer = "802edc4b-1e79-46a1-ad9e-8e88e2e2dea5";
+    const cardId = "eb456c69-3fb4-4640-a355-fafa1ff90fd9";
+    const decisionId = "9b928a7f-f098-43f3-a1cb-8e93c9d97539";
+    const sourceId = "e558d243-d48b-4a50-a7f2-0d1733698ac1";
+    const previousId = "662309b4-bf5c-4919-b20f-d5aa9c5a3d63";
+    const context = { nativeReviewInteractionId: cardId, nativeReviewDecisionId: decisionId };
+    const policy = { stages: [{ type: "review", approvalsNeeded: 1,
+      participants: [{ type: "agent", agentId: reviewer }] }] };
+    const issue = createIssue({ id: issueId, companyId, status: "in_review", revision: 384,
+      statusVersion: 7, lastStatusDecisionId: decisionId, executionPolicy: policy,
+      executionRunId: null, checkoutRunId: null });
+    const card = { id: cardId, companyId, issueId, kind: "request_confirmation", status: "pending",
+      sourceRunId: sourceId, addresseeAgentId: reviewer, addresseeUserId: null,
+      effectiveResolverPolicy: "anyone", resolverPolicyProvenance: "inherited",
+      payload: { version: 1, target: { type: "custom", key: "native_completion_review", revisionId: decisionId } } };
+    const decision = { id: decisionId, companyId, issueId, runId: sourceId,
+      applicationState: "applied", decisionJson: { projectedStatusVersion: 7 } };
+    const agent = { id: reviewer, companyId, status: "idle", reportsTo: null, name: "QA" };
+    const sourceRun = { id: sourceId, companyId, nativeIssueId: issueId, agentId: ASSIGNEE_AGENT_ID };
+    const previous = { id: previousId, companyId, nativeIssueId: issueId, agentId: reviewer,
+      runtimeMode: "native", status: "succeeded", exitCode: 0, signal: null,
+      startedAt: new Date(1000), createdAt: new Date(900), finishedAt: new Date(2000),
+      wakeupRequestId: RUN_1, contextSnapshot: context };
+    const finalization = { phase: "committed", failureCode: null, leaseOwner: null, recoveryState: null };
+    if (fault === "changed") issue.revision = 385;
+    if (fault === "locked") issue.executionRunId = RUN_2;
+    if (fault === "other reviewer") card.addresseeAgentId = CREATED_AGENT_ID;
+    if (fault === "unknown") previous.exitCode = null as any;
+    if (fault === "finalizing") finalization.phase = "terminal_failure";
+    const originalIntent = { id: RUN_2, status: "coalesced", runId: previousId,
+      reason: "native_completion_review", idempotencyKey: `native-review:${cardId}`,
+      requestedByActorType: "system", requestedByActorId: "native-status-committer" };
+    const effect = { payload: { interactionId: cardId, ownerAgentId: reviewer, reviewerWakeId: RUN_2 },
+      deliveryState: fault === "effect unknown" ? "pending" : "delivered", deliveredAt: new Date(1000) };
+    const { getTableName } = await import("drizzle-orm");
+    const rows: Record<string, any[][]> = {
+      issues: [[issue], [issue]], issue_thread_interactions: [[card], [card]], agents: [[agent], [agent]],
+      status_decisions: [[decision]], heartbeat_runs: [[sourceRun], [previous], fault === "successor" ? [{ id: RUN_9 }] : []],
+      native_run_finalizations: [[finalization]], status_decision_effects: [[effect]],
+      agent_wakeup_requests: [fault === "duplicate" ? [{ id: RUN_3, status: "failed", runId: null }] : [],
+        [originalIntent], [{ id: RUN_1, status: "completed", runId: previousId }],
+        fault === "pending" ? [{ id: RUN_9 }] : [], []],
+      instance_settings: [[{ id: RUN_9, general: { censorUsernameInLogs: false }, experimental: {} }]],
+    };
+    const inserted: any[] = [];
+    const audit: any[] = [];
+    const locks: string[] = [];
+    let read = 0;
+    const tx = {
+      select: () => {
+        const index = read++;
+        let values: any[];
+        const query: any = { from: (table: any) => {
+          const name = getTableName(table);
+          const next = rows[name]?.shift();
+          if (!next) throw new Error(`Unexpected SELECT from ${name}`);
+          values = next; return query;
+        }, where: () => query, limit: () => query,
+          for: (mode: string) => { locks.push(`${index}:${mode}`); return query; },
+          then: (resolve: any, reject: any) => Promise.resolve(values).then(resolve, reject) };
+        return query;
+      },
+      insert: (table: any) => ({ values: (value: any) => {
+        const name = getTableName(table);
+        if (name === "agent_wakeup_requests") inserted.push(value);
+        else if (name === "activity_log") audit.push(value);
+        else throw new Error(`Unexpected INSERT into ${name}`);
+        return {
+        returning: async () => [{ id: RUN_3 }],
+      }; } }),
+    };
+    mockDbTransaction.mockImplementation(async (callback: any) => callback(tx));
+    mockIssueService.getById.mockResolvedValue(issue);
+    if (fault === "permission") mockAccessDecide.mockResolvedValue({ allowed: false,
+      action: "agent:wake", reason: "deny", explanation: "Not authorized" });
+    const [{ issueRoutes }, { errorHandler }] = await loadAppModules();
+    const router = issueRoutes(mockDb as any, {} as any);
+    const route = router.stack.find((entry: any) => entry.route?.path === "/issues/:id/interactions/:interactionId/request-reviewer-return")?.route;
+    const res: any = { statusCode: 200, status(code: number) { this.statusCode = code; return this; },
+      json(body: unknown) { this.body = body; return this; }, headersSent: false };
+    if (!route) { res.status(404).json({ error: "No original reviewer return route" }); return { res, inserted, locks, audit }; }
+    const req: any = { method: "POST", path: route.path, headers: {}, params: { id: issueId, interactionId: cardId },
+      actor: fault === "agent actor" ? { type: "agent", agentId: reviewer, companyId, runId: previousId }
+        : { type: "board", userId: "owner", source: "session", companyIds: [companyId], isInstanceAdmin: false },
+      body: { expectedIssueRevision: 384, expectedDecisionId: decisionId, previousReviewerRunId: previousId } };
+    try {
+      // Schema middleware and the original route callback, without app.listen.
+      for (const layer of route.stack) await layer.handle(req, res, (err: unknown) => { if (err) throw err; });
+    } catch (error) { res.caught = String(error); errorHandler(error as any, req, res, () => {}); }
+    return { res, inserted, locks, audit };
+  }
+
+  it("reviewer return uses the original route and outbox without replaying the delivered effect", async () => {
+    const { res, inserted, locks, audit } = await reviewerReturn();
+    expect(res.statusCode, JSON.stringify({ body: res.body, caught: res.caught })).toBe(202);
+    expect(res.body).toMatchObject({ status: "queued", automaticRetry: false });
+    expect(inserted).toHaveLength(1);
+    expect(inserted[0]).toMatchObject({ requestedByActorId: "native-status-committer",
+      reason: "native_completion_review", idempotencyKey: "native-review-return:eb456c69-3fb4-4640-a355-fafa1ff90fd9",
+      payload: { _paperclipWakeContext: { forceFreshSession: true,
+        nativeReviewInteractionId: "eb456c69-3fb4-4640-a355-fafa1ff90fd9",
+        nativeReviewDecisionId: "9b928a7f-f098-43f3-a1cb-8e93c9d97539" } } });
+    expect(locks).toEqual(["0:update", "1:update"]);
+    expect(audit).toHaveLength(1);
+    expect(audit[0]).toMatchObject({ action: "issue.native_review_return_requested", actorType: "user", actorId: "owner" });
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    expect(mockInteractionService.acceptInteraction).not.toHaveBeenCalled();
+    expect(mockInteractionService.rejectInteraction).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["changed", "Issue changed or has an execution owner"],
+    ["locked", "Issue changed or has an execution owner"],
+    ["other reviewer", "Reviewer is no longer designated by the current policy"],
+    ["unknown", "Previous reviewer execution is not positively completed"],
+    ["finalizing", "Previous reviewer finalization is not settled"],
+    ["effect unknown", "Original review delivery is not proved"],
+    ["duplicate", "Reviewer return already recorded; inspect its receipt"],
+    ["successor", "A later execution or unresolved delivery must be received first"],
+    ["pending", "A later execution or unresolved delivery must be received first"],
+    ["permission", "Not authorized"],
+    ["agent actor", "Board access required"],
+  ])("reviewer return stops %s before delivery", async (fault, reason) => {
+    const { res, inserted, audit } = await reviewerReturn(fault);
+    expect([403, 409]).toContain(res.statusCode);
+    expect(res.body.error).toBe(reason);
+    expect(inserted).toEqual([]);
+    expect(audit).toEqual([]);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     vi.doUnmock("../services/index.js");
+    vi.doUnmock("../services/activity-log.js");
     registerModuleMocks();
     // Every mock here is a vi.hoisted() singleton. All 70+ tests share it.
     // A queued mockResolvedValueOnce() value can outlive its own test and

@@ -1,7 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
-import { errorHandler } from "../middleware/error-handler.js";
+import { errorHandler, recordIssueMutationFailure } from "../middleware/error-handler.js";
 
 const recordResponsibleUserDenialOnActiveRunMock = vi.hoisted(() => vi.fn());
 const captureExceptionMock = vi.hoisted(() => vi.fn());
@@ -292,4 +292,24 @@ describe("errorHandler", () => {
       },
     );
   });
+});
+
+
+it("keeps mutation failure metadata response-local and excludes it on secret-sensitive routes", () => {
+  const req = makeReq(); const res = { ...makeRes(), locals: {} } as Response;
+  recordIssueMutationFailure(res, {
+    issueId: "issue-1", issueMutationStopId: "mutation-1",
+    runCancellation: { runId: "run-1", observedStatus: "cancelled", evidence: "cancelRun_return" },
+    assignmentWrite: "outcome_unknown",
+    lastObservedOwnership: { source: "request_read", revision: 2, statusVersion: 1, assigneeAgentId: "agent-1", assigneeUserId: null },
+    currentOwnership: "unverified", automaticRetry: false, nextAction: "read_issue_and_run_before_owner_decision",
+  });
+  const err = new HttpError(409, "Existing conflict", { code: "original_code", preserved: [1, 2] });
+  errorHandler(err, req, res, vi.fn());
+  expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: "original_code", details: expect.objectContaining({ code: "original_code", preserved: [1, 2] }), issueMutation: expect.objectContaining({ assignmentWrite: "outcome_unknown" }) }));
+  const fresh = makeRes(); errorHandler(err, req, fresh, vi.fn());
+  expect(fresh.json).toHaveBeenCalledWith({ error: "Existing conflict", code: "original_code", details: { code: "original_code", preserved: [1, 2] } });
+  const sensitive = { ...req, method: "POST", originalUrl: "/api/chat-endpoints/endpoint-1/setup" } as Request;
+  (res.json as ReturnType<typeof vi.fn>).mockClear(); errorHandler(new Error("internal"), sensitive, res, vi.fn());
+  expect(res.json).toHaveBeenCalledWith({ error: "Internal server error" });
 });

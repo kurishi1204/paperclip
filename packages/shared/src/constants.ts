@@ -913,6 +913,12 @@ export const WAKEUP_REQUEST_STATUSES = [
   "completed",
   "failed",
   "cancelled",
+  // Internal durable task-watchdog intents; never generic queued work.
+  "watchdog_pending",
+  "watchdog_dispatching",
+  "watchdog_unknown",
+  "watchdog_accepted",
+  "watchdog_finished",
 ] as const;
 export type WakeupRequestStatus = (typeof WAKEUP_REQUEST_STATUSES)[number];
 

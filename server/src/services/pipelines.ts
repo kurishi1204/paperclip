@@ -1,3 +1,4 @@
+import { lockPipelineCaseDocumentOwners } from "./documents.js";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
@@ -279,6 +280,10 @@ export async function ensurePipelineCaseBodyDocumentFromSummary(
     return { created: false, document: null, revision: null };
   }
 
+  // Both original callers pass their transaction; serialize creation/linking with the route writers.
+  await dbOrTx.select({ id: pipelineCases.id }).from(pipelineCases)
+    .where(and(eq(pipelineCases.companyId, input.companyId), eq(pipelineCases.id, input.caseId))).for("no key update");
+
   const existing = await loadPipelineCaseDocument(dbOrTx, {
     companyId: input.companyId,
     caseId: input.caseId,
@@ -287,6 +292,12 @@ export async function ensurePipelineCaseBodyDocumentFromSummary(
   if (existing) {
     return { created: false, document: existing.document, revision: existing.revision };
   }
+
+  const sourceBeforeWrite = await resolvePipelineCaseConversationSource(dbOrTx, input.companyId, input.caseId);
+  const lockedDocumentIssues = await lockPipelineCaseDocumentOwners(dbOrTx, {
+    companyId: input.companyId, caseId: input.caseId, key: PIPELINE_CASE_BODY_CASE_DOCUMENT_KEY,
+    additionalIssueIds: sourceBeforeWrite?.isActive ? [sourceBeforeWrite.issue.id] : [],
+  });
 
   const now = nowDate();
   const actorFields = documentActorFields(input.actor);
@@ -332,6 +343,9 @@ export async function ensurePipelineCaseBodyDocumentFromSummary(
 
   const conversationSource = await resolvePipelineCaseConversationSource(dbOrTx, input.companyId, input.caseId);
   if (conversationSource?.isActive) {
+    if (!lockedDocumentIssues.has(conversationSource.issue.id)) {
+      throw conflict("Case conversation changed; read the current case again");
+    }
     await dbOrTx.insert(issueDocuments).values({
       companyId: input.companyId,
       issueId: conversationSource.issue.id,

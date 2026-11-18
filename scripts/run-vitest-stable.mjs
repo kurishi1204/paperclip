@@ -217,6 +217,8 @@ function parseCliOptions(argv) {
   let shardCount = null;
   let group = null;
   let dryRun = false;
+  const files = [];
+  let testName = null;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -273,9 +275,27 @@ function parseCliOptions(argv) {
       continue;
     }
 
+    if (arg === "--file") {
+      const file = readOptionValue(argv, index++, arg);
+      const absolute = path.resolve(repoRoot, file);
+      if (!absolute.startsWith(repoRoot + path.sep) || !file.endsWith(".test.ts") ||
+          file.split(/[\\/]/).some(part => ["node_modules", "dist"].includes(part)) ||
+          !statSync(absolute).isFile() || realpathSync(absolute) !== absolute) {
+        fail(`--file requires an existing source test inside this checkout: ${file}`);
+      }
+      files.push(toRepoPath(absolute));
+      continue;
+    }
+    if (arg === "--test-name") {
+      testName = readOptionValue(argv, index++, arg);
+      if (!testName.trim()) fail("--test-name cannot be empty");
+      continue;
+    }
     fail(`Unknown argument "${arg}".`);
   }
 
+  if ((files.length && (mode !== allModeName || group !== null || shardIndex !== null || shardCount !== null)) ||
+      (testName !== null && files.length === 0)) fail("--file selection cannot combine with groups/shards/modes; --test-name requires --file");
   if (!new Set([allModeName, generalModeName, serializedModeName]).has(mode)) {
     fail(`Unknown mode "${mode}". Expected one of: ${allModeName}, ${generalModeName}, ${serializedModeName}.`);
   }
@@ -324,6 +344,8 @@ function parseCliOptions(argv) {
     shardCount,
     group,
     dryRun,
+    files,
+    testName,
   };
 }
 
@@ -561,6 +583,12 @@ const generalServerTestFiles = [
   .sort((a, b) => a.localeCompare(b));
 
 const options = parseCliOptions(process.argv.slice(2));
+if (options.files?.length) {
+  if (options.dryRun) console.log(JSON.stringify({ files: options.files, testName: options.testName }));
+  else runVitest([...options.files, ...serializedServerVitestArgs, "--allowOnly=false",
+    ...(options.testName ? ["--testNamePattern", options.testName] : [])], "selected source tests");
+  process.exit(0);
+}
 if (options.dryRun) {
   const serializedSuites =
     options.mode === serializedModeName

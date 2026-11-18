@@ -1,3 +1,4 @@
+import { lockPipelineCaseDocumentOwners } from "../services/documents.js";
 import {
   stageKindSchema,
   jsonObjectSchema,
@@ -1486,6 +1487,12 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const sourceTrust = await sourceTrustForPipelineCaseDocumentWrite(db, { companyId, caseId, actor });
 
     const result = await db.transaction(async (tx) => {
+      await tx.select({ id: pipelineCases.id }).from(pipelineCases)
+        .where(and(eq(pipelineCases.companyId, companyId), eq(pipelineCases.id, caseId))).for("no key update");
+      const sourceBeforeWrite = key === "body" ? await resolvePipelineCaseConversationSource(tx, companyId, caseId) : null;
+      const lockedDocumentIssues = await lockPipelineCaseDocumentOwners(tx, { companyId, caseId, key,
+        additionalIssueIds: sourceBeforeWrite?.isActive ? [sourceBeforeWrite.issue.id] : [] });
+
       const existing = await tx
         .select({ link: pipelineCaseDocuments, document: documents, revision: documentRevisions })
         .from(pipelineCaseDocuments)
@@ -1590,6 +1597,9 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
       if (key === "body") {
         const conversationSource = await resolvePipelineCaseConversationSource(tx, companyId, caseId);
         if (conversationSource?.isActive) {
+          if (!lockedDocumentIssues.has(conversationSource.issue.id)) {
+            throw conflict("Case conversation changed; read the current case again");
+          }
           await tx.insert(issueDocuments).values({
             companyId,
             issueId: conversationSource.issue.id,
@@ -1675,6 +1685,10 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const actor = actorForMutation(req);
 
     const result = await db.transaction(async (tx) => {
+      await tx.select({ id: pipelineCases.id }).from(pipelineCases)
+        .where(and(eq(pipelineCases.companyId, companyId), eq(pipelineCases.id, caseId))).for("no key update");
+      await lockPipelineCaseDocumentOwners(tx, { companyId, caseId, key });
+
       const existing = await tx
         .select({ link: pipelineCaseDocuments, document: documents, revision: documentRevisions })
         .from(pipelineCaseDocuments)
@@ -1907,9 +1921,16 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
       outputsSvc.listCaseOutputs(companyId, caseId).then((outputs) => summarizePipelineCaseOutputsForContext(outputs)),
     ]);
     const result = await db.transaction(async (tx) => {
+      await tx.select({ id: pipelineCases.id }).from(pipelineCases)
+        .where(and(eq(pipelineCases.companyId, companyId), eq(pipelineCases.id, caseId))).for("no key update");
       const existingConversationSource = await resolvePipelineCaseConversationSource(tx, companyId, caseId);
       if (existingConversationSource?.isActive) {
         return { issue: existingConversationSource.issue, created: false };
+      }
+      await lockPipelineCaseDocumentOwners(tx, { companyId, caseId, key: "body" });
+      const currentBody = await getPipelineCaseDocumentRow(tx, { companyId, caseId, key: "body" });
+      if ((currentBody?.document.id ?? null) !== (bodyDocumentContext.bodyDocument?.id ?? null)) {
+        throw conflict("Case body document changed; read the current case again");
       }
       const [issue] = await tx.insert(issueRows).values({
         companyId,

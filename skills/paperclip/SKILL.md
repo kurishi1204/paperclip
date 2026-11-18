@@ -232,6 +232,12 @@ Headers: X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID
 
 For multiline markdown comments, do **not** hand-inline the markdown into a one-line JSON string — that is how comments get "smooshed" together. Use the helper below (or an equivalent `jq --arg` pattern reading from a heredoc/file) so literal newlines survive JSON encoding:
 
+The API decodes JSON once and preserves the resulting text, including literal
+backslash sequences inside Markdown, JSON examples, code, and paths. It does not
+guess whether those sequences should become line breaks. Callers that previously
+double-encoded newlines must fix their input encoding; send actual line breaks
+through the JSON encoder. Field-specific trimming and length limits still apply.
+
 ```bash
 scripts/paperclip-issue-update.sh --issue-id "$PAPERCLIP_TASK_ID" --status done <<'MD'
 Done

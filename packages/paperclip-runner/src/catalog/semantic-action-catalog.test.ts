@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import Ajv2020 from "ajv/dist/2020.js";
 import { describe, expect, it } from "vitest";
+import { writeDocumentAction } from "../protocol-actions/write-document.js";
 import { createTaskAction } from "../protocol-actions/create-task.js";
 import { createProjectAction } from "../protocol-actions/create-project.js";
 
@@ -20,6 +21,12 @@ const packageRoot = resolve(
 );
 
 describe("semantic action catalog", () => {
+  it("exposes fixed-source inclusion through the actual native write-document definition", () => {
+    expect(writeDocumentAction.live.descriptor.inputSchema.properties).toHaveProperty("includeDocuments");
+    expect((writeDocumentAction.live.descriptor.inputSchema.properties as Record<string, unknown>).includeDocuments)
+      .toEqual(paperclipSemanticAction("write_document")!.inputSchema.properties!.includeDocuments);
+  });
+
   it("advertises only icons accepted by the project API on both tool surfaces", async () => {
     const { PROJECT_ICON_NAMES } = await import("../../../shared/src/constants.js");
     const ajv = new Ajv2020({ allErrors: true, allowUnionTypes: true, strict: true });
@@ -143,6 +150,20 @@ describe("semantic action catalog", () => {
     expect(validateContext({ companyId: "forged-company" })).toBe(false);
   });
 
+  it("accepts exact same-task inclusion references and rejects incomplete or undeclared metadata", () => {
+    const ajv = new Ajv2020({ allErrors: true, allowUnionTypes: true, strict: true });
+    const validate = ajv.compile(paperclipSemanticAction("write_document")!.inputSchema);
+    const ref = { documentId: "00000000-0000-4000-8000-000000000001", key: "result",
+      revisionId: "00000000-0000-4000-8000-000000000002", bodyBytes: 12, bodySha256: "a".repeat(64) };
+    const input = { idempotencyKey: "include-1", key: "author-check", title: "Check", body: "Confirmed",
+      baseRevisionId: null, includeDocuments: [ref] };
+    expect(validate(input)).toBe(true);
+    for (const includeDocuments of [[], null, [{ ...ref, companyId: "foreign" }],
+      [{ ...ref, revisionId: null }], [{ ...ref, bodyBytes: 200001 }], [{ ...ref, bodySha256: "unknown" }]]) {
+      expect(validate({ ...input, includeDocuments })).toBe(false);
+    }
+  });
+
   it("matches the checked-in generated inventory byte for byte", async () => {
     const generated = await readFile(
       resolve(packageRoot, "generated/semantic-action-catalog.json"),
@@ -160,4 +181,17 @@ describe("semantic action catalog", () => {
       expect(keys).not.toContain("binding");
     }
   });
+});
+
+
+it("advertises exact append on both native document tool schemas", () => {
+  const ajv = new Ajv2020({ allErrors: true, allowUnionTypes: true, strict: true });
+  for (const schema of [writeDocumentAction.live.descriptor.inputSchema, paperclipSemanticAction("write_document")!.inputSchema]) {
+    const validate = ajv.compile(schema);
+    const input = { idempotencyKey: "append-1", key: "report", title: "Report",
+      baseRevisionId: "00000000-0000-4000-8000-000000000111", append: "\r\n追加😀" };
+    expect(validate(input), JSON.stringify(validate.errors)).toBe(true);
+    for (const changes of [{ body: "ambiguous" }, { includeDocuments: [] }, { baseRevisionId: null },
+      { baseRevisionId: "invalid" }, { append: "" }]) expect(validate({ ...input, ...changes })).toBe(false);
+  }
 });

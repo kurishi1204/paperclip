@@ -48,7 +48,14 @@ export type ReviewParticipantFacts = {
   currentParticipant: Record<string, unknown> | null;
 };
 
+export type AssignmentWorkBlockFacts = {
+  errorCode: "assignment_work_contract_invalid" | "agent_work_requirements_unavailable";
+  reason: string;
+  details: Record<string, unknown>;
+};
+
 export type ScheduledRetryGateErrorCode =
+  | AssignmentWorkBlockFacts["errorCode"]
   | "agent_not_invokable"
   | "heartbeat_wake_on_demand_disabled"
   | "budget_blocked"
@@ -76,6 +83,7 @@ export type GateDecision =
     };
 
 export type ScheduledRetryFacts = {
+  assignmentWorkBlock?: AssignmentWorkBlockFacts | null;
   runId: string;
   runAgentId: string;
   issueId: string | null;
@@ -108,6 +116,7 @@ export type ScheduledRetryFacts = {
 };
 
 export type QueuedRunStalenessErrorCode =
+  | AssignmentWorkBlockFacts["errorCode"]
   | "execution_reconciliation_required"
   | "issue_dependencies_blocked"
   | "issue_not_found"
@@ -132,11 +141,14 @@ export type StalenessDecision =
 export type PendingDocumentReviewBinding = {
   companyId: string; issueId: string; agentId: string; interactionId: string;
   documentId: string; key: string; revisionId: string; revisionNumber: number;
+  supportingDocuments?: Array<{ companyId: string; issueId: string; documentId: string;
+    key: string; revisionId: string; revisionNumber: number }>;
 };
 
 export type PendingDocumentReviewOrigin = { runId: string; wakeupRequestId: string };
 
 export type QueuedRunFacts = {
+  assignmentWorkBlock?: AssignmentWorkBlockFacts | null;
   /** Rechecked for automatic native replacements immediately before dispatch. */
   dependenciesBlocked?: DependencyBlockFacts | null;
   runId: string;
@@ -498,6 +510,8 @@ export function decideScheduledRetryGate(
     };
   }
 
+  if (facts.assignmentWorkBlock) return { allowed: false, issueId: facts.issueId, ...facts.assignmentWorkBlock };
+
   return { allowed: true };
 }
 
@@ -688,6 +702,8 @@ export function decideQueuedRunStaleness(
       },
     };
   }
+
+  if (facts.assignmentWorkBlock) return { stale: true, ...facts.assignmentWorkBlock };
 
   return { stale: false };
 }

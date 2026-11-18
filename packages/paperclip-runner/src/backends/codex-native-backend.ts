@@ -8,7 +8,7 @@ import type {
   NativeSessionBackendDescriptor,
   PersistedNativeSession,
 } from "../contracts/native-session-backend.js";
-import type { CodexAppServerTransport } from "../drivers/codex/app-server-transport.js";
+import type { CodexAppServerTransport, CodexNativeToolExecutionMetadata } from "../drivers/codex/app-server-transport.js";
 import { CodexAppServerDriver } from "../drivers/codex/codex-app-server-driver.js";
 import type { CodexWorkingDirectoryAuthority } from "../drivers/codex/codex-boundaries.js";
 import { HarnessDriverBackend } from "./harness-driver-backend.js";
@@ -48,6 +48,7 @@ export interface CodexNativeSessionBackendOptions {
     threadId: string;
     turnId: string;
     arguments: unknown;
+    nativeToolExecution?: CodexNativeToolExecutionMetadata;
   }) => Promise<unknown>;
 }
 

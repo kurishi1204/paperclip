@@ -82,3 +82,5 @@ export * as acceptedCapabilitySemanticTools from "./semantic-tools/index.js";
 export * from "./compatibility.js";
 
 export { bundledRemoteProviderPackManifestPath, bundledRemoteRunnerBinary } from "./live/bundled-remote-provider-pack.js";
+
+export { inspectPaperclipSemanticValue } from "./semantic-tools/redaction.js";
