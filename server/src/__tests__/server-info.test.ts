@@ -141,6 +141,31 @@ describe("server info snapshot", () => {
     });
   });
 
+  it("prefers the release commit over unrelated runtime Git metadata", () => {
+    let gitCalls = 0;
+    const unrelatedGit = () => {
+      gitCalls += 1;
+      return "dd37f2f2424d8fd29899c92e67ad05ecbfb5fd99\ndd37f2f\nOther checkout\n2026-11-12T01:14:01Z";
+    };
+    const snapshot = createServerInfoSnapshot({
+      buildCommitCommand: () => "169cecaaf5fdf69729b47e3990841d5be37a4571",
+      gitCommand: unrelatedGit,
+      gitStatusCommand: unrelatedGit,
+      gitBranchCommand: unrelatedGit,
+    });
+
+    expect(snapshot.git).toEqual({
+      available: true,
+      fullSha: "169cecaaf5fdf69729b47e3990841d5be37a4571",
+      shortSha: "169ceca",
+      branchName: null,
+      subject: "Source build",
+      committedAt: null,
+      localChanges: { available: false, unavailableReason: "git_status_unavailable" },
+    });
+    expect(gitCalls).toBe(0);
+  });
+
   it("uses deployment commit metadata when the runtime has no git directory", () => {
     const snapshot = createServerInfoSnapshot({
       now: new Date("2026-06-26T00:00:00.000Z"),
