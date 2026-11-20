@@ -1161,6 +1161,27 @@ async function startServerWithDatabaseTeardown(
       });
     heartbeatSchedulerInFlight.add(tracked);
   };
+  // A periodic job that must not overlap itself: a tick that arrives while the
+  // previous run is still in flight is skipped (and counted), never queued.
+  // The flag is released when the run settles, whether it resolved or threw.
+  const skipWhilePreviousTickRuns = (loop: string) => {
+    let running = false;
+    let skippedTicks = 0;
+    return (run: () => Promise<unknown>): Promise<unknown> => {
+      if (running) {
+        skippedTicks += 1;
+        logger.warn({ loop, skippedTicks }, "skipping tick — previous tick still in progress");
+        return Promise.resolve();
+      }
+      running = true;
+      skippedTicks = 0;
+      return Promise.resolve()
+        .then(run)
+        .finally(() => {
+          running = false;
+        });
+    };
+  };
   const waitForHeartbeatSchedulerIdle = async () => {
     while (heartbeatSchedulerInFlight.size > 0) {
       await Promise.allSettled([...heartbeatSchedulerInFlight]);
@@ -1649,6 +1670,8 @@ async function startServerWithDatabaseTeardown(
       return { archived, ...notifications };
     };
     await runRetentionSweep();
+    const retentionSweepTick = skipWhilePreviousTickRuns("decision_retention_sweep");
+    const periodicRecoveryTick = skipWhilePreviousTickRuns("periodic_heartbeat_recovery");
 
     startHeartbeatSchedulerInterval(() => {
       // Track the outer async callback as well as the work it starts. Shutdown
@@ -1659,7 +1682,7 @@ async function startServerWithDatabaseTeardown(
         trackHeartbeatSchedulerWork(decisionExecutor.sweepExpired().catch((err: unknown) => {
           logger.error({ err }, "decision expiry sweep failed");
         }));
-        trackHeartbeatSchedulerWork(runRetentionSweep().catch((err: unknown) => {
+        trackHeartbeatSchedulerWork(retentionSweepTick(runRetentionSweep).catch((err: unknown) => {
           logger.error({ err }, "decision retention sweep failed");
         }));
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
@@ -1787,7 +1810,7 @@ async function startServerWithDatabaseTeardown(
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
-          trackHeartbeatSchedulerWork(heartbeat
+          trackHeartbeatSchedulerWork(periodicRecoveryTick(() => heartbeat
             .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
@@ -1831,7 +1854,7 @@ async function startServerWithDatabaseTeardown(
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
               }
-            })
+            }))
             .catch((err) => {
               logger.error({ err }, "periodic heartbeat recovery failed");
             }));
