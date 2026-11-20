@@ -421,6 +421,8 @@ vi.mock("../auth/better-auth.js", () => ({
 import { startServer } from "../index.ts";
 import { reconcileSafeNativeReplacements } from "../services/native-runtime/native-safe-replacement.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "../services/execution-control-deadline.js";
+import { decisionRetentionService } from "../services/index.js";
+import { logger } from "../middleware/logger.js";
 
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
@@ -688,6 +690,168 @@ describe("startServer feedback export wiring", () => {
 
     expect(heartbeatServiceMock.reconcileHotRestartAdoption).toHaveBeenCalledTimes(1);
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
+  });
+
+  describe("periodic heartbeat work does not overlap", () => {
+    const TICK_MS = 30_017;
+    const SKIP_MESSAGE = "skipping tick — previous tick still in progress";
+
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      let reject!: (error: unknown) => void;
+      const promise = new Promise<T>((done, fail) => {
+        resolve = done;
+        reject = fail;
+      });
+      return { promise, resolve, reject };
+    }
+
+    async function settle() {
+      for (let i = 0; i < 20; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    async function startWithTicks() {
+      loadConfigMock.mockReturnValue(buildTestConfig({
+        heartbeatSchedulerEnabled: true,
+        heartbeatSchedulerIntervalMs: TICK_MS,
+      }));
+      let tick: (() => void) | undefined;
+      const setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(((
+        callback: () => void,
+        interval: number,
+      ) => {
+        if (interval === TICK_MS) tick = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+      await startServer();
+      expect(tick).toBeDefined();
+      return { tick: tick!, restore: () => setIntervalSpy.mockRestore() };
+    }
+
+    function skippedTicks(loop: string) {
+      return vi.mocked(logger.warn).mock.calls
+        .filter(([fields, message]) => message === SKIP_MESSAGE && (fields as { loop?: string })?.loop === loop)
+        .map(([fields]) => (fields as { skippedTicks: number }).skippedTicks);
+    }
+
+    function retentionExecutor() {
+      return vi.mocked(decisionRetentionService).mock.results.at(-1)!.value as {
+        deliverNotifications: ReturnType<typeof vi.fn>;
+      };
+    }
+
+    it("skips retention sweep ticks while the previous sweep runs, and sweeps again once it ends", async () => {
+      const { tick, restore } = await startWithTicks();
+      try {
+        const retention = retentionExecutor();
+        const before = retention.deliverNotifications.mock.calls.length;
+        const slow = deferred<{ notifiedAgents: number; delivered: number }>();
+        retention.deliverNotifications.mockImplementationOnce(() => slow.promise);
+        tick();
+        await settle();
+        tick();
+        await settle();
+        tick();
+        await settle();
+        expect(retention.deliverNotifications).toHaveBeenCalledTimes(before + 1);
+        expect(skippedTicks("decision_retention_sweep")).toEqual([1, 2]);
+
+        slow.resolve({ notifiedAgents: 0, delivered: 0 });
+        await settle();
+        tick();
+        await settle();
+        expect(retention.deliverNotifications).toHaveBeenCalledTimes(before + 2);
+        expect(skippedTicks("decision_retention_sweep")).toEqual([1, 2]);
+      } finally {
+        restore();
+      }
+    });
+
+    it("starts the next retention sweep after a slow one that failed", async () => {
+      const { tick, restore } = await startWithTicks();
+      try {
+        const retention = retentionExecutor();
+        const before = retention.deliverNotifications.mock.calls.length;
+        const slow = deferred<{ notifiedAgents: number; delivered: number }>();
+        retention.deliverNotifications.mockImplementationOnce(() => slow.promise);
+        tick();
+        await settle();
+        tick();
+        await settle();
+        expect(retention.deliverNotifications).toHaveBeenCalledTimes(before + 1);
+        expect(skippedTicks("decision_retention_sweep")).toEqual([1]);
+
+        slow.reject(new Error("retention sweep exploded"));
+        await settle();
+        expect(logger.error).toHaveBeenCalledWith(
+          expect.objectContaining({ err: expect.any(Error) }),
+          "decision retention sweep failed",
+        );
+        tick();
+        await settle();
+        expect(retention.deliverNotifications).toHaveBeenCalledTimes(before + 2);
+        expect(skippedTicks("decision_retention_sweep")).toEqual([1]);
+      } finally {
+        restore();
+      }
+    });
+
+    it("skips recovery ticks while the previous orphan-reaper recovery chain runs, and recovers again once it ends", async () => {
+      const { tick, restore } = await startWithTicks();
+      try {
+        const before = heartbeatServiceMock.reapOrphanedRuns.mock.calls.length;
+        const resumedBefore = heartbeatServiceMock.resumeQueuedRuns.mock.calls.length;
+        const slow = deferred<{ reaped: number; runIds: string[] }>();
+        heartbeatServiceMock.reapOrphanedRuns.mockImplementationOnce(() => slow.promise);
+        tick();
+        await settle();
+        tick();
+        await settle();
+        tick();
+        await settle();
+        expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(before + 1);
+        expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(resumedBefore);
+        expect(skippedTicks("periodic_heartbeat_recovery")).toEqual([1, 2]);
+
+        slow.resolve({ reaped: 0, runIds: [] });
+        await settle();
+        expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(resumedBefore + 1);
+        tick();
+        await settle();
+        expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(before + 2);
+        expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(resumedBefore + 2);
+      } finally {
+        restore();
+      }
+    });
+
+    it("starts the next recovery chain after a slow one that failed", async () => {
+      const { tick, restore } = await startWithTicks();
+      try {
+        const before = heartbeatServiceMock.reapOrphanedRuns.mock.calls.length;
+        const slow = deferred<{ reaped: number; runIds: string[] }>();
+        heartbeatServiceMock.reapOrphanedRuns.mockImplementationOnce(() => slow.promise);
+        tick();
+        await settle();
+        tick();
+        await settle();
+        expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(before + 1);
+        expect(skippedTicks("periodic_heartbeat_recovery")).toEqual([1]);
+
+        slow.reject(new Error("reaper exploded"));
+        await settle();
+        expect(logger.error).toHaveBeenCalledWith(
+          expect.objectContaining({ err: expect.any(Error) }),
+          "periodic heartbeat recovery failed",
+        );
+        tick();
+        await settle();
+        expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(before + 2);
+        expect(skippedTicks("periodic_heartbeat_recovery")).toEqual([1]);
+      } finally {
+        restore();
+      }
+    });
   });
 
   it("closes the bound listener when native startup recovery fails", async () => {
