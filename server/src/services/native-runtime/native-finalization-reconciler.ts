@@ -577,6 +577,23 @@ export async function reconcileNativeFinalizations(
   await retireSupersededCompletionReviews(db, runIds).catch((err) => {
     logger.warn({ err }, "Completion review handoff lookup failed; normal recovery continues");
   });
+  // Every native run that ever produced a result stays a candidate, so this
+  // list grows with history. It carries no run documents: one run's snapshot
+  // and runner profile reach megabytes, and holding them for every candidate
+  // through the loop below is what filled the heap. The two values the loop
+  // needs from them are read per run, at the point of use.
+  const readNativeStatusWakeIntentId = (runId: string) => db
+    .select({
+      intentId: sql<string | null>`case
+        when jsonb_typeof(${heartbeatRuns.contextSnapshot} -> 'nativeStatusWakeIntentId') = 'string'
+        then ${heartbeatRuns.contextSnapshot} ->> 'nativeStatusWakeIntentId' end`,
+    })
+    .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).limit(1)
+    .then((entries) => entries[0]?.intentId ?? null);
+  const readNativeWorkspaceSync = (runId: string) => db
+    .select({ nativeWorkspaceSync: sql<unknown>`${heartbeatRuns.runnerProfileJson} -> 'nativeWorkspaceSync'` })
+    .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).limit(1)
+    .then((entries) => entries[0]?.nativeWorkspaceSync ?? undefined);
   const rows = await db
     .select({
       runId: heartbeatRuns.id,
@@ -591,8 +608,6 @@ export async function reconcileNativeFinalizations(
       resultId: nativeRunFinalizations.resultId,
       assessmentId: nativeRunFinalizations.assessmentId,
       decisionId: nativeRunFinalizations.decisionId,
-      runnerProfileJson: heartbeatRuns.runnerProfileJson,
-      contextSnapshot: heartbeatRuns.contextSnapshot,
     })
     .from(heartbeatRuns)
     .innerJoin(nativeRunFinalizations, eq(nativeRunFinalizations.runId, heartbeatRuns.id))
@@ -872,8 +887,7 @@ export async function reconcileNativeFinalizations(
         }
         const childCompletionRecipient = {
           companyId: row.companyId, issueId: row.issueId, agentId: row.agentId, runId: row.runId,
-          sourceIntentId: typeof record(row.contextSnapshot).nativeStatusWakeIntentId === "string"
-            ? record(row.contextSnapshot).nativeStatusWakeIntentId as string : null,
+          sourceIntentId: await readNativeStatusWakeIntentId(row.runId),
         };
         const hasPendingChildCompletion = await hasPendingNativeChildCompletion(db, childCompletionRecipient);
         let decision = needsFinalArbitration && currentIssue
@@ -973,7 +987,7 @@ export async function reconcileNativeFinalizations(
           projectRunStatus: true,
           preserveProviderAttempt: Boolean(
             readNativeWorkspaceSyncReference(
-              record(row.runnerProfileJson).nativeWorkspaceSync,
+              await readNativeWorkspaceSync(row.runId),
             ),
           ),
         });
@@ -1031,7 +1045,7 @@ export async function reconcileNativeFinalizations(
         projectRunStatus: true,
         preserveProviderAttempt: Boolean(
           readNativeWorkspaceSyncReference(
-            record(row.runnerProfileJson).nativeWorkspaceSync,
+            await readNativeWorkspaceSync(row.runId),
           ),
         ),
       });

@@ -62,6 +62,9 @@ function createDbState(input: {
         status: input.run.status ?? "running",
         contextSnapshot: input.run.contextSnapshot ?? {},
         resultJson: input.run.resultJson ?? {},
+        // The middleware selects these two facts instead of the documents.
+        executionCancellation: input.run.resultJson?.executionCancellation ?? null,
+        conversationMode: input.run.contextSnapshot?.conversationMode === true,
       }
     : null;
 

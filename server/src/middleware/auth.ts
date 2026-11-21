@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { Request, RequestHandler } from "express";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -21,7 +21,7 @@ import {
   rekeyCompanyIssueIdentifiers,
 } from "../services/issue-prefix.js";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
-import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
+import { agentRunCancellationColumns, agentRunWritesRevoked } from "../agent-run-cancellation.js";
 import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
@@ -399,13 +399,16 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       }
 
       const [identityRun] = await db.select({ activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
-        responsibleUserId: heartbeatRuns.responsibleUserId, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson,
-        contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+        responsibleUserId: heartbeatRuns.responsibleUserId, status: heartbeatRuns.status,
+        // Every agent request passes here; read the two facts, not the documents.
+        executionCancellation: agentRunCancellationColumns().executionCancellation,
+        conversationMode: sql<boolean | null>`${heartbeatRuns.contextSnapshot} -> 'conversationMode' = 'true'::jsonb`,
+      }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.id, claims.run_id), eq(heartbeatRuns.companyId, claims.company_id), eq(heartbeatRuns.agentId, claims.sub),
         ));
-      if (agentRunWritesRevoked(identityRun)
+      if (agentRunWritesRevoked(identityRun && { status: identityRun.status, resultJson: { executionCancellation: identityRun.executionCancellation } })
         && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
-        const conversation = identityRun?.contextSnapshot?.conversationMode === true;
+        const conversation = identityRun?.conversationMode === true;
         _res.status(403).json({ error: conversation ? "This conversation turn was cancelled" : "This run was cancelled",
           code: conversation ? "conversation_turn_cancelled" : "agent_run_cancelled" });
         return;
