@@ -603,7 +603,27 @@ export async function recordNativeFinalizationFailure(input: {
   });
 }
 
-async function resolveCommittedFinalizationRecovery(db: Db, run: typeof heartbeatRuns.$inferSelect, issueId: string) {
+/** A native run's identity and state without its JSON documents. Periodic
+ * reconciliation revisits every committed run, and one run's documents can
+ * reach megabytes, so the revisit must not read them. */
+const nativeRunHeadColumns = {
+  id: heartbeatRuns.id,
+  companyId: heartbeatRuns.companyId,
+  agentId: heartbeatRuns.agentId,
+  status: heartbeatRuns.status,
+  runtimeMode: heartbeatRuns.runtimeMode,
+  errorCode: heartbeatRuns.errorCode,
+  nativePhase: heartbeatRuns.nativePhase,
+  finishedAt: heartbeatRuns.finishedAt,
+  nativeIssueId: heartbeatRuns.nativeIssueId,
+  nativeSessionId: heartbeatRuns.nativeSessionId,
+  runnerInstanceId: heartbeatRuns.runnerInstanceId,
+  completionContractId: heartbeatRuns.completionContractId,
+  completionContractSha256: heartbeatRuns.completionContractSha256,
+};
+type NativeRunHead = Pick<typeof heartbeatRuns.$inferSelect, keyof typeof nativeRunHeadColumns>;
+
+async function resolveCommittedFinalizationRecovery(db: Db, run: Pick<NativeRunHead, "id" | "companyId">, issueId: string) {
   const actions = await db.select().from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
     eq(issueRecoveryActions.kind, "active_run_watchdog"), inArray(issueRecoveryActions.status, ["active", "escalated"]),
@@ -628,7 +648,7 @@ function recoveredExecutionFailureMetadata() {
 
 async function projectCommittedRun(input: {
   db: Db;
-  run: typeof heartbeatRuns.$inferSelect;
+  run: Pick<NativeRunHead, "id" | "companyId" | "status" | "finishedAt">;
   coordinator: typeof nativeRunFinalizations.$inferSelect;
 }) {
   if (!input.coordinator.resultId) return;
@@ -726,6 +746,16 @@ async function projectCommittedRun(input: {
 
 async function materializeCommittedReviewResponse(db: Db, runId: string) {
   try {
+    // Most committed runs carry no review presentation. Ask for that one fact
+    // before reading the whole run, since every reconciliation pass comes here.
+    const [gate] = await db
+      .select({
+        hasReviewPresentation: sql<boolean | null>`jsonb_typeof(${heartbeatRuns.resultJson} -> 'externalChatReviewPresentation') <> 'null'`,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .limit(1);
+    if (gate?.hasReviewPresentation !== true) return;
     const [run] = await db
       .select()
       .from(heartbeatRuns)
@@ -787,7 +817,7 @@ async function materializeCommittedReviewResponse(db: Db, runId: string) {
 
 async function acceptedResponseDigestMatches(
   db: Db,
-  run: typeof heartbeatRuns.$inferSelect,
+  run: NativeRunHead,
   accepted: typeof nativeRunResults.$inferSelect,
 ): Promise<boolean> {
   const envelope = record(accepted.resultJson);
@@ -865,7 +895,12 @@ export async function repairCommittedNativeChatResponse(
         .for("update");
       if (!issue) return false;
       const [run] = await tx
-        .select()
+        .select({
+          ...nativeRunHeadColumns,
+          presentationCommentId: sql<string | null>`case
+            when jsonb_typeof(${heartbeatRuns.resultJson} #> '{presentationDecision,commentId}') = 'string'
+            then ${heartbeatRuns.resultJson} #>> '{presentationDecision,commentId}' end`,
+        })
         .from(heartbeatRuns)
         .where(
           and(
@@ -885,11 +920,7 @@ export async function repairCommittedNativeChatResponse(
         return false;
       // An existing selected answer, including a subsequently deleted one, must
       // never be replaced or resurrected by a background presentation repair.
-      if (
-        typeof record(record(run.resultJson).presentationDecision).commentId ===
-        "string"
-      )
-        return false;
+      if (typeof run.presentationCommentId === "string") return false;
       const [coordinator] = await tx
         .select()
         .from(nativeRunFinalizations)
@@ -1068,13 +1099,16 @@ export async function finalizeNativeRun(input: {
   preserveProviderAttempt?: boolean;
   failpoint?: NativeStatusCommitFailpoint;
 }) {
-  const run = await input.db
-    .select()
+  // An already committed run is replayed on every reconciliation pass and
+  // needs only its head; the documents are read below, once the claim shows
+  // there is real finalization work.
+  const runHead = await input.db
+    .select(nativeRunHeadColumns)
     .from(heartbeatRuns)
     .where(eq(heartbeatRuns.id, input.runId))
     .limit(1)
     .then((rows) => rows[0] ?? null);
-  if (!run || run.runtimeMode !== "native")
+  if (!runHead || runHead.runtimeMode !== "native")
     throw new Error("native_finalization_run_missing");
   const claim = await claimCoordinator({
     db: input.db,
@@ -1083,12 +1117,12 @@ export async function finalizeNativeRun(input: {
   });
   const coordinator = claim.coordinator;
   if (!claim.leaseOwner && coordinator.phase === "committed") {
-    if (isNativeRunnerOwnershipHeld(run)) return coordinator;
+    if (isNativeRunnerOwnershipHeld(runHead)) return coordinator;
     const presentationAlreadyMaterialized = coordinator.decisionId
       ? await hasMaterializedNativeReviewResponse(input.db, {
-          companyId: run.companyId,
+          companyId: runHead.companyId,
           issueId: coordinator.issueId,
-          runId: run.id,
+          runId: runHead.id,
           decisionId: coordinator.decisionId,
         })
       : false;
@@ -1100,9 +1134,9 @@ export async function finalizeNativeRun(input: {
     ) {
       await input.db.transaction((tx) =>
         restoreNativeChatReviewPresentationInTransaction(tx as unknown as Db, {
-          companyId: run.companyId,
+          companyId: runHead.companyId,
           issueId: coordinator.issueId,
-          runId: run.id,
+          runId: runHead.id,
           decisionId: coordinator.decisionId!,
           resultId: coordinator.resultId!,
           assessmentId: coordinator.assessmentId!,
@@ -1110,23 +1144,31 @@ export async function finalizeNativeRun(input: {
       );
     }
     if (input.projectRunStatus)
-      await projectCommittedRun({ db: input.db, run, coordinator });
+      await projectCommittedRun({ db: input.db, run: runHead, coordinator });
     if (input.projectRunStatus && !presentationAlreadyMaterialized)
       await materializeCommittedReviewResponse(input.db, input.runId);
     if (input.projectRunStatus)
       await repairCommittedNativeChatResponse(input.db, {
-        companyId: run.companyId,
+        companyId: runHead.companyId,
         issueId: coordinator.issueId,
-        runId: run.id,
+        runId: runHead.id,
       });
     if (input.projectRunStatus) {
-      await settleSlackConversation(input.db, run.companyId, coordinator.issueId).catch((err) => {
-        logger.warn({ err, runId: run.id }, "Slack conversation settlement deferred to reconciliation");
+      await settleSlackConversation(input.db, runHead.companyId, coordinator.issueId).catch((err) => {
+        logger.warn({ err, runId: runHead.id }, "Slack conversation settlement deferred to reconciliation");
       });
     }
-    await resolveCommittedFinalizationRecovery(input.db, run, coordinator.issueId);
+    await resolveCommittedFinalizationRecovery(input.db, runHead, coordinator.issueId);
     return coordinator;
   }
+  const run = await input.db
+    .select()
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, input.runId))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (!run || run.runtimeMode !== "native")
+    throw new Error("native_finalization_run_missing");
   const [resultRow, contractRow] = await Promise.all([
     input.db
       .select()

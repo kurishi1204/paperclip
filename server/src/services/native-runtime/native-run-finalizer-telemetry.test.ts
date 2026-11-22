@@ -273,6 +273,72 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
     expect(agentTaskRunCalls(callsBefore)).toHaveLength(0);
   });
 
+  /** Counts the characters of every value the database client hands back
+   * while `work` runs, inside transactions too. */
+  async function measureResultChars(work: () => Promise<unknown>) {
+    let chars = 0;
+    const count = (value: unknown) => {
+      if (typeof value === "string") chars += value.length;
+      else if (value && typeof value === "object" && !(value instanceof Date)) chars += JSON.stringify(value).length;
+    };
+    const restores: Array<() => void> = [];
+    const tap = (client: any) => {
+      const unsafe = client.unsafe;
+      client.unsafe = (...args: unknown[]) => {
+        const query = unsafe.apply(client, args);
+        const values = query.values;
+        query.values = () => {
+          const pending = values.call(query);
+          pending.then((rows: unknown[][]) => rows.forEach((row) => row.forEach(count)), () => {});
+          return pending;
+        };
+        return query;
+      };
+      restores.push(() => { client.unsafe = unsafe; });
+      for (const scope of ["begin", "savepoint"] as const) {
+        const open = client[scope];
+        if (typeof open !== "function") continue;
+        client[scope] = (...args: unknown[]) => {
+          const body = args.pop() as (tx: unknown) => unknown;
+          return open.call(client, ...args, (tx: unknown) => { tap(tx); return body(tx); });
+        };
+        restores.push(() => { client[scope] = open; });
+      }
+    };
+    tap((db as any).$client);
+    try { await work(); } finally { restores.reverse().forEach((restore) => restore()); }
+    return chars;
+  }
+
+  it("revisits a committed run without reading its megabyte documents", async () => {
+    const fixture = await seedNativeRun();
+    await driveToCompleteResult(fixture);
+    await db.insert(workspaceOperations).values({ companyId, issueId: fixture.issueId,
+      heartbeatRunId: fixture.runId, phase: "workspace_finalize", status: "succeeded" });
+    await finalizeNativeRun({ db, runId: fixture.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+    expect((await db.select({ phase: nativeRunFinalizations.phase }).from(nativeRunFinalizations)
+      .where(eq(nativeRunFinalizations.runId, fixture.runId)))[0]?.phase).toBe("committed");
+    // A real run's snapshot, runner profile and result reach megabytes each.
+    const padding = "x".repeat(1_000_000);
+    const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: { ...before!.contextSnapshot, padding },
+      runnerProfileJson: { padding },
+      resultJson: { ...before!.resultJson, padding },
+    }).where(eq(heartbeatRuns.id, fixture.runId));
+    const [padded] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+
+    // The periodic sweep revisits every committed run on every pass. With the
+    // documents in the candidate list, this one run costs over 3M characters.
+    const chars = await measureResultChars(() => reconcileNativeFinalizations(db, [fixture.runId]));
+    expect(chars).toBeLessThan(100_000);
+
+    // The revisit is still a no-op replay.
+    const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+    expect(after).toEqual(padded);
+    expect(await db.select().from(statusDecisions).where(eq(statusDecisions.runId, fixture.runId))).toHaveLength(1);
+  });
+
   it("repairs a stale succeeded-run error once without duplicate telemetry or destroying retained owner evidence", async () => {
     const fixture = await seedNativeRun();
     await driveToCompleteResult(fixture);

@@ -1699,7 +1699,11 @@ export function agentRoutes(
           .select({
             companyId: heartbeatRuns.companyId,
             agentId: heartbeatRuns.agentId,
-            contextSnapshot: heartbeatRuns.contextSnapshot,
+            // Only the keys read below; the whole snapshot can reach megabytes.
+            contextSnapshot: sql<Record<string, unknown>>`jsonb_build_object(
+              'executionPolicy', ${heartbeatRuns.contextSnapshot} -> 'executionPolicy',
+              'issueId', ${heartbeatRuns.contextSnapshot} -> 'issueId',
+              'paperclipIssue', jsonb_build_object('id', ${heartbeatRuns.contextSnapshot} #> '{paperclipIssue,id}'))`,
           })
           .from(heartbeatRuns)
           .where(and(eq(heartbeatRuns.id, req.actor.runId), eq(heartbeatRuns.companyId, agent.companyId)))
