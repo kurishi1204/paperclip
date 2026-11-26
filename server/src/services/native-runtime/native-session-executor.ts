@@ -7479,6 +7479,15 @@ export async function executePaperclipNativeSession(input: {
       executingRunnerdSessionScopes.get(sessionScopeId) ===
         input.execution.binding.runId
     ) {
+      // The registry routes retained backend callbacks to the current turn.
+      // Once that turn exits, its DB/tool/trace closures must not stay rooted
+      // for every historical session. A later warm turn installs fresh authority.
+      // Fence by run id so a stale finalizer cannot revoke a replacement.
+      const authority = sessionToolAuthorityEpochs.get(sessionScopeId);
+      if (authority?.runId === runId) {
+        authority.revoke();
+        sessionToolAuthorityEpochs.delete(sessionScopeId);
+      }
       executingRunnerdSessionScopes.delete(sessionScopeId);
     }
     try {

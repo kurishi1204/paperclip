@@ -223,7 +223,9 @@ async function importServerEntry(): Promise<StartedServer> {
   // Dev mode: try local workspace path (monorepo with tsx)
   const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const devEntry = path.resolve(projectRoot, "server/src/index.ts");
-  if (fs.existsSync(devEntry)) {
+  // A bundled CLI must use the published/compiled server contract, even when
+  // an unrelated source checkout happens to exist above its install directory.
+  if (fileURLToPath(import.meta.url).endsWith(".ts") && fs.existsSync(devEntry)) {
     ensureDevWorkspaceBuildDeps(projectRoot);
     maybeEnableUiDevMiddleware(devEntry);
     const mod = await import(pathToFileURL(devEntry).href);

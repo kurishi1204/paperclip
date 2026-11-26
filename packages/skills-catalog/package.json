@@ -13,9 +13,15 @@
   },
   "type": "module",
   "exports": {
-    ".": "./src/index.ts",
+    ".": {
+      "paperclip-production": "./dist/src/index.js",
+      "default": "./src/index.ts"
+    },
     "./package.json": "./package.json",
-    "./types": "./src/types.ts",
+    "./types": {
+      "paperclip-production": "./dist/src/types.js",
+      "default": "./src/types.ts"
+    },
     "./catalog.json": "./generated/catalog.json"
   },
   "publishConfig": {

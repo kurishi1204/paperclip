@@ -83,6 +83,40 @@ pnpm dev:stop --data-dir ./tmp/paperclip-dev
 
 Issue execution may also use project execution workspace policies and workspace runtime services for per-project worktrees, preview servers, and managed dev commands. Configure those through the project workspace/runtime surfaces rather than starting long-running unmanaged processes when a task needs a reusable service.
 
+### Run a built workspace
+
+For a configured, long-running instance, build before starting the service:
+
+```sh
+pnpm build
+pnpm check:production-runtime
+pnpm start
+```
+
+The build requires the Rust toolchain used by Paperclip Runner. Keep the same
+`PAPERCLIP_HOME`, instance ID, and config when replacing a source-mode launcher.
+Prepare the UI with `pnpm --filter @paperclipai/server prepare:ui-dist` when the
+service must serve the built board UI.
+
+`pnpm start` runs compiled JavaScript with the `paperclip-production` Node
+condition. Workspace package exports select their published build paths under
+that condition; development commands continue to select TypeScript sources.
+Missing build files fail startup rather than falling back to runtime compilation.
+`pnpm check:production-runtime` imports the real server module graph without
+starting the server or connecting to its database. It reports normal (exit 0),
+source files loaded or an invalid server export (exit 1), or an import that could
+not be observed successfully (exit 2). It does not prove database or API health.
+
+For CLI setup and `run` behavior with compiled workspace packages, use
+`pnpm paperclipai:production run`. A bundled CLI resolves the server package
+instead of probing a parent checkout for TypeScript sources.
+
+Runtime compilation keeps transformed modules and source maps in memory. A
+built launcher removes that cost; it does not impose a heap limit or replace
+measurement under the instance's workload. Native runner tool authority is
+released at the end of each execution, including failures. A later warm turn
+installs new authority for the same provider session.
+
 ### Document-only task delivery
 
 For a local `claude_local` agent, set these **effective adapter settings**
