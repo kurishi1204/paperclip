@@ -82,3 +82,6 @@ test-results/
 
 # Retained local lifecycle behavior measurements
 .lifecycle-baseline/
+
+# Local runtime measurements and worker reports
+/runtime/

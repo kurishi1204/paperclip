@@ -13,9 +13,18 @@
   },
   "type": "module",
   "exports": {
-    ".": "./src/index.ts",
-    "./telemetry": "./src/telemetry/index.ts",
-    "./*": "./src/*.ts"
+    ".": {
+      "paperclip-production": "./dist/index.js",
+      "default": "./src/index.ts"
+    },
+    "./telemetry": {
+      "paperclip-production": "./dist/telemetry/index.js",
+      "default": "./src/telemetry/index.ts"
+    },
+    "./*": {
+      "paperclip-production": "./dist/*.js",
+      "default": "./src/*.ts"
+    }
   },
   "publishConfig": {
     "access": "public",

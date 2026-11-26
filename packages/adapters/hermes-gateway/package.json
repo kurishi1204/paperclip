@@ -22,10 +22,22 @@
     "orchestration"
   ],
   "exports": {
-    ".": "./src/index.ts",
-    "./server": "./src/server/index.ts",
-    "./ui": "./src/ui/index.ts",
-    "./cli": "./src/cli/index.ts",
+    ".": {
+      "paperclip-production": "./dist/index.js",
+      "default": "./src/index.ts"
+    },
+    "./server": {
+      "paperclip-production": "./dist/server/index.js",
+      "default": "./src/server/index.ts"
+    },
+    "./ui": {
+      "paperclip-production": "./dist/ui/index.js",
+      "default": "./src/ui/index.ts"
+    },
+    "./cli": {
+      "paperclip-production": "./dist/cli/index.js",
+      "default": "./src/cli/index.ts"
+    },
     "./ui-parser": "./ui-parser.cjs"
   },
   "paperclip": {

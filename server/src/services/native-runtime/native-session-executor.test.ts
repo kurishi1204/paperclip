@@ -8369,6 +8369,33 @@ describe("runnerd provider runtime wiring", () => {
     await rm(isolatedStateDirectory, { recursive: true, force: true });
   });
 
+  it.each([false, true])("releases completed runnerd tool authority (failed=%s)", async (failed) => {
+    state.createBackend.mockClear();
+    state.toolAuthorityExecute.mockReset().mockResolvedValue({ ok: true });
+    state.execute.mockReset().mockImplementationOnce(async () => {
+      const handler = state.createBackend.mock.calls.at(-1)![1].dynamicToolHandler!;
+      await expect(handler({})).resolves.toEqual({ ok: true });
+      if (failed) throw new Error("fixture provider failed");
+      return {
+        result: { summary: "done" }, terminal: { runTerminalState: "succeeded" },
+        turnId: "turn", normalizedSessionId: "session", providerSessionId: null,
+        driverKind: "test", driverVersion: "1", nativeEventCount: 1,
+        highestContiguousSourceSeq: 1,
+      };
+    });
+    const running = executePaperclipNativeSession({
+      db: leaseDb(execution), execution, runnerInstanceId: "runner-authority-cleanup", useRunnerd: true,
+    });
+    // The failure fixture also rejects persistence in its minimal DB. Cleanup
+    // must run even when a secondary failure masks the provider exception.
+    if (failed) await expect(running).rejects.toBeInstanceOf(Error);
+    else await running;
+    expect(state.execute).toHaveBeenCalledOnce();
+    const handler = state.createBackend.mock.calls.at(-1)![1].dynamicToolHandler!;
+    // Missing registry entry proves disposal, rather than just setting a revoked flag.
+    expect(() => handler({})).toThrow("native_session_tool_authority_unavailable");
+  });
+
   it.each([
     ["open", "before-close"],
     ["open", "during-close"],
