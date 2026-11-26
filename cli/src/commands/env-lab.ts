@@ -131,6 +131,26 @@ function shellQuoteArgument(value: string): string {
 interface EnvLabCliInvocation {
   entry: string;
   tsxBin: string | null;
+  nodeArgs?: string[];
+}
+
+// Module resolution conditions belong to the invocation, including a copied
+// cleanup hint. Do not carry debugger/listener flags into the new process.
+function nodeConditionArguments(args: readonly string[]): string[] {
+  const conditions: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === "--conditions" || arg === "-C") {
+      const value = args[index + 1];
+      if (value !== undefined) {
+        conditions.push(arg, value);
+        index += 1;
+      }
+    } else if (arg.startsWith("--conditions=") || arg.startsWith("-C=")) {
+      conditions.push(arg);
+    }
+  }
+  return conditions;
 }
 
 // Resolve how to re-run the CLI from the running module location. The cleanup
@@ -156,7 +176,7 @@ export function resolveEnvLabCliInvocation(
       tsxBin: path.join(cliRoot, "node_modules", "tsx", "dist", "cli.mjs"),
     };
   }
-  return { entry: modulePath, tsxBin: null };
+  return { entry: modulePath, tsxBin: null, nodeArgs: nodeConditionArguments(process.execArgv) };
 }
 
 // Build the env-lab cleanup hint as a copyable shell command. The hint stops the
@@ -172,6 +192,7 @@ export function buildEnvLabCleanupCommand(
 ): string {
   const invocation = opts.invocation ?? resolveEnvLabCliInvocation();
   const parts = ["node"];
+  parts.push(...(invocation.nodeArgs ?? []).map(shellQuoteArgument));
   if (invocation.tsxBin !== null) {
     parts.push(shellQuoteArgument(invocation.tsxBin));
   }

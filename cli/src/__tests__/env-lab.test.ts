@@ -48,7 +48,7 @@ describe("env-lab cleanup command hint", () => {
   // build runs this module from `<root>/dist/index.js`, so the resolver returns
   // that file as the entry with no tsx runner.
   function bundledInvocation(root: string) {
-    return resolveEnvLabCliInvocation(path.join(root, "dist", "index.js"));
+    return { ...resolveEnvLabCliInvocation(path.join(root, "dist", "index.js")), nodeArgs: [] };
   }
 
   // Split a command that uses POSIX single-quoting into its argument tokens. The
@@ -202,6 +202,23 @@ describe("env-lab cleanup command hint", () => {
     // command.
     expect(tokens.slice(-2)).toEqual(["--instance", "$(touch pwned)"]);
     expect(command).not.toContain('"$(touch pwned)"');
+  });
+
+  it.each([
+    ["--conditions=paperclip-production"],
+    ["--conditions", "paperclip-production"],
+    ["-C", "paperclip-production"],
+  ])("preserves Node resolution conditions in a bundled cleanup hint: %j", (...conditionArgs) => {
+    const previous = process.execArgv;
+    try {
+      process.execArgv = ["--inspect=0", ...conditionArgs];
+      const invocation = resolveEnvLabCliInvocation("/opt/pkg/dist/workspace.js");
+      expect(tokenizePosix(buildEnvLabCleanupCommand({ invocation }))).toEqual([
+        "node", ...conditionArgs, "/opt/pkg/dist/workspace.js", "env-lab", "down",
+      ]);
+    } finally {
+      process.execArgv = previous;
+    }
   });
 
   it("runs the bundled dist entry directly, without the tsx runner", () => {
